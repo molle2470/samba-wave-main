@@ -225,19 +225,17 @@ CANCEL_ALERT_TARGET_STATUSES = (
 def _build_cancel_alert_clause():
     """알람 카운트와 알람 필터에서 공통으로 쓰는 WHERE 조각.
 
-    조건:
-    - 내부 status가 명시적 'cancel_requested' (운영자 인지·미처리)
-    - 또는 마켓 shipping_status 가 '취소요청'/'취소완료' + 우리 status가 처리/배송 단계
-      → 발주·송장 등록 사고 위험. 운영자가 보고 막아야 할 케이스.
-    """
-    from sqlalchemy import and_, or_
+    조건: 마켓 shipping_status 가 '취소요청'/'취소완료' + 우리 내부 status는 아직 처리/배송 단계
+      → 발주·송장 등록 사고 위험. 운영자가 보고 막아야 할 미처리 케이스.
 
-    return or_(
-        SambaOrder.status == "cancel_requested",
-        and_(
-            SambaOrder.shipping_status.in_(CANCEL_ALERT_SHIPPING_STATUSES),
-            SambaOrder.status.in_(CANCEL_ALERT_TARGET_STATUSES),
-        ),
+    내부 status='cancel_requested'는 운영자가 이미 인지하고 드롭박스를 전환한 상태라
+    더 이상 발주/송장이 나가지 않으므로 알람 대상에서 제외.
+    """
+    from sqlalchemy import and_
+
+    return and_(
+        SambaOrder.shipping_status.in_(CANCEL_ALERT_SHIPPING_STATUSES),
+        SambaOrder.status.in_(CANCEL_ALERT_TARGET_STATUSES),
     )
 
 
