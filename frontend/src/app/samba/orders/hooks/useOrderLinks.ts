@@ -62,18 +62,35 @@ export function useOrderLinks(accounts: SambaMarketAccount[]) {
     const storeSlug = (acc?.additional_fields as Record<string, string> | undefined)?.storeSlug || ''
     let productNo = o.product_id || ''
 
-    // 스마트스토어 URL은 originProductNo만 받음 (주문에는 channelProductNo 저장됨)
-    // → 수집상품 역추적해서 market_product_nos[acc.id_origin] 우선 사용
+    // 스마트스토어 정상 URL은 channelProductNo로 열림 (origin은 "존재하지 않는 페이지").
+    // - mpn[acc.id]        = channelProductNo (URL용)
+    // - mpn[acc.id_origin] = originProductNo  (Commerce API 관리/품절용)
+    // 주문 product_id에는 channelProductNo가 들어오지만, 선물하기/옵션상품 등은
+    // originalProductId(=originProductNo) fallback이 저장되어 그대로 쓰면 깨짐
+    // → 수집상품 역추적으로 channelProductNo 우선 해석 (ProductCard.tsx:539와 동일 패턴)
     if (marketType === 'smartstore' && o.product_id && o.channel_id) {
       try {
         const lookup = await collectorApi.lookupByMarketNo(o.product_id)
         const mpn = lookup?.market_product_nos || {}
-        const originRaw = mpn[`${o.channel_id}_origin`]
-        const originNo = typeof originRaw === 'object' && originRaw !== null
-          ? (originRaw.originProductNo ?? '')
-          : (originRaw ?? '')
-        if (originNo) productNo = String(originNo)
-      } catch { /* ignore — channelProductNo로 fallback */ }
+        // dict 형태({originProductNo, smartstoreChannelProductNo, groupProductNo})
+        // URL용으로는 smartstoreChannelProductNo > groupProductNo 우선
+        const pickForUrl = (v: unknown): string => {
+          if (v && typeof v === 'object') {
+            const obj = v as Record<string, unknown>
+            return String(
+              obj.smartstoreChannelProductNo ??
+              obj.groupProductNo ??
+              obj.originProductNo ??
+              ''
+            )
+          }
+          return v ? String(v) : ''
+        }
+        const resolved =
+          pickForUrl(mpn[o.channel_id]) ||
+          pickForUrl(mpn[`${o.channel_id}_origin`])
+        if (resolved) productNo = resolved
+      } catch { /* lookup 실패 시 product_id 그대로 사용 */ }
     }
 
     const urlMap: Record<string, string> = {

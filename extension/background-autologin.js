@@ -199,9 +199,10 @@ async function _spaDirectLogin(siteKey, username, password) {
               btnId: '#login',
             },
             ssg: {
-              id: ['#userId', 'input[name="userId"]', 'input[name="usrId"]', 'input[type="email"]'],
-              pw: ['input[type="password"]'],
-              btnId: '#btn_login, .btn_login, button[type="submit"]',
+              // member.ssg.com 실측(2026-05-15): id="inp_id" name="mbrLoginId" / pw id="inp_pw" / 버튼 id="loginBtn"
+              id: ['#inp_id', 'input[name="mbrLoginId"]', '#userId', 'input[name="userId"]', 'input[name="usrId"]', 'input[type="email"]'],
+              pw: ['#inp_pw', 'input[type="password"]'],
+              btnId: '#loginBtn, #btn_login, .btn_login, button[type="submit"]',
             },
           }
           const sel = SELECTORS[siteKeyArg]
