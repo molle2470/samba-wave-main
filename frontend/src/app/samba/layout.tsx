@@ -117,10 +117,11 @@ export default function SambaLayout({
 
     let curSettings: { hour: number; min: number; sleep_start: string; sleep_end: string } | null = null;
 
-    const pollOnce = async () => {
+    const pollOnce = async (force = false) => {
       if (cancelled || !curSettings) return;
       // sleep_end = 영업 시작, sleep_start = 영업 종료 (모달 입력 라벨 기준)
-      if (!inBusinessHours(curSettings.sleep_end, curSettings.sleep_start)) return;
+      // force=true 면 페이지 진입·설정 변경 등 사용자 액션이라 영업시간 무관 호출.
+      if (!force && !inBusinessHours(curSettings.sleep_end, curSettings.sleep_start)) return;
       try {
         const { count } = await orderApi.getCancelAlertCount();
         if (cancelled) return;
@@ -137,11 +138,14 @@ export default function SambaLayout({
         const settings = await orderApi.getAlarmSettings();
         if (cancelled) return;
         curSettings = settings;
-        await pollOnce();
+        // 페이지 진입·설정 변경 직후 1회는 영업시간 무관 강제 호출.
+        // 사고 위험은 시간 안 따지므로 인지는 항상 가능해야 한다.
+        await pollOnce(true);
         const intervalMs = (Number(settings.hour) * 3600 + Number(settings.min) * 60) * 1000;
-        // 0초 설정이면 폴링 안 함, 30초 미만이면 부하 보호로 30초로 보정
+        // 0초 설정이면 반복 폴링 안 함, 30초 미만이면 부하 보호로 30초로 보정.
+        // 반복 폴링은 영업시간을 따른다 (force=false 기본).
         if (intervalMs > 0) {
-          intervalId = window.setInterval(pollOnce, Math.max(intervalMs, 30_000));
+          intervalId = window.setInterval(() => pollOnce(false), Math.max(intervalMs, 30_000));
         }
       } catch {}
     };
