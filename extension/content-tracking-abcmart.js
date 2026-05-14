@@ -27,12 +27,28 @@
     return null
   }
 
+  function isLoginRedirect() {
+    try {
+      const href = location.href || ''
+      if (href.indexOf('/member/login') !== -1) return true
+      if (href.indexOf('login') !== -1 && href.indexOf('order-detail') === -1) return true
+      if (href && href.indexOf('order-detail') === -1) return true
+      return false
+    } catch { return false }
+  }
+
   async function scrape() {
+    if (isLoginRedirect()) {
+      return { success: false, needsLogin: true, error: 'needs_login: ABCmart 로그인 페이지로 리다이렉트' }
+    }
     if (isOrderCancelled()) {
       return { success: false, cancelled: true, error: 'order_cancelled' }
     }
     const courierEl = await waitFor('div.status-info .info-desc', 10000)
     if (!courierEl) {
+      if (isLoginRedirect()) {
+        return { success: false, needsLogin: true, error: 'needs_login: ABCmart 로그인 페이지로 리다이렉트' }
+      }
       return { success: false, error: 'no_tracking: status-info 미로드 (미발송)' }
     }
     const courierName = courierEl.textContent.trim()

@@ -136,8 +136,27 @@
       try { sessionStorage.removeItem(SS_KEY) } catch {}
       return
     }
-    // 클릭 후 navigation 발생 → 이 페이지 context는 곧 파괴됨.
-    // trace 페이지에서 reload된 content-script가 sessionStorage 의 requestId 로 결과 전송.
+    // 무신사는 Next.js SPA — 버튼 click이 history.pushState만 일으키는 경우가 많음.
+    // 이 경우 content script는 재주입되지 않으므로(manifest matches는 페이지 로드 시점에만 평가)
+    // 같은 컨텍스트에서 location.pathname을 폴링해 trace 페이지 도달을 감지하고 직접 스크랩.
+    // 풀 페이지 reload가 발생하면 이 컨텍스트는 destroy되고, trace 페이지의 새 content script가
+    // sessionStorage 의 requestId 로 이어받아 처리한다(아래 isTracePage 분기).
+    const navStart = Date.now()
+    while (Date.now() - navStart < MAX_WAIT_MS) {
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL))
+      if (isTracePage()) {
+        try { sessionStorage.removeItem(SS_KEY) } catch {}
+        try {
+          const res = await scrapeTrace()
+          send(requestId, res)
+        } catch (e) {
+          send(requestId, { success: false, error: String(e?.message || e) })
+        }
+        return
+      }
+    }
+    send(requestId, { success: false, error: 'trace 페이지 진입 타임아웃 (SPA navigation 실패)' })
+    try { sessionStorage.removeItem(SS_KEY) } catch {}
   }
 
   function isOrderDetailPage() {

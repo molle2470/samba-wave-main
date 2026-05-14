@@ -5046,7 +5046,7 @@ async def sync_orders_from_markets(
 
                 _dlv_status_map = {
                     "15": ("shipping", "출고지시"),
-                    "16": ("shipping", "출고확정"),
+                    "16": ("shipping", "배송대기중"),
                     "17": ("delivered", "배송완료"),
                     "18": ("confirmed", "구매확정"),
                 }
@@ -7053,10 +7053,12 @@ def _parse_lottehome_order(
         shipping_status = force_shipping_status or proc_stat or "출고지시"
     elif is_deliver_api and not proc_stat:
         status = "shipping"
-        shipping_status = "출고확정"
+        shipping_status = "배송대기중"
     else:
         status = status_map.get(proc_stat, "pending")
         shipping_status = proc_stat or "출고지시"
+        if shipping_status == "출고확정":
+            shipping_status = "배송대기중"
 
     product_name = str(prod_info.get("ProdName") or prod_info.get("GoodsNm") or "")
     product_option = str(
