@@ -368,8 +368,6 @@ export default function OrdersPage() {
       paidAt?: string | null
     }>
   } | null>(null)
-  const [trackingPolling, setTrackingPolling] = useState(false)
-
   const refreshTrackingStatus = useCallback(async () => {
     try {
       const data = await orderApi.listRecentTrackingSyncJobs(50)
@@ -379,17 +377,11 @@ export default function OrdersPage() {
     }
   }, [])
 
-  // 송장 상태 모달 열려있으면 5초마다 자동 갱신 (PENDING/DISPATCHED 잡 있을 때만)
+  // 모달 열릴 때 1회만 조회. 폴링은 하지 않는다 — 큐잉된 잡은 백엔드/확장앱이 알아서 처리.
   useEffect(() => {
     if (!trackingStatusOpen) return
     refreshTrackingStatus()
-    const interval = setInterval(() => {
-      const inFlight = (trackingStatusData?.counts.PENDING || 0)
-        + (trackingStatusData?.counts.DISPATCHED || 0)
-      if (inFlight > 0 || trackingPolling) refreshTrackingStatus()
-    }, 5000)
-    return () => clearInterval(interval)
-  }, [trackingStatusOpen, trackingStatusData, trackingPolling, refreshTrackingStatus])
+  }, [trackingStatusOpen, refreshTrackingStatus])
 
   const handleTrackingSyncOne = async (o: SambaOrder) => {
     try {
@@ -416,10 +408,9 @@ export default function OrdersPage() {
         `[송장 일괄] 큐 적재 ${fmtNum(res.queued)}건 / 스킵 ${fmtNum(res.skipped)}건 / 오류 ${fmtNum(res.errors.length)}건`,
         ...res.errors.slice(0, 5).map(e => `  · ${e}`),
       ])
-      // 적재 직후 상태 모달 자동 오픈 — 진행상황 가시화
+      // 적재 직후 상태 모달 자동 오픈 — 큐잉된 잡 목록 1회 표시 (폴링 없음)
       setTrackingStatusOpen(true)
-      setTrackingPolling(true)
-      setTimeout(() => { setTrackingPolling(false); loadOrders() }, 60000)
+      setTimeout(() => { loadOrders() }, 60000)
     } catch (err) {
       setLogMessages(prev => [...prev, `[송장 일괄] 오류: ${(err as Error).message}`])
     } finally {
@@ -883,7 +874,7 @@ export default function OrdersPage() {
             </div>
 
             <div style={{ marginTop: 12, fontSize: 11, color: '#6b7280' }}>
-              💡 모달이 열려있는 동안 5초마다 자동 갱신됩니다. 일괄 송장수집 직후 60초 동안 자동 폴링됩니다.
+              💡 송장수집 클릭 시점의 미입력건 큐잉 상태입니다. 자동 갱신 안 함 — 결과는 주문 테이블에서 확인하세요.
             </div>
           </div>
         </div>
