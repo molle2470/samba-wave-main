@@ -900,8 +900,9 @@ class ImageTransformService:
         "contents.lotteon.com",
         # GS샵 CDN — 11번가가 fetch 시 호스트 차단/확장자 누락으로 "기본이미지 없음"
         # 500 에러 유발 → R2 선미러 필요
-        "image.gsshop.com",
-        "image.gsshop.co.kr",
+        # 실제 GS샵 메인 이미지 CDN은 asset.m-gs.kr / static.m-gs.kr 사용
+        "asset.m-gs.kr",
+        "static.m-gs.kr",
     )
 
     async def mirror_external_to_r2(
