@@ -3715,7 +3715,7 @@ async def sync_orders_from_markets(
                     "결제완료",
                     "배송대기중",
                     "송장전송완료",
-                    "배송중",
+                    "국내배송중",
                 }
                 _already_fetched = {
                     d["order_number"] for d in orders_data if d.get("order_number")
@@ -5586,7 +5586,7 @@ async def sync_orders_from_markets(
                             "교환재배송",
                             "교환완료",
                         }
-                        advanced = {"발송완료", "배송중", "배송완료", "구매확정"}
+                        advanced = {"발송완료", "국내배송중", "배송완료", "구매확정"}
                         if new_ship_status in cancel_statuses:
                             # 취소 상태는 항상 갱신 (송장전송완료 → 취소요청 등 역행 허용)
                             # 단, 이미 반품 진행 중인 주문은 취소로 되돌리지 않음
@@ -5632,7 +5632,7 @@ async def sync_orders_from_markets(
                             )
                         elif existing.shipping_status not in (
                             "송장전송완료",
-                            "배송중",
+                            "국내배송중",
                             "배송완료",
                             "교환재배송",
                             "교환요청",
@@ -6374,7 +6374,7 @@ def _parse_lotteon_order(item: dict, account_id: str, label: str) -> dict:
         "23": "교환회수완료",
         "24": "교환재배송",
         "25": "교환완료",
-        "30": "배송중",
+        "30": "국내배송중",
         "40": "배송완료",
         "50": "구매확정",
         "90": "취소",
@@ -6688,7 +6688,7 @@ def _parse_elevenst_order(item: dict, account_id: str, label: str) -> dict:
         "202": "결제완료",  # 11번가 내부 처리중 상태 (결제완료와 동일 단계)
         "301": "배송대기",  # 발주확인 완료
         "400": "출고완료",
-        "500": "배송중",
+        "500": "국내배송중",
         "600": "배송완료",
         "700": "구매확정",
         "900": "취소완료",
@@ -6840,7 +6840,7 @@ def _parse_ebay_order(
         shipping_status = "취소요청"
     elif ff_status == "FULFILLED":
         status = "pending"
-        shipping_status = "배송중"
+        shipping_status = "국내배송중"
     elif ff_status == "IN_PROGRESS":
         status = "pending"
         shipping_status = "발송대기"
