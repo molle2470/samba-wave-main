@@ -71,6 +71,24 @@ async def _head_alive(client: httpx.AsyncClient, url: str) -> str | None:
         resp = await client.head(url, headers=headers, follow_redirects=True)
         if resp.status_code < 400:
             return url
+        # 일부 CDN(예: contents.lotteon.com)은 HEAD를 403/405로 막고 GET만 허용 →
+        # Range 1바이트만 받아 살아있는지 확인 (전체 다운로드 회피)
+        if resp.status_code in (403, 405, 501):
+            try:
+                get_headers = {**headers, "Range": "bytes=0-0"}
+                get_resp = await client.get(
+                    url, headers=get_headers, follow_redirects=True
+                )
+                if get_resp.status_code < 400:
+                    return url
+                logger.info(
+                    f"[image_validator] dead URL 제외 (HEAD {resp.status_code} / "
+                    f"GET {get_resp.status_code}): {url[:100]}"
+                )
+                return None
+            except Exception as ge:
+                logger.info(f"[image_validator] GET 폴백 실패 제외: {url[:100]} ({ge})")
+                return None
         logger.info(
             f"[image_validator] dead URL 제외 ({resp.status_code}): {url[:100]}"
         )

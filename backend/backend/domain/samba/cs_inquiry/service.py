@@ -331,6 +331,150 @@ class SambaCSInquiryService:
             )
         return ok
 
+    # ==================== 롯데홈쇼핑 ====================
+
+    async def collect_from_lottehome(
+        self,
+        lh_client: Any,
+        days_back: int = 7,
+        account_id: Optional[str] = None,
+        account_label: Optional[str] = None,
+    ) -> Dict[str, int]:
+        """롯데홈쇼핑 CS문의/메모(VOC) 수집 후 DB 저장.
+
+        external_id 형식: "ccn_no:mvot_req_sn" (답변 등록 시 둘 다 필수).
+        """
+        now = datetime.now(UTC)
+        start_dt = now - timedelta(days=days_back)
+        start_date = start_dt.strftime("%Y%m%d")
+        end_date = now.strftime("%Y%m%d")
+
+        collected = 0
+        skipped = 0
+        replied_marked = 0
+
+        try:
+            items = await lh_client.search_cs_voc(
+                req_start_dtime=start_date,
+                req_end_dtime=end_date,
+                proc_stat_cd="",  # 전체
+                mvot_tp_cd="",
+            )
+        except Exception as e:
+            logger.warning(f"[롯데홈 CS] 수집 실패: {e}")
+            return {"collected": 0, "skipped": 0, "replied_marked": 0}
+
+        active_ids: set[str] = set()
+        for it in items:
+            ccn_no = str(it.get("CcnNo") or "").strip()
+            mvot_req_sn = str(it.get("MvotReqSn") or "").strip()
+            if not ccn_no or not mvot_req_sn:
+                continue
+            ext_id = f"{ccn_no}:{mvot_req_sn}"
+            active_ids.add(ext_id)
+
+            existing = await self.repo.find_by_external_id("LOTTEHOME", ext_id)
+            if existing:
+                # 마켓 측 처리상태가 '완료'면 replied 마킹
+                if (
+                    str(it.get("MvotProcStatNm", "")).strip() == "완료"
+                    and existing.reply_status != "replied"
+                ):
+                    await self.repo.update_async(existing.id, reply_status="replied")
+                    replied_marked += 1
+                else:
+                    skipped += 1
+                continue
+
+            raw_date = it.get("MvotReqDtime")
+            parsed_date = _parse_date(raw_date)
+            content = str(it.get("AnsSumrCont") or "")
+            voc_type = str(it.get("VocNm") or "")
+            inquiry_type = "note" if str(it.get("CcnMvotTpNm", "")) == "알림" else "qna"
+
+            await self.repo.create_async(
+                market="LOTTEHOME",
+                inquiry_type=inquiry_type,
+                external_id=ext_id,
+                external_sent=False,
+                account_id=account_id,
+                account_name=account_label,
+                market_order_id=str(it.get("OrdNo") or "") or None,
+                questioner=str(it.get("MbrNm") or "") or None,
+                product_name=str(it.get("GoodsNm") or "") or None,
+                market_product_no=str(it.get("GoodsNo") or "") or None,
+                content=f"[{voc_type}] {content}".strip() if voc_type else content,
+                reply_status=(
+                    "replied"
+                    if str(it.get("MvotProcStatNm", "")).strip() == "완료"
+                    else "pending"
+                ),
+                inquiry_date=parsed_date,
+            )
+            collected += 1
+
+        # API 결과에 없는 기존 pending → 외부에서 처리됨으로 간주, replied 마킹
+        existing_pending = await self.repo.find_pending_since(
+            "LOTTEHOME", "qna", start_dt, account_id=account_id
+        )
+        for ep in existing_pending:
+            if ep.external_id not in active_ids:
+                await self.repo.update_async(ep.id, reply_status="replied")
+                replied_marked += 1
+
+        logger.info(
+            f"[롯데홈 CS] 수집 완료 — {collected}건, 스킵 {skipped}건, "
+            f"답변완료 마킹 {replied_marked}건"
+        )
+        return {
+            "collected": collected,
+            "skipped": skipped,
+            "replied_marked": replied_marked,
+        }
+
+    async def send_reply_to_lottehome(
+        self,
+        inquiry_id: str,
+        lh_client: Any,
+    ) -> bool:
+        """롯데홈쇼핑 VOC 답변 전송 (updateCounselMemoOpenApi.lotte)."""
+        inquiry = await self.repo.get_async(inquiry_id)
+        if not inquiry:
+            logger.warning(f"[롯데홈 CS] 문의 없음: {inquiry_id}")
+            return False
+
+        ext_id = inquiry.external_id or ""
+        reply = inquiry.reply
+        if not ext_id or not reply:
+            logger.warning(f"[롯데홈 CS] external_id 또는 답변 없음: {inquiry_id}")
+            return False
+        if ":" not in ext_id:
+            logger.warning(
+                f"[롯데홈 CS] external_id 형식 오류 (ccn_no:mvot_req_sn 필요): {ext_id}"
+            )
+            return False
+        ccn_no, mvot_req_sn = ext_id.split(":", 1)
+
+        try:
+            api_resp = await lh_client.register_cs_voc_answer(
+                ccn_no=ccn_no.strip(),
+                mvot_req_sn=mvot_req_sn.strip(),
+                cnsl_proc_cont=reply,
+            )
+        except Exception as e:
+            logger.warning(f"[롯데홈 CS] 답변 전송 실패 ({inquiry_id}): {e}")
+            return False
+
+        ok = bool(api_resp.get("ok") or api_resp.get("already_done"))
+        if ok:
+            await self.repo.update_async(
+                inquiry_id, external_sent=True, reply_status="replied"
+            )
+            logger.info(f"[롯데홈 CS] 답변 전송 완료: {inquiry_id}")
+        else:
+            logger.warning(f"[롯데홈 CS] 답변 전송 실패: {inquiry_id} resp={api_resp}")
+        return ok
+
     # ==================== 통계 ====================
 
     async def get_stats(self) -> Dict[str, Any]:

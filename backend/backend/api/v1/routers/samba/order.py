@@ -7044,6 +7044,13 @@ def _parse_lottehome_order(
     # 반품API는 SubOrdNo가 없고 OrdNo에 상품주문번호가 들어옴 → 폴백으로 일치
     order_number = sub_ord_no or order_no
 
+    # 송장전송(registDeliver.lotte)에 ord_no + ord_dtl_sn 둘 다 필수.
+    # ext_order_number 에 "ord_no:ord_dtl_sn" 형식으로 합쳐 저장한다.
+    ord_dtl_sn = str(prod_info.get("OrdDtlSn") or prod_info.get("DlvUnitSn") or "")
+    ext_order_number = (
+        f"{order_no}:{ord_dtl_sn}" if (order_no and ord_dtl_sn) else order_no
+    )
+
     proc_stat = str(item.get("OrdProcStat", "") or "")
     is_deliver_api = bool(prod_info.get("DlvUnitSn") or prod_info.get("GoodsNo"))
     status_map = {
@@ -7141,4 +7148,5 @@ def _parse_lottehome_order(
         "paid_at": paid_at,
         "source": "lottehome",
         "shipment_id": order_no,
+        "ext_order_number": ext_order_number,
     }

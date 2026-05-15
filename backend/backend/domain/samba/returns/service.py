@@ -184,6 +184,77 @@ class SambaReturnService:
             timeline=timeline,
         )
 
+    async def complete_lottehome_return(
+        self,
+        return_id: str,
+        lh_client: Any,
+    ) -> Dict[str, Any]:
+        """롯데홈쇼핑 반품 회수확정 (registDeliver.lotte, proc_gubun=rfin).
+
+        흐름:
+          1) SambaReturn → 연결 SambaOrder 조회 (source==lottehome 검증)
+          2) ext_order_number → ord_no:ord_dtl_sn 파싱
+          3) lh_client.process_return 호출
+          4) 성공 시 self.complete_return 호출하여 timeline + status=completed 갱신
+        """
+        from backend.db.orm import get_write_session
+        from backend.domain.samba.order.model import SambaOrder
+        from backend.domain.samba.proxy.lottehome import lottehome_courier_code
+
+        ret = await self.repo.get_async(return_id)
+        if not ret:
+            return {"ok": False, "error": "반품 레코드 없음"}
+
+        async with get_write_session() as session:
+            order = await session.get(SambaOrder, ret.order_id)
+
+        if not order:
+            return {"ok": False, "error": "연결 주문 없음"}
+        if (order.source or "").lower() != "lottehome":
+            return {
+                "ok": False,
+                "error": f"롯데홈쇼핑 주문 아님 (source={order.source})",
+            }
+
+        raw = (order.ext_order_number or "").strip() or (
+            order.shipment_id or ""
+        ).strip()
+        sep = ":" if ":" in raw else ("/" if "/" in raw else None)
+        if not sep:
+            return {
+                "ok": False,
+                "error": (
+                    f"롯데홈쇼핑은 'ord_no:ord_dtl_sn' 형식이 필요합니다 (현재값={raw})"
+                ),
+            }
+        parts = [p.strip() for p in raw.split(sep, 1)]
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            return {"ok": False, "error": f"주문번호 파싱 실패: {raw}"}
+        ord_no, ord_dtl_sn = parts[0], parts[1]
+
+        courier_code = lottehome_courier_code(order.shipping_company or "")
+        try:
+            api_resp = await lh_client.process_return(
+                ord_no=ord_no,
+                ord_dtl_sn=ord_dtl_sn,
+                courier_code=courier_code,
+                tracking_number=order.tracking_number or "",
+            )
+        except Exception as exc:
+            logger.warning(f"[롯데홈 반품] API 호출 실패 ({return_id}): {exc}")
+            return {"ok": False, "error": f"API 호출 실패: {exc}"}
+
+        if not api_resp.get("ok"):
+            return {
+                "ok": False,
+                "error": f"롯데홈쇼핑 응답 result={api_resp.get('result')}",
+                "raw": api_resp,
+            }
+
+        await self.complete_return(return_id)
+        logger.info(f"[롯데홈 반품] 회수확정 완료: {return_id}")
+        return {"ok": True, "raw": api_resp}
+
     async def add_note(self, return_id: str, note: str) -> Optional[SambaReturn]:
         """메모 추가."""
         ret = await self.repo.get_async(return_id)

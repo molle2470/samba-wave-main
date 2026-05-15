@@ -950,6 +950,243 @@ class LotteHomeClient:
             orders = [orders]
         return orders if isinstance(orders, list) else []
 
+    # ------------------------------------------------------------------
+    # 배송처리 / 반품처리 / 배송비조회 / CS
+    # 스펙: 롯데아이몰 OpenAPI 연동표준안 (2024-05-22 기준)
+    # ------------------------------------------------------------------
+
+    async def register_deliver(
+        self,
+        ord_no: str,
+        ord_dtl_sn: str,
+        proc_gubun: str,
+        hdc_cd: str = "",
+        inv_no: str = "",
+        snd_contr_dtime: str = "",
+        dlv_fin_dtime: str = "",
+    ) -> dict[str, Any]:
+        """배송처리 (registDeliver.lotte).
+
+        proc_gubun:
+            sfin = 출고확정 (hdc_cd + inv_no 필수)
+            dfin = 배송완료 (dlv_fin_dtime YYYYMMDD 필수)
+            contr = 발송약정 (snd_contr_dtime YYYYMMDD 필수)
+            imps = 발송불가
+        """
+        cert_key = await self._ensure_auth()
+        params: dict[str, Any] = {
+            "subscriptionId": cert_key,
+            "ord_no": ord_no,
+            "ord_dtl_sn": ord_dtl_sn,
+            "proc_gubun": proc_gubun,
+        }
+        if hdc_cd:
+            params["hdc_cd"] = hdc_cd
+        if inv_no:
+            params["inv_no"] = inv_no
+        if snd_contr_dtime:
+            params["snd_contr_dtime"] = snd_contr_dtime
+        if dlv_fin_dtime:
+            params["dlv_fin_dtime"] = dlv_fin_dtime
+
+        result = await self._call_api_auto_retry("registDeliver.lotte", "GET", params)
+        data = result.get("data", {}) or {}
+        # 성공: <Result>1</Result>
+        ok_val = data.get("Result")
+        return {
+            "ok": str(ok_val).strip() == "1",
+            "result": ok_val,
+            "raw": data,
+        }
+
+    async def send_invoice(
+        self,
+        ord_no: str,
+        ord_dtl_sn: str,
+        courier_code: str,
+        tracking_number: str,
+    ) -> dict[str, Any]:
+        """송장 전송 (배송처리 sfin = 출고확정)."""
+        return await self.register_deliver(
+            ord_no=ord_no,
+            ord_dtl_sn=ord_dtl_sn,
+            proc_gubun="sfin",
+            hdc_cd=courier_code,
+            inv_no=tracking_number,
+        )
+
+    async def process_return(
+        self,
+        ord_no: str,
+        ord_dtl_sn: str,
+        courier_code: str = "",
+        tracking_number: str = "",
+    ) -> dict[str, Any]:
+        """반품처리 — 회수확정 (registDeliver.lotte, proc_gubun=rfin).
+
+        반품완료 처리 시 hdc_cd + inv_no 필수.
+        """
+        cert_key = await self._ensure_auth()
+        params: dict[str, Any] = {
+            "subscriptionId": cert_key,
+            "ord_no": ord_no,
+            "ord_dtl_sn": ord_dtl_sn,
+            "proc_gubun": "rfin",
+        }
+        if courier_code:
+            params["hdc_cd"] = courier_code
+        if tracking_number:
+            params["inv_no"] = tracking_number
+
+        result = await self._call_api_auto_retry("registDeliver.lotte", "GET", params)
+        data = result.get("data", {}) or {}
+        ok_val = data.get("Result")
+        return {
+            "ok": str(ok_val).strip() == "1",
+            "result": ok_val,
+            "raw": data,
+        }
+
+    async def search_delivery_fee(self, dlv_unit_sn: str) -> list[dict[str, Any]]:
+        """배송비조회 (searchDeliverPriceList.lotte).
+
+        Gubun 코드 일부:
+            19 = 배송비
+            33 = 반품비
+            34 = 추가배송비
+            32 = 초도배송비
+            62 = 도서산간 추가배송비
+        OccurYn: 10=발생, 11=취소
+        """
+        cert_key = await self._ensure_auth()
+        result = await self._call_api_auto_retry(
+            "searchDeliverPriceList.lotte",
+            "GET",
+            {
+                "subscriptionId": cert_key,
+                "dlv_unit_sn": dlv_unit_sn,
+            },
+        )
+        data = result.get("data", {}) or {}
+        result_data = data.get("Result", data)
+        infos = result_data.get("PriceInfo", [])
+        if isinstance(infos, dict):
+            infos = [infos]
+        return infos if isinstance(infos, list) else []
+
+    async def search_cs_voc(
+        self,
+        req_start_dtime: str,
+        req_end_dtime: str,
+        proc_stat_cd: str = "",
+        mvot_tp_cd: str = "",
+    ) -> list[dict[str, Any]]:
+        """CS문의/메모(VOC) 조회 (searchCSCounselMemoListOpenApi.lotte).
+
+        proc_stat_cd: 빈값=전체, 01=미처리, 02=완료
+        mvot_tp_cd:   빈값=전체, 05=답변필요, 06=알림
+        """
+        cert_key = await self._ensure_auth()
+        params: dict[str, Any] = {
+            "subscriptionId": cert_key,
+            "req_start_dtime": req_start_dtime,
+            "req_end_dtime": req_end_dtime,
+        }
+        if proc_stat_cd:
+            params["proc_stat_cd"] = proc_stat_cd
+        if mvot_tp_cd:
+            params["mvot_tp_cd"] = mvot_tp_cd
+
+        result = await self._call_api_auto_retry(
+            "searchCSCounselMemoListOpenApi.lotte", "GET", params
+        )
+        data = result.get("data", {}) or {}
+        result_data = data.get("Result", data)
+        infos = result_data.get("CSQuestInfo", [])
+        if isinstance(infos, dict):
+            infos = [infos]
+        return infos if isinstance(infos, list) else []
+
+    async def register_cs_voc_answer(
+        self,
+        ccn_no: str,
+        mvot_req_sn: str,
+        cnsl_proc_cont: str,
+    ) -> dict[str, Any]:
+        """CS문의/메모(VOC) 답변 등록 (updateCounselMemoOpenApi.lotte).
+
+        Result: 1=성공, 2=실패, 3=이미 처리된 답변
+        """
+        cert_key = await self._ensure_auth()
+        result = await self._call_api_auto_retry(
+            "updateCounselMemoOpenApi.lotte",
+            "GET",
+            {
+                "subscriptionId": cert_key,
+                "ccn_no": ccn_no,
+                "mvot_req_sn": mvot_req_sn,
+                "cnsl_proc_cont": cnsl_proc_cont,
+            },
+        )
+        data = result.get("data", {}) or {}
+        ok_val = data.get("Result")
+        return {
+            "ok": str(ok_val).strip() == "1",
+            "already_done": str(ok_val).strip() == "3",
+            "result": ok_val,
+            "raw": data,
+        }
+
+
+# ----------------------------------------------------------------------
+# 택배사 코드 매핑 (스펙: 70.배송처리 별첨, 2024-05-22)
+# 한글 택배사명 → 롯데홈쇼핑 hdc_cd
+# ----------------------------------------------------------------------
+LOTTEHOME_COURIER_CODES: dict[str, str] = {
+    "롯데택배": "11",
+    "롯데글로벌로지스": "11",
+    "CJ대한통운": "12",
+    "대한통운": "12",
+    "씨제이대한통운": "12",
+    "CJGLS": "16",
+    "CJ GLS": "16",
+    "한진택배": "15",
+    "한진": "15",
+    "로젠택배": "24",
+    "로젠": "24",
+    "우체국택배": "31",
+    "우체국": "31",
+    "천일택배": "17",
+    "일양택배": "18",
+    "KG로지스": "21",
+    "경동택배": "50",
+    "DHL": "63",
+    "EMS": "64",
+    "FedEx": "65",
+    "TNTExpress": "68",
+    "UPS": "69",
+    "굿모닝택배": "70",
+    "합동택배": "76",
+    "기타": "99",
+    "기타택배": "19",
+}
+
+
+def lottehome_courier_code(name: str) -> str:
+    """한글 택배사명 → 롯데홈쇼핑 hdc_cd. 매칭 실패 시 '99'(기타)."""
+    if not name:
+        return "99"
+    n = (name or "").replace(" ", "").strip()
+    for k, v in LOTTEHOME_COURIER_CODES.items():
+        if k.replace(" ", "").strip() == n:
+            return v
+    # 부분 매칭 폴백
+    for k, v in LOTTEHOME_COURIER_CODES.items():
+        ks = k.replace(" ", "").strip()
+        if ks and (ks in n or n in ks):
+            return v
+    return "99"
+
 
 class LotteApiError(Exception):
     """롯데홈쇼핑 API 오류."""

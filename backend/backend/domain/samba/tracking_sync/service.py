@@ -771,6 +771,13 @@ async def dispatch_to_market(
                     raise RuntimeError(
                         api_resp.get("error") or "플레이오토 송장 전송 실패"
                     )
+            elif channel_source == "lottehome":
+                api_resp = await _dispatch_lottehome_invoice(order, job)
+                result["api"] = api_resp
+                if not api_resp.get("ok"):
+                    raise RuntimeError(
+                        api_resp.get("error") or "롯데홈쇼핑 송장 전송 실패"
+                    )
             else:
                 # 미지원 채널 — DISPATCH_FAILED 로 명시
                 raise RuntimeError(
@@ -916,4 +923,112 @@ async def _dispatch_playauto_invoice(order, job) -> dict[str, Any]:
     return {
         "ok": False,
         "error": "; ".join(err_msgs)[:400] or "플레이오토 송장 전송 실패",
+    }
+
+
+async def _resolve_lottehome_creds(channel_id: Optional[str]) -> dict[str, Any]:
+    """롯데홈쇼핑 자격증명 해석 — account.additional_fields → settings 폴백.
+
+    SambaMarketAccount(channel_id) 우선, 없으면 settings의
+    'lottehome_credentials' / 'store_lottehome' 키 사용.
+    """
+    from backend.domain.samba.account.model import SambaMarketAccount
+    from backend.domain.samba.shipment.dispatcher import _get_setting
+
+    creds: dict[str, Any] = {}
+    db_creds: dict[str, Any] = {}
+
+    async with get_write_session() as session:
+        # settings 폴백 로드
+        for key in ("lottehome_credentials", "store_lottehome"):
+            val = await _get_setting(session, key)
+            if isinstance(val, dict) and val:
+                db_creds = val
+                break
+
+        if channel_id:
+            account = await session.get(SambaMarketAccount, channel_id)
+            if account:
+                extra = account.additional_fields or {}
+                if isinstance(extra, dict) and (
+                    extra.get("userId")
+                    or extra.get("password")
+                    or extra.get("agncNo")
+                    or extra.get("env")
+                ):
+                    creds = {**db_creds, **extra}
+        if not creds:
+            creds = db_creds
+
+    return creds if isinstance(creds, dict) else {}
+
+
+async def _dispatch_lottehome_invoice(order, job) -> dict[str, Any]:
+    """롯데홈쇼핑 송장 전송 — registDeliver.lotte (sfin = 출고확정).
+
+    필수 사전 조건:
+      - order.ext_order_number = "ord_no:ord_dtl_sn" 형식 (콜론 구분)
+        (없으면 ord_no 단독 → ord_dtl_sn 추정 불가로 실패)
+      - 자격증명 (userId/password/env) 해석 가능
+    """
+    from backend.domain.samba.proxy.lottehome import (
+        LotteHomeClient,
+        lottehome_courier_code,
+    )
+
+    # 신규 수집 데이터: ext_order_number = "ord_no:ord_dtl_sn"
+    # 구버전 폴백: shipment_id 에 동일 형식이 들어있는 경우도 허용
+    raw = (order.ext_order_number or "").strip() or (order.shipment_id or "").strip()
+    if not raw:
+        return {"ok": False, "error": "롯데홈쇼핑 주문번호(ext_order_number) 없음"}
+
+    # ord_no:ord_dtl_sn 또는 ord_no/ord_dtl_sn 형식 모두 허용
+    sep = ":" if ":" in raw else ("/" if "/" in raw else None)
+    if not sep:
+        return {
+            "ok": False,
+            "error": (
+                "롯데홈쇼핑은 'ord_no:ord_dtl_sn' 형식이 필요합니다 — "
+                "구주문이면 재수집 후 재시도 필요 "
+                f"(현재값={raw})"
+            ),
+        }
+    parts = [p.strip() for p in raw.split(sep, 1)]
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return {"ok": False, "error": f"주문번호 파싱 실패: {raw}"}
+    ord_no, ord_dtl_sn = parts[0], parts[1]
+
+    courier_code = lottehome_courier_code(job.scraped_courier or "")
+    if courier_code == "99" and (job.scraped_courier or ""):
+        logger.warning(
+            f"[송장동기화][롯데홈] 택배사 코드 매칭 실패 → 99(기타) 폴백 "
+            f"name={job.scraped_courier}"
+        )
+
+    creds = await _resolve_lottehome_creds(getattr(order, "channel_id", None))
+    if not creds.get("userId") or not creds.get("password"):
+        return {"ok": False, "error": "롯데홈쇼핑 자격증명(userId/password) 미설정"}
+
+    client = LotteHomeClient(
+        user_id=creds.get("userId", ""),
+        password=creds.get("password", ""),
+        agnc_no=creds.get("agncNo", ""),
+        env=creds.get("env", "test"),
+    )
+    try:
+        api_resp = await client.send_invoice(
+            ord_no=ord_no,
+            ord_dtl_sn=ord_dtl_sn,
+            courier_code=courier_code,
+            tracking_number=job.scraped_tracking or "",
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"롯데홈쇼핑 API 호출 실패: {exc}"}
+
+    if api_resp.get("ok"):
+        return {"ok": True, "raw": api_resp}
+    return {
+        "ok": False,
+        "error": f"롯데홈쇼핑 응답 result={api_resp.get('result')}",
+        "raw": api_resp,
     }

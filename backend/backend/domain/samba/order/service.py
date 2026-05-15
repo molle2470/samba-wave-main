@@ -135,10 +135,12 @@ class SambaOrderService:
 
         if new_status == "shipped":
             updates["shipped_at"] = now
-            updates["shipping_status"] = "shipped"
+            updates["shipping_status"] = "배송중"
         elif new_status == "delivered":
             updates["delivered_at"] = now
-            updates["shipping_status"] = "delivered"
+            updates["shipping_status"] = "배송완료"
+        elif new_status == "confirmed":
+            updates["shipping_status"] = "구매확정"
 
         return await self.repo.update_async(order_id, **updates)
 

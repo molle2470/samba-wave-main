@@ -245,7 +245,11 @@ EXCLUDED_ORDER_STATUSES: tuple[str, ...] = (
 )
 
 # 배송이 이미 진행/종료된 단계 — shipping_status(마켓 원본 한글)에 이 키워드 포함 시 제외.
-SHIPPED_SHIPPING_STATUS_KEYWORDS: tuple[str, ...] = ("배송중", "배송완료")
+SHIPPED_SHIPPING_STATUS_KEYWORDS: tuple[str, ...] = (
+    "배송중",
+    "배송완료",
+    "구매확정",
+)
 
 
 # ---------------------------------------------------------------------------
