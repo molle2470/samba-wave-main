@@ -416,31 +416,33 @@ class ESMPlusClient:
         place_no = int(product.get("_shipping_place_no", 0) or 0)
         return_place_no = int(product.get("_return_place_no", 0) or 0)
 
-        # 배송비 타입 enum — 1=무료, 2=유료, 3=조건부무료 (ESM API 검증 필수)
-        _DELIVERY_FEE_TYPE_MAP = {"FREE": 1, "PAID": 2, "CONDITIONAL": 3}
-        delivery_fee_type_code = _DELIVERY_FEE_TYPE_MAP.get(
-            delivery_fee_type.upper(), 1
-        )
+        # 배송비 분류 (ESM API 가이드 etapi.gmarket.com/140 + 실 호출 검증):
+        # - shipping.policy.feeType: 1=묶음(bundle 필수), 2=개별(each 필수)
+        # - shipping.policy.each.feeType: 1=무료, 2=유료(fee 필수), 3=조건부
+        # 묶음배송비 정책(bundle) 은 셀러 ESMplus 측 별도 권한 필요 — 일반 케이스는 개별(2) 사용.
+        _EACH_FEE_TYPE_MAP = {"FREE": 1, "PAID": 2, "CONDITIONAL": 3}
+        each_fee_type = _EACH_FEE_TYPE_MAP.get(delivery_fee_type.upper(), 1)
 
         shipping: dict[str, Any] = {
             "type": shipping_type,
-            "deliveryFeeType": delivery_fee_type_code,
         }
         if company_no:
             shipping["companyNo"] = company_no
         # 발송정책 번호 — ESM API 가 SiteInfoModel<Int64> 형태(사이트별 dict) 요구
         if dispatch_policy_no:
             shipping["dispatchPolicyNo"] = {site_key: dispatch_policy_no}
-        policy_obj: dict[str, Any] = {}
+
+        # shipping.policy — 개별(each) 배송비 사용 (묶음 미사용 가정)
+        policy_obj: dict[str, Any] = {"feeType": 2}
         if place_no:
             policy_obj["placeNo"] = place_no
         if return_place_no:
             policy_obj["returnPlaceNo"] = return_place_no
-        if policy_obj:
-            shipping["policy"] = policy_obj
-
-        if delivery_fee_type_code == 2 and delivery_base_fee > 0:
-            shipping["fee"] = delivery_base_fee
+        each_obj: dict[str, Any] = {"feeType": each_fee_type}
+        if each_fee_type == 2 and delivery_base_fee > 0:
+            each_obj["fee"] = delivery_base_fee
+        policy_obj["each"] = each_obj
+        shipping["policy"] = policy_obj
 
         # 판매기간 (-1=무제한)
         selling_period = int(product.get("_selling_period", -1) or -1)
