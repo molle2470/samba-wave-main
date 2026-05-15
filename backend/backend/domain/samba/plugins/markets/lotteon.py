@@ -1852,14 +1852,28 @@ class LotteonPlugin(MarketPlugin):
                     return u
 
             product_copy["images"] = [_normalize_for_lotteon(u) for u in _alive_imgs]
-            _kept_count = len(product_copy["images"])
+            # transform_product 단계의 확장자 필터와 동일 기준 적용 — 확장자 없는
+            # CDN URL이 가드를 통과한 뒤 transform에서 0장으로 떨어져 9999가 나는
+            # 사고 방지(GS샵 등). 동일 정규식을 미리 통과시켜 가드에서 잡는다.
+            import re as _re_lot
+
+            _LOT_IMG_EXT_RE = _re_lot.compile(
+                r"\.(jpe?g|png|gif|webp|bmp)", _re_lot.IGNORECASE
+            )
+            _before_ext = len(product_copy["images"])
+            product_copy["images"] = [
+                u for u in product_copy["images"] if _LOT_IMG_EXT_RE.search(u)
+            ][:10]
+            _after_ext = len(product_copy["images"])
+            _kept_count = _after_ext
             _excluded = len(_orig_imgs) - _kept_count
             _changed = sum(
                 1 for o, n in zip(_alive_imgs, product_copy["images"]) if o != n
             )
             logger.info(
                 f"[롯데ON] 이미지 사전검증: 원본 {len(_orig_imgs)}장 → "
-                f"통과 {_kept_count}장 (제외 {_excluded}장, URL 정규화 {_changed}장)"
+                f"통과 {_kept_count}장 (제외 {_excluded}장, URL 정규화 {_changed}장, "
+                f"확장자 필터 제외 {_before_ext - _after_ext}장)"
             )
 
         # ── 이미지 0장 사전 차단 가드 ──────────────────────────────────

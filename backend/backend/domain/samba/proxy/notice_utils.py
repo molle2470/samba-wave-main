@@ -698,10 +698,20 @@ def build_smartstore_notice(product: dict[str, Any], **kwargs: str) -> dict[str,
 
     fallback = "상세 이미지 참조"
     # 스마트스토어 금지 특수문자 제거: \ * ? " < >
+    # + 보이지 않는 유니코드(zero-width, NBSP, NNBSP 등) 정규화
+    # — 네이버 고시정보는 NARROW NO-BREAK SPACE(U+202F) 등을 DisallowedCharacters로 거부함
     import re as _re_special
 
     def _clean_special(text: str) -> str:
-        return _re_special.sub(r'[\\*?"<>]', "", text).strip() if text else text
+        if not text:
+            return text
+        # zero-width 및 라인 구분자 제거
+        s = _re_special.sub(r"[​-‍  ﻿]", "", text)
+        # 비표준 공백을 일반 공백으로 치환 (NBSP, NNBSP, FIGURE SPACE, WORD JOINER)
+        s = _re_special.sub(r"[   ⁠]", " ", s)
+        # 스마트스토어 금지 특수문자 제거
+        s = _re_special.sub(r'[\\*?"<>]', "", s)
+        return s.strip()
 
     material = _clean_special(product.get("material", "") or fallback)
     color_text = kwargs.get("color_text", fallback)
