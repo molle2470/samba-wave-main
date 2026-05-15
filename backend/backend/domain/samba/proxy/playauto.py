@@ -68,11 +68,11 @@ class PlayAutoClient:
                 )
             else:
                 logger.warning("[플레이오토] 프록시 미설정 — 직접 연결")
-            # POST /prods(상품등록)는 옵션 다수/대용량 상세 페이로드 처리에
-            # PlayAuto 서버가 30초 이상 걸리는 케이스가 존재 → read timeout 90초로 확대.
+            # POST /prods(상품등록)는 PlayAuto 서버 측 처리가 길어 응답이 90초+ 걸리는
+            # 케이스가 관측됨 → read timeout 170초로 확대 (워커 상한 180초 직전).
             # connect=15초는 그대로(차단 IP 감지 빠르게).
             self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(90.0, connect=15.0),
+                timeout=httpx.Timeout(170.0, connect=15.0),
                 follow_redirects=True,
                 proxy=proxy if proxy else None,
             )
@@ -175,9 +175,58 @@ class PlayAutoClient:
         """
         url = f"{EMP_BASE_URL}/prods"
         body = {"data": products}
-        result = await self._call_api("POST", url, body=body)
+        try:
+            result = await self._call_api("POST", url, body=body)
+        except PlayAutoApiError as e:
+            # timeout 시 PlayAuto에는 등록됐을 수 있으므로 lookup으로 확인
+            if "타임아웃" in (e.message or ""):
+                recovered = await self._recover_registered_after_timeout(products)
+                if recovered is not None:
+                    logger.info(f"[플레이오토] 타임아웃 폴백 복구 성공: {recovered}")
+                    return recovered
+            raise
         logger.info(f"[플레이오토] 상품 등록 응답: {result}")
         return result if isinstance(result, list) else [result]
+
+    async def _recover_registered_after_timeout(
+        self, products: list[dict]
+    ) -> list[dict] | None:
+        """POST timeout 발생 시 — PlayAuto에 이미 등록됐는지 확인하여 결과 복구.
+
+        MyCateName 카테고리 안에서 ProdName 매칭으로 가장 최근 MasterCode 채택.
+        하나라도 매칭 안 되면 None 반환 → 원래 timeout 에러 그대로 던짐.
+        """
+        results: list[dict] = []
+        for p in products:
+            my_cate = (p.get("MyCateName") or "").strip()
+            prod_name = (p.get("ProdName") or "").strip()
+            if not my_cate or not prod_name:
+                return None
+            try:
+                existing = await self.get_products(my_cate_name=my_cate)
+            except Exception as ex:
+                logger.warning(f"[플레이오토] 폴백 lookup 실패: {ex}")
+                return None
+            matches = [
+                x
+                for x in (existing or [])
+                if isinstance(x, dict)
+                and (x.get("ProdName") or "").strip() == prod_name
+            ]
+            if not matches:
+                return None
+            matches.sort(key=lambda x: str(x.get("MasterCode") or ""), reverse=True)
+            master_code = matches[0].get("MasterCode") or ""
+            if not master_code:
+                return None
+            results.append(
+                {
+                    "code": master_code,
+                    "status": True,
+                    "message": "타임아웃 폴백: 등록 확인됨",
+                }
+            )
+        return results
 
     async def update_product(
         self, products: list[dict], use_no_edit_slave: bool = False

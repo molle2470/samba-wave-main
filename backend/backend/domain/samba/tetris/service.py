@@ -1263,6 +1263,9 @@ class SambaTetrisService:
                     "source_sites": [a.source_site],
                     "brands": [a.brand_name],
                     "skip_unchanged": True,
+                    # 테트리스가 계정을 직접 결정 → 정책 accountIds 필터 스킵
+                    # (DB 설정 tetris_matching_enabled OFF여도 동작하도록 명시)
+                    "skip_policy_account_filter": True,
                     "origin": "tetris_sync",
                 },
             )
@@ -1342,6 +1345,8 @@ class SambaTetrisService:
                     "source_sites": [row.source_site],
                     "brands": [row.brand_name],
                     "skip_unchanged": True,
+                    # 레거시 복원 잡도 sync_all 컨텍스트 — 정책 accountIds 필터 스킵
+                    "skip_policy_account_filter": True,
                     "origin": "tetris_sync",
                 },
             )

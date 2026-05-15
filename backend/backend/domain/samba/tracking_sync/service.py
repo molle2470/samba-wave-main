@@ -329,6 +329,13 @@ async def enqueue_for_order(order_id: str, *, force: bool = False) -> dict[str, 
         actual_site = await _resolve_actual_source_site(order, session)
         if not actual_site:
             return {"success": False, "error": "소싱처 정보가 없습니다"}
+        # 롯데ON 선물주문은 일반 배송조회 페이지에 송장이 노출되지 않음 — 명시적 거부
+        if actual_site == "LOTTEON" and ",gift," in _tags:
+            return {
+                "success": True,
+                "skipped": True,
+                "reason": "롯데ON 선물주문은 송장 추출 대상이 아닙니다",
+            }
         if order.tracking_number and not force:
             return {
                 "success": True,

@@ -389,7 +389,7 @@ export default function OrdersPage() {
       channelName: string; site: string; sourcingOrderNumber: string; sourcingAccountLabel: string
       status: string; courier?: string | null; tracking?: string | null
       lastError?: string | null; attempts: number; updatedAt?: string | null
-      paidAt?: string | null
+      paidAt?: string | null; actionTag?: string | null
     }>
   } | null>(null)
   // 이번 송장수집 배치 잡 id 목록 — 모달이 이 id들만 고정 표시하기 위한 키
@@ -825,7 +825,8 @@ export default function OrdersPage() {
                   NO_TRACKING: '#f59e0b', CANCELLED: '#a855f7', FAILED: '#ef4444',
                 }
                 // 소싱처 원주문링크 URL 매핑 (대소문자/한글 변형 모두 대응)
-                const buildSourcingOrderUrl = (site: string, srcNo: string): string | null => {
+                // 롯데ON 선물주문은 일반 orderDetail 페이지에서 조회 안 됨 → giftBoxDetail 사용
+                const buildSourcingOrderUrl = (site: string, srcNo: string, actionTag: string): string | null => {
                   if (!srcNo) return null
                   const raw = (site || '').split('(')[0].trim().toUpperCase()
                   // 한글 → 코드 정규화
@@ -841,6 +842,7 @@ export default function OrdersPage() {
                     '올리브영': 'OLIVEYOUNG',
                   }
                   const code = aliasMap[raw] || raw
+                  const isGift = `,${(actionTag || '').trim()},`.includes(',gift,')
                   const map: Record<string, string> = {
                     MUSINSA: `https://www.musinsa.com/order/order-detail/${srcNo}`,
                     KREAM: `https://kream.co.kr/my/purchasing/${srcNo}`,
@@ -849,13 +851,15 @@ export default function OrdersPage() {
                     GRANDSTAGE: `https://grandstage.a-rt.com/mypage/order/read-order-detail?orderNo=${srcNo}`,
                     NIKE: `https://www.nike.com/kr/orders/${srcNo}`,
                     SSG: `https://pay.ssg.com/myssg/orderInfoDetail.ssg?orordNo=${encodeURIComponent(srcNo)}&viewType=Ssg`,
-                    LOTTEON: `https://www.lotteon.com/p/order/claim/orderDetail?odNo=${srcNo}`,
+                    LOTTEON: isGift
+                      ? `https://www.lotteon.com/p/order/claim/giftBoxDetail?odNo=${srcNo}&type=snd`
+                      : `https://www.lotteon.com/p/order/claim/orderDetail?odNo=${srcNo}`,
                     GSSHOP: `https://www.gsshop.com/ord/dlvcursta/popup/ordDtl.gs?orderNo=${srcNo}`,
                     OLIVEYOUNG: `https://www.oliveyoung.co.kr/store/mypage/getOrderDetail.do?dlvNo=${srcNo}`,
                   }
                   return map[code] || null
                 }
-                const sourcingUrl = buildSourcingOrderUrl(j.site, j.sourcingOrderNumber || '')
+                const sourcingUrl = buildSourcingOrderUrl(j.site, j.sourcingOrderNumber || '', j.actionTag || '')
                 return (
                   <div key={j.id} style={{
                     display: 'grid', gridTemplateColumns: '36px 88px 110px 150px 160px 200px 80px 140px 90px 90px 120px 266px',

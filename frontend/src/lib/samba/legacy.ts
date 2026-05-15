@@ -357,6 +357,7 @@ export const orderApi = {
         lastError?: string | null
         attempts: number
         updatedAt?: string | null
+        actionTag?: string | null
       }>
     }>(`${SAMBA_PREFIX}/orders/tracking-sync/recent?limit=${limit}`),
   listTrackingSyncJobsByIds: (jobIds: string[]) =>
@@ -378,6 +379,7 @@ export const orderApi = {
         attempts: number
         updatedAt?: string | null
         paidAt?: string | null
+        actionTag?: string | null
       }>
     }>(`${SAMBA_PREFIX}/orders/tracking-sync/by-ids`, {
       method: 'POST',

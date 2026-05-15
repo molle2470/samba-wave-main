@@ -1379,6 +1379,7 @@ async def list_recent_tracking_sync_jobs(
                 A.account_label,
                 O.tracking_number,
                 O.paid_at,
+                O.action_tag,
             )
             .join(O, O.id == SambaTrackingSyncJob.order_id, isouter=True)
             .join(A, A.id == SambaTrackingSyncJob.sourcing_account_id, isouter=True)
@@ -1448,8 +1449,9 @@ async def list_recent_tracking_sync_jobs(
                 "attempts": j.attempts,
                 "updatedAt": j.updated_at.isoformat() if j.updated_at else None,
                 "paidAt": paid_at.isoformat() if paid_at else None,
+                "actionTag": action_tag or "",
             }
-            for j, order_number, customer_name, channel_name, _os, _ss, account_label, _otn, paid_at in result_rows
+            for j, order_number, customer_name, channel_name, _os, _ss, account_label, _otn, paid_at, action_tag in result_rows
         ],
     }
 
@@ -1491,6 +1493,7 @@ async def list_tracking_sync_jobs_by_ids(body: dict) -> dict:
                 O.channel_name,
                 A.account_label,
                 O.paid_at,
+                O.action_tag,
             )
             .join(O, O.id == SambaTrackingSyncJob.order_id, isouter=True)
             .join(A, A.id == SambaTrackingSyncJob.sourcing_account_id, isouter=True)
@@ -1508,6 +1511,7 @@ async def list_tracking_sync_jobs_by_ids(body: dict) -> dict:
         channel_name = row[3]
         account_label = row[4]
         paid_at = row[5]
+        action_tag = row[6]
         counts[j.status] = counts.get(j.status, 0) + 1
         items.append(
             {
@@ -1526,6 +1530,7 @@ async def list_tracking_sync_jobs_by_ids(body: dict) -> dict:
                 "attempts": j.attempts,
                 "updatedAt": j.updated_at.isoformat() if j.updated_at else None,
                 "paidAt": paid_at.isoformat() if paid_at else None,
+                "actionTag": action_tag or "",
             }
         )
 
@@ -3301,95 +3306,9 @@ async def ship_order(
                         market_msg = f"eBay 송장 실패: {e}"
 
             elif account and account.market_type == "playauto":
-                # 플레이오토 EMP는 신규주문 → 송장입력 전이만 지원 (PATCH /senders, changeState=false)
-                from backend.domain.samba.proxy.playauto import PlayAutoClient
-
-                pa_extras = account.additional_fields or {}
-                pa_api_key = pa_extras.get("apiKey", "") or account.api_key or ""
-                if not pa_api_key:
-                    market_msg = "플레이오토 API Key가 없습니다."
-                elif not order.shipment_id:
-                    market_msg = (
-                        "플레이오토 주문 Number가 없습니다. 주문을 다시 수집해주세요."
-                    )
-                else:
-                    pa_client = PlayAutoClient(pa_api_key)
-                    try:
-                        # 택배사 한글명 → 플레이오토 T-code 매핑 (런타임 조회)
-                        deliv_codes = await pa_client.get_deliv_codes()
-                        sender_code = ""
-                        wanted_names = set(
-                            _playauto_carrier_candidates(body.shipping_company)
-                        )
-                        for row in deliv_codes:
-                            row_name = (
-                                row.get("name")
-                                or row.get("Name")
-                                or row.get("deliveryCompanyName")
-                                or ""
-                            )
-                            if _normalize_carrier_name(row_name) in wanted_names:
-                                sender_code = row.get("code", "")
-                                break
-                        if not sender_code:
-                            market_msg = f"플레이오토 택배사 코드 미매칭: {body.shipping_company}"
-                        else:
-                            try:
-                                pa_number = int(order.shipment_id)
-                            except (TypeError, ValueError):
-                                pa_number = 0
-                            if not pa_number:
-                                market_msg = (
-                                    f"플레이오토 Number 형식 오류: {order.shipment_id}"
-                                )
-                            else:
-                                results = await pa_client.send_invoice(
-                                    invoices=[
-                                        {
-                                            "number": pa_number,
-                                            "sender": sender_code,
-                                            "senderno": body.tracking_number,
-                                        }
-                                    ],
-                                    change_state=False,  # 신규주문 → 송장입력
-                                    overwrite=True,
-                                )
-                                # 응답 파싱: 직접 {status,msg} 또는 {"성공 유형N":{...}} 래핑 모두 대응
-                                ok = False
-                                err = ""
-                                for r in results:
-                                    if not isinstance(r, dict):
-                                        continue
-                                    candidates = (
-                                        [r]
-                                        if "status" in r
-                                        else [
-                                            v
-                                            for v in r.values()
-                                            if isinstance(v, dict) and "status" in v
-                                        ]
-                                    )
-                                    for c in candidates:
-                                        if str(c.get("status", "")).lower() == "true":
-                                            ok = True
-                                        else:
-                                            err = c.get("msg", "") or err
-                                if ok:
-                                    market_sent = True
-                                    market_msg = "플레이오토 송장 전송 완료 (신규주문 → 송장입력)"
-                                    await svc.update_order(
-                                        order_id,
-                                        {
-                                            "shipping_status": "송장전송완료",
-                                            "status": "shipping",
-                                        },
-                                    )
-                                else:
-                                    market_msg = (
-                                        f"플레이오토 송장 실패: {err or '응답 미상'}"
-                                    )
-                    except Exception as e:
-                        market_msg = f"플레이오토 송장 실패: {e}"
+                # 플레이오토 주문은 마켓 전송 없이 DB 저장만 수행 (사용자 요청)
+                # 실제 마켓(스스/11번가/쿠팡 등) 송장 입력은 플레이오토 원본 마켓 측에서 별도 처리
+                market_msg = "플레이오토 주문 — 송장번호 저장만 완료 (마켓 전송 생략)"
     except Exception as e:
         market_msg = f"송장 전송 실패: {e}"
         logger.warning(f"[송장전송] {order.order_number}: {e}")
@@ -6703,8 +6622,13 @@ def _parse_playauto_order(
 
     # 주소 분리 — 플레이오토는 RecipientAddress 한 필드에 도로명+상세를 통째로 내려줌
     # (openapi.json 확인: 별도 상세주소 필드 없음). 휴리스틱으로 기본/상세 분리.
-    # 패턴1: ", "로 명시 구분 ("디지털로26길 123, 14층 플레이오토")
-    # 패턴2: 도로명(...대로/로/길) + 본번(숫자 또는 숫자-숫자) 뒤 공백 기준 분리
+    # 우선순위:
+    #  패턴0: 끝 메타괄호 `(법정동/건물명)` + 그 앞 `동/호/층/호실` 패턴
+    #         → base = 도로주소 + 메타괄호, detail = 동/호 토큰
+    #         (예) "서울 노원구 마들로 111 월계미륭아파트,월계삼호아파트 30동 304호 (월계동 13 / ...)"
+    #             → base="서울 노원구 마들로 111 (월계동 13 / ...)", detail="월계미륭아파트,월계삼호아파트 30동 304호"
+    #  패턴1: ", "로 명시 구분 ("디지털로26길 123, 14층 플레이오토")
+    #  패턴2: 도로명(...대로/로/길) + 본번(숫자 또는 숫자-숫자) 뒤 공백 기준 분리
     #         ("대구 동구 아양로 218 113동 201호(효목1동 45-1)")
     import re as _re_addr
 
@@ -6712,16 +6636,33 @@ def _parse_playauto_order(
     _addr_base = _addr_full
     _addr_detail = ""
     if _addr_full:
-        if ", " in _addr_full:
-            _b, _, _d = _addr_full.partition(", ")
-            _addr_base, _addr_detail = _b.strip(), _d.strip()
-        else:
-            _m = _re_addr.match(
-                r"^(.+?(?:대로|로|길)\s+\d+(?:-\d+)?)\s+(.+)$", _addr_full
+        _matched = False
+        # 패턴0: 끝 메타괄호 + 동/호 패턴
+        _meta_m = _re_addr.match(r"^(.*?)\s*(\([^)]*\))\s*$", _addr_full)
+        if _meta_m:
+            _before_meta = _meta_m.group(1).strip()
+            _meta = _meta_m.group(2)
+            # 옵션 prefix: 건물명(숫자로 시작하지 않는 토큰). 본번 "218"·"1462-14"가
+            # detail로 빨려들지 않도록 첫 글자에 숫자 금지.
+            _dongho_m = _re_addr.match(
+                r"^(.+?)\s+((?:[^\d\s]\S*\s+)?(?:\d+\s*동\s+)?\d+\s*(?:호|층|호실))$",
+                _before_meta,
             )
-            if _m:
-                _addr_base = _m.group(1).strip()
-                _addr_detail = _m.group(2).strip()
+            if _dongho_m:
+                _addr_base = f"{_dongho_m.group(1).strip()} {_meta}".strip()
+                _addr_detail = _dongho_m.group(2).strip()
+                _matched = True
+        if not _matched:
+            if ", " in _addr_full:
+                _b, _, _d = _addr_full.partition(", ")
+                _addr_base, _addr_detail = _b.strip(), _d.strip()
+            else:
+                _m = _re_addr.match(
+                    r"^(.+?(?:대로|로|길)\s+\d+(?:-\d+)?)\s+(.+)$", _addr_full
+                )
+                if _m:
+                    _addr_base = _m.group(1).strip()
+                    _addr_detail = _m.group(2).strip()
 
     return {
         "order_number": ro.get("OrderCode", ""),
