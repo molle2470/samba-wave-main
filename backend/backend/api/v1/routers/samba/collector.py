@@ -517,10 +517,19 @@ async def delete_filter(
     from backend.domain.samba.collector.model import SambaCollectedProduct as _CP
 
     svc = _get_services(session)
+
+    async def _invalidate_filter_caches() -> None:
+        # /filters (60s), /filters/tree (300s), /filters/tree/counts:* (300s) 모두 invalidate —
+        # 누락 시 UI 가 삭제 직후 몇 분간 stale 그룹 잔존.
+        await cache.delete("collector:filters:v1")
+        await cache.delete("filters:tree:v3")
+        await cache.clear_pattern("filters:tree:counts:*")
+
     sf = await svc.filter_repo.get_async(filter_id)
     if not sf:
         # row 이미 부재 — idempotent 처리. UI stale 캐시 시 "삭제 실패" 사고 차단.
         logger.info(f"필터 삭제 요청 — row 이미 부재: {filter_id} (idempotent)")
+        await _invalidate_filter_caches()
         return {"ok": True, "deleted_products": 0, "already_deleted": True}
 
     # 마켓등록 상품 체크
@@ -540,8 +549,7 @@ async def delete_filter(
         logger.info(f"그룹 삭제: {filter_id} → 상품 {deleted_count}건 연동 삭제")
 
     await svc.delete_filter(filter_id)
-    await cache.delete("filters:tree:v3")
-    await cache.clear_pattern("filters:tree:counts:*")
+    await _invalidate_filter_caches()
     return {"ok": True, "deleted_products": deleted_count}
 
 

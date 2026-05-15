@@ -358,6 +358,16 @@ export default function CollectorPage() {
       executeCreateGroup,
     })
 
+  // 그룹 삭제 후 drill 상태 초기화 + 트리 리로드 — 그렇지 않으면 사용자가 머물던
+  // 사이트(예: LotteON) 에 drill 이 그대로 남아 새 트리에서도 그 사이트만 보임.
+  const reloadAfterDelete = useCallback(async () => {
+    setDrillSite(null)
+    setDrillBrand(null)
+    setDrillGroup(null)
+    setDrillEntry('site')
+    await loadTree()
+  }, [loadTree])
+
   const handleDeleteSelectedGroups = () =>
     performDeleteSelectedGroups({
       displayedFilters,
@@ -371,7 +381,7 @@ export default function CollectorPage() {
       setSelectedIds,
       setSelectAll,
       load,
-      loadTree,
+      loadTree: reloadAfterDelete,
     })
 
   const handleCollectGroups = async () => {
@@ -752,7 +762,7 @@ export default function CollectorPage() {
         onClose={() => setShowDuplicatesModal(false)}
         onDeleted={() => {
           load()
-          loadTree()
+          reloadAfterDelete()
         }}
       />
     </div>
