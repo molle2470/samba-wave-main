@@ -20,6 +20,7 @@ Create Date: 2026-05-11 00:00:00.000000
 from typing import Sequence, Union
 
 from alembic import op
+from sqlalchemy import text
 
 
 revision: str = "zzzzzzzzzzzzzzzz_add_addon_options"
@@ -32,7 +33,24 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     # samba_collected_product 는 hot 테이블이라 ACCESS EXCLUSIVE 락 경합 발생.
-    # idle in transaction 세션을 사전 정리하고 lock_timeout 을 충분히 늘려 ALTER.
+    # 'IF NOT EXISTS' 도 ALTER 시점에 순간 락을 잡으므로 활성 트랜잭션과 데드락 가능 —
+    # information_schema 로 컬럼 존재 여부를 먼저 확인하여 있으면 ALTER 자체를 스킵.
+    conn = op.get_bind()
+    existing = {
+        row[0]
+        for row in conn.execute(
+            text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'samba_collected_product' "
+                "AND column_name IN ('addon_options', 'option_group_names')"
+            )
+        ).fetchall()
+    }
+    need_alter = {"addon_options", "option_group_names"} - existing
+    if not need_alter:
+        return
+
+    # 누락 컬럼이 있을 때만 idle 정리 + ALTER 실행
     op.execute(
         """
         SELECT pg_terminate_backend(pid)
@@ -42,18 +60,12 @@ def upgrade() -> None:
         """
     )
     op.execute("SET LOCAL lock_timeout = '5min'")
-    op.execute(
-        """
-        ALTER TABLE samba_collected_product
-        ADD COLUMN IF NOT EXISTS addon_options JSONB
-        """
-    )
-    op.execute(
-        """
-        ALTER TABLE samba_collected_product
-        ADD COLUMN IF NOT EXISTS option_group_names JSONB
-        """
-    )
+    if "addon_options" in need_alter:
+        op.execute("ALTER TABLE samba_collected_product ADD COLUMN addon_options JSONB")
+    if "option_group_names" in need_alter:
+        op.execute(
+            "ALTER TABLE samba_collected_product ADD COLUMN option_group_names JSONB"
+        )
 
 
 def downgrade() -> None:
