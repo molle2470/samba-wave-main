@@ -22,7 +22,10 @@ logger = logging.getLogger(__name__)
 
 
 def _per_account_timeout_seconds(days: int) -> int:
-    return max(180, min(900, days * 90))
+    # 마켓 API hang → 워커 좀비화 도미노 차단 — 60~180초로 단축 (이전: 180~900초).
+    # 한 계정 hang 시 acc_session 이 idle in transaction 으로 남아 풀 잠식 → 다음 계정 hang
+    # 누적되면 컨테이너 재시작 사고. timeout 짧게 + 명시적 rollback 으로 좀비 회수 가속.
+    return max(60, min(180, days * 30))
 
 
 async def run(
@@ -100,14 +103,25 @@ async def run(
             # (특히 스마트스토어 분기는 last-changed-statuses 13×2 호출로 26초+ 걸려
             #  공유 세션에서 트랜잭션 abort 시 후속 분기들이 silent 실패하는 사고가 있었다)
             async with get_write_session() as acc_session:
-                res = await asyncio.wait_for(
-                    sync_orders_from_markets(
-                        body=SyncOrdersRequest(days=days, account_id=acc.id),
-                        session=acc_session,
-                        tenant_id=job.tenant_id,
-                    ),
-                    timeout=per_account_timeout,
-                )
+                try:
+                    res = await asyncio.wait_for(
+                        sync_orders_from_markets(
+                            body=SyncOrdersRequest(days=days, account_id=acc.id),
+                            session=acc_session,
+                            tenant_id=job.tenant_id,
+                        ),
+                        timeout=per_account_timeout,
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    # asyncpg + CancelledError 좀비 차단 — async with 의 자동 rollback 만으로는
+                    # idle in transaction 으로 남는 사례가 있어 명시적으로 5초 안에 rollback 강제.
+                    try:
+                        await asyncio.wait_for(acc_session.rollback(), timeout=5)
+                    except Exception as _rb_err:
+                        logger.warning(
+                            f"[order_sync] {label} TimeoutError 후 명시적 rollback 실패: {_rb_err}"
+                        )
+                    raise
             total_synced += int(res.get("total_synced") or 0)
             results = res.get("results") or []
             for r in results:

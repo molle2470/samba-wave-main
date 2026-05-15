@@ -3679,6 +3679,10 @@ async def sync_orders_from_markets(
         seller_id = account["seller_id"]
         label = f"{account['market_name']}({seller_id})"
 
+        # 마켓 클라이언트들의 httpx keepalive 좀비 차단 — 매 계정 처리 후 명시적 aclose.
+        # 미회수 시 hang 한 번에 다음 계정·다른 마켓 호출까지 영향(2026-05-15 사고).
+        _clients_to_close: list[Any] = []
+
         try:
             orders_data: list[dict[str, Any]] = []
             unconfirmed_ids: list[str] = []
@@ -3705,6 +3709,7 @@ async def sync_orders_from_markets(
                     )
                     continue
                 client = SmartStoreClient(client_id, client_secret)
+                _clients_to_close.append(client)
                 raw_orders = _raw_cache.get(account["id"])
                 if raw_orders is None:
                     raw_orders = await client.get_orders(days=body.days)
@@ -3821,6 +3826,7 @@ async def sync_orders_from_markets(
                     )
                     continue
                 lotteon_client = LotteonClient(api_key)
+                _clients_to_close.append(lotteon_client)
                 await lotteon_client.test_auth()
                 raw_orders = _raw_cache.get(account["id"])
                 if raw_orders is None:
@@ -4370,6 +4376,7 @@ async def sync_orders_from_markets(
                 )
                 _has_lottehome = _lottehome_row.first() is not None
                 pa_client = PlayAutoClient(api_key)
+                _clients_to_close.append(pa_client)
                 try:
                     start_date = (
                         datetime.now(UTC) - timedelta(days=body.days)
@@ -4444,6 +4451,7 @@ async def sync_orders_from_markets(
                     continue
 
                 client = CoupangClient(access_key, secret_key, vendor_id)
+                _clients_to_close.append(client)
                 try:
                     raw_orders = _raw_cache.get(account["id"])
                     if raw_orders is None:
@@ -4528,6 +4536,7 @@ async def sync_orders_from_markets(
                     continue
 
                 _11st_client = ElevenstClient(api_key)
+                _clients_to_close.append(_11st_client)
                 _confirm_targets: list[dict[str, str]] = []
                 _confirmed = 0
                 _fmt = "%Y%m%d%H%M"
@@ -4648,6 +4657,7 @@ async def sync_orders_from_markets(
                     )
 
                     _exchange_client = ElevenstExchangeClient(api_key)
+                    _clients_to_close.append(_exchange_client)
                     (
                         _cancel_claims,
                         _return_claims,
@@ -4788,6 +4798,7 @@ async def sync_orders_from_markets(
                     refresh_token=refresh_token,
                     sandbox=bool(extras.get("sandbox", False)),
                 )
+                _clients_to_close.append(ebay_client)
                 raw_orders = _raw_cache.get(account["id"])
                 if raw_orders is None:
                     try:
@@ -4957,6 +4968,7 @@ async def sync_orders_from_markets(
                     continue
 
                 _ssg_client = SSGClient(_ssg_api_key)
+                _clients_to_close.append(_ssg_client)
                 # 정산 API 호출: (ordNo, ordItemSeq) → settIAmt(정산금액), sellFeeRt(수수료율)
                 _ssg_settle_map: dict[str, dict] = {}
                 try:
@@ -5044,6 +5056,7 @@ async def sync_orders_from_markets(
 
                 await session.commit()
                 lh_client = LotteHomeClient(lh_user_id, lh_password, lh_agnc_no, lh_env)
+                _clients_to_close.append(lh_client)
 
                 from datetime import datetime as _dt, timedelta as _td, UTC as _UTC
 
@@ -6056,6 +6069,19 @@ async def sync_orders_from_markets(
             await session.rollback()  # 세션 복구 — 다음 계정 연쇄 실패 방지
             logger.error(f"[주문동기화] {label} 실패: {e}")
             results.append({"account": label, "status": "error", "message": str(e)})
+        finally:
+            # 마켓 클라이언트 httpx keepalive 좀비 정리 — 다음 계정 hang 도미노 차단.
+            # CancelledError(상위 wait_for timeout) 시에도 이 finally 가 먼저 실행되므로
+            # connection pool 즉시 회수됨.
+            for _c in _clients_to_close:
+                try:
+                    _aclose = getattr(_c, "aclose", None)
+                    if _aclose is not None:
+                        await _aclose()
+                except Exception as _ce:
+                    logger.warning(
+                        f"[주문동기화] {label} 클라이언트 aclose 실패(무시): {_ce}"
+                    )
 
     # DB 기반 원주문 shipping_status 일괄 동기화
     # samba_return 레코드가 있고 진행 중인 주문의 shipping_status를 강제 업데이트
