@@ -2288,7 +2288,9 @@ class SambaShipmentService:
             logger.info("[상세HTML] applied_policy_id 없음 — 템플릿 미적용")
 
         if template_id_override:
-            logger.info(f"[상세HTML] 마켓별 오버라이드 템플릿 적용: {template_id_override}")
+            logger.info(
+                f"[상세HTML] 마켓별 오버라이드 템플릿 적용: {template_id_override}"
+            )
 
         if template_id:
             tpl_repo = BaseRepository(self.session, SambaDetailTemplate)
@@ -2419,7 +2421,9 @@ class SambaShipmentService:
         category_svc = SambaCategoryService(
             mapping_repo, SambaCategoryTreeRepository(self.session)
         )
-        convert_markets = set(market_types) | ({"ssg_std"} if "ssg" in market_types else set())
+        convert_markets = set(market_types) | (
+            {"ssg_std"} if "ssg" in market_types else set()
+        )
         for market_type in convert_markets:
             if market_type in result:
                 cat_path = result[market_type]

@@ -249,7 +249,9 @@ class SSGClient:
         xml_body = '<?xml version="1.0" encoding="UTF-8"?>' + self._to_xml(
             product_data, "insertItem"
         )
-        logger.debug(f"[SSG] insertItem XML (총 {len(xml_body.encode())}bytes):\n{xml_body[:2000]}")
+        logger.debug(
+            f"[SSG] insertItem XML (총 {len(xml_body.encode())}bytes):\n{xml_body[:2000]}"
+        )
         result = await self._call_api_xml("POST", "/item/0.5/insertItem.ssg", xml_body)
         return {"success": True, "data": result}
 
@@ -259,14 +261,14 @@ class SSGClient:
         SSG Open API v0.5: POST /item/0.5/updateItem.ssg (XStream XML)
         """
         item_id = product_data.pop("itemId", "") or ""
-        product_data["itemId"] = item_id  # XStream updateItem.ssg는 itemId를 XML 본문에 포함
+        product_data["itemId"] = (
+            item_id  # XStream updateItem.ssg는 itemId를 XML 본문에 포함
+        )
         xml_body = '<?xml version="1.0" encoding="UTF-8"?>' + self._to_xml(
             product_data, "updateItem"
         )
         logger.debug(f"[SSG] updateItem XML (itemId={item_id}):\n{xml_body[:2000]}")
-        result = await self._call_api_xml(
-            "POST", "/item/0.5/updateItem.ssg", xml_body
-        )
+        result = await self._call_api_xml("POST", "/item/0.5/updateItem.ssg", xml_body)
         return {"success": True, "data": result}
 
     async def delete_product(self, item_id: str) -> dict[str, Any]:
@@ -1046,7 +1048,9 @@ class SSGClient:
             _raw_manufacturer = _raw_manufacturer.split("/")[0].strip()
         if ":" in _raw_manufacturer:
             _raw_manufacturer = _raw_manufacturer.split(":", 1)[1].strip()
-        manufacturer = _raw_manufacturer[:100] if _raw_manufacturer else (brand or "상세설명참조")
+        manufacturer = (
+            _raw_manufacturer[:100] if _raw_manufacturer else (brand or "상세설명참조")
+        )
         style_no = product.get("style_no", "") or product.get("styleNo", "") or ""
 
         # 브랜드 매칭 — 정책 브랜드 매핑 우선, 없으면 CONTRACTED_BRANDS fallback
@@ -1070,7 +1074,9 @@ class SSGClient:
         _mappings = brand_mappings or []
         matched_brand_id, matched_brand_name = _match_from_mappings(brand, _mappings)
         if not matched_brand_id and manufacturer:
-            matched_brand_id, matched_brand_name = _match_from_mappings(manufacturer, _mappings)
+            matched_brand_id, matched_brand_name = _match_from_mappings(
+                manufacturer, _mappings
+            )
         if not matched_brand_id:
             matched_brand_id, matched_brand_name = self.match_brand(brand)
             if matched_brand_id == "9999999999" and manufacturer:
@@ -1224,10 +1230,18 @@ class SSGClient:
             "itemMngPropClsId": item_mng_prop_cls_id,
             "itemMngAttrs": self._wrap_list(item_mng_attrs_list, "itemMngAttr"),
             "dispCtgs": self._wrap_list_always_array(
-                [e for e in [
-                    {"siteNo": self.site_no, "dispCtgId": category_id} if category_id else None,
-                    {"siteNo": "6005", "dispCtgId": main_category_id} if main_category_id else None,
-                ] if e],
+                [
+                    e
+                    for e in [
+                        {"siteNo": self.site_no, "dispCtgId": category_id}
+                        if category_id
+                        else None,
+                        {"siteNo": "6005", "dispCtgId": main_category_id}
+                        if main_category_id
+                        else None,
+                    ]
+                    if e
+                ],
                 "dispCtg",
             )
             if (category_id or main_category_id)
@@ -1275,8 +1289,16 @@ class SSGClient:
                         "whoutShppcstId": whout_shppcst_id,
                         "retShppcstId": ret_shppcst_id,
                         "mareaShppYn": "N",
-                        **({"jejuAddShppcstId": add_shppcst_jeju} if add_shppcst_jeju else {}),
-                        **({"ismtarAddShppcstId": add_shppcst_island} if add_shppcst_island else {}),
+                        **(
+                            {"jejuAddShppcstId": add_shppcst_jeju}
+                            if add_shppcst_jeju
+                            else {}
+                        ),
+                        **(
+                            {"ismtarAddShppcstId": add_shppcst_island}
+                            if add_shppcst_island
+                            else {}
+                        ),
                     }
                 ],
                 "itemShppCritn",
@@ -1294,7 +1316,9 @@ class SSGClient:
         }
 
         if not effective_std_cat:
-            logger.warning("[SSG] stdCtgId(표준카테고리 ID)가 없습니다. API 등록 실패할 수 있습니다.")
+            logger.warning(
+                "[SSG] stdCtgId(표준카테고리 ID)가 없습니다. API 등록 실패할 수 있습니다."
+            )
 
         if not data.get("itemNm"):
             data["itemNm"] = raw_name[:49] or "상품명없음"

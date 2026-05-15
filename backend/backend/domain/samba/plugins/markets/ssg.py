@@ -173,6 +173,7 @@ class SSGPlugin(MarketPlugin):
                     "/common/0.1/displayCategory.ssg",
                     params={"dispCtgId": category_id},
                 )
+
                 def _extract_cats(resp: dict) -> list:
                     raw = resp.get("result", {}).get("displayCategorys", [])
                     if isinstance(raw, dict):
@@ -198,11 +199,19 @@ class SSGPlugin(MarketPlugin):
                 if name_cats:
                     # category_id와 일치하는 항목 우선, 없으면 마지막 항목(가장 세분류)
                     target = next(
-                        (c for c in name_cats if str(c.get("dispCtgId", "")) == category_id),
+                        (
+                            c
+                            for c in name_cats
+                            if str(c.get("dispCtgId", "")) == category_id
+                        ),
                         name_cats[-1],
                     )
-                    path = target.get("dispCtgPathNm", "") or target.get("dispCtgNm", "")
-                    leaf_name = path.split(">")[-1].strip() if ">" in path else path.strip()
+                    path = target.get("dispCtgPathNm", "") or target.get(
+                        "dispCtgNm", ""
+                    )
+                    leaf_name = (
+                        path.split(">")[-1].strip() if ">" in path else path.strip()
+                    )
                     logger.info(f"[SSG] 신세계몰 카테고리 이름: {leaf_name!r}")
 
                 # 2단계: SSG.COM(6005)에서 leaf_name 검색 (전체 → 첫 단어 순으로 시도)
@@ -212,14 +221,20 @@ class SSGPlugin(MarketPlugin):
                     if short and short != leaf_name:
                         keywords.append(short)
                     for kw in keywords:
-                        com_resp = await client.search_display_categories(kw, site_no="6005")
+                        com_resp = await client.search_display_categories(
+                            kw, site_no="6005"
+                        )
                         com_cats = _extract_cats(com_resp)
                         if com_cats:
                             main_category_id = str(com_cats[0].get("dispCtgId", ""))
-                            logger.info(f"[SSG] SSG.COM(6005) 전시카테고리 자동 조회 성공 ({kw!r}): {main_category_id}")
+                            logger.info(
+                                f"[SSG] SSG.COM(6005) 전시카테고리 자동 조회 성공 ({kw!r}): {main_category_id}"
+                            )
                             break
                     else:
-                        logger.warning(f"[SSG] SSG.COM(6005) '{leaf_name}' 검색 결과 없음")
+                        logger.warning(
+                            f"[SSG] SSG.COM(6005) '{leaf_name}' 검색 결과 없음"
+                        )
             except Exception as _e:
                 logger.warning(f"[SSG] SSG.COM(6005) 전시카테고리 조회 실패: {_e}")
 
@@ -237,9 +252,13 @@ class SSGPlugin(MarketPlugin):
                 if _images:
                     product["images"], _ = await _img_svc.mirror_external_to_r2(_images)
                 if _detail_images:
-                    product["detail_images"], _ = await _img_svc.mirror_external_to_r2(_detail_images)
+                    product["detail_images"], _ = await _img_svc.mirror_external_to_r2(
+                        _detail_images
+                    )
                 if _detail_html:
-                    product["detail_html"] = await _img_svc.mirror_urls_in_html(_detail_html)
+                    product["detail_html"] = await _img_svc.mirror_urls_in_html(
+                        _detail_html
+                    )
                 if not product.get("images"):
                     return {
                         "success": False,
