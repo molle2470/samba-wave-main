@@ -77,6 +77,17 @@ interface MarketPolicyForm {
   dayMaxQty: number
   onceMinQty: number
   onceMaxQty: number
+  // 신세계몰 전용: 고시정보
+  ssgNoticeGroup?: '의류' | '신발' | '가방/잡화' | '기타'
+  ssgNoticeMaterial?: string
+  ssgNoticeColor?: string
+  ssgNoticeSize?: string
+  ssgNoticeImport?: 'Y' | 'N'
+  ssgNoticeImporter?: string
+  ssgNoticeCaution?: string
+  ssgNoticeAsContact?: string
+  ssgNoticeManufacturer?: string
+  ssgNoticeOrigin?: string
   // 스마트스토어 전용
   discountRate: number  // 즉시할인율 (%)
   maxStock: number      // 최대 재고수량 (0=무제한)
@@ -1296,31 +1307,20 @@ export default function PoliciesPage() {
                   </label>
                 </div>
               )}
-              {marketPolicyTab !== '롯데홈쇼핑' && (
+              {marketPolicyTab !== '롯데홈쇼핑' && marketPolicyTab !== '신세계몰(전시)' && (
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                   <span style={{ color: '#888', fontSize: '0.8125rem', minWidth: '80px' }}>수수료</span>
                   <NumInput value={mp.feeRate} onChange={(v) => { setCurrentMarketPolicy({ ...mp, feeRate: v }); triggerAutoSave() }} style={{ width: '70px' }} suffix="%" />
                 </div>
               )}
-              {marketPolicyTab !== '롯데홈쇼핑' && (
+              {marketPolicyTab !== '롯데홈쇼핑' && marketPolicyTab !== '신세계몰(전시)' && (
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                   <span style={{ color: '#888', fontSize: '0.8125rem', minWidth: '80px' }}>배송비</span>
                   <NumInput value={mp.shippingCost} onChange={(v) => { setCurrentMarketPolicy({ ...mp, shippingCost: v }); triggerAutoSave() }} style={{ width: '100px' }} suffix="원" />
                 </div>
               )}
-              {/* 신세계몰 전용: 주문수량 제한 */}
-              {marketPolicyTab === '신세계몰(전시)' && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
-                <span style={{ color: '#888', fontSize: '0.8125rem' }}>1일 최대수량</span>
-                <NumInput value={mp.dayMaxQty || 5} onChange={(v) => { setCurrentMarketPolicy({ ...mp, dayMaxQty: v }); triggerAutoSave() }} style={{ width: '60px' }} suffix="개" />
-                <span style={{ color: '#888', fontSize: '0.8125rem' }}>1회 최소수량</span>
-                <NumInput value={mp.onceMinQty || 1} onChange={(v) => { setCurrentMarketPolicy({ ...mp, onceMinQty: v }); triggerAutoSave() }} style={{ width: '60px' }} suffix="개" />
-                <span style={{ color: '#888', fontSize: '0.8125rem' }}>1회 최대수량</span>
-                <NumInput value={mp.onceMaxQty || 5} onChange={(v) => { setCurrentMarketPolicy({ ...mp, onceMaxQty: v }); triggerAutoSave() }} style={{ width: '60px' }} suffix="개" />
-              </div>
-              )}
-              {/* 11번가는 판매자 계정의 발송예정일 템플릿을 사용하므로 정책 출고일 미사용 / 롯데홈쇼핑은 자체 블록에서 출고일 표시 */}
-              {marketPolicyTab !== '플레이오토' && marketPolicyTab !== '스마트스토어' && marketPolicyTab !== '11번가' && marketPolicyTab !== '롯데홈쇼핑' && (
+              {/* 11번가는 판매자 계정의 발송예정일 템플릿을 사용하므로 정책 출고일 미사용 / 롯데홈쇼핑·신세계몰은 자체 블록에서 출고일 표시 */}
+              {marketPolicyTab !== '플레이오토' && marketPolicyTab !== '스마트스토어' && marketPolicyTab !== '11번가' && marketPolicyTab !== '롯데홈쇼핑' && marketPolicyTab !== '신세계몰(전시)' && (
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                 <span style={{ color: '#888', fontSize: '0.8125rem', minWidth: '80px' }}>출고일</span>
                 <NumInput value={mp.shippingDays || 3} onChange={(v) => { setCurrentMarketPolicy({ ...mp, shippingDays: v }); triggerAutoSave() }} style={{ width: '60px' }} suffix="일" />
@@ -1342,13 +1342,11 @@ export default function PoliciesPage() {
               </div>
               </>
               )}
-              {/* 신세계몰 전용: 마진율, 브랜드 */}
+              {/* 신세계몰 전용: 주문수량, 브랜드, 고시정보 */}
               {marketPolicyTab === '신세계몰(전시)' && (
-                <>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                    <span style={{ color: '#888', fontSize: '0.8125rem', minWidth: '80px' }}>마진율</span>
-                    <NumInput value={mp.marginRate || 0} onChange={(v) => { setCurrentMarketPolicy({ ...mp, marginRate: v }); triggerAutoSave() }} style={{ width: '70px' }} suffix="%" />
-                  </div>
+                <div style={{ gridColumn: '1 / -1', borderTop: '1px solid #2D2D2D', paddingTop: '0.75rem', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                  <span style={{ fontSize: '0.75rem', color: '#FF8C00', fontWeight: 600 }}>신세계몰 기본 설정</span>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', maxWidth: '50%' }}>
                   <div style={{ display: 'flex', alignItems: 'flex-start', gap: '0.5rem' }}>
                     <span style={{ color: '#888', fontSize: '0.8125rem', minWidth: '80px', flexShrink: 0, paddingTop: '0.3rem' }}>브랜드</span>
                     <div style={{ flex: 1, minWidth: 0, position: 'relative' }}>
@@ -1387,7 +1385,23 @@ export default function PoliciesPage() {
                       )}
                     </div>
                   </div>
-                </>
+                  {/* 신세계몰 전용: 고시정보 */}
+                  <div style={{ borderTop: '1px solid #2D2D2D', paddingTop: '0.75rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                    <span style={{ fontSize: '0.75rem', color: '#FF8C00', fontWeight: 600 }}>고시정보</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      <span style={{ color: '#888', fontSize: '0.8125rem', minWidth: '120px', flexShrink: 0 }}>A/S 책임자 및 전화번호</span>
+                      <input
+                        type="text"
+                        value={mp.ssgNoticeAsContact || ''}
+                        onChange={e => { setCurrentMarketPolicy({ ...mp, ssgNoticeAsContact: e.target.value }); triggerAutoSave() }}
+                        placeholder="예: 고객센터 010-1234-5678"
+                        style={{ flex: 1, padding: '0.3rem 0.4rem', fontSize: '0.8rem', background: '#1A1A1A', border: '1px solid #2D2D2D', borderRadius: '4px', color: '#E5E5E5', outline: 'none' }}
+                      />
+                    </div>
+                    <span style={{ fontSize: '0.72rem', color: '#444' }}>나머지 항목(소재·색상·치수·수입여부 등)은 소싱 데이터 자동 입력</span>
+                  </div>
+                  </div>
+                </div>
               )}
               {/* GS샵 전용: MD 협의 마진율 */}
               {marketPolicyTab === 'GS샵' && (
