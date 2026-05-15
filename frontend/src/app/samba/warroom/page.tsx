@@ -622,9 +622,16 @@ export default function WarroomPage() {
           const runningPcs = atStatus.running_pcs || []
           const meMissing = !!dev && !runningPcs.includes(dev)
           const now = Date.now()
-          const cooldownPassed = now - autoRejoinAtRef.current > 60_000
+          // cooldown은 localStorage에 박아 페이지 재마운트 시에도 유지
+          // useRef는 unmount 시 0으로 리셋되어, 페이지 들어올 때마다 즉시 재시작 트리거되는 문제 방지
+          let _lastAutoRejoinAt = 0
+          try {
+            _lastAutoRejoinAt = Number(window.localStorage.getItem('samba.autotune.autoRejoinAt') || '0')
+          } catch { /* ignore */ }
+          const cooldownPassed = now - Math.max(autoRejoinAtRef.current, _lastAutoRejoinAt) > 60_000
           if (intent === 'start' && meMissing && cooldownPassed) {
             autoRejoinAtRef.current = now
+            try { window.localStorage.setItem('samba.autotune.autoRejoinAt', String(now)) } catch { /* ignore */ }
             // PC분담 재등록 — load() 클로저 stale 방지를 위해 ref에서 최신값 사용
             const curFilter = filterSourcesOuterRef.current
             const curAvail = availSourcesOuterRef.current

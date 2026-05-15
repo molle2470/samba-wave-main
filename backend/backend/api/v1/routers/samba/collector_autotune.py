@@ -501,6 +501,13 @@ async def _site_autotune_loop(device_id: str, site: str):
                     _target_ids = _pc_target_ids.get(device_id)
                     if _target_ids:
                         _where.append(_CP.id.in_(_target_ids))
+                    # 사이클당 배치 상한 — 무신사처럼 등록상품 많은 소싱처에서
+                    # 한 사이클 SELECT/사전로딩이 너무 길어져 첫 처리까지 수십 초~수 분
+                    # 대기하는 문제 방지. 정렬이 last_refreshed_at asc nullsfirst 이므로
+                    # 오래된 상품부터 자연스럽게 순환됨. 단일 타겟(_target_ids)은 그대로 전체 처리.
+                    _AUTOTUNE_CYCLE_BATCH = int(
+                        os.environ.get("AUTOTUNE_CYCLE_BATCH", "200")
+                    )
                     stmt = (
                         select(_CP)
                         .where(*_where)
@@ -512,6 +519,8 @@ async def _site_autotune_loop(device_id: str, site: str):
                             defer(_CP.extra_data),
                         )
                     )
+                    if not _target_ids:
+                        stmt = stmt.limit(_AUTOTUNE_CYCLE_BATCH)
                     result = await session.exec(stmt)
                     _seen_ids: set[str] = set()
                     products = []

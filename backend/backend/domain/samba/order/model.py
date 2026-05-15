@@ -249,10 +249,14 @@ EXCLUDED_ORDER_STATUSES: tuple[str, ...] = (
 )
 
 # 배송이 이미 진행/종료된 단계 — shipping_status(마켓 원본 한글)에 이 키워드 포함 시 제외.
+# 화면 배지 변환 규칙(OrdersTable.tsx:309)과 일치시키기 위해 raw 값을 모두 포함:
+#   raw "송장전송완료" → 배지 "국내배송중", raw "국내배송중" → 배지 "국내배송중"
 SHIPPED_SHIPPING_STATUS_KEYWORDS: tuple[str, ...] = (
     "배송중",
     "배송완료",
     "구매확정",
+    "국내배송중",
+    "송장전송완료",
 )
 
 
