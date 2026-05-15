@@ -55,12 +55,43 @@ export function useOrderLinks(accounts: SambaMarketAccount[]) {
     showAlert('소싱처 원문링크 정보가 없습니다', 'info')
   }
 
-  const handleMarketLink = (o: SambaOrder) => {
+  const handleMarketLink = async (o: SambaOrder) => {
     const acc = accounts.find(a => a.id === o.channel_id)
     const marketType = acc?.market_type || ''
     const sellerId = acc?.seller_id || ''
     const storeSlug = (acc?.additional_fields as Record<string, string> | undefined)?.storeSlug || ''
-    const productNo = o.product_id || ''
+    let productNo = o.product_id || ''
+
+    // 스마트스토어 정상 URL은 channelProductNo로 열림 (origin은 "존재하지 않는 페이지").
+    // - mpn[acc.id]        = channelProductNo (URL용)
+    // - mpn[acc.id_origin] = originProductNo  (Commerce API 관리/품절용)
+    // 주문 product_id에는 channelProductNo가 들어오지만, 선물하기/옵션상품 등은
+    // originalProductId(=originProductNo) fallback이 저장되어 그대로 쓰면 깨짐
+    // → 수집상품 역추적으로 channelProductNo 우선 해석 (ProductCard.tsx:539와 동일 패턴)
+    if (marketType === 'smartstore' && o.product_id && o.channel_id) {
+      try {
+        const lookup = await collectorApi.lookupByMarketNo(o.product_id)
+        const mpn = lookup?.market_product_nos || {}
+        // dict 형태({originProductNo, smartstoreChannelProductNo, groupProductNo})
+        // URL용으로는 smartstoreChannelProductNo > groupProductNo 우선
+        const pickForUrl = (v: unknown): string => {
+          if (v && typeof v === 'object') {
+            const obj = v as Record<string, unknown>
+            return String(
+              obj.smartstoreChannelProductNo ??
+              obj.groupProductNo ??
+              obj.originProductNo ??
+              ''
+            )
+          }
+          return v ? String(v) : ''
+        }
+        const resolved =
+          pickForUrl(mpn[o.channel_id]) ||
+          pickForUrl(mpn[`${o.channel_id}_origin`])
+        if (resolved) productNo = resolved
+      } catch { /* lookup 실패 시 product_id 그대로 사용 */ }
+    }
 
     const urlMap: Record<string, string> = {
       smartstore: `https://smartstore.naver.com/${storeSlug || sellerId}/products/${productNo}`,
@@ -76,8 +107,10 @@ export function useOrderLinks(accounts: SambaMarketAccount[]) {
     }
 
     if (productNo) {
-      if (marketType === 'playauto' && o.source_site) {
-        const site = o.source_site.split('(')[0]
+      // PlayAuto 판매처 별칭: 신규 sales_channel_alias 우선, 없으면 레거시 source_site
+      const playautoAlias = (o.sales_channel_alias || o.source_site || '').trim()
+      if (marketType === 'playauto' && playautoAlias) {
+        const site = playautoAlias.split('(')[0]
         const siteUrlMap: Record<string, (no: string) => string> = {
           'GS이숍': (no) => `https://www.gsshop.com/prd/prd.gs?prdid=${no}`,
           'G마켓': (no) => `https://item.gmarket.co.kr/Item?goodscode=${no}`,

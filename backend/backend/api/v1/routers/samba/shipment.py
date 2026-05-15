@@ -1007,6 +1007,908 @@ async def cleanup_elevenst_missing_prdno(
     }
 
 
+# ----------------------------------------------------------------------
+# 쿠팡 유령삭제 (양방향 동기화) — 스마트스토어 패턴 본뜸
+# ----------------------------------------------------------------------
+
+
+@router.post("/coupang/cleanup-orphans")
+async def cleanup_coupang_orphans(
+    body: CleanupOrphansRequest = CleanupOrphansRequest(),
+    dry_run: bool = Query(True, description="true면 목록만, false면 실제 삭제"),
+    account_id: Optional[str] = Query(None, description="특정 쿠팡 계정만 정리"),
+    max_delete: int = Query(
+        50, ge=0, le=100000, description="한 번에 삭제할 최대 orphan 수"
+    ),
+    full: bool = Query(
+        False,
+        description="true면 orphans/stale_db 전체 반환 (단건 스트리밍 러너용). false면 100개로 캡.",
+    ),
+    session: AsyncSession = Depends(get_write_session_dependency),
+    admin: str = Depends(require_admin),
+):
+    """쿠팡 유령상품 양방향 동기화.
+
+    - orphan: 쿠팡에 있는데 DB 매핑 없음 → `delete_product(spid)` 호출
+    - stale : DB는 등록됨인데 쿠팡 목록에 없음 → DB 매핑만 정리
+
+    statusName=DELETED 는 이미 삭제된 상태이므로 비교에서 제외.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from sqlmodel import select
+
+    from backend.domain.samba.account.model import SambaMarketAccount
+    from backend.domain.samba.collector.model import SambaCollectedProduct
+    from backend.domain.samba.proxy.coupang import CoupangApiError, CoupangClient
+
+    # 1) 활성 쿠팡 계정 조회
+    q = select(SambaMarketAccount).where(
+        SambaMarketAccount.market_type == "coupang",
+        SambaMarketAccount.is_active == True,  # noqa: E712
+    )
+    if account_id:
+        q = q.where(SambaMarketAccount.id == account_id)
+    accounts = (await session.execute(q)).scalars().all()
+    if not accounts:
+        raise HTTPException(status_code=404, detail="활성 쿠팡 계정 없음")
+
+    # 2) DB 상품 로드 (화면 필터)
+    prod_q = select(SambaCollectedProduct)
+    if body.product_ids:
+        prod_q = prod_q.where(SambaCollectedProduct.id.in_(body.product_ids))
+    all_db_products = (await session.execute(prod_q)).scalars().all()
+
+    per_account: list[dict] = []
+    total_market = 0
+    total_orphans = 0
+    total_stale_db = 0
+    total_deleted = 0
+    total_stale_cleared = 0
+
+    for account in accounts:
+        add_f = account.additional_fields or {}
+        if not isinstance(add_f, dict):
+            add_f = {}
+        access_key = str(add_f.get("accessKey") or account.api_key or "").strip()
+        secret_key = str(add_f.get("secretKey") or account.api_secret or "").strip()
+        vendor_id = str(add_f.get("vendorId") or account.seller_id or "").strip()
+        if not access_key or not secret_key or not vendor_id:
+            per_account.append(
+                {
+                    "account_id": account.id,
+                    "label": account.account_label,
+                    "error": "쿠팡 인증정보 누락",
+                }
+            )
+            continue
+
+        # 2-1) 이 계정에 매핑된 sellerProductId set + DB id 역매핑
+        account_db_spids: set[str] = set()
+        db_spid_map: dict[str, dict] = {}  # spid → {db_id, name, ...}
+        for p in all_db_products:
+            nos = p.market_product_nos or {}
+            v = nos.get(account.id)
+            spid = ""
+            if isinstance(v, str):
+                spid = v.strip()
+            elif isinstance(v, dict):
+                spid = str(
+                    v.get("sellerProductId")
+                    or v.get("spid")
+                    or v.get("productNo")
+                    or ""
+                ).strip()
+            if spid:
+                account_db_spids.add(spid)
+                db_spid_map[spid] = {
+                    "db_id": str(p.id),
+                    "style_code": str(p.style_code or ""),
+                    "mapped_spid": spid,
+                    "product_name": (p.name or "")[:80],
+                }
+
+        # 3) 쿠팡 list_seller_products 전체 페이징 수집 (DELETED 제외)
+        client = CoupangClient(access_key, secret_key, vendor_id)
+        try:
+            coupang_items = await client.list_seller_products(
+                status=None, max_per_page=100
+            )
+        except CoupangApiError as e:
+            per_account.append(
+                {
+                    "account_id": account.id,
+                    "label": account.account_label,
+                    "error": f"쿠팡 목록 조회 실패: {str(e)[:200]}",
+                }
+            )
+            continue
+
+        # DELETED 상태 제외
+        market_spids: set[str] = set()
+        market_info: dict[str, dict] = {}
+        for it in coupang_items:
+            sn = (it.get("status_name") or "").upper()
+            if sn in ("DELETED", "DENIED"):
+                continue
+            spid = it.get("seller_product_id") or ""
+            if not spid:
+                continue
+            market_spids.add(spid)
+            market_info[spid] = it
+
+        total_market += len(market_spids)
+
+        # 4) orphan / stale 분류
+        orphan_spids = market_spids - account_db_spids
+        stale_spids = account_db_spids - market_spids
+
+        orphans: list[dict] = []
+        for spid in orphan_spids:
+            info = market_info.get(spid) or {}
+            orphans.append(
+                {
+                    "spid": spid,
+                    "name": (info.get("product_name") or "")[:80],
+                    "status_name": info.get("status_name") or "",
+                }
+            )
+
+        stale_db: list[dict] = []
+        for spid in stale_spids:
+            info = db_spid_map.get(spid)
+            if info:
+                stale_db.append(info)
+
+        total_orphans += len(orphans)
+        total_stale_db += len(stale_db)
+
+        deleted_here: list[str] = []
+        failed: list[dict] = []
+        stale_cleared: list[str] = []
+
+        if not dry_run:
+            # 4-1) orphan → 쿠팡 delete_product 호출
+            remaining = max_delete - total_deleted
+            if remaining > 0 and orphans:
+                for o in orphans[:remaining]:
+                    last_err: str | None = None
+                    for attempt in range(4):
+                        try:
+                            await client.delete_product(o["spid"])
+                            deleted_here.append(o["spid"])
+                            last_err = None
+                            break
+                        except CoupangApiError as e:
+                            err_msg = str(e)
+                            last_err = err_msg
+                            if (
+                                "429" in err_msg or "TOO_MANY" in err_msg.upper()
+                            ) and attempt < 3:
+                                await asyncio.sleep(2**attempt)
+                                continue
+                            break
+                        except Exception as e:
+                            last_err = str(e)[:200]
+                            break
+                    if last_err is not None:
+                        failed.append({"spid": o["spid"], "error": last_err})
+                    await asyncio.sleep(0.4)
+                total_deleted += len(deleted_here)
+
+            # 4-2) stale → DB 매핑 정리
+            if stale_db:
+                db_ids_to_clear = [s["db_id"] for s in stale_db if s.get("db_id")]
+                if db_ids_to_clear:
+                    clear_q = select(SambaCollectedProduct).where(
+                        SambaCollectedProduct.id.in_(db_ids_to_clear)
+                    )
+                    for prod in (await session.execute(clear_q)).scalars().all():
+                        nos = dict(prod.market_product_nos or {})
+                        changed = False
+                        for k in (
+                            account.id,
+                            f"{account.id}_pid",
+                            f"{account.id}_vid",
+                            f"{account.id}_origin",
+                        ):
+                            if k in nos:
+                                nos.pop(k, None)
+                                changed = True
+                        if changed:
+                            prod.market_product_nos = nos
+                            flag_modified(prod, "market_product_nos")
+                        regs = list(prod.registered_accounts or [])
+                        if account.id in regs:
+                            prod.registered_accounts = [
+                                a for a in regs if a != account.id
+                            ]
+                            flag_modified(prod, "registered_accounts")
+                            changed = True
+                        if changed:
+                            session.add(prod)
+                            stale_cleared.append(str(prod.id))
+                    if stale_cleared:
+                        await session.commit()
+                        total_stale_cleared += len(stale_cleared)
+                        logger.info(
+                            f"[쿠팡 유령정리] {account.id} stale DB 정리 {len(stale_cleared)}건"
+                        )
+
+        per_account.append(
+            {
+                "account_id": account.id,
+                "label": account.account_label,
+                "market_count": len(market_spids),
+                "orphan_count": len(orphans),
+                "orphans": orphans if full else orphans[:100],
+                "stale_db_count": len(stale_db),
+                "stale_db": stale_db if full else stale_db[:100],
+                "stale_cleared": stale_cleared,
+                "deleted": deleted_here,
+                "failed": failed,
+            }
+        )
+
+    return {
+        "ok": True,
+        "dry_run": dry_run,
+        "total_market": total_market,
+        "total_orphans": total_orphans,
+        "total_stale_db": total_stale_db,
+        "total_deleted": total_deleted,
+        "total_stale_cleared": total_stale_cleared,
+        "max_delete": max_delete,
+        "accounts": per_account,
+    }
+
+
+# ----------------------------------------------------------------------
+# 쿠팡 유령삭제 — 단건 처리 (스트리밍 로그용)
+#   - 프론트가 1건씩 호출해 항목별 성공/실패를 실시간으로 표시
+#   - 단일 워커 점유 시간 짧음 → Caddy timeout / health-fail 회피
+# ----------------------------------------------------------------------
+
+
+class CoupangClearStaleRequest(BaseModel):
+    account_id: str
+    db_id: str
+
+
+class CoupangDeleteOrphanRequest(BaseModel):
+    account_id: str
+    spid: str
+
+
+@router.post("/coupang/clear-stale-mapping")
+async def clear_coupang_stale_mapping(
+    body: CoupangClearStaleRequest,
+    session: AsyncSession = Depends(get_write_session_dependency),
+    admin: str = Depends(require_admin),
+):
+    """쿠팡 stale 매핑 단건 정리 — 삼바 DB만 손댐(쿠팡 API 호출 없음)."""
+    from sqlalchemy.orm.attributes import flag_modified
+    from sqlmodel import select
+
+    from backend.domain.samba.account.model import SambaMarketAccount
+    from backend.domain.samba.collector.model import SambaCollectedProduct
+
+    account = (
+        await session.execute(
+            select(SambaMarketAccount).where(SambaMarketAccount.id == body.account_id)
+        )
+    ).scalar_one_or_none()
+    if not account or account.market_type != "coupang":
+        raise HTTPException(status_code=404, detail="쿠팡 계정 없음")
+
+    prod = (
+        await session.execute(
+            select(SambaCollectedProduct).where(SambaCollectedProduct.id == body.db_id)
+        )
+    ).scalar_one_or_none()
+    if not prod:
+        return {"ok": False, "cleared": False, "error": "상품 없음"}
+
+    changed = False
+    nos = dict(prod.market_product_nos or {})
+    for k in (
+        account.id,
+        f"{account.id}_pid",
+        f"{account.id}_vid",
+        f"{account.id}_origin",
+    ):
+        if k in nos:
+            nos.pop(k, None)
+            changed = True
+    if changed:
+        prod.market_product_nos = nos
+        flag_modified(prod, "market_product_nos")
+    regs = list(prod.registered_accounts or [])
+    if account.id in regs:
+        prod.registered_accounts = [a for a in regs if a != account.id]
+        flag_modified(prod, "registered_accounts")
+        changed = True
+    if changed:
+        session.add(prod)
+        await session.commit()
+    return {"ok": True, "cleared": changed}
+
+
+@router.post("/coupang/delete-orphan")
+async def delete_coupang_orphan(
+    body: CoupangDeleteOrphanRequest,
+    session: AsyncSession = Depends(get_write_session_dependency),
+    admin: str = Depends(require_admin),
+):
+    """쿠팡 orphan 단건 삭제 — 상품삭제 버튼과 동일한 stop-then-delete 우회 로직 사용.
+
+    승인완료(APPROVED)/부분승인 상품은 즉시 DELETE 가 거부되므로 dispatcher 가
+    옵션 전체 sales/stop → 대기 → DELETE 재시도 (5s/15s/30s) 까지 자동 수행한다.
+    """
+    from sqlmodel import select
+
+    from backend.domain.samba.account.model import SambaMarketAccount
+    from backend.domain.samba.shipment.dispatcher import delete_from_market
+
+    account = (
+        await session.execute(
+            select(SambaMarketAccount).where(SambaMarketAccount.id == body.account_id)
+        )
+    ).scalar_one_or_none()
+    if not account or account.market_type != "coupang":
+        raise HTTPException(status_code=404, detail="쿠팡 계정 없음")
+
+    # orphan 은 DB 매핑 없음 → product_dict 를 spid 만으로 최소 구성
+    product_dict = {
+        "id": "",
+        "market_product_no": {"coupang": body.spid},
+        "registered_accounts": [body.account_id],
+    }
+
+    try:
+        result = await delete_from_market(
+            session,
+            "coupang",
+            product_dict,
+            account=account,
+            market_delete=True,
+        )
+        if result.get("success"):
+            return {
+                "ok": True,
+                "message": result.get("message", "삭제 완료"),
+                "ghost_cleanup": bool(result.get("ghost_cleanup")),
+            }
+        return {"ok": False, "error": result.get("message", "삭제 실패")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:300]}
+
+
+# ----------------------------------------------------------------------
+# 11번가 유령삭제 양방향(v2) — list_seller_products 기반
+# ----------------------------------------------------------------------
+
+
+@router.post("/elevenst/cleanup-orphans-v2")
+async def cleanup_elevenst_orphans_v2(
+    body: CleanupOrphansRequest = CleanupOrphansRequest(),
+    dry_run: bool = Query(True, description="true면 목록만, false면 실제 처리"),
+    account_id: Optional[str] = Query(None, description="특정 11번가 계정만"),
+    max_delete: int = Query(
+        50, ge=0, le=100000, description="한 번에 처리할 최대 orphan 수"
+    ),
+    session: AsyncSession = Depends(get_write_session_dependency),
+    admin: str = Depends(require_admin),
+):
+    """11번가 유령상품 양방향 동기화 (스마트스토어 패턴).
+
+    - 11번가 selStatCd=103(판매중)만 enumerate
+    - orphan: 11번가 판매중인데 DB 매핑 없음 → delete_product(=stopdisplay)
+    - stale : DB 매핑은 있는데 11번가 판매중 목록에 없음 → DB 정리
+
+    sellerPrdCd(=samba product.id)도 함께 수집해 DB id 매칭 보강.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from sqlmodel import select
+
+    from backend.domain.samba.account.model import SambaMarketAccount
+    from backend.domain.samba.collector.model import SambaCollectedProduct
+    from backend.domain.samba.proxy.elevenst import (
+        ElevenstApiError,
+        ElevenstClient,
+        ElevenstRateLimitError,
+    )
+
+    q = select(SambaMarketAccount).where(
+        SambaMarketAccount.market_type == "11st",
+        SambaMarketAccount.is_active == True,  # noqa: E712
+    )
+    if account_id:
+        q = q.where(SambaMarketAccount.id == account_id)
+    accounts = (await session.execute(q)).scalars().all()
+    if not accounts:
+        raise HTTPException(status_code=404, detail="활성 11번가 계정 없음")
+
+    prod_q = select(SambaCollectedProduct)
+    if body.product_ids:
+        prod_q = prod_q.where(SambaCollectedProduct.id.in_(body.product_ids))
+    all_db_products = (await session.execute(prod_q)).scalars().all()
+    all_db_id_set: set[str] = {str(p.id) for p in all_db_products}
+
+    per_account: list[dict] = []
+    total_market = 0
+    total_orphans = 0
+    total_stale_db = 0
+    total_deleted = 0
+    total_stale_cleared = 0
+
+    for account in accounts:
+        add_f = account.additional_fields or {}
+        if not isinstance(add_f, dict):
+            add_f = {}
+        api_key = str(add_f.get("apiKey") or account.api_key or "").strip()
+        if not api_key:
+            per_account.append(
+                {
+                    "account_id": account.id,
+                    "label": account.account_label,
+                    "error": "11번가 API 키 없음",
+                }
+            )
+            continue
+
+        # DB → prdNo 매핑 (이 계정용)
+        account_db_prdnos: set[str] = set()
+        db_prdno_map: dict[str, dict] = {}
+        for p in all_db_products:
+            nos = p.market_product_nos or {}
+            v = nos.get(account.id)
+            prd_no = ""
+            if isinstance(v, str):
+                prd_no = v.strip()
+            elif isinstance(v, dict):
+                prd_no = str(v.get("prdNo") or v.get("productNo") or "").strip()
+            if prd_no:
+                account_db_prdnos.add(prd_no)
+                db_prdno_map[prd_no] = {
+                    "db_id": str(p.id),
+                    "style_code": str(p.style_code or ""),
+                    "mapped_prdno": prd_no,
+                    "product_name": (p.name or "")[:80],
+                }
+
+        client = ElevenstClient(api_key)
+        try:
+            market_items = await client.list_seller_products(
+                sel_stat_cd="103", page_size=500
+            )
+        except ElevenstRateLimitError as e:
+            per_account.append(
+                {
+                    "account_id": account.id,
+                    "label": account.account_label,
+                    "error": f"rate_limit (retry_after={e.retry_after}s)",
+                }
+            )
+            continue
+        except ElevenstApiError as e:
+            per_account.append(
+                {
+                    "account_id": account.id,
+                    "label": account.account_label,
+                    "error": f"11번가 목록 조회 실패: {str(e)[:200]}",
+                }
+            )
+            continue
+
+        market_prdnos: set[str] = set()
+        market_info: dict[str, dict] = {}
+        # sellerPrdCd(=samba product.id) 기반 보강 매핑
+        seller_code_to_prdno: dict[str, str] = {}
+        for it in market_items:
+            pn = it.get("prd_no") or ""
+            if not pn:
+                continue
+            market_prdnos.add(pn)
+            market_info[pn] = it
+            sc = (it.get("seller_code") or "").strip()
+            if sc:
+                seller_code_to_prdno[sc] = pn
+
+        total_market += len(market_prdnos)
+
+        # sellerPrdCd가 우리 DB product.id 와 일치하면 → 그 prdNo는 우리 것
+        # (registered_accounts에 이 account 가 들어있는 경우만 인정)
+        recovered_in_db: set[str] = set()
+        for p in all_db_products:
+            regs = p.registered_accounts or []
+            if account.id not in regs:
+                continue
+            pn = seller_code_to_prdno.get(str(p.id))
+            if pn:
+                account_db_prdnos.add(pn)
+                recovered_in_db.add(pn)
+
+        orphan_prdnos = market_prdnos - account_db_prdnos
+        stale_prdnos = account_db_prdnos - market_prdnos
+
+        orphans: list[dict] = []
+        for pn in orphan_prdnos:
+            info = market_info.get(pn) or {}
+            orphans.append(
+                {
+                    "prd_no": pn,
+                    "name": (info.get("name") or "")[:80],
+                    "seller_code": info.get("seller_code") or "",
+                }
+            )
+
+        stale_db: list[dict] = []
+        for pn in stale_prdnos:
+            info = db_prdno_map.get(pn)
+            if info:
+                stale_db.append(info)
+
+        total_orphans += len(orphans)
+        total_stale_db += len(stale_db)
+
+        deleted_here: list[str] = []
+        failed: list[dict] = []
+        stale_cleared: list[str] = []
+
+        if not dry_run:
+            remaining = max_delete - total_deleted
+            if remaining > 0 and orphans:
+                rate_limited = False
+                for o in orphans[:remaining]:
+                    if rate_limited:
+                        break
+                    try:
+                        await client.delete_product(o["prd_no"])
+                        deleted_here.append(o["prd_no"])
+                    except ElevenstRateLimitError as e:
+                        failed.append(
+                            {
+                                "prd_no": o["prd_no"],
+                                "error": f"rate_limit({e.retry_after}s)",
+                            }
+                        )
+                        rate_limited = True
+                    except ElevenstApiError as e:
+                        msg = str(e)
+                        if "삭제된 상품" in msg or "존재하지 않는 상품" in msg:
+                            # 이미 죽은 상태 — 통과
+                            deleted_here.append(o["prd_no"])
+                        else:
+                            failed.append({"prd_no": o["prd_no"], "error": msg[:200]})
+                    except Exception as e:
+                        failed.append({"prd_no": o["prd_no"], "error": str(e)[:200]})
+                    await asyncio.sleep(0.4)
+                total_deleted += len(deleted_here)
+
+            if stale_db:
+                db_ids_to_clear = [s["db_id"] for s in stale_db if s.get("db_id")]
+                if db_ids_to_clear:
+                    clear_q = select(SambaCollectedProduct).where(
+                        SambaCollectedProduct.id.in_(db_ids_to_clear)
+                    )
+                    for prod in (await session.execute(clear_q)).scalars().all():
+                        nos = dict(prod.market_product_nos or {})
+                        changed = False
+                        for k in (account.id, f"{account.id}_origin"):
+                            if k in nos:
+                                nos.pop(k, None)
+                                changed = True
+                        if changed:
+                            prod.market_product_nos = nos
+                            flag_modified(prod, "market_product_nos")
+                        regs = list(prod.registered_accounts or [])
+                        if account.id in regs:
+                            prod.registered_accounts = [
+                                a for a in regs if a != account.id
+                            ]
+                            flag_modified(prod, "registered_accounts")
+                            changed = True
+                        if changed:
+                            session.add(prod)
+                            stale_cleared.append(str(prod.id))
+                    if stale_cleared:
+                        await session.commit()
+                        total_stale_cleared += len(stale_cleared)
+                        logger.info(
+                            f"[11번가 유령정리v2] {account.id} stale DB 정리 {len(stale_cleared)}건"
+                        )
+
+        per_account.append(
+            {
+                "account_id": account.id,
+                "label": account.account_label,
+                "market_count": len(market_prdnos),
+                "orphan_count": len(orphans),
+                "orphans": orphans[:100],
+                "stale_db_count": len(stale_db),
+                "stale_db": stale_db[:100],
+                "stale_cleared": stale_cleared,
+                "deleted": deleted_here,
+                "failed": failed,
+                "recovered_via_seller_code": len(recovered_in_db),
+            }
+        )
+
+    return {
+        "ok": True,
+        "dry_run": dry_run,
+        "total_market": total_market,
+        "total_orphans": total_orphans,
+        "total_stale_db": total_stale_db,
+        "total_deleted": total_deleted,
+        "total_stale_cleared": total_stale_cleared,
+        "max_delete": max_delete,
+        "accounts": per_account,
+    }
+
+
+# ----------------------------------------------------------------------
+# 롯데ON 유령삭제 양방향 — list_registered_products 기반
+# ----------------------------------------------------------------------
+
+
+@router.post("/lotteon/cleanup-orphans")
+async def cleanup_lotteon_orphans(
+    body: CleanupOrphansRequest = CleanupOrphansRequest(),
+    dry_run: bool = Query(True, description="true면 목록만, false면 실제 처리"),
+    account_id: Optional[str] = Query(None, description="특정 롯데ON 계정만"),
+    max_delete: int = Query(
+        50, ge=0, le=100000, description="한 번에 처리할 최대 orphan 수"
+    ),
+    session: AsyncSession = Depends(get_write_session_dependency),
+    admin: str = Depends(require_admin),
+):
+    """롯데ON 유령상품 양방향 동기화.
+
+    - orphan: 롯데ON 판매중인데 DB 매핑 없음 → change_status(slStatCd=END)
+    - stale : DB 매핑은 있는데 롯데ON 목록에 없음 → DB 정리
+    """
+    import json as _json
+
+    from sqlalchemy.orm.attributes import flag_modified
+    from sqlmodel import select
+
+    from backend.domain.samba.account.model import SambaMarketAccount
+    from backend.domain.samba.collector.model import SambaCollectedProduct
+    from backend.domain.samba.proxy.lotteon import LotteonClient
+
+    q = select(SambaMarketAccount).where(
+        SambaMarketAccount.market_type == "lotteon",
+        SambaMarketAccount.is_active == True,  # noqa: E712
+    )
+    if account_id:
+        q = q.where(SambaMarketAccount.id == account_id)
+    accounts = (await session.execute(q)).scalars().all()
+    if not accounts:
+        raise HTTPException(status_code=404, detail="활성 롯데ON 계정 없음")
+
+    prod_q = select(SambaCollectedProduct)
+    if body.product_ids:
+        prod_q = prod_q.where(SambaCollectedProduct.id.in_(body.product_ids))
+    all_db_products = (await session.execute(prod_q)).scalars().all()
+
+    per_account: list[dict] = []
+    total_market = 0
+    total_orphans = 0
+    total_stale_db = 0
+    total_deleted = 0
+    total_stale_cleared = 0
+
+    PAGE_SIZE = 100
+
+    for account in accounts:
+        add_f = account.additional_fields or {}
+        if isinstance(add_f, str):
+            try:
+                add_f = _json.loads(add_f)
+            except Exception:
+                add_f = {}
+        if not isinstance(add_f, dict):
+            add_f = {}
+        api_key = (
+            str(account.api_key or "").strip() or str(add_f.get("apiKey") or "").strip()
+        )
+        if not api_key:
+            per_account.append(
+                {
+                    "account_id": account.id,
+                    "label": account.account_label,
+                    "error": "롯데ON API 키 없음",
+                }
+            )
+            continue
+
+        # DB → spdNo 매핑
+        account_db_spds: set[str] = set()
+        db_spd_map: dict[str, dict] = {}
+        for p in all_db_products:
+            nos = p.market_product_nos or {}
+            v = nos.get(account.id) or nos.get(f"{account.id}_origin")
+            spd = ""
+            if isinstance(v, str):
+                spd = v.strip()
+            elif isinstance(v, dict):
+                spd = str(v.get("spdNo") or v.get("productNo") or "").strip()
+            if spd:
+                account_db_spds.add(spd)
+                db_spd_map[spd] = {
+                    "db_id": str(p.id),
+                    "style_code": str(p.style_code or ""),
+                    "mapped_spd": spd,
+                    "product_name": (p.name or "")[:80],
+                }
+
+        client = LotteonClient(api_key)
+        market_spds: set[str] = set()
+        market_info: dict[str, dict] = {}
+        page = 1
+        error_msg: Optional[str] = None
+        while True:
+            try:
+                resp = await client.list_registered_products(
+                    page=page,
+                    size=PAGE_SIZE,
+                    reg_strt_dttm="20200101000000",
+                    reg_end_dttm="99991231235959",
+                )
+            except Exception as e:
+                error_msg = f"롯데ON 목록 조회 실패(page={page}): {str(e)[:200]}"
+                break
+            data = (resp or {}).get("data") or []
+            if not isinstance(data, list):
+                break
+            for it in data:
+                if not isinstance(it, dict):
+                    continue
+                spd = str(it.get("spdNo") or "").strip()
+                if not spd:
+                    continue
+                stat = str(it.get("slStatCd") or "").strip().upper()
+                # END/SOUT 상태는 이미 죽은 상품 — orphan 판정 제외
+                if stat in ("END", "SOUT", "DELETED"):
+                    continue
+                market_spds.add(spd)
+                market_info[spd] = {
+                    "spd_no": spd,
+                    "name": str(it.get("spdNm") or "")[:80],
+                    "sl_stat_cd": stat,
+                }
+            if len(data) < PAGE_SIZE:
+                break
+            page += 1
+            if page > 500:
+                logger.warning("[롯데ON 유령정리] 500페이지 초과 — 중단")
+                break
+            await asyncio.sleep(0.3)
+
+        if error_msg:
+            per_account.append(
+                {
+                    "account_id": account.id,
+                    "label": account.account_label,
+                    "error": error_msg,
+                }
+            )
+            continue
+
+        total_market += len(market_spds)
+
+        orphan_spds = market_spds - account_db_spds
+        stale_spds = account_db_spds - market_spds
+
+        orphans = [market_info[s] for s in orphan_spds if s in market_info]
+        stale_db = [db_spd_map[s] for s in stale_spds if s in db_spd_map]
+
+        total_orphans += len(orphans)
+        total_stale_db += len(stale_db)
+
+        deleted_here: list[str] = []
+        failed: list[dict] = []
+        stale_cleared: list[str] = []
+
+        if not dry_run:
+            remaining = max_delete - total_deleted
+            if remaining > 0 and orphans:
+                BATCH = 50
+                target_orphans = orphans[:remaining]
+                for i in range(0, len(target_orphans), BATCH):
+                    batch = target_orphans[i : i + BATCH]
+                    payload = [{"spdNo": o["spd_no"], "slStatCd": "END"} for o in batch]
+                    try:
+                        res = await client.change_status(payload)
+                        data = (res or {}).get("data") or []
+                        if isinstance(data, list) and data:
+                            for idx, item in enumerate(data):
+                                rc = (item or {}).get("resultCode", "")
+                                spd = batch[idx]["spd_no"] if idx < len(batch) else ""
+                                if rc in ("", "0000", "00", "SUCCESS"):
+                                    deleted_here.append(spd)
+                                else:
+                                    failed.append(
+                                        {
+                                            "spd_no": spd,
+                                            "error": str(
+                                                (item or {}).get("resultMessage", rc)
+                                            )[:200],
+                                        }
+                                    )
+                        else:
+                            for o in batch:
+                                deleted_here.append(o["spd_no"])
+                    except Exception as e:
+                        for o in batch:
+                            failed.append(
+                                {"spd_no": o["spd_no"], "error": str(e)[:200]}
+                            )
+                    await asyncio.sleep(0.5)
+                total_deleted += len(deleted_here)
+
+            if stale_db:
+                db_ids_to_clear = [s["db_id"] for s in stale_db if s.get("db_id")]
+                if db_ids_to_clear:
+                    clear_q = select(SambaCollectedProduct).where(
+                        SambaCollectedProduct.id.in_(db_ids_to_clear)
+                    )
+                    for prod in (await session.execute(clear_q)).scalars().all():
+                        nos = dict(prod.market_product_nos or {})
+                        changed = False
+                        for k in (account.id, f"{account.id}_origin"):
+                            if k in nos:
+                                nos.pop(k, None)
+                                changed = True
+                        if changed:
+                            prod.market_product_nos = nos
+                            flag_modified(prod, "market_product_nos")
+                        regs = list(prod.registered_accounts or [])
+                        if account.id in regs:
+                            prod.registered_accounts = [
+                                a for a in regs if a != account.id
+                            ]
+                            flag_modified(prod, "registered_accounts")
+                            changed = True
+                        if changed:
+                            session.add(prod)
+                            stale_cleared.append(str(prod.id))
+                    if stale_cleared:
+                        await session.commit()
+                        total_stale_cleared += len(stale_cleared)
+                        logger.info(
+                            f"[롯데ON 유령정리] {account.id} stale DB 정리 {len(stale_cleared)}건"
+                        )
+
+        per_account.append(
+            {
+                "account_id": account.id,
+                "label": account.account_label,
+                "market_count": len(market_spds),
+                "orphan_count": len(orphans),
+                "orphans": orphans[:100],
+                "stale_db_count": len(stale_db),
+                "stale_db": stale_db[:100],
+                "stale_cleared": stale_cleared,
+                "deleted": deleted_here,
+                "failed": failed,
+            }
+        )
+
+    return {
+        "ok": True,
+        "dry_run": dry_run,
+        "total_market": total_market,
+        "total_orphans": total_orphans,
+        "total_stale_db": total_stale_db,
+        "total_deleted": total_deleted,
+        "total_stale_cleared": total_stale_cleared,
+        "max_delete": max_delete,
+        "accounts": per_account,
+    }
+
+
 @router.get("")
 async def list_shipments(
     skip: int = Query(0, ge=0),

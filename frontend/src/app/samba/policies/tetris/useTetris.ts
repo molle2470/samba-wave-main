@@ -73,7 +73,7 @@ export function useTetris() {
           source_site: block.source_site,
           brand_name: block.brand_name,
           market_account_id: toAccountId,
-          policy_id: null,
+          policy_id: block.policy_id,
           position_order: 0,
         })
         // 옵티미스틱 업데이트: 보드 재조회 없이 즉시 블록 추가
@@ -83,9 +83,9 @@ export function useTetris() {
             id: result.id,
             source_site: block.source_site,
             brand_name: block.brand_name,
-            policy_id: null,
-            policy_name: null,
-            policy_color: '#3B82F6',
+            policy_id: block.policy_id,
+            policy_name: block.policy_name,
+            policy_color: block.policy_color,
             registered_count: 0,
             collected_count: block.collected_count,
             ai_tagged_count: block.ai_tagged_count,

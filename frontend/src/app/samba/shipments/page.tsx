@@ -52,8 +52,16 @@ function appendShipmentLogs(
   if (messages.length === 0) return
 
   setLogMessages(prev => {
+    // 폴러 간 fetch race로 동일 메시지가 다시 들어오는 경우 방어 —
+    // 직전 N줄(<=30)에 이미 존재하는 라인은 스킵 (같은 타임스탬프+같은 본문)
+    const seen = new Set(prev)
     const next = [...prev]
-    for (const msg of messages) next.push(fmtTextNumbers(msg))
+    for (const raw of messages) {
+      const formatted = fmtTextNumbers(raw)
+      if (seen.has(formatted)) continue
+      seen.add(formatted)
+      next.push(formatted)
+    }
     return next.slice(-30)
   })
 }
@@ -127,9 +135,12 @@ export default function ShipmentsPage() {
   const deletePollRef = useRef<ReturnType<typeof setInterval> | null>(null)  // 삭제 중 500ms 폴링
   const bgPollRef = useRef<ReturnType<typeof setInterval> | null>(null)  // 상시 2s 백그라운드 폴링 (다른 창 공유용)
   const sinceIdxRef = useRef(0)  // 링 버퍼 폴링용
+  const headInitDoneRef = useRef(false)  // 마운트 시 sinceIdx 헤드 초기화 완료 여부 — 과거 잡 로그 재유입 차단용
+  const logContainerRef = useRef<HTMLDivElement>(null)
+  const stickToBottomRef = useRef<boolean>(true)
 
   // 실시간 Job 큐 상태
-  type JobQueueItem = { id?: string, status?: string, kind?: 'transmit' | 'delete', markets: string, source_sites?: string[], brands?: string[], product_count: number, current: number, total: number, started_at?: string | null }
+  type JobQueueItem = { id?: string, status?: string, kind?: 'transmit' | 'delete', markets: string, source_sites?: string[], brands?: string[], product_count: number, current: number, total: number, started_at?: string | null, per_item_sec?: number | null }
   const [jobQueueStatus, setJobQueueStatus] = useState<{
     running: JobQueueItem[],
     pending: JobQueueItem[],
@@ -145,6 +156,7 @@ export default function ShipmentsPage() {
     const { API_BASE_URL: apiBase } = await import('@/config/api')
     let bgPolling = false
     bgPollRef.current = setInterval(async () => {
+      if (!headInitDoneRef.current) return  // 헤드 초기화 전엔 과거 로그 재유입 차단
       if (jobPollRef.current || deletePollRef.current || bgPolling) return
       bgPolling = true
       try {
@@ -172,6 +184,7 @@ export default function ShipmentsPage() {
     const { API_BASE_URL: apiBase } = await import('@/config/api')
     let delPolling = false
     deletePollRef.current = setInterval(async () => {
+      if (!headInitDoneRef.current) return  // 헤드 초기화 전엔 과거 로그 재유입 차단
       if (jobPollRef.current) return  // 전송 잡이 중간에 시작되면 즉시 양보
       if (delPolling) return
       delPolling = true
@@ -190,6 +203,30 @@ export default function ShipmentsPage() {
   useEffect(() => {
     accountApi.listActive().catch(() => []).then(a => setAccounts(a))
   }, [])
+
+  // 마운트 시 sinceIdx 를 현재 버퍼 끝(current_idx)으로 초기화 — 과거 transmit 잡 로그 재유입 차단
+  // 이 작업이 끝나기 전엔 모든 백그라운드/삭제 폴링이 헤드 가드(headInitDoneRef)로 대기
+  useEffect(() => {
+    (async () => {
+      try {
+        const { API_BASE_URL: apiBase } = await import('@/config/api')
+        const res = await fetchWithAuth(`${apiBase}/api/v1/samba/jobs/shipment-logs?since_idx=999999999`)
+        const data = await res.json()
+        sinceIdxRef.current = data.current_idx || 0
+      } catch { /* ignore — sinceIdx 0 유지, DB fallback 받아도 dedupe로 제한 */ }
+      finally {
+        headInitDoneRef.current = true
+      }
+    })()
+  }, [])
+
+  // 전송 로그 자동 스크롤 — 사용자가 끝에 붙어있을 때만 맨 아래로
+  useEffect(() => {
+    if (!stickToBottomRef.current) return
+    const el = logContainerRef.current
+    if (!el) return
+    el.scrollTop = el.scrollHeight
+  }, [logMessages])
 
   // 컴포넌트 언마운트 시 잡 폴링 정리
   useEffect(() => {
@@ -251,6 +288,12 @@ export default function ShipmentsPage() {
         activeJobIdRef.current = jobId
         setTransmitting(true)
         setProgress({ current: (job.current || 0) as number, total: (job.total || 0) as number })
+        // 이전 잡 로그 잔재 노출 방지 — 현재 버퍼 끝(current_idx)부터 폴링 시작
+        try {
+          const headLr = await fetchWithAuth(`${apiBase}/api/v1/samba/jobs/shipment-logs?since_idx=999999999`)
+          const headData = await headLr.json()
+          sinceIdxRef.current = headData.current_idx || 0
+        } catch { /* ignore */ }
         // 증분 폴링 즉시 시작 (500ms)
         let polling = false
         const poll = async () => {
@@ -311,29 +354,10 @@ export default function ShipmentsPage() {
     })()
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // 상시 백그라운드 폴링 — 삭제 로그를 다른 창에서도 실시간으로 표시하기 위해 2초마다 링 버퍼 조회
-  useEffect(() => {
-    let polling = false
-    const bgPoll = async () => {
-      // 전송/삭제 전용 폴링이 이미 실행 중이면 중복 실행 생략
-      if (jobPollRef.current || deletePollRef.current) return
-      // 탭이 백그라운드면 스킵 — 다른 탭에서 부하 누적 방지
-      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
-      if (polling) return
-      polling = true
-      try {
-        const { API_BASE_URL: apiBase } = await import('@/config/api')
-        const lr = await fetchWithAuth(`${apiBase}/api/v1/samba/jobs/shipment-logs?since_idx=${sinceIdxRef.current}`)
-        const logData = await lr.json()
-        const newLogs = (logData.logs || []) as string[]
-        sinceIdxRef.current = logData.current_idx || sinceIdxRef.current
-        appendShipmentLogs(setLogMessages, newLogs)
-      } catch { /* ignore */ }
-      polling = false
-    }
-    bgPollRef.current = setInterval(bgPoll, BG_LOG_POLL_INTERVAL_MS)
-    return () => { if (bgPollRef.current) clearInterval(bgPollRef.current) }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  // (제거됨) 상시 백그라운드 폴링 — startBackgroundLogPolling(L147)이 동일 역할 수행.
+  // 두 useEffect가 모두 bgPollRef.current에 setInterval을 세팅하던 탓에
+  // 한쪽이 ref를 덮어쓰면 다른 쪽은 고아 인터벌로 계속 살아남아
+  // 같은 since_idx로 shipment-logs를 두 번 가져와 화면에 같은 줄이 2번 찍히는 원인이었음.
 
   // handleStart 최신 참조를 유지하는 ref (stale closure 방지)
   const handleStartRef = useRef<(targetIds?: string[]) => Promise<void>>(async () => {})
@@ -1293,7 +1317,10 @@ export default function ShipmentsPage() {
                   : '-'
                 const pct = j.total > 0 ? Math.floor((j.current / j.total) * 100) : 0
                 const elapsedMs = started ? Math.max(0, Date.now() - started.getTime()) : 0
-                const perItemSec = j.current > 0 && elapsedMs > 0 ? elapsedMs / 1000 / j.current : 0
+                // 백엔드 최근 윈도우 기준 건당 처리시간 우선 사용 — 누적평균(시작이후 전체 elapsed/current)은 초기 오버헤드 때문에 부풀려짐
+                const perItemSec = (typeof j.per_item_sec === 'number' && j.per_item_sec > 0)
+                  ? j.per_item_sec
+                  : (j.current > 0 && elapsedMs > 0 ? elapsedMs / 1000 / j.current : 0)
                 const perItemStr = perItemSec > 0
                   ? (perItemSec >= 10 ? `${fmtNum(Math.round(perItemSec))}초/1건` : `${perItemSec.toFixed(1)}초/1건`)
                   : '—'
@@ -1590,7 +1617,13 @@ export default function ShipmentsPage() {
           </div>
         </div>
         <div
-          ref={el => { if (el) el.scrollTop = el.scrollHeight }}
+          ref={logContainerRef}
+          onScroll={() => {
+            const el = logContainerRef.current
+            if (!el) return
+            // 바닥에서 40px 이내면 "끝에 붙어있음"으로 간주 — 사용자가 위로 스크롤하면 자동 따라감 해제
+            stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+          }}
           style={{ height: '250px', overflowY: 'auto', padding: '10px 14px', fontFamily: "'Courier New', monospace", fontSize: '0.73rem', lineHeight: 1.8, color: '#DCE0E8' }}
         >
           {logMessages.map((msg, i) => (

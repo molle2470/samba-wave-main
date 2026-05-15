@@ -9,6 +9,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from backend.db.orm import get_read_session_dependency, get_write_session_dependency
 from backend.domain.samba.job.model import JobStatus
+from backend.domain.samba.job.progress_tracker import get_recent_sec_per_item
 from backend.domain.samba.job.repository import SambaJobRepository
 from backend.domain.samba.job.service import SambaJobService
 
@@ -533,6 +534,8 @@ async def get_transmit_queue_status(
             "current": j.current or 0,
             "total": j.total or 0,
             "started_at": j.started_at.isoformat() if j.started_at else None,
+            # 최근 윈도우 기준 건당 처리시간(초). 샘플 부족 시 None → 프런트가 누적평균 폴백.
+            "per_item_sec": get_recent_sec_per_item(j.id),
         }
         if j.status == JobStatus.RUNNING:
             running.append(item)

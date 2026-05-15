@@ -113,7 +113,9 @@ def _build_write_engine() -> AsyncEngine:
         connect_args={
             "timeout": 10,  # asyncpg 연결 타임아웃 10초
             "server_settings": {
-                "idle_in_transaction_session_timeout": "90000",  # 90초 초과 idle in transaction 자동 종료 (transmit 잡 최대 100초이나 그 사이 commit/HTTP 이어지므로 idle 90s면 좀비)
+                # 트랜잭션 안에서 마켓 HTTP 호출까지 처리하는 transmit/오토튠 경로가 90s를 종종 넘김
+                # → 180s로 완화 (좀비 회수는 pool_recycle=60 + 명시적 rollback 경로가 담당)
+                "idle_in_transaction_session_timeout": "180000",
             },
         },
     )

@@ -67,6 +67,18 @@ export async function performCreateGroup(args: CreateGroupArgs) {
 
     let groupName = keyword ? `${site}_${keyword.replace(/\s+/g, '_')}` : `${site}_${new Date().toLocaleDateString("ko-KR")}`
 
+    // SNKRDUNK: URL 경로 세그먼트를 카테고리명으로 사용 (예: /en/trading-cards → trading-cards)
+    if (site === 'SNKRDUNK' && isUrl && !keyword) {
+      try {
+        const parsed = new URL(input)
+        const segments = parsed.pathname.split('/').filter(s => s && s !== 'en')
+        const category = segments.join('_')
+        if (category) {
+          groupName = `SNKRDUNK_${category}`
+        }
+      } catch { /* 파싱 실패 시 기존 groupName 유지 */ }
+    }
+
     if (site === 'NAVERSTORE' && isUrl && (input.includes('smartstore.naver.com') || input.includes('brand.naver.com'))) {
       try {
         const infoRes = await fetchWithAuth(

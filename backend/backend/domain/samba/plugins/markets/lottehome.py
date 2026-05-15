@@ -728,7 +728,27 @@ class LotteHomePlugin(MarketPlugin):
             logger.warning(f"[롯데홈쇼핑] 이미지 리사이즈 단계 오류 — 원본 유지: {e}")
 
         goods_data = _transform_for_lottehome(product, category_id, auth_creds)
+
+        # 진단: 전송 직전 img_url 캡처 + AI 이미지 여부 표시 (transformed/ai_ 패턴)
+        def _img_tag(url: str | None) -> str:
+            if not url:
+                return "-"
+            tag = "AI" if ("/transformed/" in url or "/ai_" in url) else "ORIG"
+            ext = url.rsplit(".", 1)[-1].split("?")[0][:6] if "." in url else "?"
+            return f"[{tag}/.{ext}] {url}"
+
+        logger.info(
+            f"[롯데홈쇼핑 진단/REQ] img_url={_img_tag(goods_data.get('img_url'))}, "
+            f"img_url1={_img_tag(goods_data.get('img_url1'))}, "
+            f"img_url2={_img_tag(goods_data.get('img_url2'))}, "
+            f"img_url3={_img_tag(goods_data.get('img_url3'))}, "
+            f"img_url4={_img_tag(goods_data.get('img_url4'))}, "
+            f"img_url5={_img_tag(goods_data.get('img_url5'))}"
+        )
         result = await client.register_goods(goods_data)
+        # 진단: 응답 raw XML 전체 로그 — 이미지 거부 메시지 있는지 확인용
+        logger.info(f"[롯데홈쇼핑 진단/RES] rawXml={result.get('rawXml', '')[:4000]}")
+        logger.info(f"[롯데홈쇼핑 진단/RES_DATA] data={result.get('data', {})}")
 
         # 상품번호 추출
         g_data = result.get("data", {})

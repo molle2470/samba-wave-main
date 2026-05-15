@@ -259,6 +259,66 @@ async def musinsa_auth_delete(
     return {"success": True, "isLoggedIn": False, "message": "로그아웃 완료"}
 
 
+class MusinsaOptNoMapping(BaseModel):
+    ord_no: str
+    ord_opt_no: str
+
+
+class MusinsaSaveOptNosRequest(BaseModel):
+    mappings: list[MusinsaOptNoMapping]
+
+
+@extension_router.post("/musinsa/save-opt-nos")
+async def musinsa_save_opt_nos(
+    body: MusinsaSaveOptNosRequest = Body(...),
+    write_session: AsyncSession = Depends(get_write_session_dependency),
+) -> dict[str, Any]:
+    """확장앱이 무신사 마이페이지 API에서 추출한 ord_no→ord_opt_no 매핑 일괄 저장.
+
+    인증: X-Api-Key (확장앱 공통). extension_router에 등록 — JWT 면제.
+
+    동작:
+      - sourcing_order_number == ord_no AND source_site = 'MUSINSA' 인 주문에
+        musinsa_ord_opt_no 컬럼 채우기 (이미 채워진 row는 덮어쓰기 OK — 갱신 케이스)
+      - 매칭 안 되는 매핑은 카운트만 (정상 — 아직 동기화 안 된 주문 등)
+    """
+    from sqlalchemy import update
+    from backend.domain.samba.order.model import SambaOrder
+
+    updated = 0
+    not_matched = 0
+    for m in body.mappings:
+        ord_no = (m.ord_no or "").strip()
+        ord_opt_no = (m.ord_opt_no or "").strip()
+        if not ord_no or not ord_opt_no:
+            continue
+        stmt = (
+            update(SambaOrder)
+            .where(
+                SambaOrder.sourcing_order_number == ord_no,
+                SambaOrder.source_site == "MUSINSA",
+            )
+            .values(musinsa_ord_opt_no=ord_opt_no)
+        )
+        res = await write_session.execute(stmt)
+        n = res.rowcount or 0
+        if n > 0:
+            updated += n
+        else:
+            not_matched += 1
+    await write_session.commit()
+    logger.info(
+        f"[무신사 옵션번호] 매핑 저장: updated={updated} not_matched={not_matched} "
+        f"total_in={len(body.mappings)}"
+    )
+    return {
+        "ok": True,
+        "received": len(body.mappings),
+        "updated": updated,
+        "notMatched": not_matched,
+    }
+
+
 class MusinsaCookiesRequest(BaseModel):
     cookies: list[str]
 

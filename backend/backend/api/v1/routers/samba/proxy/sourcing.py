@@ -181,6 +181,7 @@ async def sourcing_tracking_result(body: dict[str, Any]) -> dict[str, Any]:
     courier_name = (body.get("courierName") or "").strip()
     tracking_number = (body.get("trackingNumber") or "").strip()
     error = (body.get("error") or "").strip()
+    cancelled = bool(body.get("cancelled"))
 
     # 인메모리 Future 깨워서 await 호출자 unblock + DB samba_sourcing_job completed 처리
     SourcingQueue.resolve_job(
@@ -190,6 +191,7 @@ async def sourcing_tracking_result(body: dict[str, Any]) -> dict[str, Any]:
             "courierName": courier_name,
             "trackingNumber": tracking_number,
             "error": error,
+            "cancelled": cancelled,
         },
     )
 
@@ -201,6 +203,7 @@ async def sourcing_tracking_result(body: dict[str, Any]) -> dict[str, Any]:
         courier_name=courier_name,
         tracking_number=tracking_number,
         error=error,
+        cancelled=cancelled,
         auto_dispatch=False,
         dry_run=True,
     )

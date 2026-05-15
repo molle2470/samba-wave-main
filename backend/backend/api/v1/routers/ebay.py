@@ -5,13 +5,9 @@ import logging
 
 from fastapi import APIRouter, Query, Request, Response
 
-logger = logging.getLogger(__name__)
+from backend.core.config import settings
 
-# eBay Developer Portal에 등록한 Verification Token과 동일하게 설정
-VERIFICATION_TOKEN = "sambaWaveEbayVerificationToken2026"
-ENDPOINT_URL = (
-    "https://samba-wave-api-vpob3wc2na-du.a.run.app/api/v1/ebay/deletion-notification"
-)
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["ebay"])
 
@@ -24,8 +20,24 @@ async def ebay_deletion_challenge(
 
     eBay가 엔드포인트 등록 시 GET 요청으로 challenge_code를 보내면
     SHA-256(challenge_code + verification_token + endpoint_url) 해시를 반환.
+
+    환경변수(EBAY_DELETION_NOTIFICATION_URL, EBAY_VERIFICATION_TOKEN)가
+    설정되어 있지 않으면 503을 반환 — 잘못된 해시로 응답해 검증 통과가 되는 사고 방지.
     """
-    hash_input = challenge_code + VERIFICATION_TOKEN + ENDPOINT_URL
+    token = settings.ebay_verification_token
+    url = settings.ebay_deletion_notification_url
+    if not token or not url:
+        logger.error(
+            "[eBay] EBAY_VERIFICATION_TOKEN / EBAY_DELETION_NOTIFICATION_URL "
+            "환경변수 미설정 — endpoint 비활성화 상태"
+        )
+        return Response(
+            content='{"error":"endpoint not configured"}',
+            media_type="application/json",
+            status_code=503,
+        )
+
+    hash_input = challenge_code + token + url
     challenge_response = hashlib.sha256(hash_input.encode("utf-8")).hexdigest()
 
     logger.info("[eBay] Challenge 검증 요청: challenge_code=%s", challenge_code[:10])

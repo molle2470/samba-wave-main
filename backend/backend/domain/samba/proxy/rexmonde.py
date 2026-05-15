@@ -298,6 +298,8 @@ class RexmondeClient:
         info_notice = self._extract_info_notice(soup)
         product_name = str(ld.get("name", "") or "")
         style_code = self._extract_style_code_from_name(product_name)
+        # 옵션 테이블의 진짜 색상명만 신뢰 (placeholder 'Free' 등은 빈 값)
+        color = self._extract_color_name_from_options(soup)
         material = self._extract_material(info_notice)
 
         return {
@@ -314,6 +316,7 @@ class RexmondeClient:
             "saleStatus": sale_status,
             "categoryPath": category_path,
             "style_code": style_code,
+            "color": color,
             "material": material,
             "detail_url": urljoin(
                 self.BASE, f"{self.DETAIL_PATH}?no={site_product_id}"
@@ -321,21 +324,97 @@ class RexmondeClient:
             "info_notice": info_notice,
         }
 
+    # 옵션 테이블 첫 컬럼이 색상이지만, 사이트가 단일 색상 상품에 표기하는
+    # placeholder 값들 — 색상 정보 아님이라 빈 값으로 처리
+    _COLOR_PLACEHOLDERS = {"", "free", "f", "none", "-", "단일", "단색"}
+
+    @classmethod
+    def _extract_color_name_from_options(cls, soup: BeautifulSoup) -> str:
+        """옵션 테이블(tr[name=selectOption])의 첫 색상명 추출.
+
+        헤더 컬럼: 구매가능한색상 | 구매가능한 사이즈 | 비고 | 택 사이즈 | 실측
+        같은 상품의 모든 row가 동일 색상이고 사이즈만 다르므로 첫 row 첫 td.
+        'Free' 같은 placeholder(단일 색상 상품 표기)는 빈 값으로 처리.
+        """
+        first_row = soup.select_one('tr[name="selectOption"]')
+        if not first_row:
+            return ""
+        first_td = first_row.select_one("td.t_center")
+        if not first_td:
+            return ""
+        color = first_td.get_text(strip=True)
+        if color.lower() in cls._COLOR_PLACEHOLDERS:
+            return ""
+        return color
+
+    @staticmethod
+    def _extract_color_code_from_name(name: str) -> str:
+        """상품명 괄호 안 마지막 코드 = 색상 코드 (사이트 색상명 미제공).
+
+        - 슬래시 `(ATOFMX7740/BLK)` → BLK
+        - 하이픈 `(GMAC09444-9999)` → 9999
+        - 공백   `(UJK897 DE0126 A036)` → A036
+        - 단일   `(STANDALONE)` → "" (색상 없음)
+        영숫자 코드일 때만 신뢰 (한글 부제 등은 빈 값).
+        """
+        if not name:
+            return ""
+        m = re.search(r"\(([^)]+)\)", name)
+        if not m:
+            return ""
+        inside = m.group(1).strip()
+        if not inside:
+            return ""
+        # 슬래시/하이픈 뒤
+        sep = re.search(r"\s*[/\-]\s*", inside)
+        if sep:
+            tail = inside[sep.end() :].strip()
+            return tail if re.match(r"^[A-Z0-9]+$", tail) else ""
+        tokens = inside.split()
+        if len(tokens) >= 2 and re.match(r"^[A-Z0-9]+$", tokens[-1]):
+            return tokens[-1]
+        return ""
+
     @staticmethod
     def _extract_style_code_from_name(name: str) -> str:
         """상품명 괄호 안 코드에서 품번 추출.
 
-        rexmonde 상품명 패턴:
-        - 슬래시 형식: `(ATOFMX7740/BLK)` — Arc'teryx 류
-        - 하이픈 형식: `(GMSW14817-U144)` — J.LINDEBERG 류
-        둘 다 슬래시/하이픈 앞이 품번. 뒤(색상/SKU 코드)는 추출하지 않음
-        — 사이트가 색상명을 명시적으로 제공하지 않아 신뢰 가능한 색상
-        매핑이 어렵기 때문.
+        rexmonde 상품명 패턴 (브랜드별 상이):
+        - 슬래시 `(ATOFMX7740/BLK)` — Arc'teryx 류, 슬래시 앞이 품번
+        - 하이픈 `(GMSW14817-U144)` — J.LINDEBERG 류, 하이픈 앞이 품번
+        - 공백   `(UJK897 DE0126 A036)` — AMI 류, 마지막 토큰=색상 SKU
+        - 다중괄호 `상품명 (색상정보)(L47740100)(한글명)` — SALOMON 류,
+                                                  둘째 괄호에 품번
+        - 단일   `(STANDALONE)` — 그대로 품번
+
+        모든 괄호를 순회하며 첫 매치를 품번으로 채택. 영문대문자 시작
+        영숫자 코드만 신뢰 (한글 부제·색상 단어 등은 패스).
         """
         if not name:
             return ""
-        m = re.search(r"\(([A-Z][A-Z0-9]+)[/\-][A-Z0-9]+\)", name)
-        return m.group(1) if m else ""
+        for inside in re.findall(r"\(([^)]+)\)", name):
+            code = RexmondeClient._parse_style_candidate(inside.strip())
+            if code:
+                return code
+        return ""
+
+    @staticmethod
+    def _parse_style_candidate(inside: str) -> str:
+        """괄호 한 개의 내용에서 품번 후보 추출. 안 맞으면 빈 문자열."""
+        if not inside:
+            return ""
+        # 슬래시/하이픈이 있으면 앞부분이 품번
+        sep = re.search(r"\s*[/\-]\s*", inside)
+        if sep:
+            head = inside[: sep.start()].strip()
+            return head if re.match(r"^[A-Z][A-Z0-9]+$", head) else ""
+        tokens = inside.split()
+        if not tokens or not re.match(r"^[A-Z][A-Z0-9]+$", tokens[0]):
+            return ""
+        # 공백 구분 + 마지막 토큰이 영숫자 SKU 형태면 색상 코드로 보고 제외
+        if len(tokens) >= 2 and re.match(r"^[A-Z0-9]+$", tokens[-1]):
+            return " ".join(tokens[:-1])
+        return tokens[0]
 
     # rexmonde info_notice의 placeholder 값 — 빈 값과 동일 취급
     _NOTICE_PLACEHOLDERS = {

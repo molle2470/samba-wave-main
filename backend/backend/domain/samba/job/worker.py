@@ -9,7 +9,6 @@ import gc
 import json
 import logging
 import re
-import threading
 import time as _time
 from collections import deque
 from datetime import datetime, timezone
@@ -317,39 +316,6 @@ async def _fail_job_safe(job_id: str, error_msg: str) -> None:
         await repo.fail_job(job_id, error_msg)
         await session.commit()
     _add_job_log(job_id, f"수집 실패: {error_msg}", job_type="collect")
-
-
-def _run_collect_in_thread(worker: "JobWorker", job_id: str, payload: dict):
-    """별도 스레드에서 독립 이벤트 루프로 수집 실행."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(worker._execute_collect_isolated(job_id, payload))
-    except Exception as e:
-        logger.error(f"[잡워커] 수집 스레드 에러: {job_id} — {e}")
-        # 잡 상태를 FAILED로 업데이트 — 미처리 시 RUNNING 고착 → stuck 복구 → 무한 재시작
-        try:
-            loop.run_until_complete(_fail_job_safe(job_id, f"수집 스레드 에러: {e}"))
-        except Exception as fe:
-            logger.error(
-                f"[잡워커] 수집 스레드 에러 후 잡 상태 갱신 실패: {job_id} — {fe}"
-            )
-    finally:
-        # 스레드 전용 엔진 dispose — 풀의 TCP 커넥션을 Cloud SQL에 즉시 반납
-        # 생략 시 loop.close() 만으로는 asyncpg 소켓이 GC까지 살아있어 좀비 누적 → max_connections 고갈 원인
-        try:
-            from backend.db.orm import _write_engine_cache, _read_engine_cache
-
-            for _cache in (_write_engine_cache, _read_engine_cache):
-                _eng = _cache.get(loop)
-                if _eng is not None:
-                    try:
-                        loop.run_until_complete(_eng.dispose())
-                    except Exception as de:
-                        logger.warning(f"[잡워커] 수집 엔진 dispose 실패: {de}")
-        except Exception:
-            pass
-        loop.close()
 
 
 def _run_transmit_in_thread(worker: "JobWorker", job_id: str, payload: dict):
@@ -713,31 +679,39 @@ class JobWorker:
                         f"[잡워커] brand_all 시작 — 직렬 실행 플래그 set: {_job_id} site={_collect_site}"
                     )
                 logger.info(
-                    f"[잡워커] 수집 실행 (격리 스레드): {_job_id} site={_collect_site}"
+                    f"[잡워커] 수집 실행 (메인 루프 task): {_job_id} site={_collect_site}"
                 )
-                thread = threading.Thread(
-                    target=_run_collect_in_thread,
-                    args=(self, _job_id, _job_payload),
-                    daemon=True,
+                # 메인 이벤트 루프에서 task로 실행 — 글로벌 AsyncEngine과 동일 루프 사용
+                # (별도 스레드 격리 시 SQLAlchemy greenlet_spawn 에러 발생)
+                _collect_task = asyncio.create_task(
+                    self._execute_collect_isolated(_job_id, _job_payload),
+                    name=f"collect-exec-{_job_id}",
                 )
-                thread.start()
                 _NO_PROGRESS_SEC = 600  # 10분 동안 새 저장 없으면 타임아웃
                 _collect_last_progress[_job_id] = _time.time()  # 시작 기준점 초기화
-                while thread.is_alive():
+                _cancel_reason: str | None = None
+                while not _collect_task.done():
                     if self._shutting_down:
-                        logger.info(
-                            f"[잡워커] 배포 종료 — 수집 스레드 대기 중단: {_job_id}"
-                        )
+                        _cancel_reason = "shutdown"
+                        logger.info(f"[잡워커] 배포 종료 — 수집 task 취소: {_job_id}")
                         break
                     idle_sec = _time.time() - _collect_last_progress.get(
                         _job_id, _time.time()
                     )
                     if idle_sec > _NO_PROGRESS_SEC:
+                        _cancel_reason = "no_progress"
                         break  # 진행 없음 → 타임아웃
                     await asyncio.sleep(2)
                 _collect_last_progress.pop(_job_id, None)
-                if thread.is_alive():
-                    if self._shutting_down:
+
+                if _cancel_reason:
+                    _collect_task.cancel()
+                    try:
+                        await _collect_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+                    if _cancel_reason == "shutdown":
                         # 배포/재시작 중단 — pending으로 복구 (다음 인스턴스에서 재실행)
                         logger.info(
                             f"[잡워커] 수집 중 배포 중단 → pending 복구: {_job_id}"
@@ -783,6 +757,19 @@ class JobWorker:
                                 await timeout_session.commit()
                         except Exception as te:
                             logger.error(f"[잡워커] 진행없음 pending 복구 실패: {te}")
+                else:
+                    # 정상 완료 — task 내부에서 finish_job/fail_job 처리 완료
+                    # 단, task 자체 예외는 여기서 catch 후 잡 상태 갱신
+                    try:
+                        await _collect_task
+                    except Exception as e:
+                        logger.error(f"[잡워커] 수집 task 예외: {_job_id} — {e}")
+                        try:
+                            await _fail_job_safe(_job_id, f"수집 예외: {e}")
+                        except Exception as fe:
+                            logger.error(
+                                f"[잡워커] 수집 예외 후 잡 상태 갱신 실패: {_job_id} — {fe}"
+                            )
                 return
 
             # 전송 + 기타: 직접 실행 (인메모리 로그 공유)
@@ -992,6 +979,8 @@ class JobWorker:
         # 새 잡 시작 — 이 잡의 잔존 플래그만 해제 (__all__ 유지 — 일시정지 중 다음 잡 클레임 차단)
         clear_cancel_transmit(job.id)
         clear_emergency_stop()
+        # 이전 잡 로그 잔재가 새 잡 화면에 흘러나오지 않도록 ring buffer 격리
+        clear_shipment_logs()
 
         payload = job.payload or {}
         product_ids = payload.get("product_ids", [])
@@ -1124,49 +1113,44 @@ class JobWorker:
                     if _source:
                         prod_name = f"[{_source}] {prod_name}"
 
-                    # tetris 매칭이 활성화된 경우 — 마켓별로 정책 계정을 테트리스 계정으로 교체
-                    # 단, 사용자가 선택한 마켓(target_account_ids의 market_type) 범위 내에서만 적용
+                    # tetris 매칭이 활성화된 경우 — 매칭된 계정으로만 전송
+                    # 매칭 없거나 선택 마켓 범위 밖이면 전송 자체 스킵 (사용자 의도)
                     effective_account_ids = list(target_account_ids)
-                    if _tetris_account_map and prod and target_account_ids:
+                    if _tetris_enabled and prod:
                         _norm_k = (
                             _ts_norm_site(prod.source_site),
                             _ts_norm_brand(prod.brand),
                         )
                         _assigned_all = _tetris_account_map.get(_norm_k) or []
-                        if _assigned_all:
-                            # target_account_ids의 market_type 집합 (선택된 마켓 범위)
+                        if not _assigned_all:
+                            # 테트리스 매칭 없음 → 전송 스킵
+                            effective_account_ids = []
+                        elif target_account_ids:
+                            # 선택된 마켓 범위 내의 매칭 계정만 사용
                             _selected_markets: set[str] = set()
-                            _target_acc_market: dict[str, str] = {}
                             for _tid in target_account_ids:
                                 _tacc = await acc_repo.get_async(_tid)
                                 if _tacc:
-                                    _target_acc_market[_tid] = _tacc.market_type
                                     _selected_markets.add(_tacc.market_type)
-                            # 선택된 마켓에 해당하는 테트리스 계정만 사용
                             _assigned_list = [
                                 a
                                 for a in _assigned_all
                                 if _tetris_acc_market.get(a) in _selected_markets
                             ]
-                            if _assigned_list:
-                                _override_markets = {
-                                    _tetris_acc_market[a]
-                                    for a in _assigned_list
-                                    if a in _tetris_acc_market
-                                }
-                                _kept = [
-                                    _tid
-                                    for _tid in target_account_ids
-                                    if _target_acc_market.get(_tid)
-                                    and _target_acc_market[_tid]
-                                    not in _override_markets
-                                ]
-                                _seen: set[str] = set()
-                                effective_account_ids = []
-                                for _x in _kept + _assigned_list:
-                                    if _x not in _seen:
-                                        _seen.add(_x)
-                                        effective_account_ids.append(_x)
+                            # 매칭됐지만 선택 마켓 범위 밖 → 전송 스킵
+                            effective_account_ids = list(_assigned_list)
+                        else:
+                            # target_account_ids 미지정 시 매칭된 계정 전부 사용
+                            effective_account_ids = list(_assigned_all)
+
+                    # 테트리스 매칭 없음/범위 밖 → 전송 스킵
+                    if _tetris_enabled and not effective_account_ids:
+                        _add_job_log(
+                            job.id,
+                            f"[{i + 1}/{total:,}] {prod_name}: 스킵 (테트리스 매칭 없음)",
+                        )
+                        await item_session.commit()
+                        return 0, 1, 0, None
 
                     item_svc = SambaShipmentService(
                         SambaShipmentRepository(item_session), item_session
@@ -1559,6 +1543,7 @@ class JobWorker:
             "LOTTEON",
             "SSG",
             "NAVERSTORE",
+            "SNKRDUNK",
         }
         # 확장앱 기반 소싱처 (소싱큐)
         EXTENSION_SITES = {
@@ -2977,10 +2962,18 @@ class JobWorker:
             if f.category_filter:
                 cat_filter_map[f.category_filter] = f.id
             # f.name = "SSG_브랜드_대분류_중분류_소분류" → "대분류 > 중분류 > 소분류"
+            # 추가: leaf 단일 토큰("소분류")도 alias 키로 등록 — SSG 크론 수집 시
+            # 검색결과 detail이 풀 path를 못 가져와 leaf만 알 때(가장 흔한 케이스)
+            # 기존 카테고리 매핑(스캔으로 만든 풀 path 필터)을 재사용해 leaf 자동생성
+            # 무한증식을 차단한다. leaf 충돌(여러 필터가 같은 leaf) 시 먼저 등록된 것을
+            # 우선해 후속 등록은 무시 — UI 매핑현황의 정의 순서 따름.
             if f.name:
                 _nm_parts = f.name.split("_")
                 if len(_nm_parts) > 2:
                     cat_name_map[" > ".join(_nm_parts[2:])] = f.id
+                    _leaf = _nm_parts[-1].strip()
+                    if _leaf and _leaf not in cat_name_map:
+                        cat_name_map[_leaf] = f.id
             # repBrandId 추출 (keyword URL)
             if f.keyword and "repBrandId=" in f.keyword:
                 try:
@@ -3227,6 +3220,13 @@ class JobWorker:
                                     or {}
                                 ),
                             )
+                        # 확장앱 detailHtml 머지 — _ext_result에 있으면 detail에 주입해
+                        # 이후 _build_product_data 의 detail.get("detailHtml", "") 폴백이
+                        # 정상 작동. 백엔드 html 필드는 script 태그만이라 cdtl_desc DOM
+                        # 추출 불가하므로 확장앱이 보내준 것을 그대로 사용.
+                        _ext_detail_html = _ext_result.get("detailHtml", "")
+                        if _ext_detail_html and detail is not None:
+                            detail["detailHtml"] = _ext_detail_html
                         # 확장앱 DOM 썸네일(domImages) 머지 — 추가이미지 백필.
                         # html 필드가 script 태그만이라 _build_images_from_base_url 정규식이
                         # body의 <img.zoom_thumb>를 못 잡아 i2~iN이 누락되는 문제 해결.
@@ -3362,6 +3362,44 @@ class JobWorker:
                                 ) or cat_name_map.get(_sub)
                                 if filter_id:
                                     break
+
+                    # 3.5순위: leaf 단일 토큰으로 cat_name_map 룩업 (카테고리 스캔으로
+                    # 만든 기존 풀 path 필터의 leaf alias 매칭). 검색결과 detail이
+                    # dispCtgLclsNm/Mcls/Scls를 비워 보내고 dispCtgNm(leaf)만 가져오는
+                    # 케이스를 위한 폴백 — leaf 1개로 새 필터 자동생성하는 무한증식을 차단.
+                    if not filter_id:
+                        _leaf_candidates: list[str] = []
+                        if _cat_parts:
+                            _leaf_candidates.append(_cat_parts[-1])
+                        _disp_nm_leaf = (detail.get("dispCtgNm") or "").strip()
+                        if _disp_nm_leaf and _disp_nm_leaf not in _leaf_candidates:
+                            _leaf_candidates.append(_disp_nm_leaf)
+                        _full_cat_leaf = (detail.get("category") or "").strip()
+                        if _full_cat_leaf:
+                            _fc_leaf = _full_cat_leaf.split(" > ")[-1].strip()
+                            if _fc_leaf and _fc_leaf not in _leaf_candidates:
+                                _leaf_candidates.append(_fc_leaf)
+                        for _leaf_key in _leaf_candidates:
+                            filter_id = cat_name_map.get(_leaf_key)
+                            if filter_id:
+                                # 풀 path 필터에 매칭됐으니 leaf-only 기록 방지를 위해
+                                # _cat_parts도 매칭 필터명에서 복원해 product.category가
+                                # 풀 path로 저장되도록 한다.
+                                _f_match = next(
+                                    (f for f in filters if f.id == filter_id), None
+                                )
+                                if _f_match and _f_match.name:
+                                    _name_parts = _f_match.name.split("_")
+                                    if len(_name_parts) > 2:
+                                        _restored = [p for p in _name_parts[2:] if p]
+                                        if len(_restored) > len(_cat_parts):
+                                            _cat_parts = _restored
+                                _add_job_log(
+                                    job.id,
+                                    f"[필터leaf매칭] '{_leaf_key}' → 기존 매핑 재사용",
+                                    job_type="collect",
+                                )
+                                break
 
                     # 3순위도 실패 시 필터 자동 생성 — 누수 0 보장
                     if not filter_id:
@@ -4270,6 +4308,10 @@ class JobWorker:
             )
 
             client = NaverStoreSourcingClient()
+        elif site == "SNKRDUNK":
+            from backend.domain.samba.proxy.snkrdunk import SnkrdunkClient
+
+            client = SnkrdunkClient()
 
         # 확장앱 소싱큐 기반 사이트 — 소싱큐로 검색 요청
         if not client:

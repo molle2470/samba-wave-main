@@ -8,7 +8,6 @@ Create Date: 2026-05-07 00:54:41.805217
 
 from typing import Sequence, Union
 
-from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "dd3eaff7233e"
@@ -18,35 +17,15 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # 컬럼 추가 (idempotent)
-    op.execute("""
-        ALTER TABLE samba_collected_product
-        ADD COLUMN IF NOT EXISTS is_unregistered BOOLEAN NOT NULL DEFAULT TRUE
-    """)
-
-    # 기존 데이터 백필: registered_accounts 기준으로 is_unregistered 계산
-    op.execute("""
-        UPDATE samba_collected_product
-        SET is_unregistered = (
-            registered_accounts IS NULL
-            OR jsonb_typeof(registered_accounts) != 'array'
-            OR jsonb_array_length(registered_accounts) = 0
-        )
-        WHERE is_unregistered = TRUE
-    """)
-
-    # 인덱스 생성 (idempotent)
-    op.execute("""
-        CREATE INDEX IF NOT EXISTS ix_samba_collected_product_is_unregistered
-        ON samba_collected_product (is_unregistered)
-    """)
+    # NO-OP: 이 마이그레이션 직후 zzzzzzz_drop_is_unregistered 가 이 컬럼을
+    # 즉시 DROP하므로 net-zero 변경. 프로덕션 samba_collected_product는
+    # 10만+ 레코드의 hot 테이블이라 ALTER TABLE이 ACCESS EXCLUSIVE 락을
+    # 얻지 못해 LockNotAvailableError 발생(워커들이 끊임없이 SELECT/UPDATE
+    # 중). 어차피 다음 revision이 net-zero로 되돌리므로 컬럼/백필/인덱스
+    # 작업 전부 skip해 배포 자체를 통과시키는 것이 안전하다.
+    pass
 
 
 def downgrade() -> None:
-    op.execute("""
-        DROP INDEX IF EXISTS ix_samba_collected_product_is_unregistered
-    """)
-    op.execute("""
-        ALTER TABLE samba_collected_product
-        DROP COLUMN IF EXISTS is_unregistered
-    """)
+    # downgrade도 net-zero이므로 no-op.
+    pass

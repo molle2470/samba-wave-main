@@ -1643,6 +1643,93 @@ class MusinsaClient:
         raise ValueError(f"무신사 주문취소 실패: {order_no} (모든 API 시도 실패)")
 
     # ------------------------------------------------------------------
+    # 송장(배송) 정보 조회 — POST /order-service/my/delivery/deliveryInfo
+    # ------------------------------------------------------------------
+
+    async def fetch_tracking(
+        self, ord_no: str, ord_opt_no: str, is_return: str = "0"
+    ) -> dict[str, Any]:
+        """무신사 마이페이지 deliveryInfo API 직접 호출.
+
+        쿠키 + ord_no + ord_opt_no 만 있으면 백엔드에서 송장 정보 fetch 가능
+        (확장앱 탭 폴링 불필요).
+
+        Returns:
+          {
+            "ok": True,
+            "courier": "우체국택배",
+            "courierCode": "EPOST",
+            "trackingNumber": "6062613923874",
+            "state": "ongoing",
+            "lastTraceText": "안성우체국에서 이동 중입니다",
+          }
+          또는 실패 시 {"ok": False, "error": "..."}
+        """
+        url = "https://www.musinsa.com/order-service/my/delivery/deliveryInfo"
+        headers = self._headers(
+            {
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/json",
+                "Origin": "https://www.musinsa.com",
+                "Referer": (
+                    f"https://www.musinsa.com/order-service/my/delivery/trace"
+                    f"?ord_no={ord_no}&ord_opt_no={ord_opt_no}&is_return={is_return}"
+                ),
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+            }
+        )
+        payload = {
+            "ord_no": ord_no,
+            "ord_opt_no": ord_opt_no,
+            "is_return": is_return,
+        }
+        timeout = httpx.Timeout(15.0, connect=10.0)
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout, follow_redirects=True
+            ) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+            if resp.status_code != 200:
+                return {
+                    "ok": False,
+                    "error": f"HTTP {resp.status_code}",
+                    "body": resp.text[:200],
+                }
+            data = resp.json()
+            meta = data.get("meta") or {}
+            if meta.get("result") != "SUCCESS":
+                return {
+                    "ok": False,
+                    "error": meta.get("message") or "deliveryInfo FAIL",
+                    "errorCode": meta.get("errorCode"),
+                }
+            d = data.get("data") or {}
+            tracking = (d.get("dlvNo") or "").strip()
+            courier = (d.get("deliverName") or "").strip()
+            if not tracking:
+                return {
+                    "ok": False,
+                    "error": "no_tracking",
+                    "courier": courier,
+                    "state": d.get("state"),
+                }
+            return {
+                "ok": True,
+                "courier": courier,
+                "courierCode": (d.get("deliverCode") or "").strip(),
+                "trackingNumber": tracking,
+                "state": d.get("state"),
+                "lastTraceText": d.get("titleText"),
+            }
+        except Exception as exc:
+            logger.warning(
+                f"[무신사 송장fetch] order={ord_no} opt={ord_opt_no} 실패: {exc}"
+            )
+            return {"ok": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------
     # 브랜드 카테고리 스캔
     # ------------------------------------------------------------------
 

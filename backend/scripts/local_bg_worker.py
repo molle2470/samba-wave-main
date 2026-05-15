@@ -44,11 +44,48 @@ _r2: dict = {}
 
 
 # ── R2 upload ────────────────────────────────────────────
+def _normalize_for_market(image_bytes: bytes) -> bytes:
+    """마켓 등록 호환 사양으로 정규화: 1000x1000 미만 → 비율유지 upscale +
+    정사각형 아니면 흰배경 padding. JPEG 재인코딩.
+
+    롯데홈쇼핑 등은 대표이미지 최소 해상도 미달 시 fetch 후 placeholder 로 대체.
+    """
+    try:
+        src = Image.open(io.BytesIO(image_bytes))
+        if src.mode != "RGB":
+            if src.mode in ("RGBA", "LA"):
+                bg = Image.new("RGB", src.size, (255, 255, 255))
+                rgba = src.convert("RGBA")
+                bg.paste(rgba, mask=rgba.split()[3])
+                src = bg
+            else:
+                src = src.convert("RGB")
+        target = 1000
+        W, H = src.size
+        if max(W, H) < target:
+            scale = target / max(W, H)
+            src = src.resize((round(W * scale), round(H * scale)), Image.LANCZOS)
+            W, H = src.size
+        if W != H:
+            side = max(W, H)
+            canvas = Image.new("RGB", (side, side), (255, 255, 255))
+            canvas.paste(src, ((side - W) // 2, (side - H) // 2))
+            src = canvas
+        out = io.BytesIO()
+        src.save(out, format="JPEG", quality=92, optimize=True)
+        return out.getvalue()
+    except Exception as e:
+        print(f"[Worker]   [normalize] 사이즈 정규화 실패, 원본 유지: {e}")
+        return image_bytes
+
+
 def upload_to_r2(image_bytes: bytes, filename: str) -> str | None:
     """R2 업로드 — 일시 장애 대비 3회 재시도(1.5s/3s 백오프)."""
     if not _r2.get("bucket"):
         return None
     import boto3
+
+    image_bytes = _normalize_for_market(image_bytes)
 
     last_err: Exception | None = None
     for attempt in range(3):
@@ -61,11 +98,16 @@ def upload_to_r2(image_bytes: bytes, filename: str) -> str | None:
                 region_name="auto",
             )
             key = f"transformed/{filename}"
+            # 마켓 서버(특히 롯데홈쇼핑) fetch 호환:
+            # - inline + 명시적 .jpg 파일명 → 외부 fetch 시 확장자 파싱 안정화
+            # - CacheControl → 마켓 캐시 친화적
             s3.put_object(
                 Bucket=_r2["bucket"],
                 Key=key,
                 Body=image_bytes,
-                ContentType="image/webp",
+                ContentType="image/jpeg",
+                ContentDisposition=f'inline; filename="{filename}"',
+                CacheControl="public, max-age=31536000",
             )
             return f"{_r2['public_url'].rstrip('/')}/transformed/{filename}"
         except Exception as e:
@@ -237,7 +279,7 @@ def _is_bg_removed(result_bytes: bytes) -> bool:
 def remove_watermark(image_bytes: bytes) -> bytes | None:
     """우상단 패턴에 따라 분기 — 결과는 항상 원본 해상도 유지(마켓 업로드 화질 보존):
 
-    - 흰배경(워터마크 없음)        → 원본 그대로 webp 저장
+    - 흰배경(워터마크 없음)        → 원본 그대로 jpg 저장
     - 흰배경 + 로고 패턴            → 원본에 흰박스 덮어 저장 (rembg 미사용)
     - 사진 컨텐츠(모델/배경)        → 768px로 다운스케일해 rembg alpha mask 추출 →
                                       mask를 원본 크기로 업스케일 → 원본 RGB와 흰배경 합성
@@ -264,7 +306,7 @@ def remove_watermark(image_bytes: bytes) -> bytes | None:
     avg = ImageStat.Stat(crop).mean
     if all(c >= _WM_NO_LOGO_THRESHOLD for c in avg[:3]):
         buf = io.BytesIO()
-        src_orig.save(buf, format="WEBP", quality=90)
+        src_orig.save(buf, format="JPEG", quality=90)
         return buf.getvalue()
 
     # 2) 흰배경 + 로고 패턴 → 원본 좌표로 box 환산해 배경색 박스 덮음 (rembg 미사용)
@@ -281,7 +323,7 @@ def remove_watermark(image_bytes: bytes) -> bytes | None:
         bg_color = _sample_bg_color(src_orig)
         ImageDraw.Draw(out).rectangle(box_orig, fill=bg_color)
         buf = io.BytesIO()
-        out.save(buf, format="WEBP", quality=90)
+        out.save(buf, format="JPEG", quality=90)
         return buf.getvalue()
 
     # 3) 사진 컨텐츠 → rembg matting=False 만 사용 (matting=True는 pymatting Cholesky
@@ -296,7 +338,7 @@ def remove_watermark(image_bytes: bytes) -> bytes | None:
     def _save_composite(alpha: Image.Image) -> bytes:
         composite = _composite_with_alpha(src_orig, alpha)
         buf = io.BytesIO()
-        composite.save(buf, format="WEBP", quality=90)
+        composite.save(buf, format="JPEG", quality=90)
         return buf.getvalue()
 
     try:
@@ -351,7 +393,7 @@ async def process_image(client: httpx.AsyncClient, url: str) -> str | None:
             # rembg 폴백 실패 — 원본 유지, 변환된 것으로 카운트하지 않음
             return None
         md5 = hashlib.md5(resp.content).hexdigest()[:8]
-        filename = f"ai_{md5}_{uuid.uuid4().hex[:6]}.webp"
+        filename = f"ai_{md5}_{uuid.uuid4().hex[:6]}.jpg"
         result_url = upload_to_r2(processed, filename)
         return result_url
     except Exception as e:

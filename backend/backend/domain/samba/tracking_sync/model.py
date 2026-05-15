@@ -18,8 +18,12 @@ STATUS_PENDING = "PENDING"  # 큐 적재 직후
 STATUS_DISPATCHED = "DISPATCHED"  # 확장앱이 잡 받음
 STATUS_SCRAPED = "SCRAPED"  # 운송장 추출 성공, 마켓 전송 대기
 STATUS_SENT = "SENT_TO_MARKET"  # 마켓 dispatch 완료
-STATUS_FAILED = "FAILED"  # 추출 실패 또는 마켓 전송 실패
+STATUS_FAILED = "FAILED"  # 추출 실패
+STATUS_DISPATCH_FAILED = (
+    "DISPATCH_FAILED"  # 추출은 성공했으나 마켓 전송 실패 (재시도 대상)
+)
 STATUS_NO_TRACKING = "NO_TRACKING"  # 소싱처에 송장 아직 없음 (재시도 대상)
+STATUS_CANCELLED = "CANCELLED"  # 소싱처에서 원주문이 취소됨 (재시도 안함)
 
 
 class SambaTrackingSyncJob(SQLModel, table=True):

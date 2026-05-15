@@ -192,6 +192,10 @@ class SambaJobRepository(BaseRepository[SambaJob]):
             job.progress = int((current / total) * 100) if total > 0 else 0
             self.session.add(job)
             await self.session.flush()
+            # 최근 건당 처리속도 트래커에 샘플 기록 (인메모리)
+            from backend.domain.samba.job.progress_tracker import record_progress
+
+            record_progress(job_id, current)
 
     async def complete_job(self, job_id: str, result: dict | None = None):
         """잡 완료 처리 — attempt 리셋 포함."""
@@ -205,6 +209,9 @@ class SambaJobRepository(BaseRepository[SambaJob]):
                 job.result = result
             self.session.add(job)
             await self.session.flush()
+            from backend.domain.samba.job.progress_tracker import clear_progress
+
+            clear_progress(job_id)
 
     async def fail_job(self, job_id: str, error: str):
         """잡 실패 처리.
@@ -226,6 +233,9 @@ class SambaJobRepository(BaseRepository[SambaJob]):
             job.completed_at = datetime.now(UTC)
             self.session.add(job)
             await self.session.flush()
+            from backend.domain.samba.job.progress_tracker import clear_progress
+
+            clear_progress(job_id)
 
     async def cancel_job(self, job_id: str) -> bool:
         """잡 취소 (pending/running 모두 가능)."""
@@ -236,6 +246,9 @@ class SambaJobRepository(BaseRepository[SambaJob]):
         job.completed_at = datetime.now(UTC)
         self.session.add(job)
         await self.session.flush()
+        from backend.domain.samba.job.progress_tracker import clear_progress
+
+        clear_progress(job_id)
         return True
 
     async def is_cancelled(self, job_id: str) -> bool:

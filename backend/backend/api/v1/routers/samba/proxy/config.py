@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from backend.db.orm import get_read_session_dependency, get_write_session_dependency
-from backend.domain.samba.tenant.middleware import require_admin
+from backend.domain.user.auth_service import get_user_id
 
 from ._helpers import _get_setting, _set_setting
 
@@ -68,7 +68,7 @@ async def get_proxy_config(
 async def save_proxy_config(
     payload: ProxyConfigPayload,
     session: AsyncSession = Depends(get_write_session_dependency),
-    admin: str = Depends(require_admin),
+    user_id: str = Depends(get_user_id),
 ):
     """프록시 설정 저장 (전체 교체) + 오토튠 프록시 캐시 즉시 갱신."""
     items = [p.model_dump() for p in payload.proxies]

@@ -251,6 +251,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     handleAbcmartMembershipSync({ rate: membershipRate, grade: membershipGrade, needsCookie: !!needsCookie, expired: !!expired })
     sendResponse({ ok: true })
   }
+  if (msg.type === 'MUSINSA_SAVE_OPT_NOS') {
+    // content-musinsa-orderlist.js에서 추출한 ord_no→ord_opt_no 매핑 일괄 저장
+    ;(async () => {
+      try {
+        const stored = await chrome.storage.local.get('proxyUrl')
+        const proxyUrl = stored.proxyUrl || ''
+        if (!proxyUrl) { sendResponse({ ok: false, error: 'no proxyUrl' }); return }
+        const url = `${proxyUrl}/api/v1/samba/musinsa/save-opt-nos`
+        const apiFetch = globalThis.SambaBackgroundCore?.apiFetch
+        const init = {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mappings: msg.mappings || [] }),
+        }
+        const res = apiFetch ? await apiFetch(url, init) : await fetch(url, init)
+        if (!res.ok) { sendResponse({ ok: false, status: res.status }); return }
+        const data = await res.json()
+        sendResponse({ ok: true, ...data })
+      } catch (e) {
+        sendResponse({ ok: false, error: e?.message || String(e) })
+      }
+    })()
+    return true // 비동기 응답
+  }
   if (msg.type === 'SCRAPE_SSG_SCORES') {
     scrapeSSGScores().then(data => sendResponse(data)).catch(e => sendResponse({ error: e.message }))
     return true // 비동기 응답

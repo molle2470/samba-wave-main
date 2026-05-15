@@ -31,6 +31,27 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/collector", tags=["samba-collector"])
 
 
+def _is_stale_conn_error(exc: BaseException) -> bool:
+    """좀비 connection/끊긴 트랜잭션 감지.
+
+    Cloud SQL idle_in_transaction_session_timeout으로 끊긴 세션을 재사용할 때
+    SQLAlchemy/asyncpg가 던지는 대표 메시지/예외 이름을 모아서 판정한다.
+    """
+    msg = str(exc)
+    name = type(exc).__name__
+    return (
+        "Can't reconnect" in msg
+        or "invalid transaction" in msg
+        or "InvalidRequestError" in name
+        or "PendingRollbackError" in name
+        or "OperationalError" in name
+        or "InterfaceError" in name
+        or "connection is closed" in msg.lower()
+        or "ssl connection has been closed" in msg.lower()
+        or "terminating connection due to" in msg.lower()
+    )
+
+
 # ══════════════════════════════════════════════════════════════
 # 오토튠 백그라운드 루프 — PC별 독립 인스턴스
 # ══════════════════════════════════════════════════════════════
@@ -397,7 +418,17 @@ async def _site_autotune_loop(device_id: str, site: str):
     # 발행자 PC를 컨텍스트에 박아 sourcing_queue.get_autotune_owner가 읽을 수 있게 함
     _owner_token = current_pc_owner.set(device_id)
     try:
+        _cycle_seq = 0
         while _is_pc_running(device_id):
+            _cycle_seq += 1
+            _cycle_started_ts = time.time()
+            log.info(
+                "[오토튠][디버그][%s][%s] 사이클 #%d 시작 (epoch=%.3f)",
+                device_id[:8],
+                site,
+                _cycle_seq,
+                _cycle_started_ts,
+            )
             try:
                 # Watchdog heartbeat 갱신
                 _pc_hb(device_id)[site] = time.time()
@@ -540,6 +571,14 @@ async def _site_autotune_loop(device_id: str, site: str):
 
                     if products:
                         filtered_count = len(products)
+                        log.info(
+                            "[오토튠][디버그][%s][%s] 사이클 #%d SELECT 완료: %d건 대상 (elapsed=%.1fs)",
+                            device_id[:8],
+                            site,
+                            _cycle_seq,
+                            filtered_count,
+                            time.time() - _cycle_started_ts,
+                        )
 
                         # 결과 처리에 필요한 서비스 사전 초기화
                         import backend.domain.samba.collector.refresher as _ref_mod
@@ -665,11 +704,54 @@ async def _site_autotune_loop(device_id: str, site: str):
                             )
                             _ref_mod._refresh_log_total += 1
 
+                        async def _partial_delete(pid: str) -> bool:
+                            """오토튠 품절 → 전 마켓 삭제 성공 시 상품 자체 삭제.
+
+                            _partial_update와 동일하게 새 세션을 매번 획득해 좀비
+                            connection 회피 + 1회 재시도 패턴 적용.
+                            """
+                            from sqlalchemy import delete as _sa_delete
+                            from backend.domain.samba.collector.model import (
+                                SambaCollectedProduct as _PD_CP,
+                            )
+                            from backend.db.orm import (
+                                get_write_session as _get_pd_session,
+                            )
+
+                            stmt = _sa_delete(_PD_CP).where(_PD_CP.id == pid)
+                            _last_exc: Exception | None = None
+                            for _attempt in range(2):
+                                try:
+                                    async with _get_pd_session() as _pd_s:
+                                        await _pd_s.execute(stmt)
+                                        await _pd_s.commit()
+                                    return True
+                                except Exception as _ex:
+                                    _last_exc = _ex
+                                    if _is_stale_conn_error(_ex) and _attempt == 0:
+                                        log.warning(
+                                            "[오토튠][DB재시도] partial_delete %s "
+                                            "좀비 connection 감지 → 새 세션으로 재시도: %s",
+                                            pid,
+                                            str(_ex)[:120],
+                                        )
+                                        await asyncio.sleep(0.1)
+                                        continue
+                                    raise
+                            if _last_exc:
+                                raise _last_exc
+                            return False
+
                         async def _partial_update(pid: str, vals: dict):
                             """last_sent_data를 건드리지 않는 partial UPDATE.
 
                             outer session은 refresh 직전 close()됐으므로 재사용 시
                             greenlet_spawn 에러 발생 — 매번 새 세션 획득.
+
+                            좀비 connection을 풀에서 받아오면 첫 execute가 'Can't
+                            reconnect until invalid transaction is rolled back'으로
+                            깨지는데, 풀이 다음 연결을 새로 채워주므로 1회 재시도하면
+                            대부분 통과한다. 2회까지만 시도해 무한루프 방지.
                             """
                             from backend.domain.samba.collector.model import (
                                 SambaCollectedProduct as _PU_CP,
@@ -682,9 +764,27 @@ async def _site_autotune_loop(device_id: str, site: str):
                             stmt = (
                                 sa_update(_PU_CP).where(_PU_CP.id == pid).values(**vals)
                             )
-                            async with _get_pu_session() as _pu_s:
-                                await _pu_s.execute(stmt)
-                                await _pu_s.commit()
+                            _last_exc: Exception | None = None
+                            for _attempt in range(2):
+                                try:
+                                    async with _get_pu_session() as _pu_s:
+                                        await _pu_s.execute(stmt)
+                                        await _pu_s.commit()
+                                    return
+                                except Exception as _ex:
+                                    _last_exc = _ex
+                                    if _is_stale_conn_error(_ex) and _attempt == 0:
+                                        log.warning(
+                                            "[오토튠][DB재시도] partial_update %s "
+                                            "좀비 connection 감지 → 새 세션으로 재시도: %s",
+                                            pid,
+                                            str(_ex)[:120],
+                                        )
+                                        await asyncio.sleep(0.1)
+                                        continue
+                                    raise
+                            if _last_exc:
+                                raise _last_exc
 
                         async def _on_result(product, r, idx=0, total=0):
                             """리프레시 직후 호출 — DB 업데이트 + 즉시 마켓 전송."""
@@ -1062,6 +1162,7 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                     },
                                                 )
                                         # 삭제 성공한 계정 → registered_accounts/market_product_nos 정리
+                                        _all_markets_deleted = False
                                         if _ok_del_ids:
                                             _cycle_deleted_pids.add(r.product_id)
                                             _orig_reg = list(
@@ -1083,15 +1184,32 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                     for d in _ok_del_ids
                                                 )
                                             }
-                                            updates["registered_accounts"] = (
-                                                _new_reg if _new_reg else []
+                                            # 등록된 모든 마켓 삭제 성공 → 상품 자체 삭제
+                                            if _orig_reg and not _new_reg:
+                                                _all_markets_deleted = True
+                                            else:
+                                                updates["registered_accounts"] = (
+                                                    _new_reg if _new_reg else []
+                                                )
+                                                updates["market_product_nos"] = (
+                                                    _new_mnos if _new_mnos else {}
+                                                )
+                                    if _all_markets_deleted:
+                                        try:
+                                            await _partial_delete(r.product_id)
+                                            _log_line(
+                                                site,
+                                                r.product_id,
+                                                f"{_idx_prefix}{_prod_label}: 품절 전 마켓 삭제 성공 → 상품 DB 삭제 완료",
                                             )
-                                            updates["market_product_nos"] = (
-                                                _new_mnos if _new_mnos else {}
+                                        except Exception as _pd_err:
+                                            log.error(
+                                                "[오토튠] %s 상품 DB 삭제 실패: %s",
+                                                r.product_id,
+                                                _pd_err,
                                             )
-                                            if not _new_reg:
-                                                updates["status"] = "collected"
-                                    await _partial_update(r.product_id, updates)
+                                    else:
+                                        await _partial_update(r.product_id, updates)
                                     _site_consecutive_soldout[site] = 0
                                     return
                                 else:
@@ -1659,25 +1777,59 @@ async def _site_autotune_loop(device_id: str, site: str):
                                     # 세마포어를 여기서 획득하면 안 됨
                                     # — start_update → _dispatch_one 내부에서 계정별 세마포어를
                                     #   다시 획득하므로 데드락 발생 (Semaphore(1) 비재진입)
+                                    #
+                                    # 세션-수명 설계: start_update는 내부에서 마켓 HTTP를
+                                    # 호출하므로 트랜잭션이 90~180s 가까이 idle 상태가 될 수
+                                    # 있다. 좀비 connection으로 깨지면 (Can't reconnect /
+                                    # InvalidRequestError 계열) 새 세션을 받아 1회 재시도한다.
                                     try:
-                                        async with get_write_session() as _tx_s:
-                                            from backend.domain.samba.shipment.repository import (
-                                                SambaShipmentRepository as _FRepo,
-                                            )
-                                            from backend.domain.samba.shipment.service import (
-                                                SambaShipmentService as _FSvc,
-                                            )
+                                        _tx_result = None
+                                        _tx_exc: Exception | None = None
+                                        for _tx_attempt in range(2):
+                                            try:
+                                                async with get_write_session() as _tx_s:
+                                                    from backend.domain.samba.shipment.repository import (
+                                                        SambaShipmentRepository as _FRepo,
+                                                    )
+                                                    from backend.domain.samba.shipment.service import (
+                                                        SambaShipmentService as _FSvc,
+                                                    )
 
-                                            _svc = _FSvc(_FRepo(_tx_s), _tx_s)
-                                            _tx_result = await _svc.start_update(
-                                                [_pid],
-                                                _items,
-                                                _accs_list,
-                                                skip_unchanged=False,
-                                                skip_refresh=True,
-                                            )
-                                            await _tx_s.commit()
-
+                                                    _svc = _FSvc(_FRepo(_tx_s), _tx_s)
+                                                    _tx_result = (
+                                                        await _svc.start_update(
+                                                            [_pid],
+                                                            _items,
+                                                            _accs_list,
+                                                            skip_unchanged=False,
+                                                            skip_refresh=True,
+                                                        )
+                                                    )
+                                                    # HTTP 끝났으면 즉시 commit — 세션이 idle
+                                                    # 상태로 더 머무르지 않도록 transaction 종료
+                                                    await _tx_s.commit()
+                                                _tx_exc = None
+                                                break
+                                            except Exception as _try_exc:
+                                                _tx_exc = _try_exc
+                                                if (
+                                                    _is_stale_conn_error(_try_exc)
+                                                    and _tx_attempt == 0
+                                                ):
+                                                    log.warning(
+                                                        "[오토튠][DB재시도] transmit_group "
+                                                        "pid=%s 좀비 connection 감지 → "
+                                                        "새 세션으로 재시도: %s",
+                                                        _pid,
+                                                        str(_try_exc)[:120],
+                                                    )
+                                                    await asyncio.sleep(0.2)
+                                                    continue
+                                                raise
+                                        if _tx_exc:
+                                            raise _tx_exc
+                                        if _tx_result is None:
+                                            _tx_result = {"results": []}
                                         # 결과 검증: start_update는 실패 시 예외 없이 dict로 반환
                                         # 결과 구조: results[0] = {product_id, status, transmit_result: {acc: status}, transmit_error: {acc: err}, update_result: {acc: ...}}
                                         _tx_res_list = _tx_result.get("results", [])
@@ -1803,10 +1955,33 @@ async def _site_autotune_loop(device_id: str, site: str):
                         async def _on_result_releasing(product, r, idx=0, total=0):
                             await _on_result(product, r, idx, total)
 
+                        log.info(
+                            "[오토튠][디버그][%s][%s] 사이클 #%d bulk 시작 "
+                            "(concurrency=%s, elapsed=%.1fs)",
+                            device_id[:8],
+                            site,
+                            _cycle_seq,
+                            dict(_SAC).get(site, "default"),
+                            time.time() - _cycle_started_ts,
+                        )
+                        _bulk_start_ts = time.time()
                         results, summary = await refresh_products_bulk(
                             products,
                             max_concurrency=dict(_SAC),
                             on_result=_on_result_releasing,
+                        )
+                        log.info(
+                            "[오토튠][디버그][%s][%s] 사이클 #%d bulk 종료: "
+                            "results=%d/%d (refreshed=%d, errors=%d) bulk_elapsed=%.1fs, cycle_elapsed=%.1fs",
+                            device_id[:8],
+                            site,
+                            _cycle_seq,
+                            len(results),
+                            filtered_count,
+                            summary.refreshed,
+                            summary.errors,
+                            time.time() - _bulk_start_ts,
+                            time.time() - _cycle_started_ts,
                         )
 
                         # 에러 결과 후처리 (콜백에서 처리 안 된 에러 건)
@@ -2027,17 +2202,31 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                 for did in _sp_deleted_ids
                                             )
                                         }
-                                        _cleanup: dict = {
-                                            "registered_accounts": _new_reg
-                                            if _new_reg
-                                            else [],
-                                            "market_product_nos": _new_mnos
-                                            if _new_mnos
-                                            else {},
-                                        }
-                                        if not _new_reg:
-                                            _cleanup["status"] = "collected"
-                                        await repo.update_async(_sp.id, **_cleanup)
+                                        # 등록된 모든 마켓 삭제 성공 → 상품 자체 삭제
+                                        if _sp_reg and not _new_reg:
+                                            try:
+                                                await repo.delete_async(_sp.id)
+                                                _log_line(
+                                                    _sp.source_site or "",
+                                                    _sp.id,
+                                                    f"{_sp.name or _sp.id}: 품절잔존 전 마켓 삭제 성공 → 상품 DB 삭제 완료",
+                                                )
+                                            except Exception as _pd_err:
+                                                log.error(
+                                                    "[오토튠] 품절잔존 %s 상품 DB 삭제 실패: %s",
+                                                    _sp.id,
+                                                    _pd_err,
+                                                )
+                                        else:
+                                            _cleanup: dict = {
+                                                "registered_accounts": _new_reg
+                                                if _new_reg
+                                                else [],
+                                                "market_product_nos": _new_mnos
+                                                if _new_mnos
+                                                else {},
+                                            }
+                                            await repo.update_async(_sp.id, **_cleanup)
 
                                 try:
                                     await asyncio.wait_for(session.commit(), timeout=30)
@@ -2172,6 +2361,16 @@ async def _site_autotune_loop(device_id: str, site: str):
                     )
 
             except asyncio.CancelledError:
+                log.warning(
+                    "[오토튠][디버그][%s][%s] 사이클 #%d CancelledError 진입 "
+                    "(cycle_elapsed=%.1fs, pc_running=%s)",
+                    device_id[:8],
+                    site,
+                    _cycle_seq,
+                    time.time() - _cycle_started_ts,
+                    _is_pc_running(device_id),
+                    exc_info=True,
+                )
                 if not _is_pc_running(device_id):
                     log.info("[오토튠][%s] 루프 취소됨 (정상 종료)", site)
                     break
@@ -2205,8 +2404,12 @@ async def _site_autotune_loop(device_id: str, site: str):
                 await asyncio.sleep(2)
             except Exception as e:
                 log.error(
-                    "[오토튠][%s] tick 오류: %s",
+                    "[오토튠][디버그][%s][%s] 사이클 #%d tick 오류 "
+                    "(cycle_elapsed=%.1fs): %s",
+                    device_id[:8],
                     site,
+                    _cycle_seq,
+                    time.time() - _cycle_started_ts,
                     e,
                     exc_info=True,
                 )

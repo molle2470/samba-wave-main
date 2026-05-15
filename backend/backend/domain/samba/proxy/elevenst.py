@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime
 from typing import Any, Optional
@@ -411,6 +412,136 @@ class ElevenstClient:
             return True
         except Exception:
             return False
+
+    async def list_seller_products(
+        self,
+        sel_stat_cd: str = "103",
+        page_size: int = 500,
+        max_pages: int = 200,
+        throttle: float = 0.4,
+    ) -> list[dict[str, Any]]:
+        """등록된 셀러 상품 페이징 조회 (유령삭제 양방향 동기화용).
+
+        11번가 공식 API: POST /rest/prodmarketservice/prodmarket
+        - XML body: <SearchProduct><limit>500</limit><start>1</start><end>500</end><selStatCd>103</selStatCd></SearchProduct>
+        - 페이징: start/end offset 증가 (1~500, 501~1000, ...)
+        - limit 최대 500
+        - selStatCd: 101=승인대기, 102=승인전, 103=판매중, 104=품절, 105=전시중지,
+          106=정상종료, 108=판매금지. 빈문자열이면 전체.
+        - max_pages: 안전장치 (200 * 500 = 최대 10만개)
+        - throttle: 호출 간격 (rate limit 회피)
+
+        Returns:
+            list[{"prd_no": str, "name": str, "seller_code": str,
+                  "sel_stat_cd": str, "sel_stat_nm": str}]
+        """
+        import re as _re
+
+        url = "https://api.11st.co.kr/rest/prodmarketservice/prodmarket"
+        results: list[dict[str, Any]] = []
+        offset = 1
+        page_count = 0
+
+        # SearchProduct XML body 생성
+        def _build_body(start: int, end: int) -> str:
+            stat_xml = f"<selStatCd>{sel_stat_cd}</selStatCd>" if sel_stat_cd else ""
+            return (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                "<SearchProduct>"
+                f"<limit>{page_size}</limit>"
+                f"<start>{start}</start>"
+                f"<end>{end}</end>"
+                f"{stat_xml}"
+                "</SearchProduct>"
+            )
+
+        client = _get_elevenst_http_client(self.api_key)
+
+        while page_count < max_pages:
+            start = offset
+            end = offset + page_size - 1
+            body = _build_body(start, end)
+            headers = self._headers()
+
+            try:
+                resp = await client.post(
+                    url, headers=headers, content=body.encode("utf-8")
+                )
+            except (httpx.ConnectError, httpx.RemoteProtocolError):
+                _elevenst_clients.pop(self.api_key, None)
+                client = _get_elevenst_http_client(self.api_key)
+                resp = await client.post(
+                    url, headers=headers, content=body.encode("utf-8")
+                )
+
+            logger.info(
+                f"[11번가] POST /prodmarket start={start} end={end} → {resp.status_code}"
+            )
+
+            if resp.status_code == 429:
+                try:
+                    retry_after = int(resp.headers.get("Retry-After", "5"))
+                except ValueError:
+                    retry_after = 5
+                raise ElevenstRateLimitError(retry_after=retry_after)
+            if resp.status_code in (503, 504):
+                raise ElevenstRateLimitError(retry_after=10)
+
+            try:
+                text = resp.content.decode("euc-kr", errors="replace")
+            except Exception:
+                text = resp.text
+
+            if not resp.is_success:
+                raise ElevenstApiError(f"HTTP {resp.status_code}: {text[:300]}")
+
+            # ns2:product 노드 추출 — 정규식으로 블록 단위 분리
+            product_blocks = _re.findall(
+                r"<ns2:product>(.*?)</ns2:product>", text, flags=_re.DOTALL
+            )
+            if not product_blocks:
+                # prefix 없는 형태 폴백
+                product_blocks = _re.findall(
+                    r"<product>(.*?)</product>", text, flags=_re.DOTALL
+                )
+
+            if not product_blocks:
+                break
+
+            def _extract(block: str, tag: str) -> str:
+                m = _re.search(rf"<{tag}>([^<]*)</{tag}>", block)
+                return m.group(1).strip() if m else ""
+
+            page_results: list[dict[str, Any]] = []
+            for blk in product_blocks:
+                prd_no = _extract(blk, "prdNo")
+                if not prd_no:
+                    continue
+                page_results.append(
+                    {
+                        "prd_no": prd_no,
+                        "name": _extract(blk, "prdNm"),
+                        "seller_code": _extract(blk, "sellerPrdCd"),
+                        "sel_stat_cd": _extract(blk, "selStatCd"),
+                        "sel_stat_nm": _extract(blk, "selStatNm"),
+                    }
+                )
+
+            results.extend(page_results)
+            page_count += 1
+
+            # 페이지 size 미만이면 마지막 페이지
+            if len(page_results) < page_size:
+                break
+
+            offset += page_size
+            await asyncio.sleep(throttle)
+
+        logger.info(
+            f"[11번가] list_seller_products 완료: {len(results)}개 "
+            f"(페이지 {page_count}, selStatCd={sel_stat_cd or 'ALL'})"
+        )
+        return results
 
     # ------------------------------------------------------------------
     # 주문 조회 / 처리
@@ -1901,9 +2032,21 @@ class ElevenstClient:
                 return ""
 
         def _is_msscdn_product(url: str) -> bool:
-            """msscdn의 정품 상품 이미지 path만 인정 (배너/공지 제외)."""
+            """msscdn의 상품 이미지 path만 인정 (배너/공지 제외).
+
+            - /images/goods_img/ : 상품 메인 이미지
+            - /images/prd_img/detail_ : 상품 상세컷 (배너 아닌 실제 상품 사진)
+            - /images/prd_img/<hash>.jpg, /display/images/common/ 등 배너성은 제외
+            """
             lower = url.lower()
-            return "msscdn.net" in lower and "/images/goods_img/" in lower
+            if "msscdn.net" not in lower:
+                return False
+            if "/images/goods_img/" in lower:
+                return True
+            # 상세컷은 detail_<상품ID>_ 패턴으로 식별 (배너성 해시 파일명 제외)
+            if "/images/prd_img/" in lower and "/detail_" in lower:
+                return True
+            return False
 
         # prdImage 후보: 1차로 _is_valid_detail_image + 확장자 OK
         # 무신사(msscdn)인 경우 detail_images에 cafe24 등 hotlink 차단 호스트 배너가 섞이므로

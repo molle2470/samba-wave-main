@@ -1617,7 +1617,7 @@ class SSGClient:
         elif shpp_prog in ("21", "22", "31", "41"):
             status, shipping_status = "pending", "상품준비중"
         elif shpp_prog == "43":
-            status, shipping_status = "shipped", "배송중"
+            status, shipping_status = "shipped", "국내배송중"
         elif shpp_prog == "51":
             status, shipping_status = "delivered", "배송완료"
         else:

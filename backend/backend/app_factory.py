@@ -240,7 +240,9 @@ def create_application() -> FastAPI:
     )
 
     # eBay 라우터 (포크 전용)
-    app.include_router(ebay_router, prefix="/api/v1", dependencies=samba_auth)
+    # deletion-notification은 eBay 외부에서 호출하는 공개 webhook이므로 인증 제외
+    # (인증 걸면 401 반환 → eBay가 24시간 미응답으로 마킹 → 30일 후 앱 키 비활성화)
+    app.include_router(ebay_router, prefix="/api/v1")
     app.include_router(
         samba_ebay_mapping_router, prefix="/api/v1/samba", dependencies=samba_auth
     )

@@ -540,6 +540,8 @@ async def delete_filter(
         logger.info(f"그룹 삭제: {filter_id} → 상품 {deleted_count}건 연동 삭제")
 
     await svc.delete_filter(filter_id)
+    await cache.delete("filters:tree:v3")
+    await cache.clear_pattern("filters:tree:counts:*")
     return {"ok": True, "deleted_products": deleted_count}
 
 
@@ -991,11 +993,10 @@ async def scroll_products(
         )
         acc_ids = acc_result.scalars().all()
         if acc_ids:
+            # jsonb_array_length 금지 — 스칼라값 행에서 에러. no_registered_accounts 헬퍼 사용
             conditions.append(
                 or_(
-                    _CP.registered_accounts.is_(None),
-                    func.jsonb_typeof(_CP.registered_accounts) != "array",
-                    func.jsonb_array_length(_CP.registered_accounts) == 0,
+                    no_registered_accounts(_CP),
                     and_(
                         *[
                             ~_CP.registered_accounts.op("@>")(
@@ -1015,11 +1016,10 @@ async def scroll_products(
     elif status and status.startswith("unreg_"):
         # 특정 계정에 미등록된 상품: registered_accounts JSONB에 account_id 미포함 (~@>)
         account_id = status[6:]  # "unreg_ma_xxx" → "ma_xxx"
+        # jsonb_array_length 금지 — 스칼라값 행에서 에러. no_registered_accounts 헬퍼 사용
         conditions.append(
             or_(
-                _CP.registered_accounts.is_(None),
-                func.jsonb_typeof(_CP.registered_accounts) != "array",
-                func.jsonb_array_length(_CP.registered_accounts) == 0,
+                no_registered_accounts(_CP),
                 ~_CP.registered_accounts.op("@>")(func.jsonb_build_array(account_id)),
             )
         )
@@ -1676,7 +1676,7 @@ async def lookup_by_market_product_no(
     # 패턴 모두 적용.
     safe = escape_like(market_product_no)
     sql = sa_text(
-        "SELECT id, source_site, site_product_id, name, images, source_url "
+        "SELECT id, source_site, site_product_id, name, images, source_url, market_product_nos "
         "FROM samba_collected_product "
         "WHERE market_product_nos::text LIKE :pattern ESCAPE '\\' "
         "   OR market_product_nos::text LIKE :pattern_bare ESCAPE '\\' "
@@ -1696,7 +1696,9 @@ async def lookup_by_market_product_no(
     row = result.fetchone()
     if not row:
         return {"found": False}
-    pid, source_site, site_product_id, name, images, source_url = row
+    pid, source_site, site_product_id, name, images, source_url, market_product_nos = (
+        row
+    )
     thumb = images[0] if images and isinstance(images, list) and images else ""
     return {
         "found": True,
@@ -1706,6 +1708,8 @@ async def lookup_by_market_product_no(
         "name": name,
         "original_link": source_url or "",
         "product_image": thumb,
+        # 스마트스토어 originProductNo 등 마켓별 등록 상품번호 (account_id / account_id_origin 키)
+        "market_product_nos": market_product_nos or {},
     }
 
 

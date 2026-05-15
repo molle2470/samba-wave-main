@@ -35,6 +35,7 @@ import UrlInputModal from './components/UrlInputModal'
 import SmsTemplateEditModal from './components/SmsTemplateEditModal'
 import AlarmSettingModal from './components/AlarmSettingModal'
 import TrackingModal from './components/TrackingModal'
+import { showConfirm } from '@/components/samba/Modal'
 
 interface OrderForm {
   channel_id: string; product_name: string; customer_name: string; customer_phone: string
@@ -66,6 +67,7 @@ export default function OrdersPage() {
   const [accountFilter, setAccountFilter] = useState('')
   const [registrationFilter, setRegistrationFilter] = useState('registered')
   const [inputFilter, setInputFilter] = useState('')
+  const [invoiceFilter, setInvoiceFilter] = useState('')
   const [statusFilter, setStatusFilter] = useState('cancel_return_excluded')
   // CS 페이지 등 외부에서 ?search=...&search_type=... 로 진입 시 자동 검색
   const initialSearch = searchParams.get('search') || ''
@@ -157,6 +159,7 @@ export default function OrdersPage() {
             market_status: marketStatus,
             status_filter: statusFilter,
             input_filter: inputFilter,
+            invoice_filter: invoiceFilter,
             registration_filter: registrationFilter,
             search_text: appliedSearchText,
             search_category: searchCategory,
@@ -173,6 +176,7 @@ export default function OrdersPage() {
             market_status: marketStatus,
             status_filter: statusFilter,
             input_filter: inputFilter,
+            invoice_filter: invoiceFilter,
             registration_filter: registrationFilter,
             search_text: appliedSearchText,
             search_category: searchCategory,
@@ -202,7 +206,7 @@ export default function OrdersPage() {
       setLogMessages(prev => [...prev, `[${fmtTime()}] 주문 조회 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`])
     }
     setLoading(false)
-  }, [isProductMode, cpId, currentPage, pageSize, marketFilter, siteFilter, accountFilter, marketStatus, statusFilter, inputFilter, registrationFilter, appliedSearchText, searchCategory, sortBy, customStart, customEnd, setSentFlags])
+  }, [isProductMode, cpId, currentPage, pageSize, marketFilter, siteFilter, accountFilter, marketStatus, statusFilter, inputFilter, invoiceFilter, registrationFilter, appliedSearchText, searchCategory, sortBy, customStart, customEnd, setSentFlags])
 
   const patchOrder = useCallback((id: string, patch: Partial<SambaOrder>) => {
     setOrders(prev => prev.map(order => (
@@ -212,11 +216,12 @@ export default function OrdersPage() {
 
   const applySearch = useCallback(() => {
     setCurrentPage(1)
-    setAppliedSearchText(searchText.trim())
-    // 필터 state(statusFilter 등)가 동일해 loadOrders useCallback이 재생성되지 않더라도
-    // 검색 버튼 클릭 시 항상 최신 필터로 재조회되도록 강제 호출
-    loadOrders()
-  }, [searchText, loadOrders])
+    const trimmed = searchText.trim()
+    // 검색어가 바뀌면 state 변경만 → loadOrders가 새 값으로 재생성되고 useEffect가 자동 재조회
+    // 같은 검색어로 다시 누르면 state가 안 바뀌므로 강제 호출
+    if (trimmed === appliedSearchText) loadOrders()
+    else setAppliedSearchText(trimmed)
+  }, [searchText, appliedSearchText, loadOrders])
 
 
   const [siteAliasMap, setSiteAliasMap] = useState<Record<string, string>>({})
@@ -249,7 +254,7 @@ export default function OrdersPage() {
   useEffect(() => { loadOrders() }, [loadOrders])
   useEffect(() => {
     setCurrentPage(1)
-  }, [pageSize, customStart, customEnd, marketFilter, siteFilter, accountFilter, marketStatus, statusFilter, registrationFilter, inputFilter, searchCategory, sortBy, isProductMode, cpId])
+  }, [pageSize, customStart, customEnd, marketFilter, siteFilter, accountFilter, marketStatus, statusFilter, registrationFilter, inputFilter, invoiceFilter, searchCategory, sortBy, isProductMode, cpId])
   useEffect(() => {
     const ids = [...new Set(orders.map(o => o.collected_product_id).filter((id): id is string => !!id))]
     if (ids.length === 0) {
@@ -299,14 +304,38 @@ export default function OrdersPage() {
     return () => window.removeEventListener('open-alarm-setting', handler)
   }, [])
 
-  // 페이지 진입 시 미처리 취소요청 알람 (1회)
+  // 알람 모달 "지금 확인하기"로 들어왔을 때 — cancel_alert 필터 + 전체 기간으로 세팅
   useEffect(() => {
-    orderApi.getCancelAlertCount().then(({ count }) => {
-      if (count > 0) {
-        showNotification(`처리 중인 주문 중 취소요청이 ${fmtNum(count)}건 있습니다. 확인해 주세요.`)
-      }
-    }).catch(() => {})
+    if (searchParams.get('cancel_alert') === '1') {
+      setStatusFilter('cancel_alert')
+      setMarketStatus('')
+      setRegistrationFilter('')
+      setInputFilter('')
+      setInvoiceFilter('')
+      setCustomStart('2020-01-01')
+      setCustomEnd(formatDateInput(getKstTodayDate()))
+      setPeriod('')
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams])
+
+  // 알람 모달 X 버튼 → 디폴트 오늘 주문 화면으로 복귀 (초기 진입 상태와 동일)
+  useEffect(() => {
+    const handler = () => {
+      setStatusFilter('cancel_return_excluded')
+      setMarketStatus('')
+      setRegistrationFilter('registered')
+      setInputFilter('')
+      setInvoiceFilter('')
+      setAppliedSearchText('')
+      setSearchText('')
+      setPeriod('today')
+      const today = formatDateInput(getKstTodayDate())
+      setCustomStart(today)
+      setCustomEnd(today)
+    }
+    window.addEventListener('reset-orders-filter', handler)
+    return () => window.removeEventListener('reset-orders-filter', handler)
   }, [])
   // 마운트 1회 — 5개 메타 API를 하나의 useEffect에서 동시 호출 (DB 커넥션 경합 최소화)
   useEffect(() => {
@@ -356,13 +385,13 @@ export default function OrdersPage() {
   const [trackingStatusData, setTrackingStatusData] = useState<{
     counts: Record<string, number>
     recent: Array<{
-      id: string; orderId: string; site: string; sourcingOrderNumber: string
+      id: string; orderId: string; orderNumber: string; customerName: string
+      channelName: string; site: string; sourcingOrderNumber: string; sourcingAccountLabel: string
       status: string; courier?: string | null; tracking?: string | null
       lastError?: string | null; attempts: number; updatedAt?: string | null
+      paidAt?: string | null
     }>
   } | null>(null)
-  const [trackingPolling, setTrackingPolling] = useState(false)
-
   const refreshTrackingStatus = useCallback(async () => {
     try {
       const data = await orderApi.listRecentTrackingSyncJobs(50)
@@ -372,17 +401,11 @@ export default function OrdersPage() {
     }
   }, [])
 
-  // 송장 상태 모달 열려있으면 5초마다 자동 갱신 (PENDING/DISPATCHED 잡 있을 때만)
+  // 모달 열릴 때 1회만 조회. 폴링은 하지 않는다 — 큐잉된 잡은 백엔드/확장앱이 알아서 처리.
   useEffect(() => {
     if (!trackingStatusOpen) return
     refreshTrackingStatus()
-    const interval = setInterval(() => {
-      const inFlight = (trackingStatusData?.counts.PENDING || 0)
-        + (trackingStatusData?.counts.DISPATCHED || 0)
-      if (inFlight > 0 || trackingPolling) refreshTrackingStatus()
-    }, 5000)
-    return () => clearInterval(interval)
-  }, [trackingStatusOpen, trackingStatusData, trackingPolling, refreshTrackingStatus])
+  }, [trackingStatusOpen, refreshTrackingStatus])
 
   const handleTrackingSyncOne = async (o: SambaOrder) => {
     try {
@@ -400,19 +423,18 @@ export default function OrdersPage() {
   }
 
   const handleTrackingSyncBulk = async () => {
-    if (!confirm('미발송 주문 최대 50건의 송장을 일괄 동기화합니다. 진행할까요?')) return
+    if (!await showConfirm('최근 7일 내 미발송 주문(소싱처 주문번호 있고 송장 미입력)의 송장을 일괄 동기화합니다.\n기존 처리 안 된(좀비 PENDING 포함) 잡은 닫고 새로 큐잉합니다. 진행할까요?')) return
     setTrackingSyncing(true)
     try {
-      const res = await orderApi.syncTrackingBulk(50)
+      const res = await orderApi.syncTrackingBulk(500, 7, true)
       setLogMessages(prev => [
         ...prev,
         `[송장 일괄] 큐 적재 ${fmtNum(res.queued)}건 / 스킵 ${fmtNum(res.skipped)}건 / 오류 ${fmtNum(res.errors.length)}건`,
         ...res.errors.slice(0, 5).map(e => `  · ${e}`),
       ])
-      // 적재 직후 상태 모달 자동 오픈 — 진행상황 가시화
+      // 적재 직후 상태 모달 자동 오픈 — 큐잉된 잡 목록 1회 표시 (폴링 없음)
       setTrackingStatusOpen(true)
-      setTrackingPolling(true)
-      setTimeout(() => { setTrackingPolling(false); loadOrders() }, 60000)
+      setTimeout(() => { loadOrders() }, 60000)
     } catch (err) {
       setLogMessages(prev => [...prev, `[송장 일괄] 오류: ${(err as Error).message}`])
     } finally {
@@ -491,6 +513,7 @@ export default function OrdersPage() {
         marketStatus={marketStatus} setMarketStatus={setMarketStatus}
         registrationFilter={registrationFilter} setRegistrationFilter={setRegistrationFilter}
         inputFilter={inputFilter} setInputFilter={setInputFilter}
+        invoiceFilter={invoiceFilter} setInvoiceFilter={setInvoiceFilter}
         statusFilter={statusFilter} setStatusFilter={setStatusFilter}
         sortBy={sortBy} setSortBy={setSortBy}
         pageSize={pageSize} setPageSize={setPageSize}
@@ -531,7 +554,7 @@ export default function OrdersPage() {
             fontSize: 13, fontWeight: 600,
           }}
         >
-          {trackingSyncing ? '큐 적재 중...' : '미발송 일괄 송장수집'}
+          {trackingSyncing ? '큐 적재 중...' : '송장수집'}
         </button>
         {selectedIds.size > 0 && (
           <button
@@ -702,7 +725,7 @@ export default function OrdersPage() {
             onClick={(e) => e.stopPropagation()}
             style={{
               background: '#1f2937', color: '#e5e7eb',
-              width: 880, maxWidth: '92vw', maxHeight: '85vh',
+              width: 1612, maxWidth: '98vw', maxHeight: '85vh',
               borderRadius: 8, padding: 20, overflow: 'auto',
               border: '1px solid #374151',
             }}
@@ -710,6 +733,23 @@ export default function OrdersPage() {
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
               <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700 }}>📦 송장 자동전송 진행 현황</h3>
               <div style={{ display: 'flex', gap: 8 }}>
+                <button
+                  onClick={async () => {
+                    if (!await showConfirm('SCRAPED + 송장전송실패 상태 잡 전체를 마켓에 일괄 전송합니다. 진행할까요?')) return
+                    try {
+                      const res = await orderApi.dispatchTrackingBulk(false)
+                      setLogMessages(prev => [
+                        ...prev,
+                        `[마켓 일괄전송] 총 ${fmtNum(res.total)}건 / 성공 ${fmtNum(res.sent)}건 / 실패 ${fmtNum(res.failed)}건`,
+                        ...res.errors.slice(0, 5).map(e => `  · ${e}`),
+                      ])
+                      refreshTrackingStatus()
+                    } catch (err) {
+                      setLogMessages(prev => [...prev, `[마켓 일괄전송] 오류: ${(err as Error).message}`])
+                    }
+                  }}
+                  style={{ padding: '4px 10px', background: '#16a34a', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer', fontSize: 12 }}
+                >일괄 마켓전송</button>
                 <button
                   onClick={refreshTrackingStatus}
                   style={{ padding: '4px 10px', background: '#2563eb', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer', fontSize: 12 }}
@@ -728,7 +768,9 @@ export default function OrdersPage() {
                 { key: 'DISPATCHED', label: '추출중', color: '#0ea5e9' },
                 { key: 'SCRAPED', label: '추출완료', color: '#16a34a' },
                 { key: 'SENT_TO_MARKET', label: '마켓전송', color: '#22c55e' },
+                { key: 'DISPATCH_FAILED', label: '송장전송실패', color: '#dc2626' },
                 { key: 'NO_TRACKING', label: '미발송', color: '#f59e0b' },
+                { key: 'CANCELLED', label: '원주문취소', color: '#a855f7' },
                 { key: 'FAILED', label: '실패', color: '#ef4444' },
               ].map(({ key, label, color }) => {
                 const cnt = trackingStatusData?.counts[key] || 0
@@ -747,37 +789,104 @@ export default function OrdersPage() {
             {/* 최근 잡 목록 */}
             <div style={{ background: '#111827', borderRadius: 6, overflow: 'hidden', border: '1px solid #374151' }}>
               <div style={{
-                display: 'grid', gridTemplateColumns: '90px 1fr 80px 110px 130px 1fr',
+                display: 'grid', gridTemplateColumns: '36px 88px 110px 150px 160px 200px 80px 140px 90px 90px 120px 266px',
                 padding: '8px 10px', background: '#0f172a', fontSize: 11, fontWeight: 700, color: '#9ca3af',
               }}>
+                <div>#</div>
                 <div>상태</div>
-                <div>주문ID</div>
+                <div>결제일</div>
+                <div>상품주문번호</div>
+                <div>고객명</div>
+                <div>판매처</div>
                 <div>소싱처</div>
+                <div>소싱주문번호</div>
+                <div>소싱처계정</div>
                 <div>택배사</div>
                 <div>송장번호</div>
                 <div>오류/메모</div>
               </div>
-              {(trackingStatusData?.recent || []).map(j => {
+              {(trackingStatusData?.recent || []).map((j, idx) => {
                 const statusColor: Record<string, string> = {
                   PENDING: '#6b7280', DISPATCHED: '#0ea5e9', SCRAPED: '#16a34a',
-                  SENT_TO_MARKET: '#22c55e', NO_TRACKING: '#f59e0b', FAILED: '#ef4444',
+                  SENT_TO_MARKET: '#22c55e', DISPATCH_FAILED: '#dc2626',
+                  NO_TRACKING: '#f59e0b', CANCELLED: '#a855f7', FAILED: '#ef4444',
                 }
+                // 소싱처 원주문링크 URL 매핑 (대소문자/한글 변형 모두 대응)
+                const buildSourcingOrderUrl = (site: string, srcNo: string): string | null => {
+                  if (!srcNo) return null
+                  const raw = (site || '').split('(')[0].trim().toUpperCase()
+                  // 한글 → 코드 정규화
+                  const aliasMap: Record<string, string> = {
+                    'GS이숍': 'GSSHOP',
+                    'GS샵': 'GSSHOP',
+                    '롯데ON': 'LOTTEON',
+                    '롯데온': 'LOTTEON',
+                    '무신사': 'MUSINSA',
+                    '크림': 'KREAM',
+                    '나이키': 'NIKE',
+                    '패션플러스': 'FASHIONPLUS',
+                    '올리브영': 'OLIVEYOUNG',
+                  }
+                  const code = aliasMap[raw] || raw
+                  const map: Record<string, string> = {
+                    MUSINSA: `https://www.musinsa.com/order/order-detail/${srcNo}`,
+                    KREAM: `https://kream.co.kr/my/purchasing/${srcNo}`,
+                    FASHIONPLUS: `https://www.fashionplus.co.kr/mypage/order/detail/${srcNo}`,
+                    ABCMART: `https://abcmart.a-rt.com/mypage/order/read-order-detail?orderNo=${srcNo}`,
+                    GRANDSTAGE: `https://grandstage.a-rt.com/mypage/order/read-order-detail?orderNo=${srcNo}`,
+                    NIKE: `https://www.nike.com/kr/orders/${srcNo}`,
+                    SSG: `https://pay.ssg.com/myssg/orderInfoDetail.ssg?orordNo=${encodeURIComponent(srcNo)}&viewType=Ssg`,
+                    LOTTEON: `https://www.lotteon.com/p/order/claim/orderDetail?odNo=${srcNo}`,
+                    GSSHOP: `https://www.gsshop.com/ord/dlvcursta/popup/ordDtl.gs?orderNo=${srcNo}`,
+                    OLIVEYOUNG: `https://www.oliveyoung.co.kr/store/mypage/getOrderDetail.do?dlvNo=${srcNo}`,
+                  }
+                  return map[code] || null
+                }
+                const sourcingUrl = buildSourcingOrderUrl(j.site, j.sourcingOrderNumber || '')
                 return (
                   <div key={j.id} style={{
-                    display: 'grid', gridTemplateColumns: '90px 1fr 80px 110px 130px 1fr',
+                    display: 'grid', gridTemplateColumns: '36px 88px 110px 150px 160px 200px 80px 140px 90px 90px 120px 266px',
                     padding: '6px 10px', borderTop: '1px solid #1f2937', fontSize: 12,
                   }}>
+                    <div style={{ color: '#6b7280', fontSize: 11 }}>{fmtNum(idx + 1)}</div>
                     <div>
                       <span style={{
                         padding: '2px 6px', borderRadius: 3, fontSize: 10, fontWeight: 700,
                         background: statusColor[j.status] || '#374151', color: '#fff',
                       }}>{j.status}</span>
                     </div>
-                    <div style={{ fontFamily: 'monospace', fontSize: 11 }}>{j.orderId}</div>
+                    <div style={{ fontSize: 11, color: '#9ca3af' }}>
+                      {j.paidAt ? new Date(j.paidAt).toLocaleString('ko-KR', { year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) : '-'}
+                    </div>
+                    <div style={{ fontFamily: 'monospace', fontSize: 11 }}>{j.orderNumber || j.orderId}</div>
+                    <div>{j.customerName || '-'}</div>
+                    <div>{j.channelName || '-'}</div>
                     <div>{j.site}</div>
+                    <div style={{ fontFamily: 'monospace', fontSize: 11 }}>{j.sourcingOrderNumber || '-'}</div>
+                    <div>{j.sourcingAccountLabel || '-'}</div>
                     <div>{j.courier || '-'}</div>
                     <div style={{ fontFamily: 'monospace' }}>{j.tracking || '-'}</div>
-                    <div style={{ color: '#9ca3af', fontSize: 11 }}>{j.lastError || ''}</div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+                      <span style={{ color: '#9ca3af', fontSize: 11, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={j.lastError || ''}>{j.lastError || ''}</span>
+                      <button
+                        onClick={() => {
+                          if (!sourcingUrl) {
+                            setLogMessages(prev => [...prev, `[원주문링크] ${j.site} 소싱처는 지원하지 않거나 소싱주문번호가 없습니다`])
+                            return
+                          }
+                          window.open(sourcingUrl, '_blank')
+                        }}
+                        disabled={!sourcingUrl}
+                        style={{
+                          padding: '2px 6px', fontSize: 10, borderRadius: 3,
+                          background: sourcingUrl ? '#374151' : '#1f2937',
+                          color: sourcingUrl ? '#e5e7eb' : '#4b5563',
+                          border: '1px solid #4b5563',
+                          cursor: sourcingUrl ? 'pointer' : 'not-allowed',
+                          whiteSpace: 'nowrap', flexShrink: 0,
+                        }}
+                      >원주문링크</button>
+                    </div>
                   </div>
                 )
               })}
@@ -789,7 +898,7 @@ export default function OrdersPage() {
             </div>
 
             <div style={{ marginTop: 12, fontSize: 11, color: '#6b7280' }}>
-              💡 모달이 열려있는 동안 5초마다 자동 갱신됩니다. 일괄 송장수집 직후 60초 동안 자동 폴링됩니다.
+              💡 송장수집 클릭 시점의 미입력건 큐잉 상태입니다. 자동 갱신 안 함 — 결과는 주문 테이블에서 확인하세요.
             </div>
           </div>
         </div>

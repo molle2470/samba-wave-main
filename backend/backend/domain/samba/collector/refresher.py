@@ -665,7 +665,8 @@ async def _refresh_product_inner(
             result = await plugin.refresh(product)
         except Exception as e:
             logger.error(
-                f"[refresher] {product.id} ({source_site}) 플러그인 갱신 실패: {e}"
+                f"[refresher] {product.id} ({source_site}) 플러그인 갱신 실패: {e}",
+                exc_info=True,
             )
             return RefreshResult(
                 product_id=product.id,
@@ -718,7 +719,10 @@ async def _refresh_product_inner(
         result = await parser(product)
         return result
     except Exception as e:
-        logger.error(f"[refresher] {product.id} ({source_site}) 갱신 실패: {e}")
+        logger.error(
+            f"[refresher] {product.id} ({source_site}) 갱신 실패: {e}",
+            exc_info=True,
+        )
         return RefreshResult(
             product_id=product.id,
             error=str(e),

@@ -31,6 +31,17 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    # samba_collected_product 는 hot 테이블이라 ACCESS EXCLUSIVE 락 경합 발생.
+    # idle in transaction 세션을 사전 정리하고 lock_timeout 을 충분히 늘려 ALTER.
+    op.execute(
+        """
+        SELECT pg_terminate_backend(pid)
+        FROM pg_stat_activity
+        WHERE state = 'idle in transaction'
+          AND pid <> pg_backend_pid()
+        """
+    )
+    op.execute("SET LOCAL lock_timeout = '5min'")
     op.execute(
         """
         ALTER TABLE samba_collected_product

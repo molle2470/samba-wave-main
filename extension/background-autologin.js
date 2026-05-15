@@ -120,21 +120,24 @@ const _AL_SITE_NAME_MAP = {
   gs: 'GSShop',
 }
 
-// 백엔드 fetch — site_name으로 is_login_default 계정의 평문 자격증명 조회
-// 사용자가 설정 페이지에서 라디오 지정해 둔 경우만 200 반환, 미지정이면 404
-async function _fetchLoginCredential(siteKey) {
+// 백엔드 fetch — 자격증명 조회.
+// accountId 제공 시 해당 계정 단건(주문 매칭 계정), 없으면 site_name 라디오 기본 계정.
+async function _fetchLoginCredential(siteKey, accountId) {
   const siteName = _AL_SITE_NAME_MAP[siteKey]
-  if (!siteName) return null
+  if (!siteName && !accountId) return null
   try {
     const stored = await chrome.storage.local.get('proxyUrl')
     const proxyUrl = stored.proxyUrl || ''
     const apiFetch = globalThis.SambaBackgroundCore?.apiFetch
     if (!apiFetch) return null
+    const qs = accountId
+      ? `account_id=${encodeURIComponent(accountId)}`
+      : `site_name=${encodeURIComponent(siteName)}`
     const res = await apiFetch(
-      `${proxyUrl}/api/v1/samba/sourcing-accounts/login-credential?site_name=${encodeURIComponent(siteName)}`,
+      `${proxyUrl}/api/v1/samba/sourcing-accounts/login-credential?${qs}`,
       { method: 'GET' }
     )
-    if (!res.ok) return null  // 404면 라디오 미지정 — 기존 chrome.debugger 폴백
+    if (!res.ok) return null  // 404면 미지정/미존재
     return await res.json()
   } catch (e) {
     console.log(`[자동로그인] 자격증명 조회 실패 (무시): ${e.message}`)
@@ -196,9 +199,10 @@ async function _spaDirectLogin(siteKey, username, password) {
               btnId: '#login',
             },
             ssg: {
-              id: ['#userId', 'input[name="userId"]', 'input[name="usrId"]', 'input[type="email"]'],
-              pw: ['input[type="password"]'],
-              btnId: '#btn_login, .btn_login, button[type="submit"]',
+              // member.ssg.com 실측(2026-05-15): id="inp_id" name="mbrLoginId" / pw id="inp_pw" / 버튼 id="loginBtn"
+              id: ['#inp_id', 'input[name="mbrLoginId"]', '#userId', 'input[name="userId"]', 'input[name="usrId"]', 'input[type="email"]'],
+              pw: ['#inp_pw', 'input[type="password"]'],
+              btnId: '#loginBtn, #btn_login, .btn_login, button[type="submit"]',
             },
           }
           const sel = SELECTORS[siteKeyArg]
@@ -366,23 +370,26 @@ async function _spaDirectLogin(siteKey, username, password) {
 const _ensureLoggedInInflight = new Map()  // siteKey → Promise<boolean>
 
 // 진입점 — 외부에서 자동로그인을 트리거할 때 호출 (3회 재시도)
-function ensureLoggedIn(siteKey) {
-  // 동기적 in-flight 체크 — async 함수 진입 시점의 첫 await 이전에 처리해야 race 차단 가능
-  if (_ensureLoggedInInflight.has(siteKey)) {
-    return _ensureLoggedInInflight.get(siteKey)
+// opts.accountId — 주문 매칭 계정으로 강제 로그인 (송장 수집 등 계정별 격리 필요시)
+function ensureLoggedIn(siteKey, opts) {
+  const accountId = (opts && opts.accountId) || ''
+  // accountId별 inflight key — 같은 사이트라도 계정별로는 독립 처리
+  const inflightKey = accountId ? `${siteKey}::${accountId}` : siteKey
+  if (_ensureLoggedInInflight.has(inflightKey)) {
+    return _ensureLoggedInInflight.get(inflightKey)
   }
   const p = (async () => {
     try {
-      return await _ensureLoggedInImpl(siteKey)
+      return await _ensureLoggedInImpl(siteKey, accountId)
     } finally {
-      _ensureLoggedInInflight.delete(siteKey)
+      _ensureLoggedInInflight.delete(inflightKey)
     }
   })()
-  _ensureLoggedInInflight.set(siteKey, p)
+  _ensureLoggedInInflight.set(inflightKey, p)
   return p
 }
 
-async function _ensureLoggedInImpl(siteKey) {
+async function _ensureLoggedInImpl(siteKey, accountId) {
   const site = AUTO_LOGIN_SITES[siteKey]
   if (!site) {
     console.log(`[자동로그인] 미지원 사이트: ${siteKey}`)
@@ -390,25 +397,32 @@ async function _ensureLoggedInImpl(siteKey) {
   }
 
   // 오토튠 비활성 상태면 자동로그인 차단 (사용자가 작업 취소했는데 계속 시도되는 것 방지)
-  // 백엔드 status API의 running 필드 기준 — 5초 캐시
-  const autotuneActive = await _isAutotuneActive()
-  if (autotuneActive === false) {
-    console.log(`[자동로그인] ${site.name} 트리거 차단 — 오토튠 비활성 상태`)
-    return false
+  // 단, accountId 명시(송장 자동수집 등 명시적 사용자 트리거)는 오토튠 게이트 우회 — 별도 기능.
+  if (!accountId) {
+    const autotuneActive = await _isAutotuneActive()
+    if (autotuneActive === false) {
+      console.log(`[자동로그인] ${site.name} 트리거 차단 — 오토튠 비활성 상태`)
+      return false
+    }
+  } else {
+    console.log(`[자동로그인] ${site.name} 오토튠 게이트 우회 — accountId 명시 트리거`)
   }
 
   // 중복 호출 차단 — 이미 진행 중이면 즉시 false (in-flight Map과 별개로 cooldown/실패카운트용)
-  if (autoLoginState.inProgress[siteKey]) {
+  // accountId 명시(송장 자동수집)는 inflight Map(_ensureLoggedInInflight)으로 이미 격리되므로 우회.
+  if (!accountId && autoLoginState.inProgress[siteKey]) {
     console.log(`[자동로그인] ${site.name} 이미 진행 중 — 무시`)
     return false
   }
 
-  // 쿨다운 체크 — 실패 누적 후 일정 시간 차단
-  const cooldownUntil = autoLoginState.cooldownUntil[siteKey] || 0
-  if (Date.now() < cooldownUntil) {
-    const remainSec = Math.ceil((cooldownUntil - Date.now()) / 1000)
-    console.log(`[자동로그인] ${site.name} 쿨다운 중 (${remainSec}초 남음) — 무시`)
-    return false
+  // 쿨다운 체크 — 실패 누적 후 일정 시간 차단. accountId 명시 트리거는 쿨다운 무시.
+  if (!accountId) {
+    const cooldownUntil = autoLoginState.cooldownUntil[siteKey] || 0
+    if (Date.now() < cooldownUntil) {
+      const remainSec = Math.ceil((cooldownUntil - Date.now()) / 1000)
+      console.log(`[자동로그인] ${site.name} 쿨다운 중 (${remainSec}초 남음) — 무시`)
+      return false
+    }
   }
 
   autoLoginState.inProgress[siteKey] = true
@@ -425,7 +439,7 @@ async function _ensureLoggedInImpl(siteKey) {
     let ok = false
     for (let attempt = 1; attempt <= AUTO_LOGIN_MAX_RETRIES; attempt++) {
       console.log(`[자동로그인] ${site.name} 시도 (${attempt}/${AUTO_LOGIN_MAX_RETRIES})`)
-      ok = await _ensureLoggedInSingle(siteKey)
+      ok = await _ensureLoggedInSingle(siteKey, accountId)
       if (ok) break
       if (attempt < AUTO_LOGIN_MAX_RETRIES) {
         await wait(3000)
@@ -474,7 +488,7 @@ async function _ensureLoggedInImpl(siteKey) {
 }
 
 // 단일 사이트 로그인 시도
-async function _ensureLoggedInSingle(siteKey) {
+async function _ensureLoggedInSingle(siteKey, accountId) {
   const site = AUTO_LOGIN_SITES[siteKey]
   if (!site) return false
 
@@ -483,31 +497,36 @@ async function _ensureLoggedInSingle(siteKey) {
   // 백엔드 자격증명 없으면 즉시 실패. chrome.debugger triple-click 폴백 제거 (드롭다운 노출 방지).
   const SPA_DIRECT_LOGIN_SITES = ['lotteon', 'abcmart', 'ssg']
   if (SPA_DIRECT_LOGIN_SITES.includes(siteKey)) {
-    // 먼저 로그인 상태 확인 — 이미 로그인 상태면 경고창 없이 즉시 반환
-    let alreadyLoggedIn = false
-    let spaCheckTabId = null
-    try {
-      const checkTab = await chrome.tabs.create({ url: site.checkUrl, active: false })
-      spaCheckTabId = checkTab.id
-      try { await waitForTabLoad(spaCheckTabId, 20000) } catch {}
-      await wait(1500)
-      const checkTabInfo = await chrome.tabs.get(spaCheckTabId)
-      alreadyLoggedIn = !site.isLoginPage(checkTabInfo.url || '')
-      try { await chrome.tabs.remove(spaCheckTabId) } catch {}
-      spaCheckTabId = null
-    } catch (e) {
-      console.log(`[자동로그인] ${site.name} 사전 로그인 체크 실패 (무시): ${e.message}`)
-      if (spaCheckTabId) try { await chrome.tabs.remove(spaCheckTabId) } catch {}
+    // accountId 지정 시 — 현재 세션이 어떤 계정인지 확인 불가하므로 pre-check 스킵하고 강제 로그인.
+    // (잘못된 계정으로 이미 로그인된 상태일 수 있음 → 무조건 지정 계정으로 새 세션 만든다)
+    if (!accountId) {
+      // 라디오 기본 계정 모드 — 이미 로그인 상태면 즉시 반환 (기존 동작 유지)
+      let alreadyLoggedIn = false
+      let spaCheckTabId = null
+      try {
+        const checkTab = await chrome.tabs.create({ url: site.checkUrl, active: false })
+        spaCheckTabId = checkTab.id
+        try { await waitForTabLoad(spaCheckTabId, 20000) } catch {}
+        await wait(1500)
+        const checkTabInfo = await chrome.tabs.get(spaCheckTabId)
+        alreadyLoggedIn = !site.isLoginPage(checkTabInfo.url || '')
+        try { await chrome.tabs.remove(spaCheckTabId) } catch {}
+        spaCheckTabId = null
+      } catch (e) {
+        console.log(`[자동로그인] ${site.name} 사전 로그인 체크 실패 (무시): ${e.message}`)
+        if (spaCheckTabId) try { await chrome.tabs.remove(spaCheckTabId) } catch {}
+      }
+
+      if (alreadyLoggedIn) {
+        console.log(`[자동로그인] ${site.name} 이미 로그인됨 — 자동로그인 스킵`)
+        return true
+      }
     }
 
-    if (alreadyLoggedIn) {
-      console.log(`[자동로그인] ${site.name} 이미 로그인됨 — 자동로그인 스킵`)
-      return true
-    }
-
-    const credential = await _fetchLoginCredential(siteKey)
+    const credential = await _fetchLoginCredential(siteKey, accountId)
     if (credential?.username && credential?.password) {
-      console.log(`[자동로그인] ${site.name} 백엔드 자격증명 사용 (${credential.account_label}) — SPA 직접 로그인 시도`)
+      const tag = accountId ? `주문매칭:${credential.account_label}` : `라디오:${credential.account_label}`
+      console.log(`[자동로그인] ${site.name} 백엔드 자격증명 사용 (${tag}) — SPA 직접 로그인 시도`)
       return await _spaDirectLogin(siteKey, credential.username, credential.password)
     }
     // 폴백 없이 즉시 중단 — 사용자가 설정 페이지에서 라디오 지정 필요

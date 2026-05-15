@@ -109,6 +109,19 @@ class BackendSettings(BaseSettings):
     collect_proxy_url: str = ""
 
     # ===========================================
+    # eBay 통합 설정
+    # ===========================================
+    ebay_deletion_notification_url: str = ""
+    """eBay 마켓플레이스 계정 삭제 알림 endpoint 전체 URL.
+       Developer Portal에 등록한 URL과 100% 동일해야 SHA-256 challenge 검증 통과.
+       환경별로 다르므로 코드 기본값은 빈 문자열 — VM의 .env로 주입."""
+
+    ebay_verification_token: str = ""
+    """eBay endpoint 검증용 token (32자 이상).
+       Developer Portal에 등록한 값과 동일해야 challenge 응답이 일치.
+       시크릿이므로 코드/PR에 노출 금지 — VM의 .env로만 주입."""
+
+    # ===========================================
     # ESMPlus 호스팅 인증정보 (셀링툴업체 고정값)
     # ===========================================
     esmplus_hosting_id: str = ""

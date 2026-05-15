@@ -9,6 +9,13 @@
 ;(() => {
   'use strict'
 
+  function isOrderCancelled() {
+    try {
+      const text = (document.body?.innerText || '').slice(0, 8000)
+      return /(취소완료|취소처리완료|구매취소완료|주문이\s*취소|취소된\s*주문)/.test(text)
+    } catch { return false }
+  }
+
   async function waitFor(selector, timeoutMs = 12000) {
     const start = Date.now()
     while (Date.now() - start < timeoutMs) {
@@ -41,6 +48,9 @@
   }
 
   async function scrape() {
+    if (isOrderCancelled()) {
+      return { success: false, cancelled: true, error: 'order_cancelled' }
+    }
     await waitFor('.lineBox2, h3', 10000)
     await new Promise(r => setTimeout(r, 800))
 

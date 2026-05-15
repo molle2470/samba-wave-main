@@ -113,7 +113,7 @@ export interface OrderDashboardStats {
   thisMonth: { count: number; sales: number; fulfillmentSales: number; fulfillmentCount: number; fulfillment: number }
   lastMonth: { count: number; sales: number; fulfillmentSales: number; fulfillmentCount: number; fulfillment: number }
   salesChange: number
-  weekly: { date: string; sales: number; count: number; fulfillmentSales: number; fulfillmentCount: number; newRegistered: number; marketDeleted: number; registeredCount: number }[]
+  weekly: { date: string; sales: number; count: number; fulfillmentSales: number; fulfillmentCount: number; newRegistered: number; marketDeleted: number; registeredCount: number; collectedCount: number }[]
   monthly: { month: number; sales: number; fulfillmentSales: number }[]
   marketRegisteredCount: number
 }
@@ -137,6 +137,7 @@ export interface SambaOrder {
   coupang_display_name?: string;
   source_url?: string;
   source_site?: string;
+  sales_channel_alias?: string;
   collected_product_id?: string;
   customer_name?: string;
   orderer_name?: string;
@@ -205,6 +206,7 @@ export const orderApi = {
     market_status?: string
     status_filter?: string
     input_filter?: string
+    invoice_filter?: string
     registration_filter?: string
     search_text?: string
     search_category?: string
@@ -221,6 +223,7 @@ export const orderApi = {
       market_status: params.market_status ?? '',
       status_filter: params.status_filter ?? '',
       input_filter: params.input_filter ?? '',
+      invoice_filter: params.invoice_filter ?? '',
       registration_filter: params.registration_filter ?? '',
       search_text: params.search_text ?? '',
       search_category: params.search_category ?? 'customer',
@@ -240,6 +243,7 @@ export const orderApi = {
     market_status?: string
     status_filter?: string
     input_filter?: string
+    invoice_filter?: string
     registration_filter?: string
     search_text?: string
     search_category?: string
@@ -255,6 +259,7 @@ export const orderApi = {
       market_status: params.market_status ?? '',
       status_filter: params.status_filter ?? '',
       input_filter: params.input_filter ?? '',
+      invoice_filter: params.invoice_filter ?? '',
       registration_filter: params.registration_filter ?? '',
       search_text: params.search_text ?? '',
       search_category: params.search_category ?? 'customer',
@@ -319,14 +324,19 @@ export const orderApi = {
       `${SAMBA_PREFIX}/orders/${orderId}/sync-tracking?force=${force}`,
       { method: 'POST' },
     ),
-  syncTrackingBulk: (limit = 50) =>
+  syncTrackingBulk: (limit = 500, days = 7, force = false) =>
     request<{ success: boolean; queued: number; skipped: number; errors: string[] }>(
-      `${SAMBA_PREFIX}/orders/sync-tracking/bulk?limit=${limit}`,
+      `${SAMBA_PREFIX}/orders/sync-tracking/bulk?limit=${limit}&days=${days}&force=${force}`,
       { method: 'POST' },
     ),
-  dispatchTrackingToMarket: (jobId: string, dryRun = true) =>
+  dispatchTrackingToMarket: (jobId: string, dryRun = false) =>
     request<{ success: boolean; dryRun?: boolean; channel?: string; courier?: string; tracking?: string; error?: string }>(
       `${SAMBA_PREFIX}/orders/tracking-sync/${jobId}/dispatch?dry_run=${dryRun}`,
+      { method: 'POST' },
+    ),
+  dispatchTrackingBulk: (dryRun = false) =>
+    request<{ success: boolean; total: number; sent: number; failed: number; errors: string[] }>(
+      `${SAMBA_PREFIX}/orders/tracking-sync/dispatch/bulk?dry_run=${dryRun}`,
       { method: 'POST' },
     ),
   listRecentTrackingSyncJobs: (limit = 50) =>
@@ -335,8 +345,12 @@ export const orderApi = {
       recent: Array<{
         id: string
         orderId: string
+        orderNumber: string
+        customerName: string
+        channelName: string
         site: string
         sourcingOrderNumber: string
+        sourcingAccountLabel: string
         status: string
         courier?: string | null
         tracking?: string | null
@@ -673,7 +687,7 @@ export const collectorApi = {
       body: JSON.stringify({ ids }),
     }),
   lookupByMarketNo: (marketProductNo: string) =>
-    request<{ found: boolean; id?: string; source_site?: string; site_product_id?: string; original_link?: string; product_image?: string }>(
+    request<{ found: boolean; id?: string; source_site?: string; site_product_id?: string; name?: string; original_link?: string; product_image?: string; market_product_nos?: Record<string, string | number | { originProductNo?: string | number }> }>(
       `${SAMBA_PREFIX}/collector/products/lookup-by-market-no/${marketProductNo}`),
   scrollProducts: (params: {
     skip?: number; limit?: number; search?: string; search_type?: string;
@@ -1074,6 +1088,124 @@ export const shipmentApi = {
         failed?: { product_id: string; error: string }[]
       }[]
     }>(`${SAMBA_PREFIX}/shipments/elevenst/cleanup-missing-prdno?${params.toString()}`, {
+      method: 'POST',
+      body: JSON.stringify({ product_ids: productIds && productIds.length > 0 ? productIds : null }),
+    })
+  },
+
+  // 쿠팡 유령삭제 양방향 (list_seller_products 기반 — orphan 삭제 + stale DB 정리)
+  cleanupCoupangOrphans: (dryRun = true, maxDelete = 50, accountId?: string, productIds?: string[], full = false) => {
+    const params = new URLSearchParams()
+    params.set('dry_run', String(dryRun))
+    params.set('max_delete', String(maxDelete))
+    if (accountId) params.set('account_id', accountId)
+    if (full) params.set('full', 'true')
+    return request<{
+      ok: boolean
+      dry_run: boolean
+      total_market: number
+      total_orphans: number
+      total_stale_db: number
+      total_deleted: number
+      total_stale_cleared: number
+      max_delete: number
+      accounts: {
+        account_id: string
+        label?: string
+        error?: string
+        market_count?: number
+        orphan_count?: number
+        orphans?: { spid: string; name: string; status_name: string }[]
+        stale_db_count?: number
+        stale_db?: { db_id: string; style_code: string; mapped_spid: string; product_name: string }[]
+        stale_cleared?: string[]
+        deleted?: string[]
+        failed?: { spid: string; error: string }[]
+      }[]
+    }>(`${SAMBA_PREFIX}/shipments/coupang/cleanup-orphans?${params.toString()}`, {
+      method: 'POST',
+      body: JSON.stringify({ product_ids: productIds && productIds.length > 0 ? productIds : null }),
+    })
+  },
+
+  // 쿠팡 단건 stale 정리 (DB만, 빠름)
+  clearCoupangStaleMapping: (accountId: string, dbId: string) =>
+    request<{ ok: boolean; cleared?: boolean; error?: string }>(
+      `${SAMBA_PREFIX}/shipments/coupang/clear-stale-mapping`,
+      { method: 'POST', body: JSON.stringify({ account_id: accountId, db_id: dbId }) },
+    ),
+
+  // 쿠팡 단건 orphan 삭제 (dispatcher 위임 — stop-then-delete 우회 포함)
+  deleteCoupangOrphan: (accountId: string, spid: string) =>
+    request<{ ok: boolean; error?: string; message?: string; ghost_cleanup?: boolean }>(
+      `${SAMBA_PREFIX}/shipments/coupang/delete-orphan`,
+      { method: 'POST', body: JSON.stringify({ account_id: accountId, spid }) },
+    ),
+
+  // 11번가 유령삭제 양방향 v2 (list_seller_products 기반)
+  cleanupElevenstOrphansV2: (dryRun = true, maxDelete = 50, accountId?: string, productIds?: string[]) => {
+    const params = new URLSearchParams()
+    params.set('dry_run', String(dryRun))
+    params.set('max_delete', String(maxDelete))
+    if (accountId) params.set('account_id', accountId)
+    return request<{
+      ok: boolean
+      dry_run: boolean
+      total_market: number
+      total_orphans: number
+      total_stale_db: number
+      total_deleted: number
+      total_stale_cleared: number
+      max_delete: number
+      accounts: {
+        account_id: string
+        label?: string
+        error?: string
+        market_count?: number
+        orphan_count?: number
+        orphans?: { prd_no: string; name: string; seller_code: string }[]
+        stale_db_count?: number
+        stale_db?: { db_id: string; style_code: string; mapped_prdno: string; product_name: string }[]
+        stale_cleared?: string[]
+        deleted?: string[]
+        failed?: { prd_no: string; error: string }[]
+        recovered_via_seller_code?: number
+      }[]
+    }>(`${SAMBA_PREFIX}/shipments/elevenst/cleanup-orphans-v2?${params.toString()}`, {
+      method: 'POST',
+      body: JSON.stringify({ product_ids: productIds && productIds.length > 0 ? productIds : null }),
+    })
+  },
+
+  // 롯데ON 유령삭제 양방향
+  cleanupLotteonOrphans: (dryRun = true, maxDelete = 50, accountId?: string, productIds?: string[]) => {
+    const params = new URLSearchParams()
+    params.set('dry_run', String(dryRun))
+    params.set('max_delete', String(maxDelete))
+    if (accountId) params.set('account_id', accountId)
+    return request<{
+      ok: boolean
+      dry_run: boolean
+      total_market: number
+      total_orphans: number
+      total_stale_db: number
+      total_deleted: number
+      total_stale_cleared: number
+      max_delete: number
+      accounts: {
+        account_id: string
+        label?: string
+        error?: string
+        market_count?: number
+        orphan_count?: number
+        orphans?: { spd_no: string; name: string; sl_stat_cd: string }[]
+        stale_db_count?: number
+        stale_db?: { db_id: string; style_code: string; mapped_spd: string; product_name: string }[]
+        stale_cleared?: string[]
+        deleted?: string[]
+        failed?: { spd_no: string; error: string }[]
+      }[]
+    }>(`${SAMBA_PREFIX}/shipments/lotteon/cleanup-orphans?${params.toString()}`, {
       method: 'POST',
       body: JSON.stringify({ product_ids: productIds && productIds.length > 0 ? productIds : null }),
     })

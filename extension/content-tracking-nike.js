@@ -28,6 +28,13 @@
     'ilogen.com': 'slipno',
   }
 
+  function isOrderCancelled() {
+    try {
+      const text = (document.body?.innerText || '').slice(0, 8000)
+      return /(취소완료|취소처리완료|구매취소완료|주문이\s*취소|취소된\s*주문|Cancell?ed)/i.test(text)
+    } catch { return false }
+  }
+
   async function waitFor(selector, timeoutMs = 12000) {
     const start = Date.now()
     while (Date.now() - start < timeoutMs) {
@@ -44,6 +51,9 @@
   }
 
   async function scrape() {
+    if (isOrderCancelled()) {
+      return { success: false, cancelled: true, error: 'order_cancelled' }
+    }
     const link = await waitFor('a[href]', 12000)
     if (!link) {
       return { success: false, error: 'no_tracking: 배송조회 링크 없음 (미발송)' }

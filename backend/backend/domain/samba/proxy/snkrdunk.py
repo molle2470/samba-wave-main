@@ -36,6 +36,11 @@ BRAND_TRADING_CARDS_URL_RE = re.compile(
     r"https?://snkrdunk\.com/en/brands/([^/?]+)/trading-cards(?:\?[^#]*?categoryId=(\d+))?",
     re.IGNORECASE,
 )
+# 전역 트레이딩카드 리스트 URL 패턴: https://snkrdunk.com/en/trading-cards?type=hottest&slide=right
+GLOBAL_TRADING_CARDS_URL_RE = re.compile(
+    r"https?://snkrdunk\.com/en/trading-cards(?:\?|$)",
+    re.IGNORECASE,
+)
 
 HEADERS = {
     "User-Agent": (
@@ -145,6 +150,11 @@ class SnkrdunkClient:
                 category_id=category_id,
                 max_count=max(max_count, 10000),
             )
+        # 전역 트레이딩카드 리스트 URL (예: /en/trading-cards?type=hottest&slide=right)
+        if GLOBAL_TRADING_CARDS_URL_RE.search(keyword or ""):
+            return await self.collect_listing_cards(
+                url=keyword, max_count=max(max_count, 1000)
+            )
         products: list[dict[str, Any]] = []
         total = 0
         async with httpx.AsyncClient(
@@ -201,6 +211,9 @@ class SnkrdunkClient:
             thumb = it.get("thumbnailUrl") or ""
             min_price = it.get("minPrice")
             sale_price = int(min_price) if isinstance(min_price, (int, float)) else 0
+            # 입찰자 없는 0원(또는 가격 미존재) 상품은 수집 제외
+            if sale_price <= 0:
+                continue
             results.append(
                 {
                     "site_product_id": sid,
@@ -296,21 +309,103 @@ class SnkrdunkClient:
         products = products[:max_count]
         return {"products": products, "total": len(products)}
 
+    async def collect_listing_cards(
+        self,
+        url: str,
+        per_page: int = 100,
+        max_count: int = 1000,
+        sleep_between_pages: float = 0.5,
+    ) -> dict[str, Any]:
+        """전역 트레이딩카드 리스트 URL 페이지네이션 수집.
+
+        예: `/en/trading-cards?type=hottest&slide=right`
+        URL의 쿼리스트링(type/slide/brandId/categoryId 등)을 그대로
+        `/en/v1/trading-cards` API에 전달.
+        """
+        import asyncio
+        from urllib.parse import urlparse, parse_qs
+
+        per_page = max(1, min(int(per_page or 100), 100))
+        # URL 쿼리스트링 → API 파라미터로 그대로 전달
+        base_params: dict[str, Any] = {}
+        try:
+            qs = parse_qs(urlparse(url or "").query)
+            for k, v in qs.items():
+                if not v:
+                    continue
+                # 페이지/사이즈는 우리가 관리
+                if k in ("perPage", "page"):
+                    continue
+                base_params[k] = v[0]
+        except Exception as exc:
+            logger.warning(f"[SNKRDUNK] 리스트 URL 파싱 실패: {exc}")
+
+        products: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        async with httpx.AsyncClient(
+            headers=HEADERS, timeout=self._timeout, follow_redirects=True
+        ) as client:
+            page = 1
+            while len(products) < max_count:
+                params: dict[str, Any] = {
+                    **base_params,
+                    "perPage": per_page,
+                    "page": page,
+                }
+                try:
+                    r = await client.get(TRADING_CARDS_URL, params=params)
+                    r.raise_for_status()
+                    data = r.json()
+                except Exception as e:
+                    logger.warning(
+                        f"[SNKRDUNK] 리스트 수집 실패 params={base_params} page={page}: {e}"
+                    )
+                    break
+                items = data.get("tradingCards") or []
+                if not items:
+                    break
+                page_items = self._parse_card_items(items)
+                new_items = [p for p in page_items if p["site_product_id"] not in seen]
+                seen.update(p["site_product_id"] for p in new_items)
+                products.extend(new_items)
+                logger.info(
+                    f"[SNKRDUNK] 리스트 수집 params={base_params} p{page} "
+                    f"+{len(new_items)}건 (누적 {len(products)})"
+                )
+                if len(items) < per_page:
+                    break
+                page += 1
+                if sleep_between_pages:
+                    await asyncio.sleep(sleep_between_pages)
+
+        products = products[:max_count]
+        return {"products": products, "total": len(products)}
+
     @staticmethod
     def _parse_card_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """tradingCards 응답 배열 → 정규화."""
+        """tradingCards 응답 배열 → 정규화.
+
+        입찰 0건(listingCount=0) 또는 가격 미존재 카드는 수집 제외.
+        """
         results: list[dict[str, Any]] = []
         for it in items:
             sid = str(it.get("id", "")).strip()
             if not sid:
                 continue
-            thumb = it.get("thumbnailUrl") or ""
+            # 입찰자 수 확인
+            try:
+                listing_count_int = int(str(it.get("listingCount", "0") or "0"))
+            except Exception:
+                listing_count_int = 0
             min_price = it.get("minPrice")
             sale_price = int(min_price) if isinstance(min_price, (int, float)) else 0
+            # 입찰 0건 또는 가격 0원은 등록 가치 없음 → 수집 제외
+            if listing_count_int <= 0 or sale_price <= 0:
+                continue
+
+            thumb = it.get("thumbnailUrl") or ""
             url = _detail_url(sid, "trading-card")
-            listing_count = str(it.get("listingCount", "0"))
-            # 매물 0이면 품절 처리
-            sale_status = "in_stock" if listing_count not in ("", "0") else "sold_out"
+            listing_count = str(listing_count_int)
             results.append(
                 {
                     "site_product_id": sid,
@@ -328,12 +423,10 @@ class SnkrdunkClient:
                     "color": "",
                     "url": url,
                     "video_url": url,
-                    "options": [{"name": "기본", "price": sale_price, "stock": 1}]
-                    if sale_status == "in_stock"
-                    else [],
+                    "options": [{"name": "기본", "price": sale_price, "stock": 1}],
                     "detail_html": "",
                     "free_shipping": False,
-                    "sale_status": sale_status,
+                    "sale_status": "in_stock",
                     "extra_data": {
                         "snkr_type": "trading-card",
                         "currency": TARGET_CURRENCY,

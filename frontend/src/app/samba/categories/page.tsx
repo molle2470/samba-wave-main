@@ -21,6 +21,9 @@ import {
 } from './styles'
 import { buildCategoryTree, getCatList } from './categoryTree'
 
+// 카테고리 동기화 제외 마켓 (롯데홈쇼핑·플레이오토는 동기화 대상에서 제외)
+const SYNC_EXCLUDED_MARKETS = new Set(['lottehome', 'playauto'])
+
 export default function CategoriesPage() {
   useEffect(() => { document.title = 'SAMBA-카테고리' }, [])
   const router = useRouter()
@@ -2007,7 +2010,7 @@ export default function CategoriesPage() {
               <button
                 onClick={() => {
                   const all: Record<string, boolean> = {}
-                  MARKETS.filter(m => !m.categoryOnly).forEach(m => { all[m.id] = true })
+                  MARKETS.filter(m => !m.categoryOnly && !SYNC_EXCLUDED_MARKETS.has(m.id)).forEach(m => { all[m.id] = true })
                   setSyncSelected(all)
                 }}
                 style={{ fontSize: '0.75rem', padding: '0.25rem 0.5rem', background: 'transparent', border: '1px solid #3D3D3D', borderRadius: '4px', color: '#888', cursor: 'pointer' }}
@@ -2019,7 +2022,7 @@ export default function CategoriesPage() {
             </div>
 
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.5rem', marginBottom: '1.25rem' }}>
-              {Object.entries(MARKET_LABELS).filter(([mk]) => !MARKETS.find(m => m.id === mk)?.categoryOnly).map(([mk, label]) => (
+              {Object.entries(MARKET_LABELS).filter(([mk]) => !MARKETS.find(m => m.id === mk)?.categoryOnly && !SYNC_EXCLUDED_MARKETS.has(mk)).map(([mk, label]) => (
                 <label key={mk} style={{ display: 'flex', alignItems: 'center', gap: '0.375rem', cursor: 'pointer', padding: '0.375rem 0.5rem', background: syncSelected[mk] ? 'rgba(81,207,102,0.1)' : 'rgba(30,30,30,0.5)', border: `1px solid ${syncSelected[mk] ? 'rgba(81,207,102,0.3)' : '#2D2D2D'}`, borderRadius: '6px' }}>
                   <input
                     type="checkbox"

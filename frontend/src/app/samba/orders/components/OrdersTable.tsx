@@ -73,7 +73,7 @@ interface OrdersTableProps {
   handleDanawa: (productName: string) => void
   handleNaver: (productName: string) => void
   handleSourceLink: (o: SambaOrder) => void | Promise<void>
-  handleMarketLink: (o: SambaOrder) => void
+  handleMarketLink: (o: SambaOrder) => void | Promise<void>
   openUrlModal: (orderId: string) => void
   handleTracking: (order: SambaOrder) => void
   loadOrders: () => void | Promise<void>
@@ -243,7 +243,9 @@ export default function OrdersTable(props: OrdersTableProps) {
                       </select>
                       <input
                         type="text"
-                        placeholder="소싱주문번호"
+                        placeholder={o.sourcing_account_id ? "소싱주문번호" : "주문계정 먼저 선택"}
+                        disabled={!o.sourcing_account_id}
+                        title={!o.sourcing_account_id ? '주문계정을 먼저 선택하세요' : undefined}
                         value={editingOrderNumbers[o.id] ?? o.sourcing_order_number ?? ''}
                         onChange={e => setEditingOrderNumbers(prev => ({ ...prev, [o.id]: e.target.value }))}
                         onBlur={async (e) => {
@@ -261,7 +263,13 @@ export default function OrdersTable(props: OrdersTableProps) {
                             ;(e.target as HTMLInputElement).blur()
                           }
                         }}
-                        style={{ ...inputStyle, flex: 1, fontSize: '0.75rem' }}
+                        style={{
+                          ...inputStyle,
+                          flex: 1,
+                          fontSize: '0.75rem',
+                          opacity: o.sourcing_account_id ? 1 : 0.5,
+                          cursor: o.sourcing_account_id ? 'text' : 'not-allowed',
+                        }}
                       />
                     </div>
 
@@ -291,13 +299,14 @@ export default function OrdersTable(props: OrdersTableProps) {
                             </optgroup>
                           ))
                         })()}
+                        <option value="etc">기타</option>
                       </select>
                       <div style={{
                         flex: 1, padding: '0.25rem 0.375rem',
                         background: 'rgba(30,30,30,0.6)', border: '1px solid #2D2D2D', borderRadius: '6px',
                         display: 'flex', alignItems: 'center', justifyContent: 'center',
                       }}>
-                        <span style={{ fontSize: '0.75rem', color: '#4C9AFF', fontWeight: 600 }}>{STATUS_MAP[o.shipping_status]?.label || o.shipping_status || '-'}</span>
+                        <span style={{ fontSize: '0.75rem', color: '#4C9AFF', fontWeight: 600 }}>{(o.shipping_status === '출고지시' || o.shipping_status === '출하지시') ? '주문접수' : o.shipping_status === '발송대기' ? '배송대기중' : o.shipping_status === '송장전송완료' ? '국내배송중' : (STATUS_MAP[o.shipping_status]?.label || o.shipping_status || '-')}</span>
                       </div>
                     </div>
 
@@ -422,6 +431,31 @@ export default function OrdersTable(props: OrdersTableProps) {
                         }}
                         onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
                       />
+                      <button
+                        onClick={async () => {
+                          const co = (document.getElementById(`ship-co-${o.id}`) as HTMLSelectElement)?.value || o.shipping_company || ''
+                          const tn = (editingTrackings[o.id] ?? o.tracking_number ?? '').trim()
+                          if (!co || !tn) {
+                            setLogMessages(prev => [...prev, `[${fmtTime()}] ${o.order_number} 택배사/송장번호 누락 — 전송 불가`])
+                            return
+                          }
+                          setLogMessages(prev => [...prev, `[${fmtTime()}] ${o.order_number} 마켓 전송 중... (${co} ${tn})`])
+                          try {
+                            const res = await orderApi.shipOrder(o.id, co, tn)
+                            setLogMessages(prev => [...prev, `[${fmtTime()}] ${o.order_number} ${res.message}`])
+                            if (!res.market_sent) {
+                              await orderApi.updateStatus(o.id, 'ship_failed').catch(() => {})
+                            }
+                            loadOrders()
+                          } catch (err) {
+                            await orderApi.updateStatus(o.id, 'ship_failed').catch(() => {})
+                            setLogMessages(prev => [...prev, `[${fmtTime()}] ${o.order_number} 마켓 전송 실패: ${(err as Error).message}`])
+                            loadOrders()
+                          }
+                        }}
+                        style={{ padding: '0.18rem 0.5rem', fontSize: '0.7rem', borderRadius: '4px', background: o.status === 'ship_failed' ? '#dc2626' : '#16a34a', color: '#fff', border: '1px solid #4b5563', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}
+                        title="택배사+송장번호를 마켓에 전송 (재전송 가능)"
+                      >{o.status === 'ship_failed' ? '재전송' : '마켓전송'}</button>
                     </div>
 
                     {/* 간단메모 */}

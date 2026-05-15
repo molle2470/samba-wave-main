@@ -14,6 +14,7 @@ from backend.db.orm import (
     get_read_session_dependency,
     get_write_session_dependency,
 )
+from backend.domain.samba.cache import cache
 from backend.domain.samba.tenant.middleware import get_optional_tenant_id
 from backend.domain.samba.order.model import SambaOrder
 from backend.domain.samba.order.playauto_alias import (
@@ -193,6 +194,9 @@ EXCLUDED_ORDER_STATUSES = (
     "exchange_done",
     "ship_failed",
     "undeliverable",
+    "shipping",
+    "delivered",
+    "confirmed",
 )
 PENDING_ORDER_STATUSES = (
     "pending",
@@ -202,6 +206,37 @@ PENDING_ORDER_STATUSES = (
     "ship_failed",
     "undeliverable",
 )
+
+# 취소요청 알람 — 마켓에서 취소 신호(shipping_status='취소요청'/'취소완료')가 들어왔지만
+# 우리 내부 status는 아직 처리/배송 단계라 발주·송장 등록 사고 위험이 있는 케이스.
+# UI 라벨 기준: 주문접수/상품준비중/배송대기중/사무실도착/국내배송중/송장전송실패/배송완료
+CANCEL_ALERT_SHIPPING_STATUSES = ("취소요청", "취소완료")
+CANCEL_ALERT_TARGET_STATUSES = (
+    "pending",
+    "preparing",
+    "wait_ship",
+    "arrived",
+    "shipping",
+    "ship_failed",
+    "delivered",
+)
+
+
+def _build_cancel_alert_clause():
+    """알람 카운트와 알람 필터에서 공통으로 쓰는 WHERE 조각.
+
+    조건: 마켓 shipping_status 가 '취소요청'/'취소완료' + 우리 내부 status는 아직 처리/배송 단계
+      → 발주·송장 등록 사고 위험. 운영자가 보고 막아야 할 미처리 케이스.
+
+    내부 status='cancel_requested'는 운영자가 이미 인지하고 드롭박스를 전환한 상태라
+    더 이상 발주/송장이 나가지 않으므로 알람 대상에서 제외.
+    """
+    from sqlalchemy import and_
+
+    return and_(
+        SambaOrder.shipping_status.in_(CANCEL_ALERT_SHIPPING_STATUSES),
+        SambaOrder.status.in_(CANCEL_ALERT_TARGET_STATUSES),
+    )
 
 
 def _build_action_tag_filter(action_tag: str):
@@ -273,6 +308,7 @@ async def _build_order_filters(
     market_status: str = "",
     status_filter: str = "",
     input_filter: str = "",
+    invoice_filter: str = "",
     registration_filter: str = "",
     search_text: str = "",
     search_category: str = "customer",
@@ -336,15 +372,19 @@ async def _build_order_filters(
     if account_filter:
         filters.append(SambaOrder.sourcing_account_id == account_filter)
     if market_status:
-        filters.append(SambaOrder.status == market_status)
+        filters.append(SambaOrder.shipping_status == market_status)
 
     if status_filter:
         if status_filter == "active":
             filters.append(SambaOrder.status.in_(ACTIVE_ORDER_STATUSES))
         elif status_filter == "cancel_return_excluded":
+            # status 컬럼만 기준 — shipping_status 는 일절 관여 금지
             filters.append(~SambaOrder.status.in_(EXCLUDED_ORDER_STATUSES))
         elif status_filter == "pending":
             filters.append(SambaOrder.status.in_(PENDING_ORDER_STATUSES))
+        elif status_filter == "cancel_alert":
+            # 알람 카운트와 동일한 조건 — 발주·송장 사고 위험 케이스
+            filters.append(_build_cancel_alert_clause())
         else:
             filters.append(SambaOrder.status == status_filter)
 
@@ -388,6 +428,22 @@ async def _build_order_filters(
         action_filter = _build_action_tag_filter(input_filter)
         if action_filter is not None:
             filters.append(action_filter)
+
+    # 송장필터 — 입력필터와 독립적으로 동작 (이중 선택 가능)
+    if invoice_filter == "has_invoice":
+        filters.append(
+            and_(
+                SambaOrder.tracking_number != None,  # noqa: E711
+                SambaOrder.tracking_number != "",
+            )
+        )
+    elif invoice_filter == "no_invoice":
+        filters.append(
+            or_(
+                SambaOrder.tracking_number == None,  # noqa: E711
+                SambaOrder.tracking_number == "",
+            )
+        )
 
     # 등록필터 — 입력필터와 독립적으로 동작 (이중 선택 가능)
     if registration_filter == "registered":
@@ -442,7 +498,13 @@ async def _build_order_filters(
                 )
             )
         else:
-            filters.append(SambaOrder.customer_name.ilike(lower_q, escape="\\"))
+            # 고객명(수령인) + 주문자명 모두 매칭 — 선물하기 등 수령인≠주문자 케이스 대응
+            filters.append(
+                or_(
+                    SambaOrder.customer_name.ilike(lower_q, escape="\\"),
+                    SambaOrder.orderer_name.ilike(lower_q, escape="\\"),
+                )
+            )
 
     return filters
 
@@ -543,6 +605,12 @@ async def dashboard_stats(
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ):
     """대시보드 집계 — DB에서 SUM/COUNT 후 결과만 반환 (빠름)."""
+    # 캐시 조회 (TTL 60초, tenant별 키)
+    _cache_key = f"order:dashboard-stats:{tenant_id or '_global'}"
+    _cached = await cache.get(_cache_key)
+    if _cached:
+        return _cached
+
     from sqlalchemy import select, func, case, and_, extract, text, or_
     from datetime import datetime, timedelta, timezone as tz
 
@@ -806,33 +874,14 @@ async def dashboard_stats(
     del_rows = (await session.execute(del_q)).all()
     del_map = {str(r.day): int(r.cnt) for r in del_rows}
 
-    # 일별 누적 등록상품수: 해당일 24시(KST) 시점에 마켓 1개라도 등록 상태였던 상품 수
-    # 조건: first_market_registered_at <= day_end_kst
-    #       AND (fully_unregistered_at IS NULL OR fully_unregistered_at > day_end_kst)
-    # 저장 컬럼은 UTC naive — KST day_end에서 9시간을 빼 UTC 비교 시각 산출
-    reg_count_map: dict[str, int] = {}
+    # 일별 누적 등록상품수: "지금 마켓에 1개 이상 등록된 상품수" 정의로 통일
+    #   - 오늘(today_str): 실시간 build_market_registered_conditions 계산값
+    #   - 과거 6일: samba_daily_registered_snapshot 테이블의 그날 0시 스냅샷
+    #   - 스냅샷이 없는 과거일은 오늘값에서 역산: count(d) = count(d+1) - newReg(d+1) + delete(d+1)
+    from backend.domain.samba.collector.model import SambaDailyRegisteredSnapshot
+
     today_str = (week_ago + timedelta(days=6)).strftime("%Y-%m-%d")
-    for i in range(6):  # 오늘은 별도 처리 (현재 marketRegisteredCount 사용)
-        d_kst = week_ago + timedelta(days=i)
-        day_end_utc = d_kst + timedelta(days=1, hours=-9)
-        reg_cnt_q = select(func.count(SambaCollectedProduct.id)).where(
-            SambaCollectedProduct.first_market_registered_at != None,  # noqa: E711
-            SambaCollectedProduct.first_market_registered_at < day_end_utc,
-            or_(
-                SambaCollectedProduct.fully_unregistered_at == None,  # noqa: E711
-                SambaCollectedProduct.fully_unregistered_at >= day_end_utc,
-            ),
-        )
-        if tenant_id is not None:
-            reg_cnt_q = reg_cnt_q.where(
-                or_(
-                    SambaCollectedProduct.tenant_id == tenant_id,
-                    SambaCollectedProduct.tenant_id == None,  # noqa: E711
-                )
-            )
-        reg_count_map[d_kst.strftime("%Y-%m-%d")] = (
-            await session.execute(reg_cnt_q)
-        ).scalar() or 0
+    reg_count_map: dict[str, int] = {}
 
     # 마켓 1개 이상 등록된 상품수 (현재 시점) — KPI + 오늘 행에 사용
     market_registered_q = select(func.count(SambaCollectedProduct.id)).where(
@@ -848,10 +897,84 @@ async def dashboard_stats(
     market_registered_count = (await session.execute(market_registered_q)).scalar() or 0
     reg_count_map[today_str] = int(market_registered_count)
 
+    # 과거 6일 스냅샷 일괄 조회
+    past_dates = [(week_ago + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6)]
+    snap_q = select(
+        SambaDailyRegisteredSnapshot.snapshot_date,
+        SambaDailyRegisteredSnapshot.registered_count,
+    ).where(SambaDailyRegisteredSnapshot.snapshot_date.in_(past_dates))
+    snap_rows = (await session.execute(snap_q)).all()
+    snap_map = {r.snapshot_date: int(r.registered_count) for r in snap_rows}
+
+    # 스냅샷 없는 과거일은 역산으로 채움 (최신일부터 역순)
+    #   d+1일의 등록상품수 = d일의 등록상품수 + (d+1일 신규등록) - (d+1일 마켓삭제)
+    #   => d일의 등록상품수 = d+1일의 등록상품수 - (d+1일 신규등록) + (d+1일 마켓삭제)
+    running = int(market_registered_count)
+    for i in range(5, -1, -1):
+        d_str = past_dates[i]
+        next_d_str = past_dates[i + 1] if i + 1 < 6 else today_str
+        # 다음날의 신규등록/마켓삭제 빼서 어제값 역산
+        running = (
+            running
+            - int(new_reg_map.get(next_d_str, 0))
+            + int(del_map.get(next_d_str, 0))
+        )
+        # 스냅샷이 있으면 그것을 우선 사용, 없으면 역산값 사용
+        if d_str in snap_map:
+            reg_count_map[d_str] = snap_map[d_str]
+            # 다음 역산 기준도 스냅샷값으로 동기화 (역산 오차 누적 방지)
+            running = snap_map[d_str]
+        else:
+            reg_count_map[d_str] = max(running, 0)
+
+    # 일별 누적 수집상품수: 전체 수집수 - (그날 이후 신규수집 합)
+    #   - 전체 수집수: samba_collected_product 전체 카운트
+    #   - 일별 신규수집: created_at KST 기준 일별 카운트
+    collected_total_q = select(func.count(SambaCollectedProduct.id))
+    if tenant_id is not None:
+        collected_total_q = collected_total_q.where(
+            or_(
+                SambaCollectedProduct.tenant_id == tenant_id,
+                SambaCollectedProduct.tenant_id == None,  # noqa: E711
+            )
+        )
+    collected_total = int((await session.execute(collected_total_q)).scalar() or 0)
+
+    created_date = SambaCollectedProduct.created_at + text("INTERVAL '9 hours'")
+    new_col_q = (
+        select(
+            func.date(created_date).label("day"),
+            func.count().label("cnt"),
+        )
+        .where(
+            SambaCollectedProduct.created_at != None,  # noqa: E711
+            created_date >= week_ago,
+        )
+        .group_by(func.date(created_date))
+    )
+    if tenant_id is not None:
+        new_col_q = new_col_q.where(
+            or_(
+                SambaCollectedProduct.tenant_id == tenant_id,
+                SambaCollectedProduct.tenant_id == None,  # noqa: E711
+            )
+        )
+    new_col_rows = (await session.execute(new_col_q)).all()
+    new_col_map = {str(r.day): int(r.cnt) for r in new_col_rows}
+
+    collected_count_map: dict[str, int] = {today_str: collected_total}
+    running_c = collected_total
+    for i in range(5, -1, -1):
+        d_str = past_dates[i]
+        next_d_str = past_dates[i + 1] if i + 1 < 6 else today_str
+        running_c = running_c - int(new_col_map.get(next_d_str, 0))
+        collected_count_map[d_str] = max(running_c, 0)
+
     for w in weekly:
         w["newRegistered"] = int(new_reg_map.get(w["date"], 0))
         w["marketDeleted"] = int(del_map.get(w["date"], 0))
         w["registeredCount"] = int(reg_count_map.get(w["date"], 0))
+        w["collectedCount"] = int(collected_count_map.get(w["date"], 0))
 
     tm_fulfillment_rate = (
         round(int(tm.fulfillment_count or 0) / int(tm.count) * 100) if tm.count else 0
@@ -865,7 +988,7 @@ async def dashboard_stats(
         else 0
     )
 
-    return {
+    result = {
         "thisMonth": {
             "count": int(tm.count),
             "sales": float(tm.sales),
@@ -885,6 +1008,8 @@ async def dashboard_stats(
         "monthly": monthly,
         "marketRegisteredCount": int(market_registered_count),
     }
+    await cache.set(_cache_key, result, ttl=60)
+    return result
 
 
 @router.get("/search", response_model=list[SambaOrder])
@@ -908,6 +1033,7 @@ async def list_orders_by_date_range_paged(
     market_status: str = Query(""),
     status_filter: str = Query(""),
     input_filter: str = Query(""),
+    invoice_filter: str = Query(""),
     registration_filter: str = Query(""),
     search_text: str = Query(""),
     search_category: str = Query("customer"),
@@ -927,6 +1053,7 @@ async def list_orders_by_date_range_paged(
         market_status=market_status,
         status_filter=status_filter,
         input_filter=input_filter,
+        invoice_filter=invoice_filter,
         registration_filter=registration_filter,
         search_text=search_text,
         search_category=search_category,
@@ -956,6 +1083,7 @@ async def list_orders_by_collected_product_paged(
     market_status: str = Query(""),
     status_filter: str = Query(""),
     input_filter: str = Query(""),
+    invoice_filter: str = Query(""),
     registration_filter: str = Query(""),
     search_text: str = Query(""),
     search_category: str = Query("customer"),
@@ -972,6 +1100,7 @@ async def list_orders_by_collected_product_paged(
         market_status=market_status,
         status_filter=status_filter,
         input_filter=input_filter,
+        invoice_filter=invoice_filter,
         registration_filter=registration_filter,
         search_text=search_text,
         search_category=search_category,
@@ -1159,17 +1288,32 @@ async def sync_order_tracking(order_id: str, force: bool = False) -> dict:
 
 @router.post("/sync-tracking/bulk")
 async def sync_order_tracking_bulk(
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(500, ge=1, le=1000),
+    days: int = Query(7, ge=1, le=90),
+    force: bool = Query(False),
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict:
-    """미발송 주문 일괄 송장 추출 큐잉."""
+    """미발송 주문 일괄 송장 추출 큐잉 — 최근 N일 + 소싱처 주문번호 있음 + 송장 미입력.
+
+    force=True 면 기존 PENDING/DISPATCHED 잡(만료 좀비 포함)을 FAILED 로 닫고 새로 큐잉.
+    """
     from backend.domain.samba.tracking_sync.service import enqueue_pending_orders
 
-    return await enqueue_pending_orders(tenant_id=tenant_id, limit=limit)
+    return await enqueue_pending_orders(
+        tenant_id=tenant_id, limit=limit, days=days, force=force
+    )
+
+
+@router.post("/tracking-sync/dispatch/bulk")
+async def dispatch_tracking_bulk(dry_run: bool = False) -> dict:
+    """SCRAPED + DISPATCH_FAILED 잡 전부 일괄 마켓 전송 (재시도 포함)."""
+    from backend.domain.samba.tracking_sync.service import dispatch_pending_to_market
+
+    return await dispatch_pending_to_market(dry_run=dry_run)
 
 
 @router.post("/tracking-sync/{job_id}/dispatch")
-async def dispatch_tracking_to_market(job_id: str, dry_run: bool = True) -> dict:
+async def dispatch_tracking_to_market(job_id: str, dry_run: bool = False) -> dict:
     """추출 완료된(SCRAPED) 잡의 운송장을 마켓으로 push.
 
     dry_run=True (기본): 페이로드만 로그. False면 실제 마켓 API 호출.
@@ -1187,30 +1331,111 @@ async def list_recent_tracking_sync_jobs(
     """최근 송장 자동전송 잡 목록 + 상태 카운트.
 
     프론트가 일괄 송장수집 후 폴링해서 진행상황 보여주는 용도.
+    SambaOrder (상품주문번호/고객명) + SambaSourcingAccount (소싱처 계정 라벨) LEFT JOIN.
     """
-    from sqlalchemy import select, func
+    from sqlalchemy import select
+    from sqlalchemy.orm import aliased
     from backend.db.orm import get_read_session
+    from backend.domain.samba.order.model import (
+        EXCLUDED_ORDER_STATUSES,
+        SHIPPED_SHIPPING_STATUS_KEYWORDS,
+        SambaOrder,
+    )
+    from backend.domain.samba.sourcing_account.model import SambaSourcingAccount
     from backend.domain.samba.tracking_sync.model import SambaTrackingSyncJob
 
-    async with get_read_session() as session:
-        # 카운트
-        count_stmt = select(SambaTrackingSyncJob.status, func.count()).group_by(
-            SambaTrackingSyncJob.status
-        )
-        if tenant_id:
-            count_stmt = count_stmt.where(SambaTrackingSyncJob.tenant_id == tenant_id)
-        rows = (await session.execute(count_stmt)).all()
-        counts = {status: int(cnt) for status, cnt in rows}
+    def _is_excluded(order_status, shipping_status) -> bool:
+        """페이지 필터 '취소/반품/교환 제외 + 배송중/배송완료 제외' 와 동일 기준."""
+        if order_status and order_status in EXCLUDED_ORDER_STATUSES:
+            return True
+        if shipping_status and any(
+            kw in shipping_status for kw in SHIPPED_SHIPPING_STATUS_KEYWORDS
+        ):
+            return True
+        return False
 
-        # 최근 N건 (가장 새로운 순)
-        recent_stmt = (
-            select(SambaTrackingSyncJob)
+    async with get_read_session() as session:
+        O = aliased(SambaOrder)
+        A = aliased(SambaSourcingAccount)
+        # 잡 + 주문 메타를 한 번에 가져와 Python에서 dedup → 카운트/리스트 일관 처리
+        # 큐잉 필터(enqueue_pending_orders)와 100% 동일 조건 적용:
+        #   2) sourcing_order_number 있음
+        #   3) source_site 있음
+        #   4) 최근 7일 (created_at >= now-7d)
+        #   7) action_tag 에 'kkadaegi' 토큰 없음
+        # 1/5/6 (송장 미입력 / 상태 제외 / 배송중·완료 제외) 은 Python loop 에서 처리.
+        from datetime import timedelta, timezone
+        from sqlalchemy import and_, func, not_, or_
+
+        # KST 캘린더 7일 (오늘 포함 -6일) + paid_at(폴백 created_at) 기준
+        _KST = timezone(timedelta(hours=9))
+        _today_kst = datetime.now(_KST).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        _since = (_today_kst - timedelta(days=6)).astimezone(timezone.utc)
+        _until = (_today_kst + timedelta(days=1)).astimezone(timezone.utc)
+        action_tag_expr = func.concat(",", func.coalesce(O.action_tag, ""), ",")
+        date_col = func.coalesce(O.paid_at, O.created_at)
+        base_stmt = (
+            select(
+                SambaTrackingSyncJob,
+                O.order_number,
+                O.customer_name,
+                O.channel_name,
+                O.status,
+                O.shipping_status,
+                A.account_label,
+                O.tracking_number,
+                O.paid_at,
+            )
+            .join(O, O.id == SambaTrackingSyncJob.order_id, isouter=True)
+            .join(A, A.id == SambaTrackingSyncJob.sourcing_account_id, isouter=True)
+            .where(
+                and_(
+                    O.sourcing_order_number.is_not(None),
+                    O.sourcing_order_number != "",
+                    # source_site 비어있어도 source_url / collected_product 로 추론 가능하면 포함
+                    or_(
+                        and_(O.source_site.is_not(None), O.source_site != ""),
+                        and_(O.source_url.is_not(None), O.source_url != ""),
+                        O.collected_product_id.is_not(None),
+                    ),
+                    date_col >= _since,
+                    date_col < _until,
+                    not_(action_tag_expr.like("%,kkadaegi,%")),
+                    # 송장 채워졌어도 잡 자체는 표시 (수집 결과 확인용).
+                    # 큐 적재 단계에서만 송장 있는 주문 제외 — enqueue_for_order 가 처리.
+                )
+            )
             .order_by(SambaTrackingSyncJob.updated_at.desc())
-            .limit(limit)
+            .limit(limit * 10)
         )
         if tenant_id:
-            recent_stmt = recent_stmt.where(SambaTrackingSyncJob.tenant_id == tenant_id)
-        jobs = (await session.execute(recent_stmt)).scalars().all()
+            base_stmt = base_stmt.where(SambaTrackingSyncJob.tenant_id == tenant_id)
+        raw_rows = (await session.execute(base_stmt)).all()
+
+        # order_id별 최신 1건만 선별 + 페이지 필터와 동일 기준 제외 +
+        # 이미 송장 입력된 주문은 처리 대상 아니므로 제외 (모달 = "처리 필요" 잡만 표시)
+        seen_order_ids: set[str] = set()
+        result_rows = []
+        counts: dict[str, int] = {}
+        for row in raw_rows:
+            j = row[0]
+            order_status = row[4]
+            shipping_status = row[5]
+            order_tracking_number = row[7]
+            if j.order_id in seen_order_ids:
+                continue
+            seen_order_ids.add(j.order_id)
+            if _is_excluded(order_status, shipping_status):
+                continue
+            # 송장 채워진 주문은 모달 대상 아님 — "송장수집 = 송장 미입력건만 처리" 정책.
+            # 외부 수동입력/이전 수집완료 무관하게 송장 있으면 숨김.
+            if order_tracking_number:
+                continue
+            counts[j.status] = counts.get(j.status, 0) + 1
+            if len(result_rows) < limit:
+                result_rows.append(row)
 
     return {
         "counts": counts,
@@ -1218,16 +1443,21 @@ async def list_recent_tracking_sync_jobs(
             {
                 "id": j.id,
                 "orderId": j.order_id,
+                "orderNumber": order_number or "",
+                "customerName": customer_name or "",
+                "channelName": channel_name or "",
                 "site": j.sourcing_site,
                 "sourcingOrderNumber": j.sourcing_order_number,
+                "sourcingAccountLabel": account_label or "",
                 "status": j.status,
                 "courier": j.scraped_courier,
                 "tracking": j.scraped_tracking,
                 "lastError": j.last_error,
                 "attempts": j.attempts,
                 "updatedAt": j.updated_at.isoformat() if j.updated_at else None,
+                "paidAt": paid_at.isoformat() if paid_at else None,
             }
-            for j in jobs
+            for j, order_number, customer_name, channel_name, _os, _ss, account_label, _otn, paid_at in result_rows
         ],
     }
 
@@ -1239,24 +1469,18 @@ async def get_cancel_alert_count(
 ):
     """아직 처리 안 한 취소요청 건수 반환.
 
-    DB 실데이터: shipping_status는 마켓 원본 한글값("취소요청"/"취소처리중"),
-    status는 내부 enum. 마켓에서 취소요청이 들어왔지만 내부 status가 아직 처리중(pending 등)
-    또는 명시적 cancel_requested 상태인 케이스를 안 처리된 것으로 간주.
+    인지 누락 사고 방지가 목적. 조건은 _build_cancel_alert_clause() 와 동일.
     """
-    from sqlalchemy import select, func, or_
+    from sqlalchemy import select, func
     from backend.domain.samba.order.model import SambaOrder as OrderModel
 
-    stmt = select(func.count()).where(
-        OrderModel.shipping_status.in_(["취소요청", "취소처리중"]),
-        or_(
-            OrderModel.status.in_(["pending", "wait_ship", "arrived", "shipping"]),
-            OrderModel.status == "cancel_requested",
-        ),
-    )
+    stmt = select(func.count()).where(_build_cancel_alert_clause())
     if tenant_id is not None:
         stmt = stmt.where(OrderModel.tenant_id == tenant_id)
-    result = await session.exec(stmt)  # type: ignore[arg-type]
-    count = result.one()
+    # session.exec(select(func.count()))는 SQLModel에서 Row 객체를 반환해
+    # FastAPI 직렬화가 실패한다(500). session.execute().scalar_one() 으로 정수만 추출.
+    result = await session.execute(stmt)
+    count = int(result.scalar_one())
     return {"count": count}
 
 
@@ -1896,11 +2120,21 @@ async def confirm_order(
 ):
     """주문확인(발주확인) 수동 처리 — 원소싱처 재고/가격 확인 후 사용자가 실행."""
     from backend.domain.samba.account.repository import SambaMarketAccountRepository
+    from backend.domain.samba.order.model import is_order_cancelled
 
     svc = _write_service(session)
     order = await svc.get_order(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="주문을 찾을 수 없습니다")
+    # 취소 가드 — 발주확인(주문확인) 직전 차단. 마켓 인지 후 잘못 발주되는 사고 방지.
+    if is_order_cancelled(order):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"취소요청 상태(주문={order.status}/마켓={order.shipping_status})라 "
+                "발주확인을 진행할 수 없습니다"
+            ),
+        )
     if not order.order_number:
         raise HTTPException(status_code=400, detail="상품주문번호가 없습니다")
     if not order.channel_id:
@@ -3522,7 +3756,7 @@ async def sync_orders_from_markets(
                     "결제완료",
                     "배송대기중",
                     "송장전송완료",
-                    "배송중",
+                    "국내배송중",
                 }
                 _already_fetched = {
                     d["order_number"] for d in orders_data if d.get("order_number")
@@ -4047,10 +4281,11 @@ async def sync_orders_from_markets(
                     for ps in progress_states:
                         od_no = str(ps.get("odNo", "") or "")
                         od_seq = str(ps.get("odSeq", 1) or 1)
-                        proc_seq = str(ps.get("procSeq", 1) or 1)
                         if not od_no:
                             continue
-                        order_number = f"{od_no}_{od_seq}_{proc_seq}"
+                        # 저장 시 키와 동일하게 (odNo, odSeq) 2부분만 사용
+                        # procSeq는 처리 단계마다 바뀌므로 키에서 제외
+                        order_number = f"{od_no}_{od_seq}"
                         if order_number in _already_in_data:
                             continue
                         step_cd = str(ps.get("odPrgsStepCd", "") or "")
@@ -4316,18 +4551,18 @@ async def sync_orders_from_markets(
                                     f"[주문동기화] {label}: 11번가 발주확인 실패 "
                                     f"ordNo={_ct['ord_no']} — {_ce}"
                                 )
-                        # 발주확인 성공한 주문의 status/shipping_status를 배송대기로 업데이트
+                        # 발주확인 성공한 주문의 status/shipping_status를 배송대기중으로 업데이트
                         for _od in orders_data:
                             if _od.get("order_number") in _confirmed_ord_nos:
                                 _od["status"] = "wait_ship"
-                                _od["shipping_status"] = "배송대기"
-                        # 이미 DB에 저장된 주문도 즉시 배송대기로 갱신
+                                _od["shipping_status"] = "배송대기중"
+                        # 이미 DB에 저장된 주문도 즉시 배송대기중으로 갱신
                         for _ord_no in _confirmed_ord_nos:
                             _ex = await svc.repo.find_by_async(order_number=_ord_no)
                             if _ex:
                                 await svc.update_order(
                                     _ex.id,
-                                    {"shipping_status": "배송대기"},
+                                    {"shipping_status": "배송대기중"},
                                 )
                         logger.info(
                             f"[주문동기화] {label}: 11번가 발주확인 {_confirmed}/{len(_confirm_targets)}건 완료"
@@ -4809,7 +5044,7 @@ async def sync_orders_from_markets(
 
                 _dlv_status_map = {
                     "15": ("shipping", "출고지시"),
-                    "16": ("shipping", "출고확정"),
+                    "16": ("shipping", "배송대기중"),
                     "17": ("delivered", "배송완료"),
                     "18": ("confirmed", "구매확정"),
                 }
@@ -5392,7 +5627,7 @@ async def sync_orders_from_markets(
                             "교환재배송",
                             "교환완료",
                         }
-                        advanced = {"발송완료", "배송중", "배송완료", "구매확정"}
+                        advanced = {"발송완료", "국내배송중", "배송완료", "구매확정"}
                         if new_ship_status in cancel_statuses:
                             # 취소 상태는 항상 갱신 (송장전송완료 → 취소요청 등 역행 허용)
                             # 단, 이미 반품 진행 중인 주문은 취소로 되돌리지 않음
@@ -5438,7 +5673,7 @@ async def sync_orders_from_markets(
                             )
                         elif existing.shipping_status not in (
                             "송장전송완료",
-                            "배송중",
+                            "국내배송중",
                             "배송완료",
                             "교환재배송",
                             "교환요청",
@@ -5883,7 +6118,7 @@ def _parse_smartstore_order(
     # 마켓 주문상태 한글 변환
     market_status_map: dict[str, str] = {
         "PAYED": "결제완료",
-        "DELIVERING": "배송중",
+        "DELIVERING": "국내배송중",
         "DELIVERED": "배송완료",
         "PURCHASE_DECIDED": "구매확정",
         "EXCHANGED": "교환완료",
@@ -6011,8 +6246,8 @@ def _parse_coupang_order(
     market_status_map = {
         "ACCEPT": "결제완료",
         "INSTRUCT": "상품준비중",
-        "DEPARTURE": "배송중",
-        "DELIVERING": "배송중",
+        "DEPARTURE": "국내배송중",
+        "DELIVERING": "국내배송중",
         "FINAL_DELIVERY": "배송완료",
         "CANCEL": "취소완료",
     }
@@ -6180,7 +6415,7 @@ def _parse_lotteon_order(item: dict, account_id: str, label: str) -> dict:
         "23": "교환회수완료",
         "24": "교환재배송",
         "25": "교환완료",
-        "30": "배송중",
+        "30": "국내배송중",
         "40": "배송완료",
         "50": "구매확정",
         "90": "취소",
@@ -6265,7 +6500,15 @@ def _normalize_synced_order_status(order_data: dict[str, Any]) -> None:
 
 
 def _can_override_source_site_from_sourcing(order_data: dict[str, Any]) -> bool:
-    return str(order_data.get("source") or "").strip().lower() != "playauto"
+    """매칭된 collected_product 의 source_site 로 order.source_site 를 덮어써도 되는지.
+
+    과거: PlayAuto 주문은 source_site 에 별칭("GS이숍(캐논)" 등)을 넣어서 매칭으로 덮어쓰면 안 됐음.
+    현재(sales_channel_alias 분리 후): PlayAuto 도 source_site="" 로 임포트되므로 비어 있으면 채워야 정상.
+    별칭은 이제 sales_channel_alias 컬럼에 별도 보관됨.
+    """
+    raw = str(order_data.get("source_site") or "").strip()
+    # 비어 있으면 항상 채움. 이미 값이 있으면 (소싱처 코드든 별칭이든) 보존.
+    return not raw
 
 
 def _normalize_carrier_name(value: Any) -> str:
@@ -6348,6 +6591,7 @@ def _parse_playauto_order(
         "송장입력": "processing",
         "출고": "shipped",
         "배송중": "shipped",
+        "국내배송중": "shipped",
         "수취확인": "delivered",
         "정산완료": "delivered",
         "주문확인": "pending",
@@ -6364,6 +6608,9 @@ def _parse_playauto_order(
     shipping_status_map = {
         "신규주문": "주문접수",
         "송장출력": "배송대기중",
+        "송장입력": "송장전송완료",
+        "출고": "국내배송중",
+        "배송중": "국내배송중",
         "주문확인": "취소중",
         "취소마감": "취소완료",
         "수취확인": "배송완료",
@@ -6439,14 +6686,17 @@ def _parse_playauto_order(
         # 매칭용 임시 키 — DB 저장 전 pop. plapro 응답에 MasterCode 있으면 추출해
         # _mpn_cache 매칭에 ProdCode와 함께 시도. 매칭 우선순위: master_code > product_id.
         "_pa_master_code": master_code,
-        # 판매처(사업자) 정보 — 별칭 매핑 적용
-        "source_site": (
+        # 판매처(사업자) 별칭 — PlayAuto 1 채널 × 다 site_id 구조 (예: "GS이숍(캐논)").
+        # source_site 와 분리 — source_site 는 진짜 소싱처 코드 전용.
+        "sales_channel_alias": (
             f"{site_name}({alias_map[site_id]})"
             if alias_map and site_id in alias_map and site_name
             else f"{site_name}({site_id})"
             if site_name
             else ""
         ),
+        # source_site 는 collected_product 매칭 후 자동 채워짐 — 임포트 시점엔 빈 값.
+        "source_site": "",
     }
 
 
@@ -6481,9 +6731,9 @@ def _parse_elevenst_order(item: dict, account_id: str, label: str) -> dict:
     shipping_map = {
         "200": "결제완료",
         "202": "결제완료",  # 11번가 내부 처리중 상태 (결제완료와 동일 단계)
-        "301": "배송대기",  # 발주확인 완료
+        "301": "배송대기중",  # 발주확인 완료
         "400": "출고완료",
-        "500": "배송중",
+        "500": "국내배송중",
         "600": "배송완료",
         "700": "구매확정",
         "900": "취소완료",
@@ -6635,7 +6885,7 @@ def _parse_ebay_order(
         shipping_status = "취소요청"
     elif ff_status == "FULFILLED":
         status = "pending"
-        shipping_status = "배송중"
+        shipping_status = "국내배송중"
     elif ff_status == "IN_PROGRESS":
         status = "pending"
         shipping_status = "발송대기"
@@ -6801,10 +7051,12 @@ def _parse_lottehome_order(
         shipping_status = force_shipping_status or proc_stat or "출고지시"
     elif is_deliver_api and not proc_stat:
         status = "shipping"
-        shipping_status = "출고확정"
+        shipping_status = "배송대기중"
     else:
         status = status_map.get(proc_stat, "pending")
         shipping_status = proc_stat or "출고지시"
+        if shipping_status == "출고확정":
+            shipping_status = "배송대기중"
 
     product_name = str(prod_info.get("ProdName") or prod_info.get("GoodsNm") or "")
     product_option = str(

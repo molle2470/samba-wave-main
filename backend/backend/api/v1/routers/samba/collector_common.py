@@ -392,7 +392,7 @@ def no_registered_accounts(model_class: Any):
     return or_(
         model_class.registered_accounts.is_(None),
         func.jsonb_typeof(model_class.registered_accounts) != "array",
-        model_class.registered_accounts.op("==")(cast("[]", _JSONB)),
+        model_class.registered_accounts.op("=")(cast("[]", _JSONB)),
     )
 
 

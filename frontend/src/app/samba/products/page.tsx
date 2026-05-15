@@ -929,7 +929,7 @@ export default function ProductsPage() {
 
   // 유령삭제 — 스마트스토어: Naver엔 있는데 DB 매핑 없는 고아 상품 정리 + DB→Naver 역고아 매핑 정리
   const runSmartstoreGhostSync = async () => {
-    if (!await showConfirm('스마트스토어 동기화를 실행합니다.\n\n1단계: DB에 없는 Naver 등록 상품(고아 상품) 조회\n2단계: 목록 확인 후 실제 삭제 여부 선택\n\n계속하시겠습니까?')) return
+    if (!await showConfirm('스마트스토어 동기화를 실행합니다.\n\n1단계: 스마트스토어 등록상품 전체를 수집합니다 (수 분 소요)\n2단계: 결과 확인 후 실제 처리 여부를 선택합니다\n  · 스마트스토어에만 있는 상품 → 스마트스토어에서 삭제\n  · 삼바에만 등록표시된 상품 → 삼바 등록표시 해제\n\n계속하시겠습니까?')) return
 
     setAiJobTitle('스마트스토어 동기화')
     setAiJobLogs(['고아 상품 조회 중... (Naver 상품 전체 페이징 수집 — 수 분 소요)'])
@@ -1135,6 +1135,255 @@ export default function ProductsPage() {
     setAiJobDone(true)
   }
 
+  // 유령삭제 — 양방향 공통 러너: 스마트스토어 패턴(쿠팡/11번가v2/롯데ON)
+  const runBidirectionalGhostSync = async (
+    marketLabel: string,
+    apiFn: (dryRun: boolean, maxDelete: number, accountId?: string, productIds?: string[]) => Promise<{
+      ok: boolean
+      total_market: number
+      total_orphans: number
+      total_stale_db: number
+      total_deleted: number
+      total_stale_cleared: number
+      accounts: Array<{
+        account_id: string
+        label?: string
+        error?: string
+        market_count?: number
+        orphan_count?: number
+        orphans?: Array<Record<string, string>>
+        stale_db_count?: number
+        stale_db?: Array<Record<string, string>>
+        deleted?: string[]
+        failed?: Array<Record<string, string>>
+        recovered_via_seller_code?: number
+      }>
+    }>,
+    orphanLabel: { idKey: string; name: string },
+  ) => {
+    if (!await showConfirm(`${marketLabel} 동기화를 실행합니다.\n\n1단계: ${marketLabel} 등록상품 전체를 수집합니다 (수 분 소요)\n2단계: 결과 확인 후 실제 처리 여부를 선택합니다\n  · ${marketLabel}에만 있는 상품 → ${marketLabel}에서 삭제\n  · 삼바에만 등록표시된 상품 → 삼바 등록표시 해제\n\n계속하시겠습니까?`)) return
+
+    setAiJobTitle(`${marketLabel} 동기화`)
+    setAiJobLogs([`목록 수집 중... (${marketLabel} 전체 페이징 — 수 분 소요)`])
+    setAiJobDone(false)
+    setAiJobModal(true)
+
+    try {
+      const syncAccountId = appliedStatusFilter.startsWith('reg_') ? appliedStatusFilter.replace('reg_', '') : undefined
+      let filteredIds: string[] = []
+      try {
+        const idRes = await collectorApi.getProductIds({
+          search: appliedSearchQ.trim() || undefined,
+          search_type: appliedSearchQ.trim() ? appliedSearchType : undefined,
+          source_site: appliedSiteFilter || undefined,
+          status: appliedStatusFilter || undefined,
+          sold_out_filter: appliedSoldOutFilter || undefined,
+          ai_filter: appliedAiFilter || undefined,
+          search_filter_id: appliedFilterByGroupId || undefined,
+        })
+        filteredIds = idRes.ids ?? []
+      } catch (idErr) {
+        setAiJobLogs([`필터 ID 조회 실패: ${idErr instanceof Error ? idErr.message : String(idErr)}`])
+        setAiJobDone(true)
+        return
+      }
+
+      const res = await apiFn(true, 50, syncAccountId, filteredIds)
+      const logs: string[] = [
+        syncAccountId ? `계정 필터: ${syncAccountId}` : `전체 ${marketLabel} 계정`,
+        `${marketLabel} 등록상품: ${fmt(res.total_market)}개`,
+        `${marketLabel}에만 있는 상품: ${fmt(res.total_orphans)}개 → ${marketLabel}에서 삭제 예정`,
+        `삼바에만 등록표시된 상품: ${fmt(res.total_stale_db)}개 → 등록표시 해제 예정`,
+        '',
+      ]
+      for (const a of res.accounts) {
+        if (a.error) {
+          logs.push(`[${a.label || a.account_id}] ${a.error}`)
+          continue
+        }
+        const rec = a.recovered_via_seller_code ? ` / 셀러코드보강 ${fmt(a.recovered_via_seller_code)}` : ''
+        logs.push(`[${a.label || a.account_id}] ${marketLabel} ${fmt(a.market_count ?? 0)}개 / 마켓에만 ${fmt(a.orphan_count ?? 0)}개 / 삼바에만 ${fmt(a.stale_db_count ?? 0)}개${rec}`)
+        for (const o of (a.orphans ?? []).slice(0, 30)) {
+          logs.push(`  [마켓에만] ${orphanLabel.idKey}=${o[orphanLabel.idKey] || ''}  ${o.name || ''}`)
+        }
+        if ((a.orphans?.length ?? 0) > 30) logs.push(`  ... 외 ${fmt((a.orphans!.length) - 30)}개`)
+        for (const s of (a.stale_db ?? []).slice(0, 20)) {
+          logs.push(`  [삼바에만] db=${s.db_id || ''}  ${s.product_name || ''}`)
+        }
+        if ((a.stale_db?.length ?? 0) > 20) logs.push(`  ... 외 ${fmt((a.stale_db!.length) - 20)}개`)
+      }
+      setAiJobLogs(logs)
+      setAiJobDone(true)
+
+      const totalToProcess = res.total_orphans + res.total_stale_db
+      if (totalToProcess === 0) {
+        logs.push('', '차이 없음 — 삼바 DB와 마켓이 이미 일치합니다.')
+        setAiJobLogs([...logs])
+        return
+      }
+
+      const estSec = Math.ceil(res.total_orphans * 0.5)
+      if (!await showConfirm(`총 ${fmt(totalToProcess)}건을 처리하시겠습니까?\n· ${marketLabel}에만 있는 상품 ${fmt(res.total_orphans)}건 → ${marketLabel}에서 삭제 (예상 ${fmt(estSec)}초)\n· 삼바에만 등록표시된 상품 ${fmt(res.total_stale_db)}건 → 삼바 등록표시 해제`)) {
+        logs.push('', '처리 취소됨.')
+        setAiJobLogs([...logs])
+        return
+      }
+
+      logs.push('', `처리 실행 중... (마켓 삭제 ${fmt(res.total_orphans)}건, 예상 ${fmt(estSec)}초)`)
+      setAiJobLogs([...logs])
+      setAiJobDone(false)
+
+      const del = await apiFn(false, res.total_orphans, syncAccountId, filteredIds)
+      logs.push(`${marketLabel} 삭제 완료: ${fmt(del.total_deleted)}건`)
+      logs.push(`삼바 등록표시 해제: ${fmt(del.total_stale_cleared)}건`)
+      for (const a of del.accounts) {
+        if (a.failed && a.failed.length > 0) {
+          logs.push(`[${a.label || a.account_id}] 실패 ${fmt(a.failed.length)}건:`)
+          for (const f of a.failed.slice(0, 10)) {
+            const idVal = f[orphanLabel.idKey] || f.spid || f.prd_no || f.spd_no || ''
+            logs.push(`  - ${idVal}: ${f.error}`)
+          }
+        }
+      }
+      setAiJobLogs([...logs])
+    } catch (e) {
+      setAiJobLogs(prev => [...prev, '', `실패: ${e instanceof Error ? e.message : String(e)}`])
+    }
+    setAiJobDone(true)
+  }
+
+  // 쿠팡 유령삭제 — 단건 스트리밍 러너 (stale DB 먼저, orphan 나중, 1건씩 로그)
+  const runCoupangGhostSync = async () => {
+    if (!await showConfirm('쿠팡 동기화를 실행합니다.\n\n1단계: 쿠팡 등록상품 전체를 수집합니다 (수 분 소요)\n2단계: 결과 확인 후 실제 처리 여부를 선택합니다\n  · 삼바에만 등록표시된 상품 → DB 등록표시 해제 (먼저, 빠름)\n  · 쿠팡에만 있는 상품 → 쿠팡에서 삭제 (1건씩 진행 로그)\n\n계속하시겠습니까?')) return
+
+    setAiJobTitle('쿠팡 동기화')
+    setAiJobLogs(['목록 수집 중... (쿠팡 전체 페이징 — 수 분 소요)'])
+    setAiJobDone(false)
+    setAiJobModal(true)
+
+    try {
+      const syncAccountId = appliedStatusFilter.startsWith('reg_') ? appliedStatusFilter.replace('reg_', '') : undefined
+      let filteredIds: string[] = []
+      try {
+        const idRes = await collectorApi.getProductIds({
+          search: appliedSearchQ.trim() || undefined,
+          search_type: appliedSearchQ.trim() ? appliedSearchType : undefined,
+          source_site: appliedSiteFilter || undefined,
+          status: appliedStatusFilter || undefined,
+          sold_out_filter: appliedSoldOutFilter || undefined,
+          ai_filter: appliedAiFilter || undefined,
+          search_filter_id: appliedFilterByGroupId || undefined,
+        })
+        filteredIds = idRes.ids ?? []
+      } catch (idErr) {
+        setAiJobLogs([`필터 ID 조회 실패: ${idErr instanceof Error ? idErr.message : String(idErr)}`])
+        setAiJobDone(true)
+        return
+      }
+
+      const res = await shipmentApi.cleanupCoupangOrphans(true, 100000, syncAccountId, filteredIds, true)
+      const logs: string[] = [
+        syncAccountId ? `계정 필터: ${syncAccountId}` : `전체 쿠팡 계정`,
+        `쿠팡 등록상품: ${fmt(res.total_market)}개`,
+        `쿠팡에만 있는 상품(orphan): ${fmt(res.total_orphans)}개`,
+        `삼바에만 등록표시된 상품(stale): ${fmt(res.total_stale_db)}개`,
+        '',
+      ]
+
+      type StaleItem = { account_id: string; db_id: string; product_name: string; style_code: string }
+      type OrphanItem = { account_id: string; spid: string; name: string; status_name: string }
+      const staleList: StaleItem[] = []
+      const orphanList: OrphanItem[] = []
+      for (const a of res.accounts) {
+        if (a.error) { logs.push(`[${a.label || a.account_id}] ${a.error}`); continue }
+        for (const s of (a.stale_db ?? [])) {
+          if (s.db_id) staleList.push({ account_id: a.account_id, db_id: s.db_id, product_name: s.product_name || '', style_code: s.style_code || '' })
+        }
+        for (const o of (a.orphans ?? [])) {
+          if (o.spid) orphanList.push({ account_id: a.account_id, spid: o.spid, name: o.name || '', status_name: o.status_name || '' })
+        }
+      }
+      setAiJobLogs([...logs])
+      setAiJobDone(true)
+
+      const totalToProcess = staleList.length + orphanList.length
+      if (totalToProcess === 0) {
+        logs.push('차이 없음 — 삼바 DB와 쿠팡이 이미 일치합니다.')
+        setAiJobLogs([...logs])
+        return
+      }
+
+      if (!await showConfirm(`총 ${fmt(totalToProcess)}건을 처리하시겠습니까?\n· 삼바 DB 등록표시 해제 ${fmt(staleList.length)}건 (먼저, 1건씩)\n· 쿠팡 삭제 ${fmt(orphanList.length)}건 (나중, 1건씩 ~0.5초/건)`)) {
+        logs.push('처리 취소됨.')
+        setAiJobLogs([...logs])
+        return
+      }
+
+      setAiJobDone(false)
+
+      // 1단계: stale DB 1건씩 정리 (빠름)
+      logs.push(`▶ DB 등록표시 해제 시작 (${fmt(staleList.length)}건)`)
+      setAiJobLogs([...logs])
+      let staleOk = 0
+      let staleFail = 0
+      for (let i = 0; i < staleList.length; i++) {
+        const s = staleList[i]
+        const idx = `${fmt(i + 1)}/${fmt(staleList.length)}`
+        const sLabel = `${s.style_code ? s.style_code + ' ' : ''}${s.product_name.slice(0, 40)}`
+        try {
+          const r = await shipmentApi.clearCoupangStaleMapping(s.account_id, s.db_id)
+          if (r.ok) {
+            staleOk++
+            logs.push(`[삼바해제 ${idx}] db=${s.db_id} ${sLabel} → ${r.cleared ? '완료' : '변경없음'}`)
+          } else {
+            staleFail++
+            logs.push(`[삼바해제 ${idx}] db=${s.db_id} ${sLabel} 실패: ${r.error || '알수없음'}`)
+          }
+        } catch (e) {
+          staleFail++
+          logs.push(`[삼바해제 ${idx}] db=${s.db_id} ${sLabel} 실패: ${e instanceof Error ? e.message : String(e)}`)
+        }
+        if ((i + 1) % 5 === 0 || i === staleList.length - 1) setAiJobLogs([...logs])
+      }
+      logs.push(`▶ DB 등록표시 해제 완료: 성공 ${fmt(staleOk)}건 / 실패 ${fmt(staleFail)}건`)
+      logs.push('')
+      setAiJobLogs([...logs])
+
+      // 2단계: orphan 쿠팡 삭제 1건씩
+      logs.push(`▶ 쿠팡 삭제 시작 (${fmt(orphanList.length)}건)`)
+      setAiJobLogs([...logs])
+      let orphanOk = 0
+      let orphanFail = 0
+      for (let i = 0; i < orphanList.length; i++) {
+        const o = orphanList[i]
+        const idx = `${fmt(i + 1)}/${fmt(orphanList.length)}`
+        const oLabel = `${o.status_name ? '[' + o.status_name + '] ' : ''}${o.name.slice(0, 50) || '(상품명없음)'}`
+        try {
+          const r = await shipmentApi.deleteCoupangOrphan(o.account_id, o.spid)
+          if (r.ok) {
+            orphanOk++
+            const tail = r.message ? ` (${r.message})` : ''
+            logs.push(`[쿠팡삭제 ${idx}] spid=${o.spid} ${oLabel} → 완료${tail}`)
+          } else {
+            orphanFail++
+            logs.push(`[쿠팡삭제 ${idx}] spid=${o.spid} ${oLabel} 실패: ${r.error || '알수없음'}`)
+          }
+        } catch (e) {
+          orphanFail++
+          logs.push(`[쿠팡삭제 ${idx}] spid=${o.spid} ${oLabel} 실패: ${e instanceof Error ? e.message : String(e)}`)
+        }
+        if ((i + 1) % 3 === 0 || i === orphanList.length - 1) setAiJobLogs([...logs])
+      }
+      logs.push(`▶ 쿠팡 삭제 완료: 성공 ${fmt(orphanOk)}건 / 실패 ${fmt(orphanFail)}건`)
+      setAiJobLogs([...logs])
+    } catch (e) {
+      setAiJobLogs(prev => [...prev, '', `실패: ${e instanceof Error ? e.message : String(e)}`])
+    }
+    setAiJobDone(true)
+  }
+  const runElevenstGhostSyncV2 = () => runBidirectionalGhostSync('11번가', shipmentApi.cleanupElevenstOrphansV2, { idKey: 'prd_no', name: 'name' })
+  const runLotteonGhostSync = () => runBidirectionalGhostSync('롯데ON', shipmentApi.cleanupLotteonOrphans, { idKey: 'spd_no', name: 'name' })
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "0" }}>
       {ghostBanner && ghostBanner.total > 0 && (
@@ -1279,7 +1528,9 @@ export default function ProductsPage() {
           >
             <div style={{ fontWeight: 700, fontSize: '0.9rem', color: '#E5E5E5', marginBottom: '8px' }}>유령삭제 — 마켓 선택</div>
             <div style={{ fontSize: '0.78rem', color: '#888', marginBottom: '14px', lineHeight: 1.5 }}>
-              마켓에는 등록되어 있지만 DB 매핑이 끊긴 상품을 정리합니다.<br />
+              삼바 DB와 마켓 등록상품 목록을 100% 일치시킵니다.<br />
+              · 마켓에만 있는 상품 → 마켓에서 삭제<br />
+              · 삼바에만 등록 표시된 상품 → 삼바 등록표시 해제<br />
               점검할 마켓을 선택하세요. (화면 필터가 적용된 상품 범위에서만 점검)
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
@@ -1292,10 +1543,10 @@ export default function ProductsPage() {
                 }}
               >
                 스마트스토어<br />
-                <span style={{ fontSize: '0.72rem', fontWeight: 400, color: '#999' }}>Naver엔 있는데 DB 매핑 없는 고아 상품 + 역고아 정리</span>
+                <span style={{ fontSize: '0.72rem', fontWeight: 400, color: '#999' }}>마켓에만 있는 상품은 마켓에서 삭제, 삼바에만 있는 등록표시는 해제</span>
               </button>
               <button
-                onClick={() => { setGhostChoiceModal(false); runElevenstGhostMissing() }}
+                onClick={() => { setGhostChoiceModal(false); runElevenstGhostSyncV2() }}
                 style={{
                   padding: '10px 14px', fontSize: '0.82rem', fontWeight: 600,
                   border: '1px solid #3D3D3D', borderRadius: '8px', color: '#E5E5E5',
@@ -1303,7 +1554,29 @@ export default function ProductsPage() {
                 }}
               >
                 11번가<br />
-                <span style={{ fontSize: '0.72rem', fontWeight: 400, color: '#999' }}>DB에 "등록됨"이지만 prdNo 누락된 매핑 → 셀러상품코드로 역조회 후 정리</span>
+                <span style={{ fontSize: '0.72rem', fontWeight: 400, color: '#999' }}>마켓에만 있는 상품은 마켓에서 삭제, 삼바에만 있는 등록표시는 해제</span>
+              </button>
+              <button
+                onClick={() => { setGhostChoiceModal(false); runLotteonGhostSync() }}
+                style={{
+                  padding: '10px 14px', fontSize: '0.82rem', fontWeight: 600,
+                  border: '1px solid #3D3D3D', borderRadius: '8px', color: '#E5E5E5',
+                  background: 'rgba(255,80,140,0.15)', cursor: 'pointer', textAlign: 'left',
+                }}
+              >
+                롯데ON<br />
+                <span style={{ fontSize: '0.72rem', fontWeight: 400, color: '#999' }}>마켓에만 있는 상품은 마켓에서 삭제, 삼바에만 있는 등록표시는 해제</span>
+              </button>
+              <button
+                onClick={() => { setGhostChoiceModal(false); runCoupangGhostSync() }}
+                style={{
+                  padding: '10px 14px', fontSize: '0.82rem', fontWeight: 600,
+                  border: '1px solid #3D3D3D', borderRadius: '8px', color: '#E5E5E5',
+                  background: 'rgba(255,200,80,0.15)', cursor: 'pointer', textAlign: 'left',
+                }}
+              >
+                쿠팡<br />
+                <span style={{ fontSize: '0.72rem', fontWeight: 400, color: '#999' }}>마켓에만 있는 상품은 마켓에서 삭제, 삼바에만 있는 등록표시는 해제</span>
               </button>
               <button
                 onClick={() => setGhostChoiceModal(false)}

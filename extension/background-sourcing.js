@@ -418,10 +418,30 @@ function _siteSemRelease(site) {
   if (sem) sem.active = Math.max(0, sem.active - 1)
 }
 
+// 무신사 송장 잡 직렬화 — Next.js SPA + 백그라운드 탭에서 React hydration 지연으로
+// 버튼 click이 무시되는 회귀 차단. Promise chain 으로 race condition 없이 1건씩 처리.
+// (이전 boolean 락은 Promise.all 동시 진입 시 while 검사 모두 false 보고 통과 → 직렬화 실패)
+let _musinsaTrackingChain = Promise.resolve()
+function _serializeMusinsaTracking(fn) {
+  const next = _musinsaTrackingChain.then(() => fn(), () => fn())
+  _musinsaTrackingChain = next.catch(() => {})
+  return next
+}
+
 async function _processJobWithCap(job) {
   const site = job.site || 'unknown'
   // 송장 추출 잡(type=tracking) — 가격수집과 격리. 동일 사이트 캡 공유로 무신사 폭주 방지
   if (job.type === 'tracking') {
+    if (site === 'MUSINSA') {
+      return _serializeMusinsaTracking(async () => {
+        _markSourcingSiteActive(site)
+        try {
+          return await handleTrackingJob(job)
+        } finally {
+          _markSourcingSiteInactive(site)
+        }
+      })
+    }
     await _siteSemAcquire(site)
     _markSourcingSiteActive(site)
     try {
@@ -454,39 +474,82 @@ async function _processJobWithCap(job) {
 // ─────────────────────────────────────────────────────────────────────────────
 const _trackingPending = new Map() // requestId → {resolve, timeoutId, tabId}
 
+// 송장 잡 site(대문자) → 자동로그인 siteKey 매핑.
+// SPA_DIRECT_LOGIN_SITES(ssg/lotteon/abcmart)는 주문매칭 계정으로 강제 로그인 지원.
+const _TRACKING_AUTO_LOGIN_MAP = {
+  SSG: 'ssg',
+  LOTTEON: 'lotteon',
+  ABCMART: 'abcmart',
+  GRANDSTAGE: 'abcmart',
+}
+
 async function handleTrackingJob(job) {
-  const { requestId, site, url, sourcingOrderNumber } = job
-  console.log(`[송장] 잡 수신 site=${site} ord=${sourcingOrderNumber} req=${requestId}`)
+  const { requestId, site, url, sourcingOrderNumber, sourcingAccountId } = job
+  console.log(`[송장] 잡 수신 site=${site} ord=${sourcingOrderNumber} acc=${sourcingAccountId || '-'} req=${requestId}`)
+
+  // 잡 처리 전 자동로그인 — 주문 매칭 계정으로 강제 로그인
+  // sourcingAccountId 없으면 라디오 기본 계정 fallback (기존 동작과 동일)
+  try {
+    const autoLoginKey = _TRACKING_AUTO_LOGIN_MAP[site]
+    if (autoLoginKey && typeof globalThis.ensureLoggedIn === 'function') {
+      console.log(`[송장] ensureLoggedIn(${autoLoginKey}, acc=${sourcingAccountId || '-'}) 호출`)
+      await globalThis.ensureLoggedIn(autoLoginKey, { accountId: sourcingAccountId || '' })
+    }
+  } catch (e) {
+    console.warn(`[송장] ensureLoggedIn 실패 (무시하고 진행): ${e?.message || e}`)
+  }
+
   let tabId = null
   let cleaned = false
   try {
     if (!url) throw new Error('tracking URL 누락')
-    const tab = await chrome.tabs.create({ url, active: false })
-    tabId = tab.id
-    await waitForTabLoad(tabId, 30000)
 
-    // content script 결과 message 대기 (최대 30초)
-    const result = await new Promise((resolve) => {
-      const timeoutId = setTimeout(() => {
-        _trackingPending.delete(requestId)
-        resolve({ success: false, error: 'timeout: content script 응답 없음' })
-      }, 30000)
-      _trackingPending.set(requestId, { resolve, timeoutId, tabId })
+    // 송장 페이지 진입 → 결과 수신 (needsLogin 시 1회 재시도)
+    // MUSINSA: Next.js SPA + 백그라운드 탭 hydration 지연으로 React click이 무시되는 회귀
+    // 차단을 위해 active: true 로 강제. 사용자 화면이 잠깐 튐 — 직렬화(_musinsaTrackingLock)와
+    // 결합해 한 번에 1건만 처리.
+    const _runOnce = async () => {
+      const _active = site === 'MUSINSA'
+      const tab = await chrome.tabs.create({ url, active: _active })
+      tabId = tab.id
+      await waitForTabLoad(tabId, 30000)
 
-      // content-tracking-musinsa.js 등은 자체적으로 추출 후 message 전송
-      // 여기선 fallback으로 chrome.scripting.executeScript에 ord_no 주입 가능
+      return await new Promise((resolve) => {
+        const timeoutId = setTimeout(() => {
+          _trackingPending.delete(requestId)
+          resolve({ success: false, error: 'timeout: content script 응답 없음' })
+        }, 60000)
+        _trackingPending.set(requestId, { resolve, timeoutId, tabId })
+
+        try {
+          chrome.tabs.sendMessage(tabId, {
+            type: 'TRACKING_REQUEST',
+            requestId,
+            site,
+            sourcingOrderNumber,
+          }, (_resp) => {
+            void chrome.runtime.lastError
+          })
+        } catch {}
+      })
+    }
+
+    let result = await _runOnce()
+
+    // 로그인 페이지 리다이렉트 → 주문매칭 계정으로 강제 로그인 후 1회 재시도
+    if (result && result.needsLogin) {
+      console.log(`[송장] needsLogin 감지 → ensureLoggedIn 재시도 (acc=${sourcingAccountId || '-'})`)
+      try { if (tabId) { await chrome.tabs.remove(tabId); tabId = null } } catch {}
       try {
-        chrome.tabs.sendMessage(tabId, {
-          type: 'TRACKING_REQUEST',
-          requestId,
-          site,
-          sourcingOrderNumber,
-        }, (_resp) => {
-          // content script가 비동기로 응답할 수 있으므로 무시
-          void chrome.runtime.lastError
-        })
-      } catch {}
-    })
+        const autoLoginKey = _TRACKING_AUTO_LOGIN_MAP[site]
+        if (autoLoginKey && typeof globalThis.ensureLoggedIn === 'function') {
+          await globalThis.ensureLoggedIn(autoLoginKey, { accountId: sourcingAccountId || '' })
+        }
+      } catch (e) {
+        console.warn(`[송장] 재로그인 실패: ${e?.message || e}`)
+      }
+      result = await _runOnce()
+    }
 
     await postResult('sourcing/tracking-result', {
       requestId,
@@ -494,6 +557,7 @@ async function handleTrackingJob(job) {
       courierName: result.courierName || '',
       trackingNumber: result.trackingNumber || '',
       error: result.error || '',
+      cancelled: !!result.cancelled,
     })
   } catch (err) {
     console.warn(`[송장] 처리 실패 req=${requestId}:`, err)
@@ -524,6 +588,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         courierName: msg.courierName || '',
         trackingNumber: msg.trackingNumber || '',
         error: msg.error || '',
+        cancelled: !!msg.cancelled,
+        needsLogin: !!msg.needsLogin,
       })
     }
     sendResponse({ ack: true })
@@ -1397,12 +1463,19 @@ async function handleSourcingJob(job) {
                 return { ready: false, hasObj: false, hasCard: false, staffOnly: true }
               }
               const hasObj = !!(window.resultItemObj && window.resultItemObj.itemNm)
-              if (!hasObj) return { ready: false, hasObj: false, hasCard: false }
+              if (!hasObj) return { ready: false, hasObj: false, hasCard: false, hasNotice: false }
               let hasCard = false
               document.querySelectorAll('dt').forEach((dt) => {
                 if (dt.textContent.trim() === '카드혜택가') hasCard = true
               })
-              return { ready: hasObj && hasCard, hasObj: true, hasCard: hasCard }
+              // 상품필수정보(제조국/색상/재질/제품소재) DOM 등장 여부 — 크론잡 lazy-render 누락 방지
+              let hasNotice = false
+              const _noticeLabels = ['제조국', '색상', '재질', '제품소재', '제품의주소재', '상품의주소재', '주소재', '소재']
+              document.querySelectorAll('dt, th').forEach((el) => {
+                const t = (el.textContent || '').replace(/\s+/g, '')
+                if (_noticeLabels.some((l) => t === l || t.indexOf(l) !== -1)) hasNotice = true
+              })
+              return { ready: hasObj && hasCard && hasNotice, hasObj: true, hasCard: hasCard, hasNotice: hasNotice }
             },
           }).catch(() => [{ result: { ready: false } }])
           const r = _chk?.result || {}
@@ -2214,6 +2287,36 @@ async function extractDetailData(tabId, site, productId) {
               domImages.push(_s)
             }
           })
+          // 상세설명 추출 — SSG는 `<p class="cdtl_desc">` 가 안내 텍스트(22자)만 담는
+          // 함정 element이므로 querySelector 방식은 못 쓴다. 백엔드 ssg_sourcing.py의
+          // _parse_detail_content 와 동일한 정규식으로 페이지 outerHTML 에서 상세 영역
+          // 통째로 추출. cdtl_review/cdtl_qna/cdtl_notice/footer 가 시작되기 전까지의
+          // 본 상세설명+이미지가 모두 포함됨 (정상 8만~10만 chars).
+          let detailHtml = ''
+          try {
+            const _fullHtml = document.documentElement.outerHTML || ''
+            const _re = /(?:id="cdtl_desc"|id="detail_cont"|class="[^"]*cdtl_desc[^"]*")[^>]*>([\s\S]*?)(?=<div[^>]+(?:id|class)="[^"]*(?:cdtl_review|cdtl_qna|cdtl_notice|footer)[^"]*")/i
+            const _m = _fullHtml.match(_re)
+            if (_m && _m[1]) {
+              detailHtml = _m[1]
+            }
+          } catch (_e) { /* detail 추출 실패 시 무시 */ }
+          // 상세설명 내부 이미지도 domImages 에 병합 (zoom_thumb 못 잡은 i2~iN 보강)
+          if (detailHtml) {
+            try {
+              const _imgRe = /<img[^>]+src="([^"]+)"/gi
+              let _im
+              while ((_im = _imgRe.exec(detailHtml)) !== null) {
+                let _s2 = (_im[1] || '').trim()
+                if (!_s2) continue
+                if (_s2.indexOf('ssgcdn.com') === -1) continue
+                if (!_imgSeen.has(_s2)) {
+                  _imgSeen.add(_s2)
+                  domImages.push(_s2)
+                }
+              }
+            } catch (_e) { /* 무시 */ }
+          }
           return {
             success: true,
             site_product_id: prdId,
@@ -2225,8 +2328,9 @@ async function extractDetailData(tabId, site, productId) {
             domOptions: domOptions,  // DOM 파싱 실재고 (JS 렌더링 후, 우선순위 최상)
             domCardPrice: domCardPrice,  // 카드혜택가 DOM 직접 추출값 → cost(원가)에 반영
             domSalePrice: domSalePrice,  // 판매가 DOM 직접 추출값 → salePrice에 반영 (sellprc 대체)
-            domImages: domImages,  // 추가이미지 DOM 직접 추출 (i2~iN, 1200 고해상도)
+            domImages: domImages,  // 추가이미지 DOM 직접 추출 (i2~iN, 1200 고해상도) + detail 내부 이미지
             domBreadcrumb: domBreadcrumb,  // 카테고리 빵부스러기 DOM 직접 추출 (대>중>소>세, leaf-only 저장 사고 차단)
+            detailHtml: detailHtml,  // 상세설명 영역 innerHTML — 백엔드 detail_html 컬럼 채움
             url: location.href,
           }
         } catch (e) {

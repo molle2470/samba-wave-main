@@ -9,6 +9,13 @@
 ;(() => {
   'use strict'
 
+  function isOrderCancelled() {
+    try {
+      const text = (document.body?.innerText || '').slice(0, 8000)
+      return /(취소완료|취소처리완료|구매취소완료|주문이\s*취소|취소된\s*주문)/.test(text)
+    } catch { return false }
+  }
+
   async function waitFor(selector, timeoutMs = 8000) {
     const start = Date.now()
     while (Date.now() - start < timeoutMs) {
@@ -20,6 +27,9 @@
   }
 
   async function scrape() {
+    if (isOrderCancelled()) {
+      return { success: false, cancelled: true, error: 'order_cancelled' }
+    }
     // 패션플러스: "배송조회" 링크 또는 텍스트 영역에서 택배사+송장 추출
     // DOM 구조가 일정치 않아 휴리스틱 — 텍스트에서 정규식
     await waitFor('body', 5000)

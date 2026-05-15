@@ -480,3 +480,28 @@ class SambaSearchCache(SQLModel, table=True):
         sa_column=Column(DateTime(timezone=True), nullable=False),
         default_factory=lambda: datetime.now(tz=timezone.utc),
     )
+
+
+class SambaDailyRegisteredSnapshot(SQLModel, table=True):
+    """일별 마켓 등록상품수 스냅샷 — 대시보드 "최근 일주일 매출" 등록상품수 칼럼 데이터.
+
+    매일 0시 크론(daily_maintenance.task_daily_snapshot)에서
+    "지금 마켓에 1개 이상 등록된 상품수"를 그날의 snapshot_date(KST)로 저장.
+
+    KPI 정의(`build_market_registered_conditions`)를 그대로 보존하므로
+    오늘 행과 과거 행이 동일한 자(尺)로 측정됨 → 신규등록/마켓삭제 산식과 정합.
+    """
+
+    __tablename__ = "samba_daily_registered_snapshot"
+
+    snapshot_date: str = Field(
+        sa_column=Column(String(10), primary_key=True),
+        description="YYYY-MM-DD (KST)",
+    )
+    registered_count: int = Field(
+        sa_column=Column(Integer, nullable=False, server_default="0")
+    )
+    created_at: datetime = Field(
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+        default_factory=lambda: datetime.now(tz=timezone.utc),
+    )

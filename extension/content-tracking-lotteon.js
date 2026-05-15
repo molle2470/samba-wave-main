@@ -8,6 +8,13 @@
 ;(() => {
   'use strict'
 
+  function isOrderCancelled() {
+    try {
+      const text = (document.body?.innerText || '').slice(0, 8000)
+      return /(취소완료|취소처리완료|구매취소완료|주문이\s*취소|취소된\s*주문)/.test(text)
+    } catch { return false }
+  }
+
   function clickDeliveryDetail() {
     for (const btn of document.querySelectorAll('button')) {
       const t = btn.textContent.trim()
@@ -53,10 +60,29 @@
     return ''
   }
 
+  function isLoginRedirect() {
+    try {
+      const href = location.href || ''
+      if (href.indexOf('member.lotteon.com') !== -1) return true
+      if (href.indexOf('/member/login') !== -1) return true
+      if (href && href.indexOf('orderDetail') === -1 && href.indexOf('order/claim') === -1) return true
+      return false
+    } catch { return false }
+  }
+
   async function scrape() {
+    if (isLoginRedirect()) {
+      return { success: false, needsLogin: true, error: 'needs_login: LOTTEON 로그인 페이지로 리다이렉트' }
+    }
+    if (isOrderCancelled()) {
+      return { success: false, cancelled: true, error: 'order_cancelled' }
+    }
     let dialog = document.querySelector('dialog[open], [role="dialog"]')
     if (!dialog) {
       if (!clickDeliveryDetail()) {
+        if (isLoginRedirect()) {
+          return { success: false, needsLogin: true, error: 'needs_login: LOTTEON 로그인 페이지로 리다이렉트' }
+        }
         return { success: false, error: 'no_tracking: 배송상세조회 버튼 없음 (미발송)' }
       }
       try { dialog = await waitForDialog(5000) } catch {

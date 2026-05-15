@@ -18,6 +18,12 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # 2026-05-14 사고 방지: ALTER TABLE은 AccessExclusiveLock 필요 → 운영 중 오토튠
+    # RowExclusiveLock과 데드락 가능. 마이그레이션 락 대기 중 운영 쿼리도 함께 cancel되어
+    # 사용자 화면에 "greenlet_spawn..." 에러 도배. 트랜잭션 로컬 락 타임아웃을 3초로 짧게
+    # 잡아, 락 못 잡으면 빠르게 fail-fast하고 다음 retry에 위임 (env.py 전역 30s보다 우선).
+    op.execute("SET LOCAL lock_timeout = '3s'")
+
     # registered_accounts가 비어있지 않은 상품을 빠르게 필터링하는 표현식 인덱스
     op.execute("""
         CREATE INDEX IF NOT EXISTS ix_scp_has_registered_accounts
@@ -26,12 +32,20 @@ def upgrade() -> None:
         )
     """)
 
-    # is_unregistered 컬럼 및 기존 B-tree 인덱스 제거
+    # 컬럼 존재 여부를 catalog 조회로 먼저 확인 (정보 스키마는 테이블 락 불필요)
+    # → 존재하지 않으면 ALTER 자체를 스킵하여 AccessExclusiveLock 시도를 회피
     op.execute("""
-        DROP INDEX IF EXISTS ix_samba_collected_product_is_unregistered
-    """)
-    op.execute("""
-        ALTER TABLE samba_collected_product DROP COLUMN IF EXISTS is_unregistered
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'samba_collected_product'
+                  AND column_name = 'is_unregistered'
+            ) THEN
+                EXECUTE 'DROP INDEX IF EXISTS ix_samba_collected_product_is_unregistered';
+                EXECUTE 'ALTER TABLE samba_collected_product DROP COLUMN is_unregistered';
+            END IF;
+        END $$;
     """)
 
 

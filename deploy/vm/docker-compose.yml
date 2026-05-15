@@ -23,6 +23,10 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+    # /opt/samba/.env 에 R2_PUBLIC_HOST=pub-XXXX.r2.dev 정의 필수
+    # (Caddyfile 의 /images/* reverse_proxy 가 환경변수 치환으로 사용)
+    env_file:
+      - /opt/samba/.env
     depends_on:
       - samba-api
     networks:

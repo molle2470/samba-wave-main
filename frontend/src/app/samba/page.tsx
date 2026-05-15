@@ -139,6 +139,7 @@ export default function SambaDashboard() {
     newRegistered: w.newRegistered ?? 0,
     marketDeleted: w.marketDeleted ?? 0,
     registeredCount: w.registeredCount ?? 0,
+    collectedCount: w.collectedCount ?? 0,
   }))
   const monthlyData = stats?.monthly || []
 
@@ -277,6 +278,7 @@ export default function SambaDashboard() {
                 <th style={{ textAlign: 'right', padding: '0.625rem 0', color: '#888', fontWeight: 500 }}>신규등록</th>
                 <th style={{ textAlign: 'right', padding: '0.625rem 0', color: '#888', fontWeight: 500 }}>마켓삭제</th>
                 <th style={{ textAlign: 'right', padding: '0.625rem 0', color: '#888', fontWeight: 500 }}>등록상품수</th>
+                <th style={{ textAlign: 'right', padding: '0.625rem 0', color: '#888', fontWeight: 500 }}>수집상품수</th>
               </tr>
             </thead>
             <tbody>
@@ -289,6 +291,7 @@ export default function SambaDashboard() {
                   <td style={{ padding: '0.625rem 0', textAlign: 'right', color: '#E5E5E5' }}>{fmtNum(d.newRegistered)}</td>
                   <td style={{ padding: '0.625rem 0', textAlign: 'right', color: '#E5E5E5' }}>{fmtNum(d.marketDeleted)}</td>
                   <td style={{ padding: '0.625rem 0', textAlign: 'right', color: '#FF8C00' }}>{fmtNum(d.registeredCount)}</td>
+                  <td style={{ padding: '0.625rem 0', textAlign: 'right', color: '#E5E5E5' }}>{fmtNum(d.collectedCount)}</td>
                 </tr>
               ))}
             </tbody>
