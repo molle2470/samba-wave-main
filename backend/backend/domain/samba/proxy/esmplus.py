@@ -254,9 +254,23 @@ class ESMPlusClient:
         except Exception:
             pass
 
-        result_code = body.get("resultCode", 0) if body else 0
+        # ESM 응답 키 case mismatch — item API ('resultCode') vs shipping/v1 API ('ResultCode').
+        # 양쪽 검사 + 0 이외(예: 1) 이면 에러로 raise.
+        result_code = (
+            body.get("resultCode")
+            if body
+            else None
+        )
+        if result_code is None and body:
+            result_code = body.get("ResultCode")
+        if result_code is None:
+            result_code = 0
         if resp.status_code >= 400 or (body and result_code != 0):
-            msg = body.get("message") or resp.text[:500]
+            msg = (
+                body.get("message")
+                or body.get("Message")
+                or resp.text[:500]
+            ) if body else resp.text[:500]
             logger.error(
                 f"[{label}] API 에러 {method} {path}: {resp.status_code} / resultCode={result_code} / {msg}"
             )
@@ -735,6 +749,90 @@ class ESMPlusClient:
     async def search_products(self, params: dict[str, Any]) -> dict[str, Any]:
         """상품 목록 조회 — POST /item/v1/goods/search (분당 30회 제한)"""
         return await self._call_api("POST", "/item/v1/goods/search", data=params)
+
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 주문 / 배송 API (path prefix: /shipping/v1/)
+    # ------------------------------------------------------------------
+    # 응답 키가 PascalCase ('ResultCode', 'Data'). _call_api 는 'resultCode'
+    # camelCase 만 검사 — 주문 API 호출 시 응답 직접 사용 + ci_get 권장.
+    # rate limit: 5초당 1회 (주문번호 직접 조회 제외) — 토큰버킷 30/min 으로 충분히 안전.
+    # ------------------------------------------------------------------
+
+    async def search_orders(self, params: dict[str, Any]) -> dict[str, Any]:
+        """주문 조회 — POST /shipping/v1/Order/RequestOrders.
+
+        Required params:
+          - siteType (int): 1=옥션, 2=G마켓
+          - orderStatus (int): 0=주문번호, 1=결제완료, 2=배송준비, 3=배송중, 4=배송완료, 5=구매결정
+          - requestDateFrom / requestDateTo (str YYYY-MM-DD): 기간 조회 시 필수
+          - requestDateType (int): 1=주문일, 2=결제일, 3=발송마감일
+          - orderNo (long): orderStatus=0 시 필수
+        Optional: pageIndex, pageSize.
+        조회 기간: G마켓 31일, 옥션 180일.
+        """
+        return await self._call_api(
+            "POST", "/shipping/v1/Order/RequestOrders", data=params
+        )
+
+    async def confirm_order(
+        self,
+        order_no: int | str,
+        seller_order_no: str | None = None,
+        seller_item_no: str | None = None,
+    ) -> dict[str, Any]:
+        """주문확인 — POST /shipping/v1/Order/OrderCheck/{OrderNo}.
+
+        주문확인 시 상태 '배송준비중' 으로 변경. 이후 취소는 판매자 승인 필요.
+        """
+        body: dict[str, Any] = {}
+        if seller_order_no:
+            body["SellerOrderNo"] = seller_order_no
+        if seller_item_no:
+            body["SellerItemNo"] = seller_item_no
+        return await self._call_api(
+            "POST", f"/shipping/v1/Order/OrderCheck/{order_no}", data=body
+        )
+
+    async def register_shipping(
+        self,
+        order_no: int | str,
+        delivery_company_code: int,
+        invoice_no: str,
+        shipping_date: str,
+        seller_order_no: str | None = None,
+        seller_item_no: str | None = None,
+    ) -> dict[str, Any]:
+        """발송처리 (송장 입력) — POST /shipping/v1/Delivery/ShippingInfo.
+
+        Args:
+          order_no: 주문번호.
+          delivery_company_code: deliveryCompCode (예: 10013 CJ택배).
+          invoice_no: 송장번호.
+          shipping_date: 발송일시 'YYYY-MM-DDThh:mm:ss'.
+        """
+        body: dict[str, Any] = {
+            "OrderNo": int(order_no),
+            "ShippingDate": shipping_date,
+            "DeliveryCompanyCode": int(delivery_company_code),
+            "InvoiceNo": invoice_no,
+        }
+        if seller_order_no:
+            body["SellerOrderNo"] = seller_order_no
+        if seller_item_no:
+            body["SellerItemNo"] = seller_item_no
+        return await self._call_api(
+            "POST", "/shipping/v1/Delivery/ShippingInfo", data=body
+        )
+
+    async def get_order_status(self, params: dict[str, Any]) -> dict[str, Any]:
+        """주문 상태 조회 — POST /shipping/v1/Order/OrderStatus (조회기간 7일 이내).
+
+        주요 응답: 주문상태 + 클레임 이력.
+        """
+        return await self._call_api(
+            "POST", "/shipping/v1/Order/OrderStatus", data=params
+        )
 
     # ------------------------------------------------------------------
     # 데이터 변환 — 상품 dict → ESM Plus API 포맷
