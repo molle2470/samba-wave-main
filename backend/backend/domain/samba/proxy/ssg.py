@@ -244,28 +244,26 @@ class SSGClient:
     async def register_product(self, product_data: dict[str, Any]) -> dict[str, Any]:
         """상품 전체 등록.
 
-        SSG Open API v0.1: POST /item/0.1/online
-        SSG POST API는 JSON이 아닌 XML body를 요구함 (XStream 기반).
+        SSG Open API v0.5: POST /item/0.5/insertItem.ssg (XStream XML)
         """
         xml_body = '<?xml version="1.0" encoding="UTF-8"?>' + self._to_xml(
             product_data, "insertItem"
         )
-        logger.info(f"[SSG DEBUG] insertItem XML (총 {len(xml_body.encode())}bytes):\n{xml_body[:2000]}")
+        logger.debug(f"[SSG] insertItem XML (총 {len(xml_body.encode())}bytes):\n{xml_body[:2000]}")
         result = await self._call_api_xml("POST", "/item/0.5/insertItem.ssg", xml_body)
         return {"success": True, "data": result}
 
     async def update_product(self, product_data: dict[str, Any]) -> dict[str, Any]:
         """상품 전체 수정.
 
-        SSG Open API v0.1: POST /item/0.1/online/{itemId}
-        SSG POST API는 JSON이 아닌 XML body를 요구함 (XStream 기반).
+        SSG Open API v0.5: POST /item/0.5/updateItem.ssg (XStream XML)
         """
         item_id = product_data.pop("itemId", "") or ""
         product_data["itemId"] = item_id  # XStream updateItem.ssg는 itemId를 XML 본문에 포함
         xml_body = '<?xml version="1.0" encoding="UTF-8"?>' + self._to_xml(
             product_data, "updateItem"
         )
-        logger.info(f"[SSG DEBUG] updateItem XML (itemId={item_id}):\n{xml_body[:2000]}")
+        logger.debug(f"[SSG] updateItem XML (itemId={item_id}):\n{xml_body[:2000]}")
         result = await self._call_api_xml(
             "POST", "/item/0.5/updateItem.ssg", xml_body
         )
@@ -1028,11 +1026,15 @@ class SSGClient:
         )
         # SSG XML 바디 크기 제한 — 전체 HTML이 너무 크면 Tomcat 400 발생
         _detail_bytes = _raw_detail_html.encode("utf-8")
-        detail_html = (
-            _detail_bytes[:50000].decode("utf-8", errors="ignore")
-            if len(_detail_bytes) > 50000
-            else _raw_detail_html
-        )
+        if len(_detail_bytes) > 50000:
+            detail_html = _detail_bytes[:50000].decode("utf-8", errors="ignore")
+            logger.warning(
+                "[SSG] detail_html %d bytes → 50,000 bytes로 절단 (상품: %s)",
+                len(_detail_bytes),
+                (product.get("name") or "")[:50],
+            )
+        else:
+            detail_html = _raw_detail_html
         images = product.get("images") or []
         brand = product.get("brand", "")
         material = product.get("material", "") or "상세설명참조"
