@@ -22,10 +22,11 @@ logger = logging.getLogger(__name__)
 
 
 def _per_account_timeout_seconds(days: int) -> int:
-    # 마켓 API hang → 워커 좀비화 도미노 차단 — 60~180초로 단축 (이전: 180~900초).
-    # 한 계정 hang 시 acc_session 이 idle in transaction 으로 남아 풀 잠식 → 다음 계정 hang
-    # 누적되면 컨테이너 재시작 사고. timeout 짧게 + 명시적 rollback 으로 좀비 회수 가속.
-    return max(60, min(180, days * 30))
+    # 120~300초 (1차 단축 60~180초는 너무 짧아 정상 응답도 timeout, 이전 180~900초는 너무 김).
+    # 롯데ON 한 계정 정상 처리에 주문조회+정산+교환/취소/반품+배송진행 등 5~7개 API 호출이
+    # 누적돼 60~90초까지 걸림. hang 좀비는 명시적 rollback + 클라이언트 aclose 로 차단되므로
+    # timeout 을 적당히 늘려도 도미노는 안 남.
+    return max(120, min(300, days * 60))
 
 
 async def run(
