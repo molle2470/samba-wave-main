@@ -171,11 +171,11 @@ asyncio.run(fix())
   # 기본값 1 (미설정 포함) → 실행 + 실패 시 exit 1. 스킵해도 verify_schema는 아래에서 실행됨.
   if [ "${RUN_MIGRATIONS:-1}" = "1" ]; then
     echo "Running database migrations..."
-    # 두 현재 HEAD로 stamp (2026-05-04 기준: z_add_sourcing_recipes, z_add_tetris_assignment)
-    # 각 배포마다 최신 HEAD를 반영하여 alembic upgrade heads가 이전 마이그레이션을 재실행하지 않도록 함
-    echo "Stamping alembic to current heads..."
-    uv run alembic stamp --purge z_add_sourcing_recipes 2>/dev/null || true
-    uv run alembic stamp z_add_tetris_assignment 2>/dev/null || true
+    # 최신 HEAD로 stamp — 컬럼/인덱스가 이미 DB에 존재하는 상태에서 hot 테이블 ALTER가
+    # 활성 트랜잭션과 데드락 일으키는 문제 방지. 누락 컬럼이 진짜 있다면
+    # alembic upgrade heads 가 IF NOT EXISTS로 추가하므로 안전.
+    echo "Stamping alembic to current head..."
+    uv run alembic stamp --purge zzzzzzzzzzzzzzzzzzzzzzzz_merge_heads_postal_sales 2>/dev/null || true
     _MIGRATION_OK=0
     for i in 1 2 3; do
       if uv run alembic upgrade heads; then
