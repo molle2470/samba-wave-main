@@ -51,14 +51,13 @@ class AuctionPlugin(MarketPlugin):
             }
 
         # 호스팅 인증정보 — 서버 환경변수에서 로드 (셀링툴업체 고정값)
-        from backend.core.config import settings
+        from backend.domain.samba.proxy.esmplus import resolve_esm_credentials
 
-        hosting_id = settings.esmplus_hosting_id
-        secret_key = settings.esmplus_secret_key
+        hosting_id, secret_key = await resolve_esm_credentials(session, account)
         if not hosting_id or not secret_key:
             return {
                 "success": False,
-                "message": "서버 환경변수(ESMPLUS_HOSTING_ID/ESMPLUS_SECRET_KEY)가 설정되지 않았습니다.",
+                "message": "ESM 인증정보 없음 — account.additional_fields / samba_settings.esm_credentials / ESMPLUS_HOSTING_ID env 중 하나 필요.",
             }
 
         client = ESMPlusClient(hosting_id, secret_key, seller_id, site="auction")
@@ -250,12 +249,11 @@ class AuctionPlugin(MarketPlugin):
         if not seller_id:
             return {"success": False, "message": "옥션 판매자 ID 없음"}
 
-        from backend.core.config import settings
+        from backend.domain.samba.proxy.esmplus import resolve_esm_credentials
 
-        hosting_id = settings.esmplus_hosting_id
-        secret_key = settings.esmplus_secret_key
+        hosting_id, secret_key = await resolve_esm_credentials(session, account)
         if not hosting_id or not secret_key:
-            return {"success": False, "message": "호스팅 인증정보(환경변수) 없음"}
+            return {"success": False, "message": "ESM 인증정보 없음"}
         client = ESMPlusClient(hosting_id, secret_key, seller_id, site="auction")
 
         # 판매중지 — 실 호출 검증 schema (PascalCase). 'IsSell' 만으로도 ESM 측 검증 통과.

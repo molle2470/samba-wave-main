@@ -1169,6 +1169,58 @@ def esm_find_category_by_path(path: str, site: str) -> str:
 
 
 # ------------------------------------------------------------------
+# 인증 정보 resolve 헬퍼
+# ------------------------------------------------------------------
+
+
+async def resolve_esm_credentials(
+    session: Any,
+    account: Any = None,
+) -> tuple[str, str]:
+    """ESM 인증 정보 조회 — 다단계 우선순위:
+
+    1. account.additional_fields.esmHostingId/esmSecretKey (계정별 다중 hosting 지원)
+    2. samba_settings.esm_credentials = {hosting_id, secret_key} (단일 hosting 다계정)
+    3. env (settings.esmplus_hosting_id/esmplus_secret_key) — 1단계 (movestory1 검증)
+
+    Returns:
+      (hosting_id, secret_key). 모두 빈 문자열이면 미설정.
+    """
+    # 1) account.additional_fields
+    if account is not None:
+        extras = getattr(account, "additional_fields", None) or {}
+        h = (extras.get("esmHostingId") or "").strip()
+        s = (extras.get("esmSecretKey") or "").strip()
+        if h and s:
+            return h, s
+
+    # 2) samba_settings.esm_credentials
+    if session is not None:
+        try:
+            from backend.api.v1.routers.samba.proxy._helpers import _get_setting
+
+            creds = await _get_setting(session, "esm_credentials") or {}
+            if isinstance(creds, dict):
+                h = (creds.get("hosting_id") or "").strip()
+                s = (creds.get("secret_key") or "").strip()
+                if h and s:
+                    return h, s
+        except Exception as exc:
+            logger.debug(f"[ESM] settings esm_credentials 조회 실패: {exc}")
+
+    # 3) env (settings.esmplus_*)
+    try:
+        from backend.core.config import settings
+
+        return (
+            (settings.esmplus_hosting_id or "").strip(),
+            (settings.esmplus_secret_key or "").strip(),
+        )
+    except Exception:
+        return "", ""
+
+
+# ------------------------------------------------------------------
 # samba options → ESM 추천옵션 흐름 헬퍼 (plugins 공유)
 # ------------------------------------------------------------------
 
