@@ -87,96 +87,132 @@ async def run(
     all_results: list[dict[str, Any]] = []
     per_account_timeout = _per_account_timeout_seconds(days)
 
-    for idx, acc in enumerate(accs):
-        # 사용자 취소 체크 — 매 계정 시작 전
-        if await repo.is_cancelled(job.id):
-            logger.info(f"[order_sync] {job.id} 취소 감지 — 중단")
-            _add_job_log(job.id, "사용자 취소 — 동기화 중단")
-            return
+    # 동시 실행 한도 — 풀(write max 50) 안에서 오토튠 ~10 + 마진 고려해 5로 제한.
+    # 21계정 sequential → 5개씩 병렬로 약 4배 빠름. isolation 은 계정별 독립 세션으로 유지.
+    _CONCURRENCY = 5
+    _sem = asyncio.Semaphore(_CONCURRENCY)
+    _done_counter = {"n": 0}
+    _cancel_flag = {"cancelled": False}
 
-        label = f"{acc.market_name}({acc.seller_id or '-'})"
-        _add_job_log(
-            job.id,
-            f"{label}: 주문수집 시작 ({idx + 1}/{total}, 최근 {days}일, 제한 {per_account_timeout}초)",
-        )
-        try:
-            # 계정마다 독립 세션 — 앞 계정의 commit/rollback 잔류 상태로 인한 오염 차단
-            # (특히 스마트스토어 분기는 last-changed-statuses 13×2 호출로 26초+ 걸려
-            #  공유 세션에서 트랜잭션 abort 시 후속 분기들이 silent 실패하는 사고가 있었다)
-            async with get_write_session() as acc_session:
-                try:
-                    res = await asyncio.wait_for(
-                        sync_orders_from_markets(
-                            body=SyncOrdersRequest(days=days, account_id=acc.id),
-                            session=acc_session,
-                            tenant_id=job.tenant_id,
-                        ),
-                        timeout=per_account_timeout,
-                    )
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    # asyncpg + CancelledError 좀비 차단 — async with 의 자동 rollback 만으로는
-                    # idle in transaction 으로 남는 사례가 있어 명시적으로 5초 안에 rollback 강제.
-                    try:
-                        await asyncio.wait_for(acc_session.rollback(), timeout=5)
-                    except Exception as _rb_err:
-                        logger.warning(
-                            f"[order_sync] {label} TimeoutError 후 명시적 rollback 실패: {_rb_err}"
-                        )
-                    raise
-            total_synced += int(res.get("total_synced") or 0)
-            results = res.get("results") or []
-            for r in results:
-                all_results.append(r)
-                if r.get("status") == "success":
-                    _add_job_log(
-                        job.id,
-                        f"{r.get('account', label)}: "
-                        f"{r.get('fetched', 0)}건 조회, "
-                        f"{r.get('synced', 0)}건 신규 저장",
-                    )
-                elif r.get("status") == "skip":
-                    _add_job_log(
-                        job.id, f"{r.get('account', label)}: {r.get('message', '')}"
-                    )
-                else:
-                    _add_job_log(
-                        job.id,
-                        f"{r.get('account', label)}: 오류 — {r.get('message', '')}",
-                    )
-        except asyncio.TimeoutError:
-            logger.error(f"[order_sync] {label} timeout after {per_account_timeout}s")
+    async def _process_account(idx: int, acc: Any) -> None:
+        # 사용자 취소 감지 시 새 계정 시작 막음 (이미 시작된 건 끝까지 진행)
+        if _cancel_flag["cancelled"]:
+            return
+        async with _sem:
+            if _cancel_flag["cancelled"]:
+                return
+            label = f"{acc.market_name}({acc.seller_id or '-'})"
             _add_job_log(
                 job.id,
-                f"{label} 오류: {per_account_timeout}초 동안 응답이 없어 다음 계정으로 넘어갑니다",
+                f"{label}: 주문수집 시작 ({idx + 1}/{total}, 최근 {days}일, 제한 {per_account_timeout}초)",
             )
-            all_results.append(
-                {
-                    "account": label,
-                    "status": "error",
-                    "message": f"timeout after {per_account_timeout}s",
-                }
-            )
-        except Exception as e:
-            logger.error(f"[order_sync] {label} 실패: {e}")
-            _add_job_log(job.id, f"{label} 오류: {e}")
-            all_results.append(
-                {"account": label, "status": "error", "message": str(e)[:500]}
-            )
-            # acc_session 은 컨텍스트 매니저가 자체 rollback — 워커 세션은 노출 안 됐으므로 별도 롤백 불필요
-
-        # 진행률 갱신 — 매 계정 처리 후 fresh 세션 + 5초 타임아웃
-        # 워커 세션이 풀 압박/idle in transaction 으로 hang 시
-        # "주문수집 중..." 무한 표시되는 사고 방지
-        try:
-            async with get_write_session() as prog_session:
-                prog_repo = SambaJobRepository(prog_session)
-                await asyncio.wait_for(
-                    prog_repo.update_progress(job.id, idx + 1, total),
-                    timeout=5,
+            res: dict[str, Any] | None = None
+            try:
+                # 계정마다 독립 세션 — 앞 계정의 commit/rollback 잔류 상태로 인한 오염 차단
+                async with get_write_session() as acc_session:
+                    try:
+                        res = await asyncio.wait_for(
+                            sync_orders_from_markets(
+                                body=SyncOrdersRequest(days=days, account_id=acc.id),
+                                session=acc_session,
+                                tenant_id=job.tenant_id,
+                            ),
+                            timeout=per_account_timeout,
+                        )
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        # asyncpg + CancelledError 좀비 차단 — 명시적 rollback
+                        try:
+                            await asyncio.wait_for(acc_session.rollback(), timeout=5)
+                        except Exception as _rb_err:
+                            logger.warning(
+                                f"[order_sync] {label} TimeoutError 후 명시적 rollback 실패: {_rb_err}"
+                            )
+                        raise
+                nonlocal total_synced
+                total_synced += int(res.get("total_synced") or 0)
+                results = res.get("results") or []
+                for r in results:
+                    all_results.append(r)
+                    if r.get("status") == "success":
+                        _add_job_log(
+                            job.id,
+                            f"{r.get('account', label)}: "
+                            f"{r.get('fetched', 0)}건 조회, "
+                            f"{r.get('synced', 0)}건 신규 저장",
+                        )
+                    elif r.get("status") == "skip":
+                        _add_job_log(
+                            job.id,
+                            f"{r.get('account', label)}: {r.get('message', '')}",
+                        )
+                    else:
+                        _add_job_log(
+                            job.id,
+                            f"{r.get('account', label)}: 오류 — {r.get('message', '')}",
+                        )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"[order_sync] {label} timeout after {per_account_timeout}s"
                 )
-                await prog_session.commit()
-        except (asyncio.TimeoutError, Exception) as pe:
-            logger.warning(f"[order_sync] {job.id} 진행률 갱신 실패 (계속 진행): {pe}")
+                _add_job_log(
+                    job.id,
+                    f"{label} 오류: {per_account_timeout}초 동안 응답이 없어 다음 계정으로 넘어갑니다",
+                )
+                all_results.append(
+                    {
+                        "account": label,
+                        "status": "error",
+                        "message": f"timeout after {per_account_timeout}s",
+                    }
+                )
+            except Exception as e:
+                logger.error(f"[order_sync] {label} 실패: {e}")
+                _add_job_log(job.id, f"{label} 오류: {e}")
+                all_results.append(
+                    {"account": label, "status": "error", "message": str(e)[:500]}
+                )
+
+            # 진행률 갱신 — 처리 끝낼 때마다 fresh 세션 + 5초 타임아웃
+            _done_counter["n"] += 1
+            _done = _done_counter["n"]
+            try:
+                async with get_write_session() as prog_session:
+                    prog_repo = SambaJobRepository(prog_session)
+                    await asyncio.wait_for(
+                        prog_repo.update_progress(job.id, _done, total),
+                        timeout=5,
+                    )
+                    await prog_session.commit()
+            except (asyncio.TimeoutError, Exception) as pe:
+                logger.warning(
+                    f"[order_sync] {job.id} 진행률 갱신 실패 (계속 진행): {pe}"
+                )
+
+    # 백그라운드 취소 감시 — 5초마다 is_cancelled 확인 후 _cancel_flag 토글
+    async def _cancel_watcher() -> None:
+        while not _cancel_flag["cancelled"]:
+            await asyncio.sleep(5)
+            try:
+                if await repo.is_cancelled(job.id):
+                    _cancel_flag["cancelled"] = True
+                    _add_job_log(job.id, "사용자 취소 — 신규 계정 시작 중단")
+                    return
+            except Exception:
+                pass
+
+    _watcher_task = asyncio.create_task(_cancel_watcher())
+    try:
+        await asyncio.gather(
+            *[_process_account(idx, acc) for idx, acc in enumerate(accs)],
+            return_exceptions=True,
+        )
+    finally:
+        _cancel_flag["cancelled"] = True  # 워처 종료 신호
+        _watcher_task.cancel()
+        try:
+            await _watcher_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     _add_job_log(job.id, f"전체마켓 주문수집 완료 — 총 {total_synced}건 신규 저장")
 
