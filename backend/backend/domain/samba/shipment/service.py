@@ -2411,7 +2411,9 @@ class SambaShipmentService:
             logger.info(f"[카테고리] {market_type} DB 매핑 없음 — 전송 대상에서 제외")
 
         # 경로 문자열 → 숫자 코드 변환
-        # ssg/ssg_std는 각각 cat2에 dispCtgId/stdCtgId 코드맵이 있으므로 함께 변환
+        # ssg: _sync_ssg_display가 cat2에 dispCtgId 코드맵을 저장하므로 변환 가능
+        # ssg_std: _sync_ssg가 cat2에 stdCtgDclsId 코드맵을 저장하므로 변환 가능
+        # (이전에는 cat2가 표준카테고리만 담아 ssg 변환이 불가했으나, sync_service 개선으로 해소됨)
         from backend.domain.samba.category.repository import SambaCategoryTreeRepository
 
         category_svc = SambaCategoryService(
@@ -2433,6 +2435,12 @@ class SambaShipmentService:
                             code,
                         )
                         result[market_type] = code
+                    else:
+                        logger.warning(
+                            "[카테고리 코드 변환] %s: '%s' 코드 없음 — 카테고리 동기화 후 재시도",
+                            market_type,
+                            cat_path,
+                        )
 
         return result
 
