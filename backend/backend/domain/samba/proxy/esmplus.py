@@ -248,29 +248,36 @@ class ESMPlusClient:
         if resp.status_code == 204:
             return {"resultCode": 0}
 
-        body: dict[str, Any] = {}
+        raw: Any = {}
         try:
-            body = resp.json()
+            raw = resp.json()
         except Exception:
             pass
 
+        # 일부 endpoint (CS 등) 는 list 직접 반환 — dict wrapping.
+        if isinstance(raw, list):
+            body: dict[str, Any] = {"data": raw, "_list_response": True}
+        elif isinstance(raw, dict):
+            body = raw
+        else:
+            body = {}
+
         # ESM 응답 키 case mismatch — item API ('resultCode') vs shipping/v1 API ('ResultCode').
-        # 양쪽 검사 + 0 이외(예: 1) 이면 에러로 raise.
-        result_code = (
-            body.get("resultCode")
-            if body
-            else None
-        )
-        if result_code is None and body:
-            result_code = body.get("ResultCode")
-        if result_code is None:
+        # 양쪽 검사 + 0 이외(예: 1) 이면 에러로 raise. list 응답은 검증 skip.
+        if body.get("_list_response"):
             result_code = 0
+        else:
+            result_code = body.get("resultCode")
+            if result_code is None:
+                result_code = body.get("ResultCode")
+            if result_code is None:
+                result_code = 0
         if resp.status_code >= 400 or (body and result_code != 0):
             msg = (
                 body.get("message")
                 or body.get("Message")
                 or resp.text[:500]
-            ) if body else resp.text[:500]
+            )
             logger.error(
                 f"[{label}] API 에러 {method} {path}: {resp.status_code} / resultCode={result_code} / {msg}"
             )
@@ -832,6 +839,127 @@ class ESMPlusClient:
         """
         return await self._call_api(
             "POST", "/shipping/v1/Order/OrderStatus", data=params
+        )
+
+    # ------------------------------------------------------------------
+    # 정산조회 (account/v1/settle/...)
+    # SiteType: 'A'(옥션) 또는 'G'(G마켓) — 문자열.
+    # 환불된 주문은 반대 부호.
+    # ------------------------------------------------------------------
+
+    async def search_settle_orders(self, params: dict[str, Any]) -> dict[str, Any]:
+        """판매대금 정산조회 — POST /account/v1/settle/getsettleorder.
+
+        params:
+          - SiteType: 'A'/'G'
+          - SrchType: D1~D10 (입금확인일/배송일/송금일 등)
+          - SrchStartDate, SrchEndDate: YYYY-MM-DD
+          - PageNo, PageRowCnt
+        """
+        return await self._call_api(
+            "POST", "/account/v1/settle/getsettleorder", data=params
+        )
+
+    async def search_settle_delivery_fees(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """배송비 정산조회 — POST /account/v1/settle/getsettledeliveryfee."""
+        return await self._call_api(
+            "POST", "/account/v1/settle/getsettledeliveryfee", data=params
+        )
+
+    # ------------------------------------------------------------------
+    # 클레임 (claim/v1/...): 취소/반품/교환/미수령
+    # 응답 schema: PascalCase (ResultCode, Data: list).
+    # ------------------------------------------------------------------
+
+    async def search_cancels(self, params: dict[str, Any]) -> dict[str, Any]:
+        """취소 조회 — POST /claim/v1/sa/Cancels.
+
+        params:
+          - SiteType: 1=옥션, 3=G마켓
+          - CancelStatus: 0(전체)~6
+          - Type: 0=주문번호, 1=장바구니, 2=신청일, 3=완료일, 4=결제일
+          - StartDate / EndDate: 7일 이내 범위
+        """
+        return await self._call_api("POST", "/claim/v1/sa/Cancels", data=params)
+
+    async def approve_cancel(self, params: dict[str, Any]) -> dict[str, Any]:
+        """취소승인 — POST /claim/v1/sa/Cancels/Approval."""
+        return await self._call_api(
+            "POST", "/claim/v1/sa/Cancels/Approval", data=params
+        )
+
+    async def seller_cancel(self, params: dict[str, Any]) -> dict[str, Any]:
+        """판매취소 (품절 등) — POST /claim/v1/sa/Cancels/SellerCancel."""
+        return await self._call_api(
+            "POST", "/claim/v1/sa/Cancels/SellerCancel", data=params
+        )
+
+    async def search_exchanges(self, params: dict[str, Any]) -> dict[str, Any]:
+        """교환 조회 — POST /claim/v1/sa/Exchanges."""
+        return await self._call_api("POST", "/claim/v1/sa/Exchanges", data=params)
+
+    async def search_non_receipts(self, params: dict[str, Any]) -> dict[str, Any]:
+        """미수령 신고 조회 — POST /claim/v1/sa/NonReceipts."""
+        return await self._call_api("POST", "/claim/v1/sa/NonReceipts", data=params)
+
+    # ------------------------------------------------------------------
+    # CS / 판매자 문의 (item/v1/communications/...)
+    # ------------------------------------------------------------------
+
+    async def search_customer_inquiries(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """판매자 문의 조회 — POST /item/v1/communications/customer/bulletin-board.
+
+        Required params:
+          - qnaType (int): 문의 종류 (3 등)
+          - status (int): 답변상태
+          - type (int): 마켓 구분
+          - startDate / endDate (YYYY-MM-DD): 7일 단위
+        """
+        return await self._call_api(
+            "POST",
+            "/item/v1/communications/customer/bulletin-board",
+            data=params,
+        )
+
+    async def answer_customer_inquiry(
+        self,
+        message_no: str,
+        token: str,
+        title: str,
+        comments: str,
+        answer_status: int = 2,
+    ) -> dict[str, Any]:
+        """판매자 문의 답변 — POST .../bulletin-board/qna.
+
+        answer_status: 1=처리중, 2=처리완료.
+        comments 1000byte 이내.
+        SSG.COM 제휴 문의는 답변 후 수정 불가 — 운영자 주의.
+        """
+        body = {
+            "messageNo": message_no,
+            "token": token,
+            "answerStatus": int(answer_status),
+            "title": title[:200],
+            "comments": comments,  # 1000byte 이내 호출자 보장
+        }
+        return await self._call_api(
+            "POST",
+            "/item/v1/communications/customer/bulletin-board/qna",
+            data=body,
+        )
+
+    async def search_urgent_alerts(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """긴급알리미 조회 — ESM 측 CS 긴급 요청 사항."""
+        return await self._call_api(
+            "POST",
+            "/item/v1/communications/urgent-alert/bulletin-board",
+            data=params,
         )
 
     # ------------------------------------------------------------------
