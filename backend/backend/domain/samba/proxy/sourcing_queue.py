@@ -17,7 +17,43 @@ from backend.shutdown_state import is_shutting_down
 from backend.utils.logger import logger
 
 _UTC = timezone.utc
-_JOB_TTL_SEC: dict[str, int] = {"search": 600, "detail": 180, "tracking": 3600}
+_JOB_TTL_SEC: dict[str, int] = {
+    "search": 600,
+    "detail": 180,
+    "tracking": 3600,
+    "reward": 3600,
+}
+
+# 적립 액션별 진입 URL — 확장앱이 잡 받으면 이 URL의 탭을 열고 content script 주입.
+REWARD_ACTION_URLS: dict[str, str] = {
+    "musinsa_attendance": "https://www.musinsa.com/events/attendance",
+    "musinsa_snap_like": "https://www.musinsa.com/mission?tab=snap-daily-like",
+    "musinsa_balance": "https://www.musinsa.com/mypage",
+    "musinsa_review": "https://www.musinsa.com/mypage/myreview",
+    "abcmart_attendance": "https://member.a-rt.com/p/attendance-check",
+    "abcmart_review": "https://abcmart.a-rt.com/mypage/claim/claim-order-main?orderPrdtStatCodeClick=10007",
+    "ssg_review": "https://www.ssg.com/myssg/activityMng/pdtEvalList.ssg?quick=pdtEvalList",
+    "gs_review": "https://www.gsshop.com/ord/dlvcursta/ordList.gs",
+    "lotteon_review": "https://www.lotteon.com/p/review/myLotte/reviewWriteListTab",
+    "naver_review": "https://shopping.naver.com/my/writable-reviews",
+    "kream_review": "https://kream.co.kr/my/reviews?tab=to_write",
+}
+
+# 사이트별 지원 액션 (자동 적립 매트릭스)
+SITE_REWARD_ACTIONS: dict[str, list[str]] = {
+    "MUSINSA": [
+        "musinsa_attendance",
+        "musinsa_snap_like",
+        "musinsa_balance",
+        "musinsa_review",
+    ],
+    "ABCmart": ["abcmart_attendance", "abcmart_review"],
+    "SSG": ["ssg_review"],
+    "GSShop": ["gs_review"],
+    "LOTTEON": ["lotteon_review"],
+    "NAVERSTORE": ["naver_review"],
+    "KREAM": ["kream_review"],
+}
 
 
 async def _db_insert_job(
@@ -289,6 +325,51 @@ class SourcingQueue:
         _owner_tag = f" owner={owner_device_id[:8]}" if owner_device_id else ""
         logger.info(
             f"[소싱큐] 송장조회 추가: {site} ord={sourcing_order_number} "
+            f"(id={request_id}){_owner_tag}"
+        )
+        return request_id, future
+
+    @classmethod
+    async def add_reward_job(
+        cls,
+        site: str,
+        action: str,
+        sourcing_account_id: str,
+        *,
+        owner_device_id: str | None = None,
+    ) -> tuple[str, asyncio.Future[Any]]:
+        """적립금 자동 적립 작업 큐에 추가.
+
+        action: 'musinsa_attendance' | 'musinsa_snap_like' | 'musinsa_balance' | 'abcmart_attendance'
+        결과는 라우터 `/sourcing-accounts/extension/reward-result` 로 수신되어
+        `additional_fields.last_{action}_at` / balance 갱신에 사용된다.
+
+        송장조회와 동일하게 sequential 적재로 같은 계정 잡 연속 처리 보장.
+        """
+        cls._ensure_accepting_jobs()
+        url = REWARD_ACTION_URLS.get(action)
+        if not url:
+            raise ValueError(f"지원하지 않는 적립 액션: {action}")
+        request_id = str(uuid.uuid4())[:8]
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+        if owner_device_id is None:
+            owner_device_id = get_autotune_owner(site)
+
+        job: dict[str, Any] = {
+            "requestId": request_id,
+            "site": site,
+            "type": "reward",
+            "action": action,
+            "url": url,
+            "sourcingAccountId": sourcing_account_id,
+            "ownerDeviceId": owner_device_id or "",
+        }
+        cls.resolvers[request_id] = future
+        await _db_insert_job(job, "reward")
+        _owner_tag = f" owner={owner_device_id[:8]}" if owner_device_id else ""
+        logger.info(
+            f"[소싱큐] 적립 추가: {site} action={action} acct={sourcing_account_id} "
             f"(id={request_id}){_owner_tag}"
         )
         return request_id, future

@@ -342,6 +342,8 @@ _sourcing_job_cleanup_task: asyncio.Task | None = None
 _tetris_sync_last_run: float = 0.0
 _order_auto_sync_task: asyncio.Task | None = None
 _order_auto_sync_last_run: float = 0.0
+_reward_auto_task: asyncio.Task | None = None
+_reward_auto_last_run: float = 0.0
 
 
 async def _tetris_sync_loop() -> None:
@@ -705,6 +707,102 @@ async def _start_order_auto_sync_scheduler() -> None:
     )
 
 
+async def _reward_auto_loop() -> None:
+    """적립금 자동 적립 인터벌 루프 — 1분마다 설정 확인 후 인터벌 도달 시
+    활성 소싱처 계정(MUSINSA/ABCmart) 전체에 reward 잡 적재.
+
+    각 액션은 라우터의 `_enqueue_reward_for_account` 내부에서 24h 가드를 다시 체크하므로
+    여기서는 인터벌 도달 여부만 판단한다.
+    """
+    global _reward_auto_last_run
+    import time
+
+    _log = logging.getLogger("backend.lifecycle")
+    while True:
+        await asyncio.sleep(60)
+        try:
+            from backend.api.v1.routers.samba.proxy._helpers import (
+                _get_setting,
+                _set_setting,
+            )
+            from backend.db.orm import get_read_session, get_write_session
+
+            async with get_read_session() as rs:
+                val = await _get_setting(rs, "reward_auto_run_interval_hours")
+                try:
+                    interval_h = int(val) if val is not None else 0
+                except (TypeError, ValueError):
+                    interval_h = 0
+
+            if interval_h <= 0:
+                continue
+
+            now = time.time()
+            if now - _reward_auto_last_run < interval_h * 3600:
+                continue
+
+            _log.info(f"[적립금 auto] 인터벌 {interval_h}시간 도달 — 시작")
+
+            from backend.api.v1.routers.samba.sourcing_account import (
+                _enqueue_reward_for_account,
+            )
+            from backend.domain.samba.sourcing_account.model import (
+                SambaSourcingAccount,
+            )
+            from sqlmodel import select as _select
+
+            async with get_read_session() as rs2:
+                stmt = _select(SambaSourcingAccount).where(
+                    SambaSourcingAccount.site_name.in_(  # type: ignore[attr-defined]
+                        [
+                            "MUSINSA",
+                            "ABCmart",
+                            "SSG",
+                            "GSShop",
+                            "LOTTEON",
+                            "NAVERSTORE",
+                            "KREAM",
+                        ]
+                    ),
+                    SambaSourcingAccount.is_active == True,  # noqa: E712
+                )
+                rows = (await rs2.execute(stmt)).scalars().all()
+
+            count = 0
+            for a in rows:
+                try:
+                    enq = await _enqueue_reward_for_account(a)
+                    count += sum(1 for e in enq if "request_id" in e)
+                except Exception as ee:
+                    _log.warning(f"[적립금 auto] 계정 처리 실패 {a.id}: {ee}")
+
+            _log.info(f"[적립금 auto] 적재 완료: 잡 {count}건 ({len(rows)}개 계정)")
+
+            # 마지막 실행 시각 저장 (페이지 표시용)
+            from datetime import datetime as _dt, timezone as _tz
+
+            try:
+                async with get_write_session() as ws:
+                    await _set_setting(
+                        ws,
+                        "reward_auto_run_last_at",
+                        _dt.now(_tz.utc).isoformat(),
+                    )
+            except Exception as ee:
+                _log.warning(f"[적립금 auto] last_at 저장 실패: {ee}")
+
+            _reward_auto_last_run = now
+
+        except Exception as e:
+            _log.error(f"[적립금 auto 루프] 오류: {e}")
+
+
+async def _start_reward_auto_scheduler() -> None:
+    global _reward_auto_task
+    _reward_auto_task = asyncio.create_task(_reward_auto_loop())
+    logging.getLogger("backend.lifecycle").info("[lifecycle] 적립금 auto 스케줄러 시작")
+
+
 async def _start_order_poller() -> None:
     global _order_poller_task
     from backend.domain.samba.order.poller import start_order_poller
@@ -959,6 +1057,7 @@ async def lifespan(app: FastAPI):
         await _start_lottehome_qa_poller()
         await _start_tetris_sync_scheduler()
         await _start_order_auto_sync_scheduler()
+        await _start_reward_auto_scheduler()
         await _start_sourcing_job_cleanup()
         await _start_lotteon_ghost_reconciler()
         await _start_elevenst_ghost_reconciler()
@@ -982,6 +1081,7 @@ async def lifespan(app: FastAPI):
         await _cancel_task(_lottehome_qa_poller_task)
         await _cancel_task(_tetris_sync_task)
         await _cancel_task(_order_auto_sync_task)
+        await _cancel_task(_reward_auto_task)
         await _cancel_task(_lotteon_ghost_reconciler_task)
         await _cancel_task(_elevenst_ghost_reconciler_task)
         await _shutdown_worker_runtime(worker_runtime)

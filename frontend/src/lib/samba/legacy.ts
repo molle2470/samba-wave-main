@@ -2429,6 +2429,83 @@ export const sourcingAccountApi = {
     request<{ ok: boolean }>(`${SAMBA_PREFIX}/sourcing-accounts/request-chrome-profile-sync`, { method: 'POST' }),
 }
 
+// ── Rewards (적립금 자동 적립) ──
+
+export interface RewardActionMeta {
+  id: string
+  site: string
+  label: string
+}
+
+export interface RewardAccountRow {
+  id: string
+  site_name: string
+  account_label: string
+  username: string
+  is_active: boolean
+  is_login_default: boolean
+  balance: number | null
+  balance_updated_at: string | null
+  mileage: number | null
+  last_musinsa_attendance_at: string | null
+  last_musinsa_attendance_reward: number | null
+  musinsa_attendance_streak: number | null
+  last_musinsa_snap_like_at: string | null
+  last_musinsa_snap_reward: number | null
+  last_abcmart_attendance_at: string | null
+  abcmart_stamp_count: number | null
+  abcmart_stamp_score: number | null
+  // 리뷰 자동작성 누적
+  last_musinsa_review_at: string | null
+  musinsa_review_total: number | null
+  last_musinsa_review_count: number | null
+  last_abcmart_review_at: string | null
+  abcmart_review_total: number | null
+  last_abcmart_review_count: number | null
+  last_ssg_review_at: string | null
+  ssg_review_total: number | null
+  last_ssg_review_count: number | null
+  last_gs_review_at: string | null
+  gs_review_total: number | null
+  last_gs_review_count: number | null
+  last_lotteon_review_at: string | null
+  lotteon_review_total: number | null
+  last_lotteon_review_count: number | null
+  last_naver_review_at: string | null
+  naver_review_total: number | null
+  last_naver_review_count: number | null
+  last_kream_review_at: string | null
+  kream_review_total: number | null
+  last_kream_review_count: number | null
+  cookie_expired: boolean
+}
+
+export interface RewardsStatus {
+  actions: RewardActionMeta[]
+  accounts: RewardAccountRow[]
+  auto_interval_hours: number
+  last_auto_run_at: string | null
+}
+
+export const rewardsApi = {
+  status: () => request<RewardsStatus>(`${SAMBA_PREFIX}/sourcing-accounts/rewards/status`),
+  runNow: (actions?: string[]) =>
+    request<{ ok: boolean; summary: unknown[] }>(`${SAMBA_PREFIX}/sourcing-accounts/rewards/run-now`, {
+      method: 'POST',
+      body: JSON.stringify({ actions: actions ?? null }),
+    }),
+  runAccount: (accountId: string, actions?: string[]) =>
+    request<{ ok: boolean; account_id: string; enqueued: unknown[] }>(
+      `${SAMBA_PREFIX}/sourcing-accounts/rewards/run-account/${accountId}`,
+      { method: 'POST', body: JSON.stringify({ actions: actions ?? null }) },
+    ),
+  setAutoSettings: (intervalHours: number) =>
+    request<{ ok: boolean; interval_hours: number }>(`${SAMBA_PREFIX}/sourcing-accounts/rewards/auto-settings`, {
+      method: 'POST',
+      body: JSON.stringify({ interval_hours: intervalHours }),
+    }),
+}
+
 // ── Tenant (티어/사용량) ──
 
 export interface TenantInfo {

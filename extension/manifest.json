@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "SAMBA-WAVE",
-  "version": "2.13.24",
-  "description": "무재고 위탁판매 솔루션 - 무신사/KREAM/소싱처 수집 + 송장 자동전송",
+  "version": "2.13.27",
+  "description": "무재고 위탁판매 솔루션 - 무신사/KREAM/소싱처 수집 + 송장 자동전송 + 적립금 + 리뷰 자동작성",
   "permissions": [
     "cookies",
     "storage",
@@ -41,6 +41,9 @@
     "https://sell.smartstore.naver.com/*",
     "https://smartstore.naver.com/*",
     "https://brand.naver.com/*",
+    "https://shopping.naver.com/*",
+    "https://order.pay.naver.com/*",
+    "https://*.pay.naver.com/*",
     "http://localhost:28080/*",
     "http://localhost:3000/*",
     "https://samba-wave-api-363598397345.asia-northeast3.run.app/*",
@@ -146,6 +149,16 @@
     {
       "matches": ["https://www.oliveyoung.co.kr/store/mypage/getOrderDetail.do*"],
       "js": ["content-tracking-oliveyoung.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://shopping.naver.com/popup/reviews/form*",
+        "https://shopping.naver.com/popup/reviews/monthly-form*",
+        "https://*.naver.com/popup/reviews/form*",
+        "https://*.naver.com/popup/reviews/monthly-form*"
+      ],
+      "js": ["content-review-naver.js"],
       "run_at": "document_idle"
     }
   ],

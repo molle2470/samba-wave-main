@@ -32,6 +32,7 @@ const NAV_ITEMS: NavItem[] = [
   { href: "/samba/returns", label: "반품교환" },
   { href: "/samba/cs", label: "CS" },
   { href: "/samba/analytics", label: "매출통계" },
+  { href: "/samba/rewards", label: "적립금" },
   { href: "/samba/settings", label: "설정" },
 ];
 

@@ -9,6 +9,7 @@ export {
   snsApi,
   wholesaleApi,
   sourcingAccountApi,
+  rewardsApi,
   tenantApi,
   analyticsApi,
 } from '../legacy'
@@ -30,6 +31,9 @@ export type {
   SambaSourcingAccount,
   ChromeProfile,
   BalanceResult,
+  RewardActionMeta,
+  RewardAccountRow,
+  RewardsStatus,
   TenantInfo,
   TenantUsage,
   SourcingRoi,
