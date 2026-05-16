@@ -478,10 +478,10 @@ export default function OrdersPage() {
         `[송장 일괄] 큐 적재 ${fmtNum(res.queued)}건 / 스킵 ${fmtNum(res.skipped)}건 / 오류 ${fmtNum(res.errors.length)}건`,
         ...res.errors.slice(0, 5).map(e => `  · ${e}`),
       ])
-      // 이번 배치 잡 id 목록 — 이전 배치와 누적해서 모달이 SCRAPED/SENT 등 옛 결과도 계속 표시.
-      // 누적 안 하면 새 trigger 시 옛 SCRAPED 잡(예: 도혜연 송장번호 추출됨)이 모달에서 사라져
-      // 운영자가 결과 확인 못함. 중복 ID는 Set으로 제거.
-      setTrackingBatchIds(prev => Array.from(new Set([...prev, ...(res.job_ids || [])])))
+      // 이번 배치 잡 id 목록 저장 — 모달이 이 batch 의 잡들만 고정 표시 (status 변화 추적).
+      // SCRAPED/NO_TRACKING 등 처리 완료된 잡도 같은 batch 안에선 계속 표시되어 사라지지 않음.
+      // 새 송장수집 trigger 시 새 batch 로 replace — 옛 batch 의 잡은 모달에서 빠짐 (의도).
+      setTrackingBatchIds(res.job_ids || [])
       setTrackingStatusOpen(true)
       setTimeout(() => { loadOrders() }, 60000)
     } catch (err) {

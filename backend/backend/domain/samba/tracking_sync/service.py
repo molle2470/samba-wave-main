@@ -731,6 +731,49 @@ async def apply_tracking_result(
                 job.status = STATUS_FAILED
             session.add(job)
             await session.commit()
+
+            # [자동 재큐잉 2026-05-16] timeout/unexpected_page/abnormal_access 등 일시적 오류는
+            # 최대 3회까지 자동 재큐잉 (1시간 내 FAILED 카운트 기반). 무신사 SPA 가 산발적으로
+            # 응답 안 하거나 다른 페이지로 자동 리다이렉트되는 케이스 자동 복구.
+            # wrong_account 는 매핑 오류 가능성 커서 자동 재시도 제외 (운영자 매핑 확인 필요).
+            # 폭주 방지: 같은 order 의 1시간 이내 FAILED 잡이 3건 이상이면 재큐잉 차단.
+            _retryable = (
+                "timeout" in reason_lc
+                or "unexpected_page" in reason_lc
+                or "abnormal_access" in reason_lc
+                or "trace 페이지 진입" in reason
+            )
+            if job.status == STATUS_FAILED and _retryable:
+                from sqlalchemy import func as _func
+
+                _recent_failed_stmt = select(_func.count()).where(
+                    SambaTrackingSyncJob.order_id == job.order_id,
+                    SambaTrackingSyncJob.status == STATUS_FAILED,
+                    SambaTrackingSyncJob.created_at
+                    >= datetime.now(_UTC) - timedelta(hours=1),
+                )
+                async with get_write_session() as _retry_session:
+                    _failed_cnt = (
+                        await _retry_session.execute(_recent_failed_stmt)
+                    ).scalar() or 0
+
+                if _failed_cnt < 3:
+                    logger.info(
+                        f"[송장동기화] 자동 재큐잉 ({_failed_cnt}/3): "
+                        f"order={job.order_id} reason='{reason[:60]}'"
+                    )
+                    try:
+                        await enqueue_for_order(job.order_id, force=True)
+                    except Exception as exc:
+                        logger.warning(
+                            f"[송장동기화] 자동 재큐잉 실패: order={job.order_id} err={exc}"
+                        )
+                else:
+                    logger.warning(
+                        f"[송장동기화] 자동 재큐잉 차단 (1h 내 FAILED {_failed_cnt}회): "
+                        f"order={job.order_id} — 운영자 확인 필요"
+                    )
+
             return {"success": False, "status": job.status, "reason": reason}
 
         normalized_courier = normalize_courier_name(courier_name)
