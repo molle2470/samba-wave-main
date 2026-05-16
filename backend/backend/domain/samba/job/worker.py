@@ -1091,6 +1091,24 @@ class JobWorker:
             _add_job_log(job.id, f"이전 진행 {start_from}/{total}건 이후부터 재개")
             logger.info(f"[잡워커] 전송 재개: {job.id} — {start_from}/{total}건부터")
 
+        # 잡 단위 계정 차단 셋 — 등록갯수 한도 초과 등 "계정 자체가 더 이상 등록 불가"인 경우
+        # 즉시 해당 계정의 후속 시도를 건너뜀
+        blocked_account_ids: set[str] = set()
+        blocked_account_reasons: dict[str, str] = {}
+
+        def _is_account_blocking_error(err: str) -> bool:
+            if not err:
+                return False
+            # 11번가: "판매 중인 상품은 최대 5,000개까지 등록할 수 있습니다"
+            # 기타 마켓에서도 등록 한도/판매자 상태 차단 메시지 추가 시 여기에 보강
+            patterns = (
+                "판매 중인 상품은 최대",
+                "최대 5,000개",
+                "최대 5000개",
+                "상품을 판매중지",
+            )
+            return any(p in err for p in patterns)
+
         async def _process_one(i: int, pid: str) -> tuple[int, int, int, str | None]:
             """상품 1건 처리 → (success_delta, skip_delta, fail_delta, failed_pid)"""
             prod_name = pid[-8:]
@@ -1151,6 +1169,24 @@ class JobWorker:
                         await item_session.commit()
                         return 0, 1, 0, None
 
+                    # 잡 단위 차단 계정 제거 — 등록 한도 초과 등으로 더 이상 시도 불가
+                    if blocked_account_ids and effective_account_ids:
+                        _before = list(effective_account_ids)
+                        effective_account_ids = [
+                            a for a in effective_account_ids if a not in blocked_account_ids
+                        ]
+                        _removed = [a for a in _before if a in blocked_account_ids]
+                        if _removed:
+                            for _ra in _removed:
+                                _reason = blocked_account_reasons.get(_ra, "등록 차단")
+                                _add_job_log(
+                                    job.id,
+                                    f"[{i + 1}/{total:,}] {prod_name} → 계정 {_ra}: 스킵 (잡 차단: {_reason[:80]})",
+                                )
+                        if not effective_account_ids:
+                            await item_session.commit()
+                            return 0, 1, 0, None
+
                     item_svc = SambaShipmentService(
                         SambaShipmentRepository(item_session), item_session
                     )
@@ -1208,6 +1244,17 @@ class JobWorker:
                                 job.id,
                                 f"[{i + 1}/{total:,}] {prod_name} → {acc_label}: {err}{rl}",
                             )
+                            # 계정 등록 한도 초과 등 — 이후 상품에서 이 계정 자동 스킵
+                            if _is_account_blocking_error(err) and acc_id not in blocked_account_ids:
+                                blocked_account_ids.add(acc_id)
+                                blocked_account_reasons[acc_id] = err
+                                _add_job_log(
+                                    job.id,
+                                    f"[잡차단] {acc_label} 계정 등록 차단 — 이후 상품에서 이 계정은 자동 스킵 (사유: {err[:120]})",
+                                )
+                                logger.warning(
+                                    f"[잡워커] 계정 등록 차단: job={job.id} account={acc_id} reason={err[:200]}"
+                                )
                     if not tx_result:
                         if status == "skipped":
                             _sk += 1
