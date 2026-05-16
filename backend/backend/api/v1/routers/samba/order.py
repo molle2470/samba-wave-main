@@ -997,7 +997,9 @@ async def dashboard_stats(
         "monthly": monthly,
         "marketRegisteredCount": int(market_registered_count),
     }
-    await cache.set(_cache_key, result, ttl=60)
+    # 캐시 TTL 5분 — 첫 로드는 무거우나 후속 로드는 즉시. 매출 집계는 1분 단위
+    # 변화 의미 없고, 매 새로고침마다 풀스캔 도는 게 더 큰 비용.
+    await cache.set(_cache_key, result, ttl=300)
     return result
 
 

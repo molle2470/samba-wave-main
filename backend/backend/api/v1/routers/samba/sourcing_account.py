@@ -263,6 +263,28 @@ async def get_sourcing_account(
     return mask_model_secrets(account.model_dump())
 
 
+@router.get("/{account_id}/reveal-password")
+async def reveal_sourcing_account_password(
+    account_id: str,
+    session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
+):
+    """소싱처 계정 평문 password 반환 — 운영자 본인 확인용.
+
+    JWT 인증된 사용자 + 자기 테넌트 계정만 조회 가능.
+    UI는 토글 버튼(눈 아이콘) 클릭 시에만 호출. 평문은 응답 후 즉시 폼에 표시되고
+    저장되지 않음. DB에 평문 저장된 자격증명을 그대로 전달 — 새로운 보안 위험 없음.
+    """
+    svc = _read_service(session)
+    account = await svc.get_account(account_id)
+    if not account:
+        raise HTTPException(404, "소싱처 계정을 찾을 수 없습니다")
+    # IDOR 방지: 테넌트 소유권 검증
+    if tenant_id is not None and account.tenant_id != tenant_id:
+        raise HTTPException(403, "해당 계정에 대한 권한이 없습니다")
+    return {"password": account.password or ""}
+
+
 @router.post("", status_code=201)
 async def create_sourcing_account(
     body: SourcingAccountCreate,
@@ -294,7 +316,13 @@ async def update_sourcing_account(
             raise HTTPException(404, "소싱처 계정을 찾을 수 없습니다")
         if existing.tenant_id != tenant_id:
             raise HTTPException(403, "해당 계정에 대한 권한이 없습니다")
-    result = await svc.update_account(account_id, body.model_dump(exclude_unset=True))
+    # [중요] GET 응답의 마스킹값(****xxxx)을 사용자가 그대로 PUT으로 돌려보낸 경우,
+    # DB의 진짜 password를 마스킹값으로 덮어쓰는 사고 차단. 이미 인프라(sanitize_top_level_secrets)
+    # 존재했으나 라우터에서 호출 안 되어 병기 계정 password가 '****74@@'로 저장되는 사고 발생(2026-05-16).
+    from backend.utils.masking import sanitize_top_level_secrets
+
+    incoming = sanitize_top_level_secrets(body.model_dump(exclude_unset=True))
+    result = await svc.update_account(account_id, incoming)
     if not result:
         raise HTTPException(404, "소싱처 계정을 찾을 수 없습니다")
     return result

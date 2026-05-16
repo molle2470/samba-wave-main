@@ -1,11 +1,13 @@
 'use client'
 
+import { useState, useEffect } from 'react'
 import { card, inputStyle, fmtNum } from '@/lib/samba/styles'
 import {
   sourcingAccountApi,
   type SambaSourcingAccount,
   type ChromeProfile,
 } from '@/lib/samba/api/operations'
+import { showAlert } from '@/components/samba/Modal'
 import type { SourcingAccountsState, SourcingAccountsActions } from '../hooks/useSourcingAccounts'
 
 type Props = SourcingAccountsState & Pick<SourcingAccountsActions,
@@ -38,6 +40,42 @@ export function SourcingAccountsPanel(props: Props) {
     setSourcingForm,
     loadSourcingAccounts,
   } = props
+
+  // 비밀번호 보기 토글 — 수정 모드에서 마스킹값이면 reveal API 호출해서 진짜 비번 fetch
+  const [showPassword, setShowPassword] = useState(false)
+  const [revealing, setRevealing] = useState(false)
+
+  // 다른 계정으로 수정 전환 또는 폼 리셋 시 항상 마스킹 상태로 복귀 (값 노출 방지)
+  useEffect(() => {
+    setShowPassword(false)
+  }, [sourcingEditId])
+
+  // 마스킹 패턴 감지 — backend masking.py의 _MASKED_PATTERN과 동일 (^\*{4}.{0,4}$)
+  const _isMasked = (v: string) => /^\*{4}.{0,4}$/.test(v || '')
+
+  const handleTogglePassword = async () => {
+    // 이미 보이는 상태면 단순 숨김 (값은 유지)
+    if (showPassword) {
+      setShowPassword(false)
+      return
+    }
+    // 폼 password가 마스킹값이면 reveal API로 진짜 password fetch (수정 모드만)
+    if (sourcingEditId && _isMasked(sourcingForm.password)) {
+      setRevealing(true)
+      try {
+        const res = await sourcingAccountApi.revealPassword(sourcingEditId)
+        setSourcingForm(prev => ({ ...prev, password: res.password }))
+        setShowPassword(true)
+      } catch (err) {
+        showAlert(err instanceof Error ? err.message : '비밀번호 조회 실패', 'error')
+      } finally {
+        setRevealing(false)
+      }
+      return
+    }
+    // 마스킹 아님 → 그대로 표시
+    setShowPassword(true)
+  }
 
   return (
     <div style={{ ...card, padding: '1.5rem', marginTop: '1.5rem' }}>
@@ -104,7 +142,34 @@ export function SourcingAccountsPanel(props: Props) {
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
               <label style={{ color: '#888', fontSize: '0.875rem', minWidth: '120px', flexShrink: 0 }}>비밀번호</label>
-              <input style={{ ...inputStyle, flex: 1 }} type="password" placeholder="로그인 비밀번호" value={sourcingForm.password} onChange={e => setSourcingForm(prev => ({ ...prev, password: e.target.value }))} />
+              <input
+                style={{ ...inputStyle, flex: 1 }}
+                type={showPassword ? 'text' : 'password'}
+                placeholder="로그인 비밀번호"
+                value={sourcingForm.password}
+                onChange={e => {
+                  setSourcingForm(prev => ({ ...prev, password: e.target.value }))
+                  // 사용자가 직접 수정 시작하면 평문 그대로 보이게 유지
+                  if (!showPassword) setShowPassword(true)
+                }}
+              />
+              <button
+                type="button"
+                onClick={handleTogglePassword}
+                disabled={revealing}
+                title={showPassword ? '숨기기' : '보기 (저장된 비밀번호 확인)'}
+                style={{
+                  padding: '0.55rem 0.8rem',
+                  background: showPassword ? 'rgba(255,140,0,0.15)' : 'rgba(76,154,255,0.12)',
+                  color: revealing ? '#666' : (showPassword ? '#FF8C00' : '#4C9AFF'),
+                  border: `1px solid ${showPassword ? 'rgba(255,140,0,0.3)' : 'rgba(76,154,255,0.3)'}`,
+                  borderRadius: '6px',
+                  fontSize: '0.8125rem',
+                  cursor: revealing ? 'not-allowed' : 'pointer',
+                  whiteSpace: 'nowrap',
+                  flexShrink: 0,
+                }}
+              >{revealing ? '조회중...' : (showPassword ? '숨기기' : '보기')}</button>
             </div>
             {sourcingTab === 'MUSINSA' && (
               <>

@@ -2405,6 +2405,8 @@ export const sourcingAccountApi = {
     request<{ ok: boolean }>(`${SAMBA_PREFIX}/sourcing-accounts/${id}`, { method: 'DELETE' }),
   getBalance: (id: string) =>
     request<{ balance: number; mileage: number; balance_updated_at: string; has_cookie: boolean }>(`${SAMBA_PREFIX}/sourcing-accounts/${id}/balance`),
+  revealPassword: (id: string) =>
+    request<{ password: string }>(`${SAMBA_PREFIX}/sourcing-accounts/${id}/reveal-password`),
   requestBalanceCheck: () =>
     request<{ ok: boolean }>(`${SAMBA_PREFIX}/sourcing-accounts/request-balance-check`, { method: 'POST' }),
   requestChromeProfileSync: () =>
