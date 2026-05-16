@@ -797,47 +797,20 @@ async def dispatch_to_market(
             await session.commit()
             return {"success": True, "dryRun": True, **result}
 
-        # 실전송 분기
+        # [통일 2026-05-16] 마켓별 분기 인라인 → dispatch_service.send_invoice_to_market 으로 이관.
+        # ship_order 라우터(수동)와 자동 dispatch 가 동일 service 사용 → 자격증명/필드 차이 사고 차단.
+        from backend.domain.samba.order.dispatch_service import send_invoice_to_market
+
         try:
-            if channel_source == "smartstore":
-                from backend.domain.samba.proxy.smartstore import SmartStoreClient
-
-                client = SmartStoreClient()
-                api_resp = await client.ship_product_order(
-                    product_order_id=order.ext_order_number or "",
-                    delivery_company=job.scraped_courier or "",
-                    tracking_number=job.scraped_tracking,
-                )
-                result["api"] = api_resp
-            elif channel_source == "coupang":
-                from backend.domain.samba.proxy.coupang import CoupangClient
-
-                client = CoupangClient()
-                # 쿠팡은 shipmentBoxId(int) + 코드(string) 사용 — order.ext_order_number에 박스ID 저장 가정
-                shipment_box_id = int(order.ext_order_number or 0)
-                api_resp = await client.update_shipping(
-                    shipment_box_id=shipment_box_id,
-                    delivery_company_code=job.scraped_courier or "",
-                    invoice_number=job.scraped_tracking,
-                )
-                result["api"] = api_resp
-            elif channel_source == "playauto":
-                # 플레이오토 EMP API 송장전송은 실효성 없어 호출 생략. DB에 저장된 송장번호만
-                # 유지하고 SENT로 마킹 → 아래 블록에서 order.status='shipping' 갱신.
-                # 실제 마켓(스스/11번가/쿠팡 등) 송장 입력은 원본 마켓 측에서 별도 처리.
-                result["api"] = {"ok": True, "skipped": "playauto-emp-bypass"}
-            elif channel_source == "lottehome":
-                api_resp = await _dispatch_lottehome_invoice(order, job)
-                result["api"] = api_resp
-                if not api_resp.get("ok"):
-                    raise RuntimeError(
-                        api_resp.get("error") or "롯데홈쇼핑 송장 전송 실패"
-                    )
-            else:
-                # 미지원 채널 — DISPATCH_FAILED 로 명시
-                raise RuntimeError(
-                    f"미지원 채널: {channel_source} (마켓 송장 전송 미구현)"
-                )
+            market_sent, market_msg = await send_invoice_to_market(
+                order,
+                job.scraped_courier or "",
+                job.scraped_tracking,
+                session,
+            )
+            result["api"] = {"market_sent": market_sent, "message": market_msg}
+            if not market_sent:
+                raise RuntimeError(market_msg or "마켓 송장 전송 실패")
 
             job.status = STATUS_SENT
             job.dispatched_to_market_at = datetime.now(_UTC)

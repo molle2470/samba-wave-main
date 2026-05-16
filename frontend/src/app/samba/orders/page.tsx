@@ -35,7 +35,7 @@ import UrlInputModal from './components/UrlInputModal'
 import SmsTemplateEditModal from './components/SmsTemplateEditModal'
 import AlarmSettingModal from './components/AlarmSettingModal'
 import TrackingModal from './components/TrackingModal'
-import { showConfirm } from '@/components/samba/Modal'
+import { showConfirm, showAlert } from '@/components/samba/Modal'
 
 interface OrderForm {
   channel_id: string; product_name: string; customer_name: string; customer_phone: string
@@ -444,8 +444,10 @@ export default function OrdersPage() {
         `[송장 일괄] 큐 적재 ${fmtNum(res.queued)}건 / 스킵 ${fmtNum(res.skipped)}건 / 오류 ${fmtNum(res.errors.length)}건`,
         ...res.errors.slice(0, 5).map(e => `  · ${e}`),
       ])
-      // 이번 배치 잡 id 목록 저장 — 모달이 이 id들만 고정 표시 + 5초 폴링으로 셀 값만 갱신
-      setTrackingBatchIds(res.job_ids || [])
+      // 이번 배치 잡 id 목록 — 이전 배치와 누적해서 모달이 SCRAPED/SENT 등 옛 결과도 계속 표시.
+      // 누적 안 하면 새 trigger 시 옛 SCRAPED 잡(예: 도혜연 송장번호 추출됨)이 모달에서 사라져
+      // 운영자가 결과 확인 못함. 중복 ID는 Set으로 제거.
+      setTrackingBatchIds(prev => Array.from(new Set([...prev, ...(res.job_ids || [])])))
       setTrackingStatusOpen(true)
       setTimeout(() => { loadOrders() }, 60000)
     } catch (err) {
@@ -729,17 +731,10 @@ export default function OrdersPage() {
       {trackingStatusOpen && (
         <div
           onClick={() => {
-            // 모달 닫기 = 송장 수집 프로세스 즉시 종료 — 배치 PENDING/DISPATCHED 잡을
-            // CANCELLED 로 일괄 전환. 확장앱 in-flight 잡은 결과 폐기 가드로 무시됨.
-            if (trackingBatchIds.length > 0) {
-              orderApi.cancelTrackingSyncBatch(trackingBatchIds)
-                .then(res => {
-                  if ((res?.cancelled || 0) > 0) {
-                    setLogMessages(prev => [...prev, `[송장] 배치 취소: ${fmtNum(res.cancelled)}건`])
-                  }
-                })
-                .catch(err => setLogMessages(prev => [...prev, `[송장] 취소 실패: ${(err as Error).message}`]))
-            }
+            // 모달 닫기 = 단순 UI 닫기. 백그라운드 잡 처리는 계속 진행.
+            // (이전 회귀: 모달 닫기에서 배치 취소 자동 호출 → 처리 중 잡 전부 cancelled
+            //  되어 사용자가 결과 보러 닫을 때마다 송장수집 무효화되던 사고 차단)
+            // 진짜 취소 의도는 별도 "취소" 버튼 명시 클릭만 인정.
             setTrackingStatusOpen(false)
           }}
           style={{
@@ -761,39 +756,50 @@ export default function OrdersPage() {
               <div style={{ display: 'flex', gap: 8 }}>
                 <button
                   onClick={async () => {
-                    if (!await showConfirm('SCRAPED + 송장전송실패 상태 잡 전체를 마켓에 일괄 전송합니다. 진행할까요?')) return
+                    if (trackingBatchIds.length === 0) {
+                      showAlert('중단할 배치가 없습니다', 'info')
+                      return
+                    }
+                    if (!await showConfirm('진행 중인 송장수집을 모두 중단합니다.\n자동 로그인 + 잡 처리가 즉시 종료됩니다. 진행할까요?')) return
+                    try {
+                      const res = await orderApi.cancelTrackingSyncBatch(trackingBatchIds)
+                      if ((res?.cancelled || 0) > 0) {
+                        setLogMessages(prev => [...prev, `[송장] 중단: ${fmtNum(res.cancelled)}건`])
+                      }
+                      refreshTrackingStatus()
+                    } catch (err) {
+                      setLogMessages(prev => [...prev, `[송장] 중단 실패: ${(err as Error).message}`])
+                    }
+                  }}
+                  style={{ padding: '4px 10px', background: '#ef4444', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer', fontSize: 12, fontWeight: 700 }}
+                  title="진행 중인 송장수집 즉시 중단 (확인 다이얼로그 후)"
+                >⏹ 중단</button>
+                <button
+                  onClick={async () => {
+                    if (!await showConfirm('자동 마켓전송이 실패한 잡들(SCRAPED + 송장전송실패)을 다시 시도합니다.\n도혜연 같은 ext_order_number 누락 케이스는 운영자가 먼저 보강 후 재시도하세요. 진행할까요?')) return
                     try {
                       const res = await orderApi.dispatchTrackingBulk(false)
                       setLogMessages(prev => [
                         ...prev,
-                        `[마켓 일괄전송] 총 ${fmtNum(res.total)}건 / 성공 ${fmtNum(res.sent)}건 / 실패 ${fmtNum(res.failed)}건`,
+                        `[마켓 재전송] 총 ${fmtNum(res.total)}건 / 성공 ${fmtNum(res.sent)}건 / 실패 ${fmtNum(res.failed)}건`,
                         ...res.errors.slice(0, 5).map(e => `  · ${e}`),
                       ])
                       refreshTrackingStatus()
                     } catch (err) {
-                      setLogMessages(prev => [...prev, `[마켓 일괄전송] 오류: ${(err as Error).message}`])
+                      setLogMessages(prev => [...prev, `[마켓 재전송] 오류: ${(err as Error).message}`])
                     }
                   }}
                   style={{ padding: '4px 10px', background: '#16a34a', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer', fontSize: 12 }}
-                >일괄 마켓전송</button>
+                  title="자동 dispatch가 실패한 SCRAPED/송장전송실패 잡 일괄 재시도 (자동 dispatch는 SCRAPED 직후 1회 시도, 실패 시 이 버튼으로 수동 재시도)"
+                >마켓전송 재시도</button>
                 <button
                   onClick={refreshTrackingStatus}
                   style={{ padding: '4px 10px', background: '#2563eb', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer', fontSize: 12 }}
                 >새로고침</button>
                 <button
-                  onClick={() => {
-                    if (trackingBatchIds.length > 0) {
-                      orderApi.cancelTrackingSyncBatch(trackingBatchIds)
-                        .then(res => {
-                          if ((res?.cancelled || 0) > 0) {
-                            setLogMessages(prev => [...prev, `[송장] 배치 취소: ${fmtNum(res.cancelled)}건`])
-                          }
-                        })
-                        .catch(err => setLogMessages(prev => [...prev, `[송장] 취소 실패: ${(err as Error).message}`]))
-                    }
-                    setTrackingStatusOpen(false)
-                  }}
+                  onClick={() => setTrackingStatusOpen(false)}
                   style={{ padding: '4px 10px', background: '#4b5563', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer', fontSize: 12 }}
+                  title="모달만 닫기 (백그라운드 처리는 계속)"
                 >닫기</button>
               </div>
             </div>

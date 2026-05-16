@@ -1,0 +1,273 @@
+"""주문 마켓 송장 전송 통일 service.
+
+ship_order 라우터(수동 마켓전송 버튼)와 dispatch_to_market(자동 dispatch) 양쪽이
+이 함수만 호출하도록 통일. 이전엔 마켓별 분기를 양쪽이 중복 구현해서
+자격증명 누락/필드 차이로 자동 dispatch 가 실패하던 회귀 차단 (도혜연 사례).
+
+사용:
+    market_sent, msg = await send_invoice_to_market(
+        order, shipping_company, tracking_number, session
+    )
+"""
+
+from __future__ import annotations
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from backend.utils.logger import logger
+
+
+async def send_invoice_to_market(
+    order,
+    shipping_company: str,
+    tracking_number: str,
+    session: AsyncSession,
+) -> tuple[bool, str]:
+    """단일 주문 마켓 송장 전송 — 마켓별 분기 통일.
+
+    Returns: (market_sent, message)
+    """
+    if not order.channel_id:
+        return False, "마켓 채널 계정 미연결(channel_id 없음)"
+
+    from backend.domain.samba.account.repository import SambaMarketAccountRepository
+
+    account_repo = SambaMarketAccountRepository(session)
+    account = await account_repo.get_async(order.channel_id)
+    if not account:
+        return False, "마켓 계정 조회 실패"
+
+    market_type = (account.market_type or "").lower()
+    courier = shipping_company or ""
+    tracking = tracking_number or ""
+
+    try:
+        if market_type == "lotteon":
+            return await _send_lotteon(order, account, courier, tracking, session)
+        if market_type == "smartstore":
+            return await _send_smartstore(order, account, courier, tracking, session)
+        if market_type == "11st":
+            return await _send_11st(order, account, courier, tracking, session)
+        if market_type == "ebay":
+            return await _send_ebay(order, account, courier, tracking, session)
+        if market_type == "coupang":
+            return await _send_coupang(order, account, courier, tracking, session)
+        if market_type == "playauto":
+            # 플레이오토는 EMP API 실효성 없어 마켓 전송 생략, DB 저장만.
+            return True, "플레이오토 주문 — 송장번호 저장만 완료 (마켓 전송 생략)"
+        if market_type == "lottehome":
+            return await _send_lottehome(order, account, courier, tracking, session)
+        return False, f"미지원 마켓: {market_type}"
+    except Exception as e:
+        logger.warning(
+            f"[송장전송] order={order.order_number} market={market_type} err={e}"
+        )
+        return False, f"{market_type} 송장 전송 실패: {e}"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 마켓별 구현 — 모두 ship_order 라우터의 로직과 동일.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+async def _send_lotteon(order, account, courier, tracking, session):
+    from backend.domain.samba.forbidden.repository import SambaSettingsRepository
+    from backend.domain.samba.proxy.lotteon import LotteonClient
+
+    lo_api_key = (
+        (account.additional_fields or {}).get("apiKey", "") or account.api_key or ""
+    )
+    if not lo_api_key:
+        _repo = SambaSettingsRepository(session)
+        _row = await _repo.find_by_async(key="store_lotteon")
+        if _row and isinstance(_row.value, dict):
+            lo_api_key = _row.value.get("apiKey", "")
+    if not lo_api_key:
+        return False, "롯데ON API Key 누락"
+
+    client = LotteonClient(lo_api_key)
+    await client.test_auth()
+    sent = await client.ship_order(
+        od_no=order.od_no or order.order_number,
+        od_seq=order.od_seq or "1",
+        proc_seq=order.proc_seq or "1",
+        sitm_no=order.sitm_no or order.shipment_id or "",
+        spd_no=order.product_id or "",
+        quantity=order.quantity or 1,
+        shipping_company=courier,
+        tracking_number=tracking,
+    )
+    return (True, "롯데ON 송장 등록 완료") if sent else (False, "롯데ON 송장 등록 실패")
+
+
+async def _send_smartstore(order, account, courier, tracking, session):
+    from backend.domain.samba.forbidden.repository import SambaSettingsRepository
+    from backend.domain.samba.proxy.smartstore import SmartStoreClient
+
+    _extras = account.additional_fields or {}
+    cid = _extras.get("clientId", "") or account.api_key or ""
+    csecret = _extras.get("clientSecret", "") or account.api_secret or ""
+    if not cid or not csecret:
+        _repo = SambaSettingsRepository(session)
+        _row = await _repo.find_by_async(key="store_smartstore")
+        if _row and isinstance(_row.value, dict):
+            cid = cid or _row.value.get("clientId", "")
+            csecret = csecret or _row.value.get("clientSecret", "")
+    if not cid or not csecret:
+        return False, "스마트스토어 자격증명(clientId/Secret) 누락"
+
+    product_order_id = (order.order_number or order.ext_order_number or "").strip()
+    if not product_order_id:
+        return False, "스마트스토어 product_order_id 누락"
+
+    client = SmartStoreClient(cid, csecret)
+    await client.ship_product_order(product_order_id, courier, tracking)
+    return True, "스마트스토어 송장 전송 완료"
+
+
+async def _send_11st(order, account, courier, tracking, session):
+    from backend.domain.samba.proxy.elevenst import ElevenstClient
+
+    _CARRIER_MAP = {
+        "CJ대한통운": "00034",
+        "대한통운": "00034",
+        "롯데택배": "00012",
+        "한진택배": "00011",
+        "우체국택배": "00002",
+        "로젠택배": "00017",
+        "GS포스트박스": "00015",
+        "경동택배": "00004",
+        "합동택배": "00005",
+        "딜리박스": "00133",
+        "직접배송": "00099",
+        "직접 배송": "00099",
+    }
+    api_key = account.api_key or ""
+    if not api_key and isinstance(account.additional_fields, dict):
+        api_key = account.additional_fields.get("apiKey", "") or ""
+    if not api_key:
+        return False, "11번가 API Key 누락"
+
+    dlv_no = order.shipment_id or ""
+    if not dlv_no:
+        return False, "11번가 배송번호(dlvNo) 누락"
+
+    dlv_etprs_cd = _CARRIER_MAP.get(courier, courier)
+    is_direct = (courier or "").replace(" ", "") == "직접배송"
+    client = ElevenstClient(api_key)
+    sent = await client.ship_order(
+        dlv_no=dlv_no,
+        invc_no=tracking,
+        dlv_etprs_cd=dlv_etprs_cd,
+        dlv_mthd_cd="03" if is_direct else "01",
+    )
+    return (True, "11번가 송장 전송 완료") if sent else (False, "11번가 송장 전송 실패")
+
+
+async def _send_ebay(order, account, courier, tracking, session):
+    from backend.domain.samba.proxy.ebay import EbayApiError, EbayClient
+
+    extras = account.additional_fields or {}
+    app_id = extras.get("clientId") or extras.get("appId") or account.api_key or ""
+    cert_id = (
+        extras.get("clientSecret") or extras.get("certId") or account.api_secret or ""
+    )
+    refresh_token = extras.get("oauthToken") or extras.get("authToken", "") or ""
+    if not (app_id and cert_id and refresh_token):
+        return False, "eBay 자격증명(appId/certId/oauthToken) 누락"
+
+    client = EbayClient(
+        app_id=app_id,
+        dev_id="",
+        cert_id=cert_id,
+        refresh_token=refresh_token,
+        sandbox=bool(extras.get("sandbox", False)),
+    )
+    carrier_map = {"USPS": "USPS", "UPS": "UPS", "FedEx": "FEDEX", "DHL": "DHL"}
+    ebay_carrier = carrier_map.get(courier, "KoreaPost")
+    ebay_order_id = order.ext_order_number or order.order_number
+    try:
+        await client.ship_order(
+            order_id=ebay_order_id,
+            tracking_number=tracking,
+            carrier_code=ebay_carrier,
+        )
+        return True, "eBay 송장 전송 완료"
+    except EbayApiError as e:
+        return False, f"eBay 송장 실패: {e}"
+
+
+async def _send_coupang(order, account, courier, tracking, session):
+    """쿠팡 — additional_fields 기반 자격증명 (Wing OpenAPI HMAC)."""
+    from backend.domain.samba.proxy.coupang import CoupangClient
+
+    extras = account.additional_fields or {}
+    access_key = extras.get("accessKey") or account.api_key or ""
+    secret_key = extras.get("secretKey") or account.api_secret or ""
+    vendor_id = extras.get("vendorId") or ""
+    if not (access_key and secret_key and vendor_id):
+        return False, "쿠팡 자격증명(accessKey/secretKey/vendorId) 누락"
+
+    try:
+        shipment_box_id = int(order.ext_order_number or order.shipment_id or 0)
+    except (TypeError, ValueError):
+        return False, f"쿠팡 shipmentBoxId 형식 오류: {order.ext_order_number}"
+    if not shipment_box_id:
+        return False, "쿠팡 shipmentBoxId 누락 (ext_order_number/shipment_id)"
+
+    try:
+        client = CoupangClient(
+            access_key=access_key, secret_key=secret_key, vendor_id=vendor_id
+        )
+    except TypeError:
+        # CoupangClient 시그니처가 다른 경우 폴백 — 기본 생성자
+        client = CoupangClient()
+    api_resp = await client.update_shipping(
+        shipment_box_id=shipment_box_id,
+        delivery_company_code=courier,
+        invoice_number=tracking,
+    )
+    if isinstance(api_resp, dict) and api_resp.get("ok", True):
+        return True, "쿠팡 송장 전송 완료"
+    return False, f"쿠팡 송장 전송 실패: {(api_resp or {}).get('error') or 'unknown'}"
+
+
+async def _send_lottehome(order, account, courier, tracking, session):
+    """롯데홈쇼핑 — _dispatch_lottehome_invoice 와 동일 흐름."""
+    from backend.domain.samba.proxy.lottehome import (
+        LotteHomeClient,
+        lottehome_courier_code,
+    )
+
+    raw = (order.ext_order_number or "").strip() or (order.shipment_id or "").strip()
+    if not raw:
+        return False, "롯데홈쇼핑 주문번호(ext_order_number) 누락"
+
+    sep = ":" if ":" in raw else ("/" if "/" in raw else None)
+    if not sep:
+        return False, f"롯데홈쇼핑 주문번호 형식 오류 (ord_no:ord_dtl_sn): {raw}"
+    parts = [p.strip() for p in raw.split(sep, 1)]
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return False, f"롯데홈쇼핑 주문번호 파싱 실패: {raw}"
+    ord_no, ord_dtl_sn = parts[0], parts[1]
+
+    courier_code = lottehome_courier_code(courier)
+    extras = account.additional_fields or {}
+    if not extras.get("userId") or not extras.get("password"):
+        return False, "롯데홈쇼핑 자격증명(userId/password) 누락"
+
+    client = LotteHomeClient(
+        user_id=extras.get("userId", ""),
+        password=extras.get("password", ""),
+        agnc_no=extras.get("agncNo", ""),
+        env=extras.get("env", "test"),
+    )
+    api_resp = await client.send_invoice(
+        ord_no=ord_no,
+        ord_dtl_sn=ord_dtl_sn,
+        courier_code=courier_code,
+        tracking_number=tracking,
+    )
+    if api_resp.get("ok"):
+        return True, "롯데홈쇼핑 송장 전송 완료"
+    return False, f"롯데홈쇼핑 송장 전송 실패: {api_resp.get('result')}"

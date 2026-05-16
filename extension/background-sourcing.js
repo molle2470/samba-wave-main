@@ -710,19 +710,25 @@ async function handleTrackingJob(job) {
     // 2단계 — 1차 시도
     let result = await _runOnce()
 
-    // 3단계 — wrong_account/needsLogin 감지 시 (선제 스왑 안 했거나 스왑 후에도 실패) 재로그인 후 1회 재시도
+    // 3단계 — wrong_account/needsLogin 감지 시 강제 재시도 (선제 스왑 여부 무관).
+    // wrong_account = 메모리 캐시와 실제 무신사 세션이 동기화 깨진 신호 (세션 만료 등).
+    // 메모리 캐시 무효화 후 ensureLoggedIn 재시도 → 다시 _runOnce. 최대 1회 추가 시도.
     const _isWrongAccount = result && (
       result.wrongAccount === true ||
       (typeof result.error === 'string' && /wrong_account|not_my_order|account_mismatch|계정불일치/i.test(result.error))
     )
     const _needsLogin = result && result.needsLogin
-    if ((_isWrongAccount || _needsLogin) && !_preemptiveSwapAttempted) {
+    if (_isWrongAccount || _needsLogin) {
       const reason = _isWrongAccount ? 'wrong_account' : 'needsLogin'
-      console.log(`[송장] ${reason} 감지 → 재로그인 후 재시도 (acc=${sourcingAccountId || '-'})`)
+      const _swapTag = _preemptiveSwapAttempted ? `${reason}-after-preemptive` : reason
+      console.log(`[송장] ${reason} 감지 → 메모리 캐시 무효화 + 재로그인 재시도 (acc=${sourcingAccountId || '-'}, 선제스왑=${_preemptiveSwapAttempted})`)
+      // 메모리 캐시 무효화 — 실제 세션 깨진 상태이므로 다음 잡들도 영향받지 않게.
+      if (autoLoginKey && _lastEnsuredTrackingAccount[autoLoginKey]) {
+        delete _lastEnsuredTrackingAccount[autoLoginKey]
+      }
       try { if (tabId) { await chrome.tabs.remove(tabId); tabId = null } } catch {}
-      const loginOk = await _swapToJobAccount(reason)
-      // 재로그인 성공 시에만 재시도 — 실패 시 1차 결과를 그대로 보고해서
-      // 백엔드가 WRONG_ACCOUNT 상태로 분류. 캡챠 등으로 로그인 못한 케이스에서 무한 retry 폭주 방지.
+      const loginOk = await _swapToJobAccount(_swapTag)
+      // 재로그인 성공 시 _runOnce 한 번 더. 실패 시 1차 결과 보고 (무한 retry 폭주 방지).
       if (loginOk) {
         result = await _runOnce()
       }
