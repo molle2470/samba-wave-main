@@ -624,6 +624,11 @@ async def apply_tracking_result(
                 or "no_tracking" in reason_lc
             ):
                 job.status = STATUS_NO_TRACKING
+                # 메시지 표준화 — UI 오류/메모 컬럼에 "배송대기중" 같은 raw 에러 대신 명확한 한국어.
+                if "captcha" in reason_lc:
+                    job.last_error = "캡챠 발생 — 수동 처리 필요"
+                else:
+                    job.last_error = "미발송 — 소싱처 송장 미도착"
             else:
                 job.status = STATUS_FAILED
             session.add(job)

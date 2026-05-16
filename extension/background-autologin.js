@@ -152,33 +152,10 @@ async function _spaDirectLogin(siteKey, username, password) {
   const site = AUTO_LOGIN_SITES[siteKey]
   if (!site) return false
 
-  // [계정 전환 필수] 이미 로그인된 세션이 있으면 무신사/SSG 등이 로그인 페이지 진입 시
-  // 자동으로 마이페이지로 리다이렉트 → 로그인 폼 안 보임 → SPA input 폴링 timeout → 실패.
-  // → 진입 전 해당 사이트 쿠키 전부 삭제(로그아웃 효과)해서 항상 새 로그인 페이지 보장.
-  const _COOKIE_CLEAR_DOMAINS = {
-    musinsa: 'musinsa.com',
-    ssg: 'ssg.com',
-    lotteon: 'lotteon.com',
-    abcmart: 'a-rt.com',
-  }
-  const _clearDomain = _COOKIE_CLEAR_DOMAINS[siteKey]
-  if (_clearDomain) {
-    try {
-      const cookies = await chrome.cookies.getAll({ domain: _clearDomain })
-      let removed = 0
-      for (const c of cookies) {
-        const cleanDomain = c.domain.replace(/^\./, '')
-        const url = `${c.secure ? 'https' : 'http'}://${cleanDomain}${c.path}`
-        try {
-          await chrome.cookies.remove({ url, name: c.name })
-          removed++
-        } catch {}
-      }
-      console.log(`[자동로그인][SPA] ${site.name} 기존 세션 쿠키 ${removed}개 삭제 (계정 전환 위해 로그아웃)`)
-    } catch (e) {
-      console.warn(`[자동로그인][SPA] 쿠키 삭제 실패: ${e?.message || e}`)
-    }
-  }
+  // [중요] 쿠키 무분별 삭제 금지 — 사용자 수동 로그인 세션 파괴 + 알람 폭주 원인
+  // 대신 checkUrl 로 사전 진입해서 이미 로그인 상태면 그대로 두고 진행 (계정이 같든 다르든
+  // ensureLoggedIn 호출자 측에서 wrong_account 판정해서 다른 PC fallback 하도록).
+  // 자동 로그인 시도는 비로그인 상태일 때만.
 
   let tabId = null
   let tabCreated = false
@@ -589,14 +566,18 @@ async function _ensureLoggedInImpl(siteKey, accountId) {
       autoLoginState.failedAttempts[siteKey] = (autoLoginState.failedAttempts[siteKey] || 0) + 1
       autoLoginState.cooldownUntil[siteKey] = Date.now() + AUTO_LOGIN_COOLDOWN_MS
       console.log(`[자동로그인] ❌ ${site.name} ${AUTO_LOGIN_MAX_RETRIES}회 실패 — ${AUTO_LOGIN_COOLDOWN_MS / 60000}분 쿨다운`)
-      try {
-        chrome.notifications?.create?.(`autologin-fail-${siteKey}-${Date.now()}`, {
-          type: 'basic',
-          iconUrl: 'icon128.png',
-          title: 'SAMBA-WAVE 자동로그인 실패',
-          message: `${site.name} 자동 로그인이 실패했습니다. 브라우저에서 수동 로그인해주세요. (5분 후 자동 재시도)`,
-        })
-      } catch {}
+      // 알람은 라디오 기본 계정 모드(!accountId)만 발송 — accountId 명시 트리거(송장수집)는
+      // 잡당 시도라 실패 알람 폭주 위험. 호출자가 wrong_account 로 분류해서 모달로 보여줌.
+      if (!accountId) {
+        try {
+          chrome.notifications?.create?.(`autologin-fail-${siteKey}-${Date.now()}`, {
+            type: 'basic',
+            iconUrl: 'icon128.png',
+            title: 'SAMBA-WAVE 자동로그인 실패',
+            message: `${site.name} 자동 로그인이 실패했습니다. 브라우저에서 수동 로그인해주세요. (5분 후 자동 재시도)`,
+          })
+        } catch {}
+      }
     }
     return ok
   } finally {
@@ -620,30 +601,31 @@ async function _ensureLoggedInSingle(siteKey, accountId) {
   // 백엔드 자격증명 없으면 즉시 실패. chrome.debugger triple-click 폴백 제거 (드롭다운 노출 방지).
   const SPA_DIRECT_LOGIN_SITES = ['lotteon', 'abcmart', 'ssg', 'musinsa']
   if (SPA_DIRECT_LOGIN_SITES.includes(siteKey)) {
-    // accountId 지정 시 — 현재 세션이 어떤 계정인지 확인 불가하므로 pre-check 스킵하고 강제 로그인.
-    // (잘못된 계정으로 이미 로그인된 상태일 수 있음 → 무조건 지정 계정으로 새 세션 만든다)
-    if (!accountId) {
-      // 라디오 기본 계정 모드 — 이미 로그인 상태면 즉시 반환 (기존 동작 유지)
-      let alreadyLoggedIn = false
-      let spaCheckTabId = null
-      try {
-        const checkTab = await chrome.tabs.create({ url: site.checkUrl, active: false })
-        spaCheckTabId = checkTab.id
-        try { await waitForTabLoad(spaCheckTabId, 20000) } catch {}
-        await wait(1500)
-        const checkTabInfo = await chrome.tabs.get(spaCheckTabId)
-        alreadyLoggedIn = !site.isLoginPage(checkTabInfo.url || '')
-        try { await chrome.tabs.remove(spaCheckTabId) } catch {}
-        spaCheckTabId = null
-      } catch (e) {
-        console.log(`[자동로그인] ${site.name} 사전 로그인 체크 실패 (무시): ${e.message}`)
-        if (spaCheckTabId) try { await chrome.tabs.remove(spaCheckTabId) } catch {}
-      }
+    // [중요] accountId 명시 트리거든 라디오 기본 모드든 — 이미 로그인 상태면 자동 로그인 스킵.
+    // 잘못된 계정으로 로그인된 상태일 수 있지만, 강제 스왑은 사용자 세션 파괴 + 자동 로그인
+    // 실패 시 알람 폭주 위험이 커서 보수적으로 처리. accountId 명시인데 계정 다르면 호출자
+    // (송장수집)가 wrong_account 로 보고 → 다른 PC fallback 또는 운영자 수동 스위치로 위임.
+    let alreadyLoggedIn = false
+    let spaCheckTabId = null
+    try {
+      const checkTab = await chrome.tabs.create({ url: site.checkUrl, active: false })
+      spaCheckTabId = checkTab.id
+      try { await waitForTabLoad(spaCheckTabId, 20000) } catch {}
+      await wait(1500)
+      const checkTabInfo = await chrome.tabs.get(spaCheckTabId)
+      alreadyLoggedIn = !site.isLoginPage(checkTabInfo.url || '')
+      try { await chrome.tabs.remove(spaCheckTabId) } catch {}
+      spaCheckTabId = null
+    } catch (e) {
+      console.log(`[자동로그인] ${site.name} 사전 로그인 체크 실패 (무시): ${e.message}`)
+      if (spaCheckTabId) try { await chrome.tabs.remove(spaCheckTabId) } catch {}
+    }
 
-      if (alreadyLoggedIn) {
-        console.log(`[자동로그인] ${site.name} 이미 로그인됨 — 자동로그인 스킵`)
-        return true
-      }
+    if (alreadyLoggedIn) {
+      // accountId 명시인데 이미 로그인된 상태 → 세션 보존하고 true 반환.
+      // 송장수집 잡이 이 세션으로 1차 시도해서 wrong_account 면 다른 PC 가 처리.
+      console.log(`[자동로그인] ${site.name} 이미 로그인됨 — 자동로그인 스킵 (세션 보호)`)
+      return true
     }
 
     const credential = await _fetchLoginCredential(siteKey, accountId)
