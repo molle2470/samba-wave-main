@@ -24,7 +24,7 @@ const NAV_ITEMS: NavItem[] = [
   { href: "/samba/manual-products", label: "수동등록", planned: true },
   { href: "/samba/policies", label: "정책관리" },
   { href: "/samba/categories", label: "카테고리매핑" },
-  { href: "/samba/shipments", label: "상품전송/삭제" },
+  { href: "/samba/shipments", label: "상품전송" },
   { href: "/samba/warroom", label: "오토튠" },
   { href: "/samba/store-care", label: "스토어케어", planned: true },
   { href: "/samba/sns", label: "SNS마케팅", planned: true },
