@@ -300,14 +300,36 @@ async function _spaDirectLogin(siteKey, username, password) {
       const POLL_INTERVAL = 1500
       const TIMEOUT = 15000
       const startTime = Date.now()
+      // 자격증명 오류로 간주할 alert 메시지 키워드 — 그 외 부수 alert(예: 비번변경 권장,
+      // 약관/이벤트 안내)는 로그인 성공 여부와 무관하므로 false-positive 차단.
+      const CREDENTIAL_ERROR_TOKENS = [
+        '아이디', '비밀번호', '비번', '일치하지', '일치하는', '존재하지', '잘못',
+        '오류', '실패', '다시', '확인', '재입력', '에러', '캡차', 'captcha',
+      ]
       while (Date.now() - startTime < TIMEOUT) {
         await wait(POLL_INTERVAL)
 
-        // alert로 에러 떴으면 즉시 실패 (가짜/잘못된 자격증명)
-        if (dialogMessage && dialogMessage.length > 0) {
-          console.log(`[자동로그인][SPA] ${site.name} 자격증명 오류 alert: "${dialogMessage.substring(0, 60)}"`)
+        // URL이 로그인 페이지를 벗어났으면 alert 유무와 관계없이 성공으로 처리
+        // (부수 alert가 떴어도 실제 로그인은 이미 완료됨)
+        let tabInfo = null
+        try { tabInfo = await chrome.tabs.get(tabId) } catch {
           chrome.debugger.onEvent.removeListener(dialogHandler)
           return false
+        }
+        const urlLeftLoginPage = !site.isLoginPage(tabInfo.url || '')
+
+        // 자격증명 오류 alert만 실패로 간주 (URL이 로그인 페이지에 남아있을 때만)
+        if (dialogMessage && dialogMessage.length > 0 && !urlLeftLoginPage) {
+          const msgLower = dialogMessage.toLowerCase()
+          const looksLikeCredentialError = CREDENTIAL_ERROR_TOKENS.some(t => msgLower.includes(t.toLowerCase()))
+          if (looksLikeCredentialError) {
+            console.log(`[자동로그인][SPA] ${site.name} 자격증명 오류 alert: "${dialogMessage.substring(0, 60)}"`)
+            chrome.debugger.onEvent.removeListener(dialogHandler)
+            return false
+          }
+          // 부수 alert는 메시지만 초기화하고 계속 대기
+          console.log(`[자동로그인][SPA] ${site.name} 부수 alert 무시: "${dialogMessage.substring(0, 60)}"`)
+          dialogMessage = null
         }
 
         // 오토튠 진행 중 취소 감지
@@ -319,8 +341,7 @@ async function _spaDirectLogin(siteKey, username, password) {
         }
 
         try {
-          const tabInfo = await chrome.tabs.get(tabId)
-          if (!site.isLoginPage(tabInfo.url || '')) {
+          if (urlLeftLoginPage) {
             // LOTTEON: URL 이탈만으로 부족 — #memInfo.mbNo 실제 확인 (비로그인 리다이렉트 오판 방지)
             if (siteKey === 'lotteon') {
               await wait(2000)

@@ -3153,10 +3153,6 @@ async def ship_order(
                     if sent:
                         market_sent = True
                         market_msg = "롯데ON 송장 등록 완료"
-                        await svc.update_order(
-                            order_id,
-                            {"shipping_status": "송장전송완료", "status": "shipping"},
-                        )
                     else:
                         market_msg = "롯데ON 송장 등록 실패 (로그 확인)"
 
@@ -3188,9 +3184,6 @@ async def ship_order(
                     )
                     market_sent = True
                     market_msg = "스마트스토어 송장 전송 완료"
-                    await svc.update_order(
-                        order_id, {"shipping_status": "송장전송완료"}
-                    )
 
             elif account and account.market_type == "11st":
                 from backend.domain.samba.proxy.elevenst import (
@@ -3240,13 +3233,6 @@ async def ship_order(
                         if sent:
                             market_sent = True
                             market_msg = "11번가 송장 전송 완료"
-                            await svc.update_order(
-                                order_id,
-                                {
-                                    "shipping_status": "송장전송완료",
-                                    "status": "shipping",
-                                },
-                            )
                         else:
                             market_msg = "11번가 송장 전송 실패 (로그 확인)"
 
@@ -3300,23 +3286,26 @@ async def ship_order(
                         )
                         market_sent = True
                         market_msg = "eBay 송장 전송 완료"
-                        await svc.update_order(
-                            order_id,
-                            {
-                                "shipping_status": "송장전송완료",
-                                "status": "shipping",
-                            },
-                        )
                     except EbayApiError as e:
                         market_msg = f"eBay 송장 실패: {e}"
 
             elif account and account.market_type == "playauto":
-                # 플레이오토 주문은 마켓 전송 없이 DB 저장만 수행 (사용자 요청)
-                # 실제 마켓(스스/11번가/쿠팡 등) 송장 입력은 플레이오토 원본 마켓 측에서 별도 처리
+                # 플레이오토는 EMP API 송장전송이 실효성 없어 마켓 전송 생략하고 DB 저장만 수행.
+                # 실제 마켓(스스/11번가/쿠팡 등) 송장 입력은 플레이오토 원본 마켓 측에서 별도 처리.
+                # 프론트가 market_sent=False를 실패로 간주해 status='ship_failed'로 박는 사고를
+                # 막기 위해 성공으로 표기 — 아래 unified 블록이 status='shipping'으로 갱신.
+                market_sent = True
                 market_msg = "플레이오토 주문 — 송장번호 저장만 완료 (마켓 전송 생략)"
     except Exception as e:
         market_msg = f"송장 전송 실패: {e}"
         logger.warning(f"[송장전송] {order.order_number}: {e}")
+
+    # 마켓 송장 전송 성공 시 status를 '국내배송중'으로 일괄 변경
+    if market_sent:
+        await svc.update_order(
+            order_id,
+            {"shipping_status": "송장전송완료", "status": "shipping"},
+        )
 
     return {
         "ok": True,

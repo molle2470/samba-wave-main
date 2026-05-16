@@ -780,12 +780,10 @@ async def dispatch_to_market(
                 )
                 result["api"] = api_resp
             elif channel_source == "playauto":
-                api_resp = await _dispatch_playauto_invoice(order, job)
-                result["api"] = api_resp
-                if not api_resp.get("ok"):
-                    raise RuntimeError(
-                        api_resp.get("error") or "플레이오토 송장 전송 실패"
-                    )
+                # 플레이오토 EMP API 송장전송은 실효성 없어 호출 생략. DB에 저장된 송장번호만
+                # 유지하고 SENT로 마킹 → 아래 블록에서 order.status='shipping' 갱신.
+                # 실제 마켓(스스/11번가/쿠팡 등) 송장 입력은 원본 마켓 측에서 별도 처리.
+                result["api"] = {"ok": True, "skipped": "playauto-emp-bypass"}
             elif channel_source == "lottehome":
                 api_resp = await _dispatch_lottehome_invoice(order, job)
                 result["api"] = api_resp

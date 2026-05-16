@@ -613,12 +613,10 @@ async function handleTrackingJob(job) {
     if (!url) throw new Error('tracking URL 누락')
 
     // 송장 페이지 진입 → 결과 수신
-    // MUSINSA: Next.js SPA + 백그라운드 탭 hydration 지연으로 React click이 무시되는 회귀
-    // 차단을 위해 active: true 로 강제. 사용자 화면이 잠깐 튐 — 직렬화(_musinsaTrackingLock)와
-    // 결합해 한 번에 1건만 처리.
+    // 사용자 요청(2026-05-16): 송장수집 시 포커스 뺏지 않도록 모든 사이트 active:false 통일.
+    // MUSINSA hydration 이슈는 content-tracking-musinsa.js 의 폴링 로직으로 대응.
     const _runOnce = async () => {
-      const _active = site === 'MUSINSA'
-      const tab = await chrome.tabs.create({ url, active: _active })
+      const tab = await chrome.tabs.create({ url, active: false })
       tabId = tab.id
       await waitForTabLoad(tabId, 30000)
 
