@@ -2319,7 +2319,7 @@ export default function PoliciesPage() {
                   color: tetrisMatchingEnabled ? '#06130A' : '#FFB84D',
                   fontSize: '0.8125rem',
                   fontWeight: 700,
-                  cursor: tetrisMatchingSaving ? 'wait' : 'pointer',
+                  cursor: tetrisMatchingSaving ? 'not-allowed' : 'pointer',
                   opacity: tetrisMatchingSaving ? 0.7 : 1,
                 }}
               >

@@ -330,6 +330,22 @@ export const orderApi = {
       `${SAMBA_PREFIX}/orders/sync-tracking/bulk?limit=${limit}&days=${days}&force=${force}`,
       { method: 'POST' },
     ),
+  retryFailedTrackingJobs: (days = 7) =>
+    request<{ success: boolean; target: number; queued: number; skipped: number; errors: string[]; job_ids: string[] }>(
+      `${SAMBA_PREFIX}/orders/tracking-sync/retry-failed?days=${days}`,
+      { method: 'POST' },
+    ),
+  getAutoSyncInterval: () =>
+    request<{ interval_minutes: number }>(`${SAMBA_PREFIX}/orders/auto-sync-interval`),
+  setAutoSyncInterval: (interval_minutes: number) =>
+    request<{ interval_minutes: number }>(
+      `${SAMBA_PREFIX}/orders/auto-sync-interval`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ interval_minutes }),
+      },
+    ),
   dispatchTrackingToMarket: (jobId: string, dryRun = false) =>
     request<{ success: boolean; dryRun?: boolean; channel?: string; courier?: string; tracking?: string; error?: string }>(
       `${SAMBA_PREFIX}/orders/tracking-sync/${jobId}/dispatch?dry_run=${dryRun}`,

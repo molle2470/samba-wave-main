@@ -1303,6 +1303,23 @@ async def dispatch_tracking_bulk(dry_run: bool = False) -> dict:
     return await dispatch_pending_to_market(dry_run=dry_run)
 
 
+@router.post("/tracking-sync/retry-failed")
+async def retry_failed_tracking_jobs(
+    days: int = 7,
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
+) -> dict:
+    """WRONG_ACCOUNT / FAILED / DISPATCH_FAILED 잡들을 자동 재큐잉.
+
+    송장수집이 실패한 주문들만 모아서 다시 자동 로그인 + 송장 추출 시도.
+    송장 미입력 주문 전체 재큐잉(sync-tracking/bulk)과 다른 점:
+    - 미발송으로 끝난 잡은 제외 (실패한 것만)
+    - 한 번에 빠르게 retry 트리거 가능
+    """
+    from backend.domain.samba.tracking_sync.service import retry_failed_jobs
+
+    return await retry_failed_jobs(tenant_id=tenant_id, days=days)
+
+
 @router.post("/tracking-sync/{job_id}/dispatch")
 async def dispatch_tracking_to_market(job_id: str, dry_run: bool = False) -> dict:
     """추출 완료된(SCRAPED) 잡의 운송장을 마켓으로 push.
@@ -1638,6 +1655,39 @@ async def save_alarm_settings(
         },
     )
     return {"ok": True}
+
+
+@router.get("/auto-sync-interval")
+async def get_auto_sync_interval(
+    session: AsyncSession = Depends(get_read_session_dependency),
+) -> dict:
+    """주문 자동수집 인터벌 설정 조회 (분 단위, 0=OFF)."""
+    from backend.api.v1.routers.samba.proxy import _get_setting
+
+    val = await _get_setting(session, "order_auto_sync_interval_minutes")
+    try:
+        minutes = int(val) if val is not None else 0
+    except (TypeError, ValueError):
+        minutes = 0
+    return {"interval_minutes": minutes}
+
+
+@router.post("/auto-sync-interval")
+async def set_auto_sync_interval(
+    body: dict,
+    session: AsyncSession = Depends(get_write_session_dependency),
+) -> dict:
+    """주문 자동수집 인터벌 설정 저장 (분 단위, 0 이하면 OFF)."""
+    from backend.api.v1.routers.samba.proxy import _set_setting
+
+    try:
+        minutes = int(body.get("interval_minutes", 0))
+    except (TypeError, ValueError):
+        minutes = 0
+    if minutes < 0:
+        minutes = 0
+    await _set_setting(session, "order_auto_sync_interval_minutes", minutes)
+    return {"interval_minutes": minutes}
 
 
 @router.get("/{order_id}", response_model=SambaOrder)

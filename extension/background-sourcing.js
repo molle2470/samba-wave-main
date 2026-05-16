@@ -710,28 +710,44 @@ async function handleTrackingJob(job) {
     // 2단계 — 1차 시도
     let result = await _runOnce()
 
-    // 3단계 — wrong_account/needsLogin 감지 시 강제 재시도 (선제 스왑 여부 무관).
-    // wrong_account = 메모리 캐시와 실제 무신사 세션이 동기화 깨진 신호 (세션 만료 등).
-    // 메모리 캐시 무효화 후 ensureLoggedIn 재시도 → 다시 _runOnce. 최대 1회 추가 시도.
-    const _isWrongAccount = result && (
-      result.wrongAccount === true ||
-      (typeof result.error === 'string' && /wrong_account|not_my_order|account_mismatch|계정불일치/i.test(result.error))
+    // 3단계 — wrong_account/needsLogin/timeout 감지 시 최대 2회 재시도 (백오프).
+    // wrong_account = 메모리 캐시와 실제 무신사 세션이 동기화 깨진 신호 (세션 만료/무신사 보안).
+    // 매 재시도: 메모리 캐시 무효화 + ensureLoggedIn 재호출 + 3초 백오프 + _runOnce.
+    const _isWrong = (r) => r && (
+      r.wrongAccount === true ||
+      (typeof r.error === 'string' && /wrong_account|not_my_order|account_mismatch|계정불일치/i.test(r.error))
     )
-    const _needsLogin = result && result.needsLogin
-    if (_isWrongAccount || _needsLogin) {
-      const reason = _isWrongAccount ? 'wrong_account' : 'needsLogin'
-      const _swapTag = _preemptiveSwapAttempted ? `${reason}-after-preemptive` : reason
-      console.log(`[송장] ${reason} 감지 → 메모리 캐시 무효화 + 재로그인 재시도 (acc=${sourcingAccountId || '-'}, 선제스왑=${_preemptiveSwapAttempted})`)
-      // 메모리 캐시 무효화 — 실제 세션 깨진 상태이므로 다음 잡들도 영향받지 않게.
+    const _isTimeout = (r) => r && typeof r.error === 'string' && /timeout/i.test(r.error)
+    // unexpected_page = 무신사 SPA 가 송장 URL 진입 후 다른 페이지로 자동 리다이렉트 케이스.
+    // abnormal_access = 무신사 "정상적인 접근이 아닙니다" 차단. trace 진입 타임아웃 포함.
+    const _isUnexpectedPage = (r) => r && typeof r.error === 'string' && /unexpected_page|abnormal_access|trace 페이지 진입 타임아웃/i.test(r.error)
+
+    // [정책 2026-05-16] wrong_account = 백엔드 sourcing_account_id 매핑이 잘못됐을 가능성.
+    // 같은 계정으로 재시도해도 같은 결과 + 다른 계정 자동 순회는 무신사 보안 차단 위험 ↑.
+    // → 자동 재시도 안 함. 경고 메시지만 남기고 운영자 수동 처리(매핑 확인) 위임.
+    if (_isWrong(result)) {
+      console.warn(`⚠ [송장][wrong_account] 자동 재시도 안 함 — 백엔드 sourcing_account_id 매핑이 잘못됐을 가능성. 운영자가 해당 주문의 진짜 무신사 계정을 확인 후 매핑 수정 필요. (acc=${sourcingAccountId || '-'}, ord=${sourcingOrderNumber})`)
+    }
+
+    // timeout / unexpected_page / needsLogin 만 자동 재시도 (최대 2회 + 백오프).
+    let retryAttempt = 0
+    const MAX_RETRY = 2
+    while (((result && result.needsLogin) || _isTimeout(result) || _isUnexpectedPage(result)) && retryAttempt < MAX_RETRY) {
+      retryAttempt++
+      const reason = _isTimeout(result) ? 'timeout' : (_isUnexpectedPage(result) ? 'unexpected_page' : 'needsLogin')
+      console.log(`[송장] ${reason} 감지 (${retryAttempt}/${MAX_RETRY}) → 캐시 무효화 + 재로그인 + ${retryAttempt > 1 ? '3초 백오프 + ' : ''}재시도 (acc=${sourcingAccountId || '-'})`)
       if (autoLoginKey && _lastEnsuredTrackingAccount[autoLoginKey]) {
         delete _lastEnsuredTrackingAccount[autoLoginKey]
       }
       try { if (tabId) { await chrome.tabs.remove(tabId); tabId = null } } catch {}
-      const loginOk = await _swapToJobAccount(_swapTag)
-      // 재로그인 성공 시 _runOnce 한 번 더. 실패 시 1차 결과 보고 (무한 retry 폭주 방지).
-      if (loginOk) {
-        result = await _runOnce()
+      if (retryAttempt > 1) {
+        await new Promise(r => setTimeout(r, 3000))
       }
+      const loginOk = await _swapToJobAccount(`${reason}-retry${retryAttempt}`)
+      if (!loginOk) {
+        break  // 무한 retry 방지
+      }
+      result = await _runOnce()
     }
 
     await postResult('sourcing/tracking-result', {

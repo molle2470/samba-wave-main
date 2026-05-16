@@ -557,6 +557,75 @@ async def enqueue_pending_orders(
     }
 
 
+async def retry_failed_jobs(
+    tenant_id: Optional[str] = None,
+    days: int = 7,
+) -> dict[str, Any]:
+    """WRONG_ACCOUNT / FAILED / DISPATCH_FAILED 잡들을 재큐잉.
+
+    enqueue_pending_orders 와 다른 점:
+    - 송장 미입력 주문이 아니라 "송장 잡이 실패 상태" 인 주문만 대상
+    - SCRAPED 상태 잡은 dispatch_pending_to_market 로 별도 처리
+    """
+    from sqlalchemy import select as sa_select
+
+    retry_target_statuses = [
+        STATUS_WRONG_ACCOUNT,
+        STATUS_FAILED,
+        STATUS_DISPATCH_FAILED,
+    ]
+
+    _KST = timezone(timedelta(hours=9))
+    _today_kst = datetime.now(_KST).replace(hour=0, minute=0, second=0, microsecond=0)
+    since = (_today_kst - timedelta(days=days - 1)).astimezone(_UTC)
+
+    queued = 0
+    skipped = 0
+    errors: list[str] = []
+    job_ids: list[str] = []
+
+    async with get_write_session() as session:
+        stmt = (
+            sa_select(SambaTrackingSyncJob.order_id)
+            .where(
+                SambaTrackingSyncJob.status.in_(retry_target_statuses),
+                SambaTrackingSyncJob.created_at >= since,
+            )
+            .distinct()
+        )
+        if tenant_id:
+            stmt = stmt.where(SambaTrackingSyncJob.tenant_id == tenant_id)
+        order_ids = [row[0] for row in (await session.execute(stmt)).all()]
+
+    for order_id in order_ids:
+        try:
+            res = await enqueue_for_order(order_id, force=True)
+            jid = res.get("jobId")
+            if jid:
+                job_ids.append(jid)
+            if res.get("skipped"):
+                skipped += 1
+            elif res.get("success"):
+                queued += 1
+            else:
+                errors.append(f"{order_id}: {res.get('error')}")
+        except Exception as exc:
+            errors.append(f"{order_id}: {exc}")
+
+    logger.info(
+        f"[송장동기화] 실패 재수집: target={len(order_ids)} queued={queued} "
+        f"skipped={skipped} errors={len(errors)}"
+    )
+    return {
+        "success": True,
+        "target": len(order_ids),
+        "queued": queued,
+        "skipped": skipped,
+        "errors": errors[:20],
+        "job_ids": job_ids,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 2) 결과 수신 (확장앱 → 백엔드)
 # ---------------------------------------------------------------------------
@@ -640,6 +709,12 @@ async def apply_tracking_result(
                 or "다른 계정" in reason
             ):
                 job.status = STATUS_WRONG_ACCOUNT
+                # 메시지 표준화 — 운영자가 모달에서 보고 즉시 매핑 확인 가능하게 명확화.
+                # [정책 2026-05-16] 자동 다른 계정 순회 안 함 (무신사 보안 차단 위험).
+                job.last_error = (
+                    "⚠ 계정불일치 — 등록된 소싱처 계정 매핑이 잘못됐을 가능성. "
+                    "운영자가 주문관리에서 진짜 무신사 계정 확인 후 sourcing_account_id 재매핑 필요."
+                )
             elif (
                 "captcha" in reason_lc
                 or "미발송" in reason

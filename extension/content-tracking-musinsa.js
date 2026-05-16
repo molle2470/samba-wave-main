@@ -218,6 +218,15 @@
           .catch((err) =>
             send(msg.requestId, { success: false, error: String(err?.message || err) })
           )
+      } else {
+        // [중요] 무신사 SPA navigation 으로 송장 URL 진입 후 다른 페이지로 자동 리다이렉트되는
+        // 케이스 (보안 인증/약관/추천 페이지 등). 이전엔 어떤 분기도 안 타서 send 안 되고
+        // background 가 120초 timeout 대기 → 'timeout: content script 응답 없음' 회귀.
+        // 즉시 명확한 에러 send 해서 background 의 wrong_account/timeout 자동 재시도 로직 트리거.
+        send(msg.requestId, {
+          success: false,
+          error: `unexpected_page: ${location.pathname} (송장 페이지 아님 — 무신사 자동 리다이렉트 추정)`,
+        })
       }
       return true
     }

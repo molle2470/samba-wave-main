@@ -381,6 +381,40 @@ export default function OrdersPage() {
   })
   const [trackingOrder, setTrackingOrder] = useState<SambaOrder | null>(null)
   const [trackingSyncing, setTrackingSyncing] = useState(false)
+  // 주문 자동실행 인터벌 (분 단위, 0=OFF)
+  const [autoSyncIntervalInput, setAutoSyncIntervalInput] = useState<number>(60)
+  const [autoSyncEnabled, setAutoSyncEnabled] = useState<boolean>(false)
+  const [autoSyncSaving, setAutoSyncSaving] = useState<boolean>(false)
+  useEffect(() => {
+    orderApi.getAutoSyncInterval()
+      .then(res => {
+        if (res.interval_minutes > 0) {
+          setAutoSyncIntervalInput(res.interval_minutes)
+          setAutoSyncEnabled(true)
+        }
+      })
+      .catch(() => {})
+  }, [])
+  const handleToggleAutoSync = async () => {
+    if (autoSyncSaving) return
+    const nextValue = !autoSyncEnabled
+    setAutoSyncSaving(true)
+    try {
+      const minutes = nextValue ? Math.max(5, autoSyncIntervalInput) : 0
+      const res = await orderApi.setAutoSyncInterval(minutes)
+      setAutoSyncEnabled(res.interval_minutes > 0)
+      setLogMessages(prev => [
+        ...prev,
+        res.interval_minutes > 0
+          ? `[자동실행] ON — ${fmtNum(res.interval_minutes)}분 간격으로 주문가져오기+송장수집 자동 실행`
+          : '[자동실행] OFF',
+      ])
+    } catch (err) {
+      showAlert('주문 자동실행 설정 저장 실패: ' + ((err as Error)?.message || String(err)))
+    } finally {
+      setAutoSyncSaving(false)
+    }
+  }
   const [trackingStatusOpen, setTrackingStatusOpen] = useState(false)
   const [trackingStatusData, setTrackingStatusData] = useState<{
     counts: Record<string, number>
@@ -535,6 +569,62 @@ export default function OrdersPage() {
         accounts={accounts} sourcingAccounts={sourcingAccounts}
         siteOptions={siteOptions}
       />
+
+      {/* 주문 자동실행 토글바 — 주문가져오기 + 송장수집 인터벌 자동 실행 */}
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        gap: '1rem', padding: '0.75rem 1rem', margin: '6px 0',
+        background: autoSyncEnabled ? 'rgba(34,197,94,0.08)' : 'rgba(255,140,0,0.08)',
+        border: autoSyncEnabled ? '1px solid rgba(34,197,94,0.25)' : '1px solid rgba(255,140,0,0.25)',
+        borderRadius: 10,
+      }}>
+        <div>
+          <div style={{ fontSize: '0.9375rem', fontWeight: 700, color: '#E5E5E5', marginBottom: '0.2rem' }}>
+            🔄 주문 자동실행
+          </div>
+          <div style={{ fontSize: '0.75rem', color: '#888' }}>
+            ON이면 설정한 분 간격마다 서버에서 전체 주문가져오기 → 송장수집을 자동 실행합니다.
+          </div>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+          <input
+            type="number"
+            value={autoSyncIntervalInput}
+            onChange={e => setAutoSyncIntervalInput(Math.max(5, Number(e.target.value)))}
+            min={5}
+            max={1440}
+            style={{
+              width: 56,
+              background: '#2A2A2A',
+              border: '1px solid #444',
+              color: '#ccc',
+              borderRadius: 6,
+              padding: '4px 6px',
+              fontSize: '0.8125rem',
+              textAlign: 'center',
+            }}
+          />
+          <span style={{ color: '#888', fontSize: '0.8125rem' }}>분</span>
+          <button
+            onClick={handleToggleAutoSync}
+            disabled={autoSyncSaving}
+            style={{
+              minWidth: '92px',
+              padding: '0.5rem 0.875rem',
+              borderRadius: '999px',
+              border: autoSyncEnabled ? '1px solid rgba(34,197,94,0.35)' : '1px solid rgba(255,140,0,0.35)',
+              background: autoSyncEnabled ? '#22C55E' : '#2A2A2A',
+              color: autoSyncEnabled ? '#06130A' : '#FFB84D',
+              fontSize: '0.8125rem',
+              fontWeight: 700,
+              cursor: autoSyncSaving ? 'not-allowed' : 'pointer',
+              opacity: autoSyncSaving ? 0.7 : 1,
+            }}
+          >
+            {autoSyncSaving ? '저장 중...' : autoSyncEnabled ? 'ON' : 'OFF'}
+          </button>
+        </div>
+      </div>
 
       {/* 송장 자동전송 미니바 — 일괄 트리거 + 안내 */}
       <div style={{
