@@ -668,7 +668,7 @@ async def _order_auto_sync_loop() -> None:
                 async with get_read_session() as rs2:
                     job = (
                         await rs2.execute(
-                            _sa_text("SELECT status FROM samba_job WHERE id = :jid"),
+                            _sa_text("SELECT status FROM samba_jobs WHERE id = :jid"),
                             {"jid": job_id},
                         )
                     ).first()
