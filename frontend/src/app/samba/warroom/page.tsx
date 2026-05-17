@@ -417,7 +417,19 @@ export default function WarroomPage() {
       if (msg.source !== 'samba-extension') return
       if (msg.type !== 'ALLOWED_SITES') return
       const sites = msg.sites
-      const next = Array.isArray(sites) ? sites : null
+      const fromExt = Array.isArray(sites) ? sites : null
+      // 확장앱이 null 보내는데 로컬(sessionStorage)에 명시 선택값이 있으면 → 로컬 값으로 확장앱 storage 복구
+      // (페이지 갔다오면 부분선택이 전체선택으로 되돌아가는 버그 방지)
+      const localStored = loadInitialFilterSources()
+      let next: string[] | null
+      if (fromExt === null && Array.isArray(localStored)) {
+        next = localStored
+        try {
+          window.postMessage({ source: 'samba-page', type: 'SET_ALLOWED_SITES', sites: localStored }, window.location.origin)
+        } catch { /* ignore */ }
+      } else {
+        next = fromExt
+      }
       setFilterSources(next)
       saveFilterSourcesToSession(next)
       // 첫 수신 시 백엔드 PC분담 등록 (heartbeat 시작) — 폴링으로 last_seen 자동 갱신됨
@@ -816,21 +828,31 @@ export default function WarroomPage() {
                 const { API_BASE_URL: apiBase } = await import('@/config/api')
                 const { getDeviceId } = await import('@/lib/samba/deviceId')
                 const dev = getDeviceId()
+                // device_id 누락 가드 — 빈값으로 호출 시 백엔드가 HTTP 200 + {ok:false}로 응답해 silent fail 발생
+                if (!dev) {
+                  showAlert('device_id 누락 — 확장앱 재로드 필요 (정지 안 됨)', 'error')
+                  return
+                }
                 // 본인 PC만 정지 — 다른 PC는 영향 없음
                 const r = await fetchWithAuth(`${apiBase}/api/v1/samba/collector/autotune/stop`, {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ device_id: dev }),
                 })
-                window.postMessage({ source: 'samba-page', type: 'AUTOTUNE_SET_JOIN', joined: false }, window.location.origin)
-                setAutotuneRunning(false)
-                falseCountRef.current = 0
-                // 사용자 의도 저장 — 자동 재등록 비활성화
-                try { window.localStorage.setItem('samba.autotune.userIntent', 'stop') } catch { /* ignore */ }
-                if (r.ok) {
+                let data: { ok?: boolean; error?: string; status?: string } = {}
+                try { data = await r.json() } catch { /* ignore */ }
+                if (r.ok && data.ok !== false) {
+                  window.postMessage({ source: 'samba-page', type: 'AUTOTUNE_SET_JOIN', joined: false }, window.location.origin)
+                  setAutotuneRunning(false)
+                  falseCountRef.current = 0
+                  try { window.localStorage.setItem('samba.autotune.userIntent', 'stop') } catch { /* ignore */ }
                   showAlert('이 PC 오토튠 정지 완료', 'success')
+                } else if (r.ok && data.ok === false) {
+                  showAlert(`정지 실패 — ${data.error || '백엔드 거절'}`, 'error')
                 } else {
                   showAlert(`정지 요청 응답 ${r.status} — UI는 정지 상태로 동기화됨`, 'info')
+                  setAutotuneRunning(false)
+                  falseCountRef.current = 0
                 }
               } catch {
                 setAutotuneRunning(false)
@@ -847,7 +869,7 @@ export default function WarroomPage() {
               fontWeight: 600,
               cursor: 'pointer',
             }}
-            >작업취소</button>
+            >오토튠 정지</button>
             <button
               onClick={handlePriorityToggle}
               style={{
