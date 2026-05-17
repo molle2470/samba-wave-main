@@ -971,11 +971,34 @@ async def receive_reward_result(
         account.balance_updated_at = now
     account.updated_at = now
     session.add(account)
+
+    # SambaSourcingJob 상태/에러도 함께 마킹 — 디버깅용. request_id 없으면 스킵(과거 호환).
+    # 기존엔 SambaSourcingAccount.additional_fields 만 업데이트했고 SambaSourcingJob 는 그대로
+    # 남아 expired 처리되거나 상태 불명으로 'failed' 라벨링 되어 실패 사유 추적 불가했음.
+    if body.request_id:
+        from backend.domain.samba.sourcing_job.model import SambaSourcingJob
+
+        job = await session.get(SambaSourcingJob, body.request_id)
+        if job:
+            job.status = "completed" if body.success else "failed"
+            job.result = {
+                "success": body.success,
+                "already_done": body.already_done,
+                "reward": body.reward,
+                "stamp_count": body.stamp_count,
+                "money": body.money,
+                "mileage": body.mileage,
+            }
+            job.error = body.error or None
+            job.completed_at = now
+            session.add(job)
+
     await session.commit()
 
     logger.info(
         f"[적립금] 결과 수신 {body.site_name}/{body.action} acct={account.account_label} "
-        f"success={body.success} reward={body.reward} stamp={body.stamp_count}"
+        f"success={body.success} reward={body.reward} stamp={body.stamp_count} "
+        f"req={body.request_id or '-'} error={(body.error or '')[:120]}"
     )
     return {"ok": True}
 
