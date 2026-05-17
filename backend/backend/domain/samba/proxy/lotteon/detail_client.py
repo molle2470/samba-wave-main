@@ -90,9 +90,7 @@ class DetailClientMixin:
 
         try:
             async with httpx.AsyncClient(
-                **self._httpx_kwargs(
-                    timeout=self._timeout_obj(), follow_redirects=True
-                )
+                **self._httpx_kwargs(timeout=self._timeout_obj(), follow_redirects=True)
             ) as client:
                 resp = await client.get(url, headers=self.HEADERS)
 

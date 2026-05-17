@@ -92,9 +92,7 @@ class SearchClientMixin:
         try:
             qapi_headers = {**self.HEADERS, "Accept": "application/json, */*"}
             async with httpx.AsyncClient(
-                **self._httpx_kwargs(
-                    timeout=self._timeout_obj(), follow_redirects=True
-                )
+                **self._httpx_kwargs(timeout=self._timeout_obj(), follow_redirects=True)
             ) as client:
                 resp = await client.get(search_url, headers=qapi_headers)
 
@@ -152,9 +150,7 @@ class SearchClientMixin:
         try:
             qapi_headers = {**self.HEADERS, "Accept": "application/json, */*"}
             async with httpx.AsyncClient(
-                **self._httpx_kwargs(
-                    timeout=self._timeout_obj(), follow_redirects=True
-                )
+                **self._httpx_kwargs(timeout=self._timeout_obj(), follow_redirects=True)
             ) as client:
                 resp = await client.get(url, headers=qapi_headers)
                 if resp.status_code == 200:
@@ -270,9 +266,7 @@ class SearchClientMixin:
 
         try:
             async with httpx.AsyncClient(
-                **self._httpx_kwargs(
-                    timeout=self._timeout_obj(), follow_redirects=True
-                )
+                **self._httpx_kwargs(timeout=self._timeout_obj(), follow_redirects=True)
             ) as client:
                 resp = await client.get(search_url, headers=self.HEADERS)
 
