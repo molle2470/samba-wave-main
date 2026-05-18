@@ -96,6 +96,28 @@ _autotune_global_total: dict[
     tuple[str, str], int
 ] = {}  # (device_id, site) → 전체 대상수
 
+
+# 한 사이클(전체 1바퀴) 누적 통계 — 배치마다 합산, 사이클 완료 시 출력 후 리셋
+def _new_cycle_stats() -> dict:
+    return {
+        "ok": 0,
+        "err": 0,
+        "no_pid": 0,
+        "blocked": 0,
+        "timeout": 0,
+        "other": 0,
+        "total": 0,
+        "price_pids": set(),
+        "stock_pids": set(),
+        "synced": 0,
+        "deleted": 0,
+        "batches": 0,
+        "started_at": None,
+    }
+
+
+_autotune_cycle_stats: dict[tuple[str, str], dict] = {}
+
 # Watchdog
 STUCK_TIMEOUT_SECONDS = 300  # 5분간 heartbeat 없으면 stuck 판정
 MAX_RESTART_COUNT = 50  # 코디네이터 재시작 상한선
@@ -193,7 +215,7 @@ AUTOTUNE_PRIORITY_ENABLED_KEY = "autotune_priority_enabled"
 # OOM 일으키지 않도록 상한. 너무 낮으면 backlog, 너무 높으면 메모리 폭주.
 # 정책 변경 직후 폭주 시 backlog는 이벤트 루프가 자연스럽게 흡수 (백프레셔).
 _AUTOTUNE_TRANSMIT_MAX_CONCURRENCY = int(
-    os.environ.get("AUTOTUNE_TRANSMIT_MAX_CONCURRENCY", "10")
+    os.environ.get("AUTOTUNE_TRANSMIT_MAX_CONCURRENCY", "5")
 )
 _autotune_transmit_sem: Optional[asyncio.Semaphore] = None
 
@@ -600,8 +622,18 @@ async def _site_autotune_loop(device_id: str, site: str):
                         _gkey = (device_id, site)
                         # 한 바퀴 회전 완료(분자 ≥ 분모) 또는 분모 변동 시 0부터 재시작
                         _prev_idx = _autotune_global_idx.get(_gkey, 0)
-                        if _prev_idx >= _total_global or _total_global <= 0:
+                        _prev_total = _autotune_global_total.get(_gkey, 0)
+                        if (
+                            _prev_idx >= _total_global
+                            or _total_global <= 0
+                            or _prev_total != _total_global
+                        ):
                             _autotune_global_idx[_gkey] = 0
+                            _autotune_cycle_stats[_gkey] = _new_cycle_stats()
+                            _autotune_cycle_stats[_gkey]["started_at"] = now.isoformat()
+                        elif _gkey not in _autotune_cycle_stats:
+                            _autotune_cycle_stats[_gkey] = _new_cycle_stats()
+                            _autotune_cycle_stats[_gkey]["started_at"] = now.isoformat()
                         _autotune_global_total[_gkey] = _total_global
                         log.info(
                             "[오토튠][디버그][%s][%s] 사이클 #%d SELECT 완료: %d건 대상 / 전체 %d건 (진행 %d) (elapsed=%.1fs)",
@@ -2087,25 +2119,99 @@ async def _site_autotune_loop(device_id: str, site: str):
                         _err_detail = (
                             f" ({', '.join(_err_parts)})" if _err_parts else ""
                         )
+                        # ── 사이클 누적 통계 합산 ──
+                        _cstats = _autotune_cycle_stats.setdefault(
+                            _gkey, _new_cycle_stats()
+                        )
+                        if _cstats.get("started_at") is None:
+                            _cstats["started_at"] = now.isoformat()
+                        _cstats["ok"] += _ok_count
+                        _cstats["err"] += _err_count
+                        _cstats["no_pid"] += _no_pid_count
+                        _cstats["blocked"] += _blocked_count
+                        _cstats["timeout"] += _timeout_count
+                        _cstats["other"] += _other_err
+                        _cstats["total"] += len(results)
+                        _cstats["price_pids"].update(_all_price_pids)
+                        _cstats["stock_pids"].update(_all_stock_pids)
+                        _cstats["synced"] += _synced_count
+                        _cstats["deleted"] += deleted_count
+                        _cstats["batches"] += 1
+
+                        _g_idx_now = _autotune_global_idx.get(_gkey, 0)
+                        _g_total_now = _autotune_global_total.get(_gkey, 0)
+                        _is_full_cycle = _g_total_now > 0 and _g_idx_now >= _g_total_now
+
+                        # 배치 완료 로그 (매 배치마다)
                         _ref_mod._refresh_log_buffer.append(
                             {
                                 "ts": _now.isoformat(),
                                 "site": site,
                                 "product_id": "",
                                 "name": "",
-                                "msg": f"[{_kst.strftime('%H:%M:%S')}] -- [{site}] 사이클 완료: {_ok_count:,}건 성공, {_err_count:,}건 실패{_err_detail} / 총 {len(results):,}건, 가격전송 {len(_all_price_pids):,}건, 재고전송 {len(_all_stock_pids):,}건, 동기 {_synced_count:,}건, 마켓삭제 {deleted_count:,}건 --",
+                                "msg": f"[{_kst.strftime('%H:%M:%S')}] -- [{site}] 배치 완료 [{_g_idx_now:,}/{_g_total_now:,}]: {_ok_count:,}건 성공, {_err_count:,}건 실패{_err_detail} / 총 {len(results):,}건, 가격전송 {len(_all_price_pids):,}건, 재고전송 {len(_all_stock_pids):,}건, 동기 {_synced_count:,}건, 마켓삭제 {deleted_count:,}건 --",
                                 "level": "info",
                                 "source": "autotune",
                             }
                         )
                         _ref_mod._refresh_log_total += 1
                         log.info(
-                            "[오토튠] 사이클 완료: %d성공, %d실패%s / %d건",
+                            "[오토튠] 배치 완료 [%s/%s]: %d성공, %d실패%s / %d건",
+                            f"{_g_idx_now:,}",
+                            f"{_g_total_now:,}",
                             _ok_count,
                             _err_count,
                             _err_detail,
                             len(results),
                         )
+
+                        # 사이클(전체 1바퀴) 완료 로그
+                        if _is_full_cycle:
+                            _c_err_parts = []
+                            if _cstats["no_pid"]:
+                                _c_err_parts.append(f"ID없음 {_cstats['no_pid']:,}")
+                            if _cstats["blocked"]:
+                                _c_err_parts.append(f"차단 {_cstats['blocked']:,}")
+                            if _cstats["timeout"]:
+                                _c_err_parts.append(f"타임아웃 {_cstats['timeout']:,}")
+                            if _cstats["other"] > 0:
+                                _c_err_parts.append(f"기타 {_cstats['other']:,}")
+                            _c_err_detail = (
+                                f" ({', '.join(_c_err_parts)})" if _c_err_parts else ""
+                            )
+                            _c_started = _cstats.get("started_at")
+                            _c_dur_str = ""
+                            try:
+                                if _c_started:
+                                    _c_dur = (
+                                        _now - datetime.fromisoformat(_c_started)
+                                    ).total_seconds()
+                                    _c_dur_str = f", 소요 {int(_c_dur):,}초"
+                            except Exception:
+                                pass
+                            _ref_mod._refresh_log_buffer.append(
+                                {
+                                    "ts": _now.isoformat(),
+                                    "site": site,
+                                    "product_id": "",
+                                    "name": "",
+                                    "msg": f"[{_kst.strftime('%H:%M:%S')}] ══ [{site}] 사이클 완료 (1바퀴 {_g_total_now:,}건): {_cstats['ok']:,}건 성공, {_cstats['err']:,}건 실패{_c_err_detail} / 배치 {_cstats['batches']:,}회, 가격전송 {len(_cstats['price_pids']):,}건, 재고전송 {len(_cstats['stock_pids']):,}건, 동기 {_cstats['synced']:,}건, 마켓삭제 {_cstats['deleted']:,}건{_c_dur_str} ══",
+                                    "level": "info",
+                                    "source": "autotune",
+                                }
+                            )
+                            _ref_mod._refresh_log_total += 1
+                            log.info(
+                                "[오토튠][%s] 사이클 완료 (1바퀴 %s건): %d성공, %d실패%s / 배치 %d회",
+                                site,
+                                f"{_g_total_now:,}",
+                                _cstats["ok"],
+                                _cstats["err"],
+                                _c_err_detail,
+                                _cstats["batches"],
+                            )
+                            # 다음 회전을 위해 통계 리셋
+                            _autotune_cycle_stats[_gkey] = _new_cycle_stats()
 
                         # ★ 품절 잔존 상품 마켓삭제 재시도
                         # sale_status="sold_out"인데 registered_accounts가 남아있는 상품
@@ -2399,7 +2505,7 @@ async def _site_autotune_loop(device_id: str, site: str):
                     _scc[site] = _scc.get(site, 0) + 1
                     _pc_slt(device_id)[site] = now.isoformat()
                     log.info(
-                        "[오토튠][%s] 사이클 완료 (누적 %d회) — 즉시 재시작",
+                        "[오토튠][%s] 배치 완료 (누적 %d회) — 즉시 재시작",
                         site,
                         _scc.get(site, 0),
                     )

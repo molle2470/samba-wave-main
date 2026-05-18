@@ -1003,8 +1003,6 @@ export default function OrdersPage() {
             <div style={{ display: 'flex', gap: 8, marginBottom: 14, flexWrap: 'wrap' }}>
               {[
                 { key: 'PENDING', label: '대기', color: '#6b7280' },
-                { key: 'DISPATCHED', label: '추출중', color: '#0ea5e9' },
-                { key: 'SCRAPED', label: '추출완료', color: '#16a34a' },
                 { key: 'SENT_TO_MARKET', label: '마켓전송', color: '#22c55e' },
                 { key: 'DISPATCH_FAILED', label: '송장전송실패', color: '#dc2626' },
                 { key: 'NO_TRACKING', label: '미발송', color: '#f59e0b' },

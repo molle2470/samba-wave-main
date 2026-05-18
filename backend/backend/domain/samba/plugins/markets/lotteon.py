@@ -1924,7 +1924,7 @@ class LotteonPlugin(MarketPlugin):
         try:
             from backend.domain.samba.image.service import ImageTransformService
 
-            _img_svc = ImageTransformService()
+            _img_svc = ImageTransformService(session)
             if product_copy.get("images"):
                 _mirrored, _ = await _img_svc.mirror_external_to_r2(
                     product_copy["images"]
@@ -2116,9 +2116,9 @@ class LotteonPlugin(MarketPlugin):
                                         import re as _re_a
 
                                         _am = _re_a.search(
-                                            r"항목코드\((\d+)\)", str(_artl_err)
+                                            r"항목코드\D{0,3}(\d{3,4})", str(_artl_err)
                                         )
-                                        _bad = _am.group(1) if _am else None
+                                        _bad = _am.group(1).zfill(4) if _am else None
                                         if not _bad:
                                             break
                                         logger.info(
@@ -2131,7 +2131,8 @@ class LotteonPlugin(MarketPlugin):
                                             _ntc3["pdItmsArtlLst"] = [
                                                 a
                                                 for a in _al3
-                                                if a.get("pdArtlCd") != _bad
+                                                if str(a.get("pdArtlCd", "")).zfill(4)
+                                                != _bad
                                             ]
                                         try:
                                             api_result = await client.update_product(
@@ -2203,11 +2204,11 @@ class LotteonPlugin(MarketPlugin):
                                                         import re as _re38
 
                                                         _m38 = _re38.search(
-                                                            r"항목코드\((\d+)\)",
+                                                            r"항목코드\D{0,3}(\d{3,4})",
                                                             str(_ea2),
                                                         )
                                                         _bad38 = (
-                                                            _m38.group(1)
+                                                            _m38.group(1).zfill(4)
                                                             if _m38
                                                             else None
                                                         )
@@ -2218,7 +2219,11 @@ class LotteonPlugin(MarketPlugin):
                                                             _artl_lst[:] = [
                                                                 a
                                                                 for a in _artl_lst
-                                                                if a.get("pdArtlCd")
+                                                                if str(
+                                                                    a.get(
+                                                                        "pdArtlCd", ""
+                                                                    )
+                                                                ).zfill(4)
                                                                 != _bad38
                                                             ]
                                                             logger.info(
@@ -2586,11 +2591,11 @@ class LotteonPlugin(MarketPlugin):
                                                         import re as _re38
 
                                                         _m38 = _re38.search(
-                                                            r"항목코드\((\d+)\)",
+                                                            r"항목코드\D{0,3}(\d{3,4})",
                                                             str(_ea2),
                                                         )
                                                         _bad38 = (
-                                                            _m38.group(1)
+                                                            _m38.group(1).zfill(4)
                                                             if _m38
                                                             else None
                                                         )
@@ -2601,7 +2606,11 @@ class LotteonPlugin(MarketPlugin):
                                                             _artl_lst[:] = [
                                                                 a
                                                                 for a in _artl_lst
-                                                                if a.get("pdArtlCd")
+                                                                if str(
+                                                                    a.get(
+                                                                        "pdArtlCd", ""
+                                                                    )
+                                                                ).zfill(4)
                                                                 != _bad38
                                                             ]
                                                             logger.info(
@@ -2675,6 +2684,24 @@ class LotteonPlugin(MarketPlugin):
                                     f"[롯데ON] pdItmsInfo 제거 후에도 실패: {_ea_final}"
                                 )
                                 _reg_exception = _ea_final
+                    elif "not supported type" in str(_e):
+                        # scatAttrLst optValCd 미지원 → scatAttrLst 제거 후 재시도
+                        _reg_exception = _e
+                        if data.get("spdLst") and isinstance(data["spdLst"], list):
+                            for _spd_s in data["spdLst"]:
+                                _spd_s.pop("scatAttrLst", None)
+                                _spd_s.pop("scatAttrChgYn", None)
+                        logger.info(
+                            f"[롯데ON] scatAttrLst 미지원 optValCd fallback — scatAttrLst 제거 재시도 (원인: {_e})"
+                        )
+                        try:
+                            api_result = await client.register_product(data)
+                            _reg_exception = None
+                        except Exception as _es:
+                            logger.warning(
+                                f"[롯데ON] scatAttrLst 제거 재시도 실패: {_es}"
+                            )
+                            _reg_exception = _es
                     elif "등록이 불가한 브랜드" in str(_e):
                         # 거래처-브랜드-전시카테고리 계약 누락: brdNo 공란으로 1회 재시도
                         _reg_exception = _e

@@ -1284,12 +1284,14 @@ async def sync_order_tracking(order_id: str, force: bool = False) -> dict:
 async def sync_order_tracking_bulk(
     limit: int = Query(500, ge=1, le=1000),
     days: int = Query(7, ge=1, le=90),
-    force: bool = Query(False),
+    force: bool = Query(True),
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict:
     """미발송 주문 일괄 송장 추출 큐잉 — 최근 N일 + 소싱처 주문번호 있음 + 송장 미입력.
 
-    force=True 면 기존 PENDING/DISPATCHED 잡(만료 좀비 포함)을 FAILED 로 닫고 새로 큐잉.
+    force=True (기본): 트리거 시점에 옛 sourcing_job tracking + 옛 tracking_sync_job PENDING/DISPATCHED 모두
+    리셋 후 새 batch 적재 — 모달 리스트 = 큐 카운트 1:1 매칭 보장.
+    force=False 사용 케이스 없음 (단건 호출은 sync-tracking/<id> 사용).
     """
     from backend.domain.samba.tracking_sync.service import enqueue_pending_orders
 
@@ -6926,16 +6928,28 @@ def _parse_elevenst_order(item: dict, account_id: str, label: str) -> dict:
     # 우편번호 — 화면 확인용 (복사 버튼 분리). 11번가 API 우편번호 필드: rcvrMlmtNo
     postal_code = str(item.get("rcvrMlmtNo") or "").strip() or None
 
-    # 판매금액: selPrc(단가) 우선, 없으면 ordAmt(주문금액)
-    sale_price = _to_int(item.get("selPrc"), _to_int(item.get("ordAmt")))
+    # 판매금액: selPrc(단가) 우선, 없으면 ordAmt(주문총액)을 수량으로 나눠 단가 환산
+    quantity = max(1, _to_int(item.get("ordQty"), 1))
+    sel_prc = _to_int(item.get("selPrc"))
+    ord_amt = _to_int(item.get("ordAmt"))
+    if sel_prc > 0:
+        sale_price = sel_prc
+    elif ord_amt > 0 and quantity > 0:
+        sale_price = ord_amt // quantity
+    else:
+        sale_price = 0
 
-    # 정산예정금액: stlPlnAmt
-    revenue = _to_int(item.get("stlPlnAmt"), sale_price)
+    # 결제금액(주문 총액) — ordAmt(단가×수량+옵션가) 우선, 폴백 sale_price×quantity
+    # 멀티수량 주문에서 결제 컬럼이 단가로 표시되는 회귀 방지 (2026-05-18)
+    total_payment_amount = ord_amt if ord_amt > 0 else sale_price * quantity
 
-    # 수수료율 = (1 - 정산예정금액 / 판매가) × 100
-    # 음수/이상값 방지: revenue가 sale_price보다 크면 0으로 처리
-    if sale_price > 0 and 0 < revenue <= sale_price:
-        fee_rate = round((1 - revenue / sale_price) * 100, 2)
+    # 정산예정금액: stlPlnAmt (라인 총액 — 수량 포함)
+    revenue = _to_int(item.get("stlPlnAmt"), total_payment_amount)
+
+    # 수수료율 = (1 - 정산예정금액 / 결제금액) × 100
+    # 음수/이상값 방지: revenue가 total_payment_amount보다 크면 0으로 처리
+    if total_payment_amount > 0 and 0 < revenue <= total_payment_amount:
+        fee_rate = round((1 - revenue / total_payment_amount) * 100, 2)
     else:
         fee_rate = 0.0
 
@@ -6949,8 +6963,9 @@ def _parse_elevenst_order(item: dict, account_id: str, label: str) -> dict:
         "product_id": str(item.get("prdNo", "") or ""),
         "product_name": str(item.get("prdNm", "") or ""),
         "product_option": str(item.get("slctPrdOptNm", "") or ""),
-        "quantity": max(1, _to_int(item.get("ordQty"), 1)),
+        "quantity": quantity,
         "sale_price": sale_price,
+        "total_payment_amount": total_payment_amount,
         "cost": 0,
         "revenue": revenue,
         "fee_rate": fee_rate,
