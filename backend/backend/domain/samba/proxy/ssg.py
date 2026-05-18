@@ -433,12 +433,8 @@ class SSGClient:
         if has_option_inventories:
             payload["optionInventories"] = [
                 {
-                    **opt,
-                    "sellStatCd": str(opt.get("sellStatCd", 20)),
-                    # sellFrmCd가 없거나 None이면 기본값 "10"(일반판매) 적용 — 빈값 전송 시 API 오류
-                    "sellFrmCd": str(opt["sellFrmCd"])
-                    if opt.get("sellFrmCd") is not None
-                    else "10",
+                    "uitemId": opt.get("uitemId"),
+                    "sellStatCd": str(opt.get("sellStatCd", "20")),
                 }
                 for opt in option_inventories
                 if isinstance(opt, dict)
