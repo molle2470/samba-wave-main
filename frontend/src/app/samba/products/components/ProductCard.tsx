@@ -1674,13 +1674,15 @@ const ProductCard = React.memo(function ProductCard({
               {(() => {
                 const _mktNames = (p.market_names || {}) as Record<string, string>
                 const _composed = composeProductName(p, nameRules.find(r => r.id === (policy?.extras as Record<string, string> | undefined)?.name_rule_id), deletionWords)
-                // 마켓가격 행에 이미 표시된 마켓명 목록
-                const priceMarketNames = new Set(marketPriceList.map(m => m.marketName))
+                // 마켓가격 행에 이미 표시된 마켓 ID 목록 (이름이 아닌 ID 기준 중복 제거)
+                // "신세계몰(전시)" 같이 정책 마켓명이 MARKETS.name과 다른 경우도 처리
+                const priceMarketIds = new Set(
+                  marketPriceList
+                    .map(m => MARKETS.find(mk => m.marketName.includes(mk.name))?.id)
+                    .filter((id): id is string => !!id)
+                )
                 // 등록된 스토어 중 마켓가격 행이 없는 것만 추출
-                const extraStores = registeredMarkets.filter(rm => {
-                  const mkt = MARKETS.find(m => m.id === rm.marketId)
-                  return mkt && !priceMarketNames.has(mkt.name)
-                })
+                const extraStores = registeredMarkets.filter(rm => !priceMarketIds.has(rm.marketId))
                 if (extraStores.length === 0) return null
                 return extraStores.map(rm => {
                   const mkt = MARKETS.find(m => m.id === rm.marketId)
