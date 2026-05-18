@@ -28,6 +28,12 @@ class SambaUserRepository(BaseRepository[SambaUser]):
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def find_by_email_any(self, email: str) -> Optional[SambaUser]:
+        """이메일로 사용자 조회 (삭제된 사용자 포함) — 재가입 복구용."""
+        stmt = select(SambaUser).where(SambaUser.email == email)
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
     async def soft_delete(self, user_id: str) -> bool:
         """소프트 삭제 (deleted_at 설정)."""
         user = await self.get_async(user_id)

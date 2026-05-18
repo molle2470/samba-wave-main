@@ -100,24 +100,34 @@ async def create_user(
         raise HTTPException(status_code=403, detail="초대 코드가 올바르지 않습니다")
 
     repo = SambaUserRepository(session)
+    hashed = hash_password(body.password)
 
-    # 이메일 중복 검사
-    existing = await repo.find_by_email(body.email)
-    if existing:
+    # 이메일 중복 검사 (삭제된 계정 포함)
+    any_existing = await repo.find_by_email_any(body.email)
+    if any_existing and any_existing.deleted_at is None:
         raise HTTPException(status_code=409, detail="이미 등록된 이메일입니다")
 
-    hashed = hash_password(body.password)
-    user = await repo.create_async(
-        email=body.email,
-        name=body.name,
-        password_hash=hashed,
-        is_admin=False,
-        status="active",
-    )
-
-    # 신규 테넌트 자동 생성 → 데이터 격리 보장
     from backend.domain.samba.tenant.model import SambaTenant
 
+    if any_existing and any_existing.deleted_at is not None:
+        # 탈퇴한 계정 — 비밀번호·이름 재설정 + 새 테넌트로 부활
+        user = any_existing
+        user.deleted_at = None
+        user.password_hash = hashed
+        user.name = body.name
+        user.status = "active"
+        user.is_admin = False
+        logger.info(f"[사용자관리] 탈퇴 계정 복구: {user.email}")
+    else:
+        user = await repo.create_async(
+            email=body.email,
+            name=body.name,
+            password_hash=hashed,
+            is_admin=False,
+            status="active",
+        )
+
+    # 신규 테넌트 자동 생성 → 데이터 격리 보장
     tenant = SambaTenant(
         name=body.name,
         owner_user_id=user.id,
