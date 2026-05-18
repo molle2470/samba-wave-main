@@ -15,7 +15,16 @@ from backend.domain.samba.collector.refresher import (
 from backend.domain.samba.warroom.service import SambaMonitorService
 from backend.domain.samba.warroom.repository import SambaMonitorEventRepository
 
-router = APIRouter(prefix="/monitor", tags=["samba-monitor"])
+from fastapi import Depends as _Depends
+from backend.domain.samba.tenant.middleware import require_admin as _require_admin
+
+# 워룸/모니터링 — monitor_event 테이블에 tenant_id 컬럼 없어 격리 불가
+# 임시로 admin only로 차단 (다음 라운드에서 컬럼 추가 + 사용자별 격리)
+router = APIRouter(
+    prefix="/monitor",
+    tags=["samba-monitor"],
+    dependencies=[_Depends(_require_admin)],
+)
 
 
 def _normalize_source_site(site: str | None) -> str:

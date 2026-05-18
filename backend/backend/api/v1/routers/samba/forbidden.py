@@ -308,6 +308,7 @@ async def get_exchange_rates(
 @router.get("/tag-banned-words")
 async def get_tag_banned_words(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ):
     """태그 금지어 통합 조회: 소싱처 + 수집 브랜드 + API 거부 태그."""
     from sqlmodel import select
@@ -319,7 +320,7 @@ async def get_tag_banned_words(
     rejected = await svc.get_setting("smartstore_banned_tags")
     rejected_tags: list[str] = rejected if isinstance(rejected, list) else []
 
-    # 2. 수집된 브랜드 (distinct)
+    # 2. 수집된 브랜드 (distinct) — projection 쿼리이므로 수동 tenant 필터 필요
     stmt = (
         select(SambaCollectedProduct.brand)
         .where(
@@ -329,6 +330,8 @@ async def get_tag_banned_words(
         .distinct()
         .limit(500)
     )
+    if tenant_id is not None:
+        stmt = stmt.where(SambaCollectedProduct.tenant_id == tenant_id)
     result = await session.exec(stmt)
     brands = sorted(set(b for b in result.all() if b and len(b.strip()) >= 2))
 
