@@ -1924,7 +1924,7 @@ class LotteonPlugin(MarketPlugin):
         try:
             from backend.domain.samba.image.service import ImageTransformService
 
-            _img_svc = ImageTransformService()
+            _img_svc = ImageTransformService(session)
             if product_copy.get("images"):
                 _mirrored, _ = await _img_svc.mirror_external_to_r2(
                     product_copy["images"]
