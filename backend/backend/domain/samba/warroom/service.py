@@ -45,14 +45,30 @@ class SambaMonitorService:
         product_id: Optional[str] = None,
         product_name: Optional[str] = None,
         detail: Optional[Any] = None,
+        tenant_id: Optional[str] = None,
     ) -> Optional[str]:
         """이벤트 기록 — 메인 로직을 방해하지 않도록 try/except 감싸기.
 
+        tenant_id 미지정 시 product_id로 SambaCollectedProduct.tenant_id 자동 lookup.
         Returns:
             생성된 이벤트 id. 실패 시 None.
         """
         global _emit_counter
         try:
+            # tenant_id 자동 채움 — 워커는 HTTP context 없어 contextvar=None
+            if not tenant_id and product_id:
+                try:
+                    from backend.domain.samba.collector.model import (
+                        SambaCollectedProduct as _CP,
+                    )
+                    from sqlmodel import select as _sel
+
+                    _tid_stmt = _sel(_CP.tenant_id).where(_CP.id == product_id)
+                    _tid_result = await self.session.execute(_tid_stmt)
+                    tenant_id = _tid_result.scalar_one_or_none()
+                except Exception:
+                    pass
+
             event = SambaMonitorEvent(
                 event_type=event_type,
                 severity=severity,
@@ -62,6 +78,7 @@ class SambaMonitorService:
                 product_id=product_id,
                 product_name=product_name,
                 detail=detail,
+                tenant_id=tenant_id,
             )
             self.session.add(event)
             await self.session.flush()

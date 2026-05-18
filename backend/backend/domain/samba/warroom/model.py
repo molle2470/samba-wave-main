@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from sqlalchemy import String
 from sqlmodel import Column, DateTime, Field, JSON, SQLModel, Text
 
 from ulid import ULID
@@ -21,6 +22,11 @@ class SambaMonitorEvent(SQLModel, table=True):
         default_factory=generate_monitor_event_id,
         primary_key=True,
         max_length=30,
+    )
+
+    # 테넌트 격리
+    tenant_id: Optional[str] = Field(
+        default=None, sa_column=Column(String, index=True, nullable=True)
     )
 
     # 이벤트 분류

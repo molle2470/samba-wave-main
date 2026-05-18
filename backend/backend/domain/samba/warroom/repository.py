@@ -28,7 +28,13 @@ class SambaMonitorEventRepository(BaseRepository[SambaMonitorEvent]):
         self,
         since: datetime,
     ) -> Dict[str, int]:
-        """특정 시각 이후 event_type별 카운트."""
+        """특정 시각 이후 event_type별 카운트.
+
+        projection 쿼리이므로 ORM 자동 필터 우회 — contextvar에서 직접 가져와 적용.
+        """
+        from backend.core.tenant_context import current_tenant_id as _ctv
+
+        _tid = _ctv.get()
         stmt = (
             select(
                 SambaMonitorEvent.event_type,
@@ -37,6 +43,8 @@ class SambaMonitorEventRepository(BaseRepository[SambaMonitorEvent]):
             .where(SambaMonitorEvent.created_at >= since)
             .group_by(SambaMonitorEvent.event_type)
         )
+        if _tid is not None:
+            stmt = stmt.where(SambaMonitorEvent.tenant_id == _tid)
         result = await self.session.execute(stmt)
         return {row[0]: row[1] for row in result.all()}
 
