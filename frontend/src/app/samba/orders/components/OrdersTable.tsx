@@ -306,7 +306,7 @@ export default function OrdersTable(props: OrdersTableProps) {
                         background: 'rgba(30,30,30,0.6)', border: '1px solid #2D2D2D', borderRadius: '6px',
                         display: 'flex', alignItems: 'center', justifyContent: 'center',
                       }}>
-                        <span style={{ fontSize: '0.75rem', color: '#4C9AFF', fontWeight: 600 }}>{(o.shipping_status === '출고지시' || o.shipping_status === '출하지시') ? '주문접수' : o.shipping_status === '발송대기' ? '배송대기중' : o.shipping_status === '송장전송완료' ? '국내배송중' : (STATUS_MAP[o.shipping_status]?.label || o.shipping_status || '-')}</span>
+                        <span style={{ fontSize: '0.75rem', color: '#4C9AFF', fontWeight: 600 }}>{(o.shipping_status === '출고지시' || o.shipping_status === '출하지시' || o.shipping_status === '결제완료') ? '주문접수' : o.shipping_status === '발송대기' ? '배송대기중' : o.shipping_status === '송장전송완료' ? '국내배송중' : (STATUS_MAP[o.shipping_status]?.label || o.shipping_status || '-')}</span>
                       </div>
                     </div>
 

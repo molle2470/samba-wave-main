@@ -137,8 +137,11 @@ async def sourcing_collect_queue(request: Request) -> Any:
         allowed_sites: list[str] | None = None
     else:
         allowed_sites = [s.strip() for s in raw_sites.split(",") if s.strip()]
+    ext_version = request.headers.get("X-Ext-Version", "").strip()
     job = await SourcingQueue.get_next_job(
-        device_id=device_id, allowed_sites=allowed_sites
+        device_id=device_id,
+        allowed_sites=allowed_sites,
+        ext_version=ext_version or None,
     )
     # 확장앱 최소 호환 버전 — extension/manifest.json 의 version 과 비교.
     # 확장앱이 미달이면 popup에 경고 표시 + polling 중단 가능 (background-core.js 처리).

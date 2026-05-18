@@ -35,7 +35,7 @@ import UrlInputModal from './components/UrlInputModal'
 import SmsTemplateEditModal from './components/SmsTemplateEditModal'
 import AlarmSettingModal from './components/AlarmSettingModal'
 import TrackingModal from './components/TrackingModal'
-import { showConfirm } from '@/components/samba/Modal'
+import { showConfirm, showAlert } from '@/components/samba/Modal'
 
 interface OrderForm {
   channel_id: string; product_name: string; customer_name: string; customer_phone: string
@@ -381,6 +381,40 @@ export default function OrdersPage() {
   })
   const [trackingOrder, setTrackingOrder] = useState<SambaOrder | null>(null)
   const [trackingSyncing, setTrackingSyncing] = useState(false)
+  // 주문 자동실행 인터벌 (분 단위, 0=OFF)
+  const [autoSyncIntervalInput, setAutoSyncIntervalInput] = useState<number>(60)
+  const [autoSyncEnabled, setAutoSyncEnabled] = useState<boolean>(false)
+  const [autoSyncSaving, setAutoSyncSaving] = useState<boolean>(false)
+  useEffect(() => {
+    orderApi.getAutoSyncInterval()
+      .then(res => {
+        if (res.interval_minutes > 0) {
+          setAutoSyncIntervalInput(res.interval_minutes)
+          setAutoSyncEnabled(true)
+        }
+      })
+      .catch(() => {})
+  }, [])
+  const handleToggleAutoSync = async () => {
+    if (autoSyncSaving) return
+    const nextValue = !autoSyncEnabled
+    setAutoSyncSaving(true)
+    try {
+      const minutes = nextValue ? Math.max(5, autoSyncIntervalInput) : 0
+      const res = await orderApi.setAutoSyncInterval(minutes)
+      setAutoSyncEnabled(res.interval_minutes > 0)
+      setLogMessages(prev => [
+        ...prev,
+        res.interval_minutes > 0
+          ? `[자동실행] ON — ${fmtNum(res.interval_minutes)}분 간격으로 주문가져오기+송장수집 자동 실행`
+          : '[자동실행] OFF',
+      ])
+    } catch (err) {
+      showAlert('주문 자동실행 설정 저장 실패: ' + ((err as Error)?.message || String(err)))
+    } finally {
+      setAutoSyncSaving(false)
+    }
+  }
   const [trackingStatusOpen, setTrackingStatusOpen] = useState(false)
   const [trackingStatusData, setTrackingStatusData] = useState<{
     counts: Record<string, number>
@@ -444,7 +478,9 @@ export default function OrdersPage() {
         `[송장 일괄] 큐 적재 ${fmtNum(res.queued)}건 / 스킵 ${fmtNum(res.skipped)}건 / 오류 ${fmtNum(res.errors.length)}건`,
         ...res.errors.slice(0, 5).map(e => `  · ${e}`),
       ])
-      // 이번 배치 잡 id 목록 저장 — 모달이 이 id들만 고정 표시 + 5초 폴링으로 셀 값만 갱신
+      // 이번 배치 잡 id 목록 저장 — 모달이 이 batch 의 잡들만 고정 표시 (status 변화 추적).
+      // SCRAPED/NO_TRACKING 등 처리 완료된 잡도 같은 batch 안에선 계속 표시되어 사라지지 않음.
+      // 새 송장수집 trigger 시 새 batch 로 replace — 옛 batch 의 잡은 모달에서 빠짐 (의도).
       setTrackingBatchIds(res.job_ids || [])
       setTrackingStatusOpen(true)
       setTimeout(() => { loadOrders() }, 60000)
@@ -533,6 +569,62 @@ export default function OrdersPage() {
         accounts={accounts} sourcingAccounts={sourcingAccounts}
         siteOptions={siteOptions}
       />
+
+      {/* 주문 자동실행 토글바 — 주문가져오기 + 송장수집 인터벌 자동 실행 */}
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        gap: '1rem', padding: '0.75rem 1rem', margin: '6px 0',
+        background: autoSyncEnabled ? 'rgba(34,197,94,0.08)' : 'rgba(255,140,0,0.08)',
+        border: autoSyncEnabled ? '1px solid rgba(34,197,94,0.25)' : '1px solid rgba(255,140,0,0.25)',
+        borderRadius: 10,
+      }}>
+        <div>
+          <div style={{ fontSize: '0.9375rem', fontWeight: 700, color: '#E5E5E5', marginBottom: '0.2rem' }}>
+            🔄 주문 자동실행
+          </div>
+          <div style={{ fontSize: '0.75rem', color: '#888' }}>
+            ON이면 설정한 분 간격마다 서버에서 전체 주문가져오기 → 송장수집을 자동 실행합니다.
+          </div>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+          <input
+            type="number"
+            value={autoSyncIntervalInput}
+            onChange={e => setAutoSyncIntervalInput(Math.max(5, Number(e.target.value)))}
+            min={5}
+            max={1440}
+            style={{
+              width: 56,
+              background: '#2A2A2A',
+              border: '1px solid #444',
+              color: '#ccc',
+              borderRadius: 6,
+              padding: '4px 6px',
+              fontSize: '0.8125rem',
+              textAlign: 'center',
+            }}
+          />
+          <span style={{ color: '#888', fontSize: '0.8125rem' }}>분</span>
+          <button
+            onClick={handleToggleAutoSync}
+            disabled={autoSyncSaving}
+            style={{
+              minWidth: '92px',
+              padding: '0.5rem 0.875rem',
+              borderRadius: '999px',
+              border: autoSyncEnabled ? '1px solid rgba(34,197,94,0.35)' : '1px solid rgba(255,140,0,0.35)',
+              background: autoSyncEnabled ? '#22C55E' : '#2A2A2A',
+              color: autoSyncEnabled ? '#06130A' : '#FFB84D',
+              fontSize: '0.8125rem',
+              fontWeight: 700,
+              cursor: autoSyncSaving ? 'not-allowed' : 'pointer',
+              opacity: autoSyncSaving ? 0.7 : 1,
+            }}
+          >
+            {autoSyncSaving ? '저장 중...' : autoSyncEnabled ? 'ON' : 'OFF'}
+          </button>
+        </div>
+      </div>
 
       {/* 송장 자동전송 미니바 — 일괄 트리거 + 안내 */}
       <div style={{
@@ -728,7 +820,13 @@ export default function OrdersPage() {
       {/* 송장 자동전송 진행 현황 모달 */}
       {trackingStatusOpen && (
         <div
-          onClick={() => setTrackingStatusOpen(false)}
+          onClick={() => {
+            // 모달 닫기 = 단순 UI 닫기. 백그라운드 잡 처리는 계속 진행.
+            // (이전 회귀: 모달 닫기에서 배치 취소 자동 호출 → 처리 중 잡 전부 cancelled
+            //  되어 사용자가 결과 보러 닫을 때마다 송장수집 무효화되던 사고 차단)
+            // 진짜 취소 의도는 별도 "취소" 버튼 명시 클릭만 인정.
+            setTrackingStatusOpen(false)
+          }}
           style={{
             position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
             display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999,
@@ -748,21 +846,42 @@ export default function OrdersPage() {
               <div style={{ display: 'flex', gap: 8 }}>
                 <button
                   onClick={async () => {
-                    if (!await showConfirm('SCRAPED + 송장전송실패 상태 잡 전체를 마켓에 일괄 전송합니다. 진행할까요?')) return
+                    if (trackingBatchIds.length === 0) {
+                      showAlert('중단할 배치가 없습니다', 'info')
+                      return
+                    }
+                    if (!await showConfirm('진행 중인 송장수집을 모두 중단합니다.\n자동 로그인 + 잡 처리가 즉시 종료됩니다. 진행할까요?')) return
+                    try {
+                      const res = await orderApi.cancelTrackingSyncBatch(trackingBatchIds)
+                      if ((res?.cancelled || 0) > 0) {
+                        setLogMessages(prev => [...prev, `[송장] 중단: ${fmtNum(res.cancelled)}건`])
+                      }
+                      refreshTrackingStatus()
+                    } catch (err) {
+                      setLogMessages(prev => [...prev, `[송장] 중단 실패: ${(err as Error).message}`])
+                    }
+                  }}
+                  style={{ padding: '4px 10px', background: '#ef4444', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer', fontSize: 12, fontWeight: 700 }}
+                  title="진행 중인 송장수집 즉시 중단 (확인 다이얼로그 후)"
+                >⏹ 중단</button>
+                <button
+                  onClick={async () => {
+                    if (!await showConfirm('자동 마켓전송이 실패한 잡들(SCRAPED + 송장전송실패)을 다시 시도합니다.\n도혜연 같은 ext_order_number 누락 케이스는 운영자가 먼저 보강 후 재시도하세요. 진행할까요?')) return
                     try {
                       const res = await orderApi.dispatchTrackingBulk(false)
                       setLogMessages(prev => [
                         ...prev,
-                        `[마켓 일괄전송] 총 ${fmtNum(res.total)}건 / 성공 ${fmtNum(res.sent)}건 / 실패 ${fmtNum(res.failed)}건`,
+                        `[마켓 재전송] 총 ${fmtNum(res.total)}건 / 성공 ${fmtNum(res.sent)}건 / 실패 ${fmtNum(res.failed)}건`,
                         ...res.errors.slice(0, 5).map(e => `  · ${e}`),
                       ])
                       refreshTrackingStatus()
                     } catch (err) {
-                      setLogMessages(prev => [...prev, `[마켓 일괄전송] 오류: ${(err as Error).message}`])
+                      setLogMessages(prev => [...prev, `[마켓 재전송] 오류: ${(err as Error).message}`])
                     }
                   }}
                   style={{ padding: '4px 10px', background: '#16a34a', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer', fontSize: 12 }}
-                >일괄 마켓전송</button>
+                  title="자동 dispatch가 실패한 SCRAPED/송장전송실패 잡 일괄 재시도 (자동 dispatch는 SCRAPED 직후 1회 시도, 실패 시 이 버튼으로 수동 재시도)"
+                >마켓전송 재시도</button>
                 <button
                   onClick={refreshTrackingStatus}
                   style={{ padding: '4px 10px', background: '#2563eb', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer', fontSize: 12 }}
@@ -770,6 +889,7 @@ export default function OrdersPage() {
                 <button
                   onClick={() => setTrackingStatusOpen(false)}
                   style={{ padding: '4px 10px', background: '#4b5563', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer', fontSize: 12 }}
+                  title="모달만 닫기 (백그라운드 처리는 계속)"
                 >닫기</button>
               </div>
             </div>
@@ -783,6 +903,7 @@ export default function OrdersPage() {
                 { key: 'SENT_TO_MARKET', label: '마켓전송', color: '#22c55e' },
                 { key: 'DISPATCH_FAILED', label: '송장전송실패', color: '#dc2626' },
                 { key: 'NO_TRACKING', label: '미발송', color: '#f59e0b' },
+                { key: 'WRONG_ACCOUNT', label: '계정불일치', color: '#fb923c' },
                 { key: 'CANCELLED', label: '원주문취소', color: '#a855f7' },
                 { key: 'FAILED', label: '실패', color: '#ef4444' },
               ].map(({ key, label, color }) => {
@@ -822,7 +943,7 @@ export default function OrdersPage() {
                 const statusColor: Record<string, string> = {
                   PENDING: '#6b7280', DISPATCHED: '#0ea5e9', SCRAPED: '#16a34a',
                   SENT_TO_MARKET: '#22c55e', DISPATCH_FAILED: '#dc2626',
-                  NO_TRACKING: '#f59e0b', CANCELLED: '#a855f7', FAILED: '#ef4444',
+                  NO_TRACKING: '#f59e0b', WRONG_ACCOUNT: '#fb923c', CANCELLED: '#a855f7', FAILED: '#ef4444',
                 }
                 // 소싱처 원주문링크 URL 매핑 (대소문자/한글 변형 모두 대응)
                 // 롯데ON 선물주문은 일반 orderDetail 페이지에서 조회 안 됨 → giftBoxDetail 사용
@@ -842,7 +963,7 @@ export default function OrdersPage() {
                     '올리브영': 'OLIVEYOUNG',
                   }
                   const code = aliasMap[raw] || raw
-                  const isGift = `,${(actionTag || '').trim()},`.includes(',gift,')
+                  void actionTag
                   const map: Record<string, string> = {
                     MUSINSA: `https://www.musinsa.com/order/order-detail/${srcNo}`,
                     KREAM: `https://kream.co.kr/my/purchasing/${srcNo}`,
@@ -851,9 +972,7 @@ export default function OrdersPage() {
                     GRANDSTAGE: `https://grandstage.a-rt.com/mypage/order/read-order-detail?orderNo=${srcNo}`,
                     NIKE: `https://www.nike.com/kr/orders/${srcNo}`,
                     SSG: `https://pay.ssg.com/myssg/orderInfoDetail.ssg?orordNo=${encodeURIComponent(srcNo)}&viewType=Ssg`,
-                    LOTTEON: isGift
-                      ? `https://www.lotteon.com/p/order/claim/giftBoxDetail?odNo=${srcNo}&type=snd`
-                      : `https://www.lotteon.com/p/order/claim/orderDetail?odNo=${srcNo}`,
+                    LOTTEON: `https://www.lotteon.com/p/order/claim/giftBoxDetail?odNo=${srcNo}&type=snd`,
                     GSSHOP: `https://www.gsshop.com/ord/dlvcursta/popup/ordDtl.gs?orderNo=${srcNo}`,
                     OLIVEYOUNG: `https://www.oliveyoung.co.kr/store/mypage/getOrderDetail.do?dlvNo=${srcNo}`,
                   }
@@ -916,6 +1035,10 @@ export default function OrdersPage() {
 
             <div style={{ marginTop: 12, fontSize: 11, color: '#6b7280' }}>
               💡 송장수집 클릭 시점의 미입력건 큐잉 상태입니다. 자동 갱신 안 함 — 결과는 주문 테이블에서 확인하세요.
+              <div style={{ marginTop: 4 }}>
+                <span style={{ color: '#f59e0b' }}>미발송</span> = 소싱처에 송장 아직 미도착(시간 지나면 자동 재시도) ·{' '}
+                <span style={{ color: '#fb923c' }}>계정불일치</span> = 현재 로그인된 소싱처 계정과 주문 계정이 다름(해당 계정 PC에서 재시도 필요)
+              </div>
             </div>
           </div>
         </div>

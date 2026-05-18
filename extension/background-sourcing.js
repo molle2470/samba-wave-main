@@ -430,6 +430,17 @@ function _serializeMusinsaTracking(fn) {
 
 async function _processJobWithCap(job) {
   const site = job.site || 'unknown'
+  // 적립금 자동 적립 잡(type=reward) — 가격수집과 격리, 사이트 세마포어 사용
+  if (job.type === 'reward') {
+    await _siteSemAcquire(site)
+    _markSourcingSiteActive(site)
+    try {
+      return await handleRewardJob(job)
+    } finally {
+      _markSourcingSiteInactive(site)
+      _siteSemRelease(site)
+    }
+  }
   // 송장 추출 잡(type=tracking) — 가격수집과 격리. 동일 사이트 캡 공유로 무신사 폭주 방지
   if (job.type === 'tracking') {
     if (site === 'MUSINSA') {
@@ -475,28 +486,522 @@ async function _processJobWithCap(job) {
 const _trackingPending = new Map() // requestId → {resolve, timeoutId, tabId}
 
 // 송장 잡 site(대문자) → 자동로그인 siteKey 매핑.
-// SPA_DIRECT_LOGIN_SITES(ssg/lotteon/abcmart)는 주문매칭 계정으로 강제 로그인 지원.
+// SPA_DIRECT_LOGIN_SITES(ssg/lotteon/abcmart/musinsa)는 주문매칭 계정으로 강제 로그인 지원.
 const _TRACKING_AUTO_LOGIN_MAP = {
   SSG: 'ssg',
   LOTTEON: 'lotteon',
   ABCMART: 'abcmart',
   GRANDSTAGE: 'abcmart',
+  MUSINSA: 'musinsa',
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 현재 로그인된 소싱처 계정 감지 — 송장수집 안전망: 매칭 잡 우선 처리용.
+// 사이트별 마이페이지 진입 → username/nickname 스크랩 → 백엔드 find-by-username
+// → account_id 캐싱(chrome.storage.local, TTL 30분).
+// 매칭 잡은 빠른 경로(현재 로그인 그대로), 미매칭 잡은 느린 경로(2단계 재로그인 + 재시도).
+// ─────────────────────────────────────────────────────────────────────────────
+const _CURRENT_ACCOUNT_CACHE_TTL_MS = 30 * 60 * 1000  // 30분
+
+// 사이트별 마이페이지 URL + username 스크랩 함수
+const _CURRENT_ACCOUNT_DETECTORS = {
+  MUSINSA: {
+    mypageUrl: 'https://www.musinsa.com/mypage/order',
+    scrape: () => {
+      // 프로필 영역에서 닉네임/아이디 추출 — 무신사 마이페이지 헤더 패턴
+      for (const el of document.querySelectorAll('a[href*="/my"], a[href*="/member"], a[href*="/mypage"]')) {
+        const t = (el.textContent || '').trim().replace(/\s*>.*/, '')
+        if (t && t.length >= 2 && t.length <= 30 && !t.includes('마이') && !t.includes('로그') && !t.includes('주문') && !t.includes('회원')) {
+          return t
+        }
+      }
+      // 폴백: "OOO님" 패턴
+      const greet = (document.body?.innerText || '').match(/([가-힣A-Za-z0-9_]{2,20})\s*님/)
+      if (greet) return greet[1]
+      return ''
+    },
+  },
+}
+
+async function _detectCurrentSourcingAccount(site) {
+  const detector = _CURRENT_ACCOUNT_DETECTORS[site]
+  if (!detector) return null
+  const cacheKey = `_currentSourcingAccountId_${site}`
+  // 캐시 조회
+  try {
+    const stored = await chrome.storage.local.get(cacheKey)
+    const entry = stored[cacheKey]
+    if (entry && entry.accountId && entry.at && Date.now() - entry.at < _CURRENT_ACCOUNT_CACHE_TTL_MS) {
+      return entry.accountId
+    }
+  } catch {}
+
+  // 마이페이지 진입 → 스크랩
+  let tabId = null
+  try {
+    const tab = await chrome.tabs.create({ url: detector.mypageUrl, active: false })
+    tabId = tab.id
+    try { await waitForTabLoad(tabId, 20000) } catch {}
+    await wait(2500)
+    // 로그인 페이지 리다이렉트면 비로그인 — null 캐시
+    const tabInfo = await chrome.tabs.get(tabId)
+    const curUrl = tabInfo.url || ''
+    if (curUrl.includes('/auth/login') || curUrl.includes('member.one.musinsa.com/login') || curUrl.includes('/login.ssg') || curUrl.includes('/member/login')) {
+      console.log(`[송장][계정감지] ${site} 비로그인 상태 — 캐시 스킵`)
+      return null
+    }
+    const [r] = await chrome.scripting.executeScript({ target: { tabId }, func: detector.scrape })
+    const username = (r?.result || '').trim()
+    if (!username) {
+      console.log(`[송장][계정감지] ${site} username 스크랩 실패`)
+      return null
+    }
+    // 백엔드 find-by-username 호출
+    const stored = await chrome.storage.local.get('proxyUrl')
+    const proxyUrl = stored.proxyUrl || ''
+    const apiFetch = globalThis.SambaBackgroundCore?.apiFetch
+    if (!apiFetch) return null
+    const res = await apiFetch(
+      `${proxyUrl}/api/v1/samba/sourcing-accounts/find-by-username?site_name=${encodeURIComponent(site)}&username=${encodeURIComponent(username)}`,
+      { method: 'GET' }
+    )
+    if (!res.ok) {
+      console.log(`[송장][계정감지] ${site} username="${username}" 백엔드 매칭 실패 (${res.status})`)
+      return null
+    }
+    const data = await res.json()
+    const accountId = data?.id || ''
+    if (accountId) {
+      try { await chrome.storage.local.set({ [cacheKey]: { accountId, username, at: Date.now() } }) } catch {}
+      console.log(`[송장][계정감지] ${site} 현재 로그인 계정 식별: ${data.account_label} (id=${accountId})`)
+    }
+    return accountId || null
+  } catch (e) {
+    console.warn(`[송장][계정감지] ${site} 예외: ${e?.message || e}`)
+    return null
+  } finally {
+    if (tabId) {
+      try { await chrome.tabs.remove(tabId) } catch {}
+    }
+  }
+}
+
+// 계정 캐시 무효화 — 자동로그인 성공 직후 호출하면 다음 잡에서 재감지
+async function _invalidateCurrentAccountCache(site) {
+  const cacheKey = `_currentSourcingAccountId_${site}`
+  try { await chrome.storage.local.remove(cacheKey) } catch {}
+}
+
+// 송장수집용 — 마지막으로 ensureLoggedIn 성공한 계정 메모리 캐시 (autoLoginKey → accountId).
+// _detectCurrentSourcingAccount 가 username 스크랩에 실패해도(currentAccountId=null)
+// 이 캐시로 잡 계정과 비교해 선제 스왑 여부 판단 → 같은 계정 잡 연속이면 스왑 스킵.
+const _lastEnsuredTrackingAccount = {}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 적립금 자동 적립 잡 핸들러
+// action 별로 적절한 URL 탭 열고 content script 주입 → 결과 메시지 대기 → 백엔드 콜백.
+// ─────────────────────────────────────────────────────────────────────────────
+const _rewardPending = new Map() // requestId → {resolve, timeoutId, tabId}
+
+const _REWARD_ACTION_CONTENT = {
+  musinsa_attendance: 'content-reward-musinsa-attendance.js',
+  musinsa_snap_like: 'content-reward-musinsa-snap.js',
+  musinsa_balance: 'content-musinsa-balance.js', // 기존 잔액 수집 스크립트 재사용
+  abcmart_attendance: 'content-reward-abcmart-attend.js',
+  musinsa_review: 'content-review-musinsa.js',
+  abcmart_review: 'content-review-abcmart.js',
+  ssg_review: 'content-review-ssg.js',
+  gs_review: 'content-review-gs.js',
+  lotteon_review: 'content-review-lotteon.js',
+  naver_review: 'content-review-naver.js',
+  kream_review: 'content-review-kream.js',
+}
+
+const _REWARD_ACTION_AUTO_LOGIN = {
+  musinsa_attendance: 'musinsa',
+  musinsa_snap_like: 'musinsa',
+  musinsa_balance: 'musinsa',
+  musinsa_review: 'musinsa',
+  abcmart_attendance: 'abcmart',
+  abcmart_review: 'abcmart',
+  ssg_review: 'ssg',
+  gs_review: 'gs',
+  lotteon_review: 'lotteon',
+  // naver는 자동로그인 미지원 (수동 로그인 필요)
+  kream_review: 'kream',
+}
+
+// 리뷰 액션 사이트별 메타 (mode: 'navigate' = path별 새 탭 / 'inplace' = 같은 탭 반복)
+const _REVIEW_META = {
+  musinsa_review: {
+    mode: 'navigate',
+    listUrl: 'https://www.musinsa.com/mypage/myreview',
+    buildWriteUrl: path => `https://www.musinsa.com${path}?channelSource=musinsa`,
+    site: 'MUSINSA',
+  },
+  abcmart_review: {
+    mode: 'inplace',
+    listUrl: 'https://abcmart.a-rt.com/mypage/claim/claim-order-main?orderPrdtStatCodeClick=10007',
+    site: 'ABCmart',
+  },
+  ssg_review: {
+    mode: 'navigate',
+    listUrl: 'https://www.ssg.com/myssg/activityMng/pdtEvalList.ssg?quick=pdtEvalList',
+    buildWriteUrl: path => path.startsWith('http') ? path : `https://www.ssg.com${path}`,
+    site: 'SSG',
+  },
+  gs_review: {
+    mode: 'navigate',
+    listUrl: 'https://www.gsshop.com/ord/dlvcursta/ordList.gs',
+    buildWriteUrl: path => path.startsWith('http') ? path : `https://www.gsshop.com${path}`,
+    site: 'GSShop',
+  },
+  lotteon_review: {
+    // 인페이지 모달 — 같은 탭에서 클릭→모달→제출→닫힘 반복
+    mode: 'inplace',
+    listUrl: 'https://www.lotteon.com/p/review/myLotte/reviewWriteListTab',
+    site: 'LOTTEON',
+  },
+  naver_review: {
+    // 인페이지 + window.open 팝업 — 같은 탭에서 반복 처리(팝업은 content script가 자체 처리)
+    mode: 'inplace',
+    listUrl: 'https://shopping.naver.com/my/writable-reviews',
+    site: 'NAVERSTORE',
+  },
+  kream_review: {
+    mode: 'inplace',
+    listUrl: 'https://kream.co.kr/my/reviews?tab=to_write',
+    site: 'KREAM',
+  },
+}
+
+// 리뷰 잡 처리 (사이트 공통 orchestrator)
+async function handleReviewJob(job) {
+  const { requestId, action, sourcingAccountId, site } = job
+  const meta = _REVIEW_META[action]
+  if (!meta) {
+    await postResult('sourcing-accounts/extension/reward-result', {
+      request_id: requestId, account_id: sourcingAccountId || '', site_name: site, action,
+      success: false, error: `unknown review action: ${action}`,
+    })
+    return
+  }
+  const contentFile = _REWARD_ACTION_CONTENT[action]
+  const DAILY_LIMIT = 30 // 안전 한도 — 무신사 미차단 경험 기반
+  let writeCount = 0
+  let lastError = ''
+  const processed = new Set()
+
+  let listTabId = null
+  try {
+    // 목록 탭 열기
+    const listTab = await chrome.tabs.create({ url: meta.listUrl, active: false })
+    listTabId = listTab.id
+    try { await waitForTabLoad(listTabId, 30000) } catch {}
+    await new Promise(r => setTimeout(r, 4000)) // 가상스크롤 초기 렌더 대기
+
+    // ─── inplace 모드 (Lotteon/Naver): 같은 탭에서 processOne 반복 ───
+    if (meta.mode === 'inplace') {
+      let noNewCount = 0
+      while (writeCount < DAILY_LIMIT) {
+        try {
+          await chrome.scripting.executeScript({ target: { tabId: listTabId }, files: [contentFile] })
+        } catch (e) {
+          lastError = `inplace 스크립트 주입 실패: ${e?.message || e}`
+          break
+        }
+        const result = await chrome.tabs.sendMessage(listTabId, { action: 'samba_review_processOne' }).catch(e => ({ success: false, error: e?.message || String(e) }))
+        if (result?.noItems || result?.allReviewed) {
+          // 더보기 시도
+          const more = await chrome.tabs.sendMessage(listTabId, { action: 'samba_review_loadMore' }).catch(() => ({ ok: false }))
+          if (!more?.ok) break
+          await new Promise(r => setTimeout(r, 2500))
+          noNewCount++
+          if (noNewCount >= 5) break
+          continue
+        }
+        if (result?.success) {
+          writeCount++
+          noNewCount = 0
+          console.log(`[적립금-리뷰] ${action} ${writeCount}건 완료 (inplace)`)
+        } else {
+          lastError = result?.error || 'unknown'
+          console.log(`[적립금-리뷰] ${action} inplace 실패: ${lastError}`)
+          // 실패 시 다음 항목으로 시도 (1회 재시도 후 종료)
+          noNewCount++
+          if (noNewCount >= 3) break
+        }
+        await new Promise(r => setTimeout(r, 3000 + Math.random() * 4000))
+      }
+      await postResult('sourcing-accounts/extension/reward-result', {
+        request_id: requestId,
+        account_id: sourcingAccountId || '',
+        site_name: site,
+        action,
+        success: writeCount > 0,
+        stamp_count: writeCount,
+        error: writeCount === 0 ? lastError : '',
+      })
+      return
+    }
+
+    // ─── navigate 모드 (Musinsa/SSG/GS/ABCmart): write URL 새 탭 ───
+    let noNewCount = 0
+    while (writeCount < DAILY_LIMIT) {
+      // content script 주입 (idempotent)
+      try {
+        await chrome.scripting.executeScript({ target: { tabId: listTabId }, files: [contentFile] })
+      } catch (e) {
+        lastError = `목록 스크립트 주입 실패: ${e?.message || e}`
+        break
+      }
+
+      // 페이지 정보 조회
+      const pageInfo = await chrome.tabs.sendMessage(listTabId, { action: 'samba_review_getPageInfo' }).catch(() => null)
+      const allPaths = (pageInfo?.generalPaths || pageInfo?.paths || []).filter(p => !processed.has(p))
+
+      if (allPaths.length === 0) {
+        // 스크롤 더 시도
+        const sr = await chrome.tabs.sendMessage(listTabId, { action: 'samba_review_scrollAndCollect' }).catch(() => null)
+        const more = (sr?.generalPaths || sr?.paths || []).filter(p => !processed.has(p))
+        if (more.length === 0) {
+          noNewCount++
+          if (sr?.atBottom || noNewCount >= 8) break
+          continue
+        }
+        // 다음 루프에서 getPageInfo 재시도
+        continue
+      }
+      noNewCount = 0
+
+      const path = allPaths[0]
+      processed.add(path)
+      const writeUrl = meta.buildWriteUrl(path)
+      console.log(`[적립금-리뷰] ${action} 작성 시도: ${path}`)
+
+      // write 탭 열고 폼 채우기
+      let writeTabId = null
+      try {
+        const wt = await chrome.tabs.create({ url: writeUrl, active: false })
+        writeTabId = wt.id
+        try { await waitForTabLoad(writeTabId, 25000) } catch {}
+        await new Promise(r => setTimeout(r, 1500))
+        try {
+          await chrome.scripting.executeScript({ target: { tabId: writeTabId }, files: [contentFile] })
+        } catch (e) {
+          lastError = `write 스크립트 주입 실패: ${e?.message || e}`
+        }
+        const result = await chrome.tabs.sendMessage(writeTabId, { action: 'samba_review_fillAndSubmit' }).catch(e => ({ success: false, error: e?.message || String(e) }))
+        if (result?.success) {
+          writeCount++
+          console.log(`[적립금-리뷰] ${action} ${writeCount}건 완료`)
+        } else {
+          lastError = result?.error || 'unknown'
+          console.log(`[적립금-리뷰] ${action} 실패: ${lastError}`)
+        }
+      } finally {
+        if (writeTabId) {
+          try { await chrome.tabs.remove(writeTabId) } catch {}
+        }
+      }
+
+      // 작성 간 랜덤 대기 (3~7초) — 무신사 rate limit 회피
+      await new Promise(r => setTimeout(r, 3000 + Math.random() * 4000))
+
+      // 목록 페이지로 복귀 + 새로고침
+      try {
+        await chrome.tabs.update(listTabId, { url: meta.listUrl })
+        await waitForTabLoad(listTabId, 30000)
+        await new Promise(r => setTimeout(r, 3000))
+      } catch {}
+    }
+  } catch (e) {
+    lastError = String(e?.message || e)
+    console.warn(`[적립금-리뷰] ${action} 오류:`, e)
+  } finally {
+    if (listTabId) {
+      try { await chrome.tabs.remove(listTabId) } catch {}
+    }
+  }
+
+  await postResult('sourcing-accounts/extension/reward-result', {
+    request_id: requestId,
+    account_id: sourcingAccountId || '',
+    site_name: site,
+    action,
+    success: writeCount > 0,
+    stamp_count: writeCount, // 리뷰 작성 건수 (백엔드가 review 카운트로 누적)
+    error: writeCount === 0 ? lastError : '',
+  })
+  console.log(`[적립금-리뷰] ${action} 종료 — 작성 ${writeCount}건, 에러='${lastError}'`)
+}
+
+async function handleRewardJob(job) {
+  const { requestId, site, url, action, sourcingAccountId } = job
+  console.log(`[적립금] 잡 수신 site=${site} action=${action} acc=${sourcingAccountId || '-'} req=${requestId}`)
+
+  // 자동 로그인: 잡의 sourcingAccountId 로 ensureLoggedIn 시도 (현재 다른 계정이면 스왑)
+  const autoKey = _REWARD_ACTION_AUTO_LOGIN[action]
+  if (autoKey && typeof globalThis.ensureLoggedIn === 'function' && sourcingAccountId) {
+    try {
+      const ok = await globalThis.ensureLoggedIn(autoKey, { accountId: sourcingAccountId })
+      if (!ok) console.warn(`[적립금] 자동 로그인 실패 — 그대로 진행 (site=${site})`)
+    } catch (e) {
+      console.warn(`[적립금] 자동 로그인 예외: ${e?.message || e}`)
+    }
+  }
+
+  // 리뷰 액션은 멀티페이지 orchestrator 사용
+  if (action.endsWith('_review')) {
+    return await handleReviewJob(job)
+  }
+
+  const contentFile = _REWARD_ACTION_CONTENT[action]
+  if (!contentFile) {
+    await postResult('sourcing-accounts/extension/reward-result', {
+      request_id: requestId,
+      account_id: sourcingAccountId || '',
+      site_name: site,
+      action,
+      success: false,
+      error: `unknown action: ${action}`,
+    })
+    return
+  }
+
+  let tabId = null
+  try {
+    if (!url) throw new Error('reward URL 누락')
+    const tab = await chrome.tabs.create({ url, active: false })
+    tabId = tab.id
+    try { await waitForTabLoad(tabId, 30000) } catch {}
+    // 페이지 안정화 대기
+    await new Promise(r => setTimeout(r, 1500))
+
+    // musinsa_balance 액션: manifest 자동 주입 content-musinsa-balance.js가 처리
+    // → 별도 reward-result 콜백 없이 8초 대기 후 종료(기존 sync-balance가 DB 갱신)
+    if (action === 'musinsa_balance') {
+      await new Promise(r => setTimeout(r, 8000))
+      await postResult('sourcing-accounts/extension/reward-result', {
+        request_id: requestId,
+        account_id: sourcingAccountId || '',
+        site_name: site,
+        action,
+        success: true,
+        already_done: false,
+      })
+      return
+    }
+
+    // content script 주입
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: [contentFile],
+      })
+    } catch (e) {
+      throw new Error(`스크립트 주입 실패: ${e?.message || e}`)
+    }
+
+    // 스냅 좋아요는 페이지 이동(미션→피드→미션복귀) 마다 스크립트 재주입 필요
+    let navListener = null
+    if (action === 'musinsa_snap_like') {
+      navListener = (changedTabId, info) => {
+        if (changedTabId !== tabId || info.status !== 'complete') return
+        // 미션/스냅 페이지 모두 같은 스크립트 사용 (페이지 내부에서 location.href 분기)
+        chrome.scripting.executeScript({
+          target: { tabId },
+          files: [contentFile],
+        }).catch(() => {})
+      }
+      chrome.tabs.onUpdated.addListener(navListener)
+    }
+
+    // 결과 수신 대기 — 스냅은 멀티스텝이라 90초, 그 외 45초
+    const timeoutMs = action === 'musinsa_snap_like' ? 90000 : 45000
+    const result = await new Promise((resolve) => {
+      const timeoutId = setTimeout(() => {
+        _rewardPending.delete(tabId)
+        resolve({ success: false, error: 'timeout: 적립 결과 수신 실패' })
+      }, timeoutMs)
+      _rewardPending.set(tabId, { resolve, timeoutId, tabId, action, requestId })
+    })
+    if (navListener) {
+      try { chrome.tabs.onUpdated.removeListener(navListener) } catch {}
+    }
+
+    await postResult('sourcing-accounts/extension/reward-result', {
+      request_id: requestId,
+      account_id: sourcingAccountId || '',
+      site_name: site,
+      action,
+      success: !!result.success,
+      already_done: !!result.alreadyDone,
+      reward: Number(result.reward || 0),
+      streak_count: Number(result.streakCount || 0),
+      money: result.money !== undefined ? Number(result.money) : null,
+      mileage: result.mileage !== undefined ? Number(result.mileage) : null,
+      stamp_count: result.stampCount !== undefined ? Number(result.stampCount) : null,
+      stamp_score: result.stampScore !== undefined ? Number(result.stampScore) : null,
+      error: result.error || '',
+    })
+    console.log(`[적립금] 결과 전송 ${site}/${action} success=${result.success} reward=${result.reward || 0}`)
+  } catch (err) {
+    console.warn(`[적립금] 처리 실패 req=${requestId}:`, err)
+    try {
+      await postResult('sourcing-accounts/extension/reward-result', {
+        request_id: requestId,
+        account_id: sourcingAccountId || '',
+        site_name: site,
+        action,
+        success: false,
+        error: String(err?.message || err),
+      })
+    } catch {}
+  } finally {
+    if (tabId) {
+      try { await chrome.tabs.remove(tabId) } catch {}
+    }
+  }
+}
+
+// content script(주입된 페이지)가 보내는 적립 결과 메시지 매칭 — sender.tab.id 로 1:1 매칭
+chrome.runtime.onMessage.addListener((msg, sender, _sendResponse) => {
+  if (!msg || msg.type !== 'REWARD_RESULT') return
+  const tabId = sender?.tab?.id
+  if (!tabId) return
+  const pending = _rewardPending.get(tabId)
+  if (pending) {
+    clearTimeout(pending.timeoutId)
+    _rewardPending.delete(tabId)
+    pending.resolve(msg)
+  }
+})
+
 
 async function handleTrackingJob(job) {
   const { requestId, site, url, sourcingOrderNumber, sourcingAccountId } = job
   console.log(`[송장] 잡 수신 site=${site} ord=${sourcingOrderNumber} acc=${sourcingAccountId || '-'} req=${requestId}`)
 
-  // 잡 처리 전 자동로그인 — 주문 매칭 계정으로 강제 로그인
-  // sourcingAccountId 없으면 라디오 기본 계정 fallback (기존 동작과 동일)
+  // [정책 2026-05-16] — 한 PC 다계정 순회 지원.
+  // → 0단계: 현재 로그인 계정 감지 (캐시 30분)
+  // → 1단계: 잡 계정 ≠ 현재 계정이면 **선제적 ensureLoggedIn 스왑** (잡 처리 전 미리 로그인 전환)
+  //          백엔드가 sourcing_account_id 로 그룹화 적재하므로 스왑 횟수는 계정 수 ≈ N회로 최소화.
+  // → 2단계: 1차 시도. 실패면 wrong_account/needsLogin 시 한 번 더 재로그인 시도.
+  // 멀티 PC 운영 시: ensureLoggedIn 자체가 실패하면 wrong_account 보고 → 다른 PC fallback.
+
+  // 0단계 — 현재 로그인 계정 식별
+  let currentAccountId = null
   try {
-    const autoLoginKey = _TRACKING_AUTO_LOGIN_MAP[site]
-    if (autoLoginKey && typeof globalThis.ensureLoggedIn === 'function') {
-      console.log(`[송장] ensureLoggedIn(${autoLoginKey}, acc=${sourcingAccountId || '-'}) 호출`)
-      await globalThis.ensureLoggedIn(autoLoginKey, { accountId: sourcingAccountId || '' })
-    }
+    currentAccountId = await _detectCurrentSourcingAccount(site)
   } catch (e) {
-    console.warn(`[송장] ensureLoggedIn 실패 (무시하고 진행): ${e?.message || e}`)
+    console.warn(`[송장] 계정 감지 실패 (무시): ${e?.message || e}`)
+  }
+  const _isCurrentMatch = currentAccountId && sourcingAccountId && currentAccountId === sourcingAccountId
+  if (currentAccountId) {
+    console.log(`[송장] 현재 로그인=${currentAccountId} / 잡 매칭=${sourcingAccountId || '-'} → ${_isCurrentMatch ? '매칭(스왑 불필요)' : '미매칭(선제 스왑 시도)'}`)
+  } else {
+    console.log(`[송장] 현재 로그인 계정 식별 불가 — 1차 시도 후 조건부 스왑`)
   }
 
   let tabId = null
@@ -504,13 +1009,28 @@ async function handleTrackingJob(job) {
   try {
     if (!url) throw new Error('tracking URL 누락')
 
-    // 송장 페이지 진입 → 결과 수신 (needsLogin 시 1회 재시도)
-    // MUSINSA: Next.js SPA + 백그라운드 탭 hydration 지연으로 React click이 무시되는 회귀
-    // 차단을 위해 active: true 로 강제. 사용자 화면이 잠깐 튐 — 직렬화(_musinsaTrackingLock)와
-    // 결합해 한 번에 1건만 처리.
+    // 송장 페이지 진입 → 결과 수신
+    // 사용자 요청(2026-05-16): 송장수집 시 포커스 뺏지 않도록 모든 사이트 active:false 통일.
+    // MUSINSA hydration 이슈는 content-tracking-musinsa.js 의 폴링 로직으로 대응.
+    // chrome.tabs.create 호출은 다른 탭이 detach/close 전이 중이거나 사용자가 탭을 드래그하는
+      // 짧은 순간에 "Tabs cannot be edited right now (user may be dragging a tab)" 로 거부될 수 있다.
+      // 일시적이므로 짧은 백오프로 최대 3회 재시도.
+      const _createTabWithRetry = async () => {
+        let lastErr = null
+        for (let i = 0; i < 3; i++) {
+          try {
+            return await chrome.tabs.create({ url, active: false })
+          } catch (e) {
+            lastErr = e
+            const msg = String(e?.message || e)
+            if (!/Tabs cannot be edited|dragging/i.test(msg)) throw e
+            await new Promise(r => setTimeout(r, 800 + i * 600))
+          }
+        }
+        throw lastErr
+      }
     const _runOnce = async () => {
-      const _active = site === 'MUSINSA'
-      const tab = await chrome.tabs.create({ url, active: _active })
+      const tab = await _createTabWithRetry()
       tabId = tab.id
       await waitForTabLoad(tabId, 30000)
 
@@ -518,7 +1038,7 @@ async function handleTrackingJob(job) {
         const timeoutId = setTimeout(() => {
           _trackingPending.delete(requestId)
           resolve({ success: false, error: 'timeout: content script 응답 없음' })
-        }, 60000)
+        }, 120000)  // 60s → 120s: 자동 로그인 직후 무신사 SPA hydration + 모달 폴링 여유
         _trackingPending.set(requestId, { resolve, timeoutId, tabId })
 
         try {
@@ -534,19 +1054,91 @@ async function handleTrackingJob(job) {
       })
     }
 
+    // 선제 스왑 헬퍼 — 잡 계정으로 ensureLoggedIn → 캐시 무효화. 성공 여부 반환.
+    const autoLoginKey = _TRACKING_AUTO_LOGIN_MAP[site]
+    const _swapToJobAccount = async (reason) => {
+      if (!autoLoginKey || typeof globalThis.ensureLoggedIn !== 'function' || !sourcingAccountId) {
+        console.log(`[송장] 스왑 스킵(${reason}) — 미지원 사이트(${site}) 또는 accountId 없음`)
+        return false
+      }
+      console.log(`[송장] 계정 스왑 시도(${reason}) → acc=${sourcingAccountId}`)
+      try {
+        const ok = await globalThis.ensureLoggedIn(autoLoginKey, { accountId: sourcingAccountId })
+        if (ok) {
+          try { await _invalidateCurrentAccountCache(site) } catch {}
+          // 메모리 캐시 갱신 — 다음 잡에서 같은 계정이면 스왑 스킵
+          _lastEnsuredTrackingAccount[autoLoginKey] = sourcingAccountId
+          console.log(`[송장] 계정 스왑 성공 — acc=${sourcingAccountId}`)
+        } else {
+          console.warn(`[송장] 계정 스왑 실패(${reason}) acc=${sourcingAccountId}`)
+        }
+        return ok
+      } catch (e) {
+        console.warn(`[송장] 계정 스왑 예외: ${e?.message || e}`)
+        return false
+      }
+    }
+
+    // 1단계 — 잡 계정과 "마지막 스왑 계정" 또는 "현재 로그인 계정" 이 다르면 선제 스왑
+    //   • currentAccountId(DOM 스크랩)는 무신사 mypage username 못 잡으면 null → 신뢰 못함.
+    //   • _lastEnsuredTrackingAccount(메모리 캐시)는 ensureLoggedIn 성공 이력 — ground truth.
+    //   • 둘 다 잡 계정과 다르면 선제 스왑. 메모리 캐시 매칭이면 굳이 스왑 안 함(빠른 경로).
+    const _lastEnsured = autoLoginKey ? _lastEnsuredTrackingAccount[autoLoginKey] : null
+    const _knownMismatch = sourcingAccountId && (
+      (_lastEnsured && _lastEnsured !== sourcingAccountId) ||  // 메모리 캐시와 불일치
+      (!_lastEnsured && currentAccountId && currentAccountId !== sourcingAccountId) ||  // DOM 캐시와 불일치
+      (!_lastEnsured && !currentAccountId)  // 둘 다 모름 → 안전하게 스왑
+    )
+    let _preemptiveSwapAttempted = false
+    if (_knownMismatch) {
+      _preemptiveSwapAttempted = true
+      const swapOk = await _swapToJobAccount('preemptive')
+      if (!swapOk) {
+        // 스왑 실패 — 현재 세션 그대로 1차 시도. wrong_account 보고 후 다른 PC fallback.
+      }
+    } else if (_lastEnsured && _lastEnsured === sourcingAccountId) {
+      console.log(`[송장] 메모리 캐시 매칭 — 스왑 스킵 (acc=${sourcingAccountId})`)
+    }
+
+    // 2단계 — 1차 시도
     let result = await _runOnce()
 
-    // 로그인 페이지 리다이렉트 → 주문매칭 계정으로 강제 로그인 후 1회 재시도
-    if (result && result.needsLogin) {
-      console.log(`[송장] needsLogin 감지 → ensureLoggedIn 재시도 (acc=${sourcingAccountId || '-'})`)
+    // 3단계 — wrong_account/needsLogin/timeout 감지 시 최대 2회 재시도 (백오프).
+    // wrong_account = 메모리 캐시와 실제 무신사 세션이 동기화 깨진 신호 (세션 만료/무신사 보안).
+    // 매 재시도: 메모리 캐시 무효화 + ensureLoggedIn 재호출 + 3초 백오프 + _runOnce.
+    const _isWrong = (r) => r && (
+      r.wrongAccount === true ||
+      (typeof r.error === 'string' && /wrong_account|not_my_order|account_mismatch|계정불일치/i.test(r.error))
+    )
+    const _isTimeout = (r) => r && typeof r.error === 'string' && /timeout/i.test(r.error)
+    // unexpected_page = 무신사 SPA 가 송장 URL 진입 후 다른 페이지로 자동 리다이렉트 케이스.
+    // abnormal_access = 무신사 "정상적인 접근이 아닙니다" 차단. trace 진입 타임아웃 포함.
+    const _isUnexpectedPage = (r) => r && typeof r.error === 'string' && /unexpected_page|abnormal_access|trace 페이지 진입 타임아웃/i.test(r.error)
+
+    // [정책 2026-05-16] wrong_account = 백엔드 sourcing_account_id 매핑이 잘못됐을 가능성.
+    // 같은 계정으로 재시도해도 같은 결과 + 다른 계정 자동 순회는 무신사 보안 차단 위험 ↑.
+    // → 자동 재시도 안 함. 경고 메시지만 남기고 운영자 수동 처리(매핑 확인) 위임.
+    if (_isWrong(result)) {
+      console.warn(`⚠ [송장][wrong_account] 자동 재시도 안 함 — 백엔드 sourcing_account_id 매핑이 잘못됐을 가능성. 운영자가 해당 주문의 진짜 무신사 계정을 확인 후 매핑 수정 필요. (acc=${sourcingAccountId || '-'}, ord=${sourcingOrderNumber})`)
+    }
+
+    // timeout / unexpected_page / needsLogin 만 자동 재시도 (최대 2회 + 백오프).
+    let retryAttempt = 0
+    const MAX_RETRY = 2
+    while (((result && result.needsLogin) || _isTimeout(result) || _isUnexpectedPage(result)) && retryAttempt < MAX_RETRY) {
+      retryAttempt++
+      const reason = _isTimeout(result) ? 'timeout' : (_isUnexpectedPage(result) ? 'unexpected_page' : 'needsLogin')
+      console.log(`[송장] ${reason} 감지 (${retryAttempt}/${MAX_RETRY}) → 캐시 무효화 + 재로그인 + ${retryAttempt > 1 ? '3초 백오프 + ' : ''}재시도 (acc=${sourcingAccountId || '-'})`)
+      if (autoLoginKey && _lastEnsuredTrackingAccount[autoLoginKey]) {
+        delete _lastEnsuredTrackingAccount[autoLoginKey]
+      }
       try { if (tabId) { await chrome.tabs.remove(tabId); tabId = null } } catch {}
-      try {
-        const autoLoginKey = _TRACKING_AUTO_LOGIN_MAP[site]
-        if (autoLoginKey && typeof globalThis.ensureLoggedIn === 'function') {
-          await globalThis.ensureLoggedIn(autoLoginKey, { accountId: sourcingAccountId || '' })
-        }
-      } catch (e) {
-        console.warn(`[송장] 재로그인 실패: ${e?.message || e}`)
+      if (retryAttempt > 1) {
+        await new Promise(r => setTimeout(r, 3000))
+      }
+      const loginOk = await _swapToJobAccount(`${reason}-retry${retryAttempt}`)
+      if (!loginOk) {
+        break  // 무한 retry 방지
       }
       result = await _runOnce()
     }
@@ -1377,7 +1969,16 @@ async function handleSourcingJob(job) {
       // 검증(2026-05-10): focused:false popup은 Chromium 페이지 라이프사이클 throttling으로
       //   AJAX(카드혜택가/최대혜택가)가 발화하지 않음 → 사용자 클릭해야 로딩 시작 → 빈화면 멈춤.
       // 해결: focused:true로 활성화 보장 + 좌측 하단 작은 코너에 배치(사용자 작업 영역인 상단 미가림).
-      // 메인 윈도우 focused 복원은 호출하지 않음(이전 회귀: 다른 앱 가림 문제).
+      // 포커스 복원(2026-05-17): 팝업 생성 전 "현재 OS 포커스를 가진 크롬 창"이 있으면 ID를 보관하고,
+      //   팝업 생성 직후 그 창으로 포커스 되돌림. focused:true 창이 없으면(=크롬이 백그라운드 앱)
+      //   복원 안 함 → 다른 앱(엑셀·메모장 등) 가림 회귀 차단.
+      let _prevFocusedWinId = null
+      try {
+        const _allWins = await chrome.windows.getAll()
+        const _f = _allWins.find(w => w.focused)
+        if (_f) _prevFocusedWinId = _f.id
+      } catch {}
+
       let _bottomY = 800   // fallback (1080 해상도 기준 - 하단 280)
       let _leftX = 10
       try {
@@ -1400,6 +2001,13 @@ async function handleSourcingJob(job) {
       tab = win.tabs?.[0]
       sourcingWindowId = win.id
       openedSourcingWindow = true
+
+      // 이전 포커스 창이 크롬에 있었다면 즉시 포커스 복원 — 사용자가 크롬에서 다른 작업 중이었으면
+      // 그 창이 다시 위로 올라옴. (페이지 라이프사이클상 popup 생성 시점에 focused:true였으므로
+      // AJAX는 발화 시작됨 — 이후 background 상태에서도 in-flight 요청은 정상 완료.)
+      if (_prevFocusedWinId && _prevFocusedWinId !== win.id) {
+        try { await chrome.windows.update(_prevFocusedWinId, { focused: true }) } catch {}
+      }
     } else {
       tab = await chrome.tabs.create({ url: job.url, active: false })
     }

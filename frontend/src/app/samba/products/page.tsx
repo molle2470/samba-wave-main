@@ -323,6 +323,10 @@ export default function ProductsPage() {
       ? appliedStatusFilter : appliedStatusFilter || undefined
     const aiParam = (appliedAiFilter === 'has_orders') ? appliedAiFilter : appliedAiFilter || undefined
 
+    // Phase 2를 Phase 1과 동시에 시작 (응답 처리는 scrollProducts 이후)
+    // → 정책/계정 셀렉터가 조작 가능해지는 시점이 scrollProducts 응답시간만큼 앞당겨짐
+    const metaPromise = collectorApi.initData()
+
     // Phase 1: 상품 목록만 먼저 (빠른 초기 렌더링)
     setLoading(true)
     try {
@@ -355,7 +359,8 @@ export default function ProductsPage() {
     }
 
     // Phase 2: 메타데이터 백그라운드 로드 — 통합 엔드포인트 1회 호출 (기존 7개 개별 호출 대체)
-    collectorApi.initData().then(meta => {
+    // load 진입 직후 시작된 metaPromise의 응답을 여기서 처리
+    metaPromise.then(meta => {
       setPolicies(meta.policies ?? [])
       setAccounts(meta.accounts ?? [])
       setDetailTemplates(meta.detail_templates ?? [])
@@ -2828,7 +2833,31 @@ export default function ProductsPage() {
       </div>
 
       {/* Product list */}
-      {loading ? (
+      {loading && products.length === 0 ? (
+        /* 스켈레톤 — 빈 화면 대신 카드 형태 placeholder (체감 속도 향상) */
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: viewMode === 'compact' ? '4px' : '8px' }}>
+          {Array.from({ length: Math.min(pageSize, 10) }).map((_, i) => (
+            <div
+              key={i}
+              style={{
+                minWidth: 0,
+                height: viewMode === 'compact' ? '180px' : '240px',
+                background: 'linear-gradient(90deg, #1A1A1A 0%, #232323 50%, #1A1A1A 100%)',
+                backgroundSize: '200% 100%',
+                borderRadius: '8px',
+                border: '1px solid #2D2D2D',
+                animation: 'sambaSkeletonPulse 1.4s ease-in-out infinite',
+              }}
+            />
+          ))}
+          <style jsx>{`
+            @keyframes sambaSkeletonPulse {
+              0% { background-position: 200% 0; }
+              100% { background-position: -200% 0; }
+            }
+          `}</style>
+        </div>
+      ) : loading ? (
         <div style={{ padding: "3rem", textAlign: "center", color: "#555", fontSize: "0.9rem" }}>로딩 중...</div>
       ) : loadError ? (
         <div style={{ padding: "3rem", textAlign: "center", fontSize: "0.85rem" }}>

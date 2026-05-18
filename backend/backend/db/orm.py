@@ -144,8 +144,8 @@ def _build_read_engine() -> AsyncEngine:
         future=True,
         echo=False,
         pool_pre_ping=False,  # asyncpg 버그: SELECT 1이 idle in transaction 좀비 누적 → pool_recycle로 대체
-        pool_size=5,  # idle 연결 수 축소 (read는 주로 조회용)
-        max_overflow=10,  # 추가 허용 (read 최대 15개)
+        pool_size=8,  # idle 연결 수 (scroll_products 병렬화로 진입당 ~3 세션 사용 가능)
+        max_overflow=10,  # 추가 허용 (read 최대 18개)
         pool_recycle=60,  # idle 커넥션 1분 후 재활용 — 좀비 회수 가속
         pool_timeout=10,  # 빠른 실패 — 30s 대기 중 ASGI 워커 타임아웃 방지
         connect_args={

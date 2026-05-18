@@ -1926,6 +1926,11 @@ class SambaShipmentService:
                 # 비교는 그대로 동작하지만 failed_at 존재 여부로 강제 전송)
                 _existing = dict(merged_sent.get(aid, {}) or {})
                 _existing["failed_at"] = datetime.now(UTC).isoformat()
+                # 안전망: 동일 (cp, account) 전송 실패 누적 — 3회 도달 시 테트리스 sync에서 제외
+                # (스마트스토어 등 plugin 응답 추출 실패로 A칸 동기화 못 해 무한 재등록 가는 사고 방지)
+                _existing["failure_count"] = (
+                    int(_existing.get("failure_count") or 0) + 1
+                )
                 merged_sent[aid] = _existing
             elif ar.get("_clear_failed_at") and aid in merged_sent:
                 # _skip_retry 케이스 (플레이오토 미등록 상품코드): 기존 failed_at 제거 → 재시도 루프 차단
@@ -2288,7 +2293,9 @@ class SambaShipmentService:
             logger.info("[상세HTML] applied_policy_id 없음 — 템플릿 미적용")
 
         if template_id_override:
-            logger.info(f"[상세HTML] 마켓별 오버라이드 템플릿 적용: {template_id_override}")
+            logger.info(
+                f"[상세HTML] 마켓별 오버라이드 템플릿 적용: {template_id_override}"
+            )
 
         if template_id:
             tpl_repo = BaseRepository(self.session, SambaDetailTemplate)
@@ -2419,7 +2426,9 @@ class SambaShipmentService:
         category_svc = SambaCategoryService(
             mapping_repo, SambaCategoryTreeRepository(self.session)
         )
-        convert_markets = set(market_types) | ({"ssg_std"} if "ssg" in market_types else set())
+        convert_markets = set(market_types) | (
+            {"ssg_std"} if "ssg" in market_types else set()
+        )
         for market_type in convert_markets:
             if market_type in result:
                 cat_path = result[market_type]

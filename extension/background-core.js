@@ -67,10 +67,13 @@
     //   - 배열 (빈 배열 포함) = 명시적 설정. 빈 배열 = "이 PC는 아무 작업도 안 받음"
     //   - 헤더 'X-Allowed-Sites'는 값이 빈 문자열이어도 부착되어 백엔드가 명시적 0개로 인식
     const allowedSites = Array.isArray(proxyData.allowedSites) ? proxyData.allowedSites : null
+    // 확장앱 버전 — 백엔드가 reward 등 신기능 잡을 옛 PC에 안 주도록 필터링용
+    const extVersion = chrome.runtime.getManifest().version
     const headers = {
       ...(init.headers || {}),
       'X-Api-Key': apiKey,
       'X-Device-Id': deviceId,
+      'X-Ext-Version': extVersion,
     }
     if (allowedSites !== null) {
       headers['X-Allowed-Sites'] = allowedSites.join(',')
@@ -85,6 +88,7 @@
         ...(init.headers || {}),
         'X-Api-Key': newKey,
         'X-Device-Id': deviceId,
+        'X-Ext-Version': extVersion,
       }
       if (allowedSites !== null) {
         retryHeaders['X-Allowed-Sites'] = allowedSites.join(',')

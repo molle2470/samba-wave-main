@@ -330,6 +330,22 @@ export const orderApi = {
       `${SAMBA_PREFIX}/orders/sync-tracking/bulk?limit=${limit}&days=${days}&force=${force}`,
       { method: 'POST' },
     ),
+  retryFailedTrackingJobs: (days = 7) =>
+    request<{ success: boolean; target: number; queued: number; skipped: number; errors: string[]; job_ids: string[] }>(
+      `${SAMBA_PREFIX}/orders/tracking-sync/retry-failed?days=${days}`,
+      { method: 'POST' },
+    ),
+  getAutoSyncInterval: () =>
+    request<{ interval_minutes: number }>(`${SAMBA_PREFIX}/orders/auto-sync-interval`),
+  setAutoSyncInterval: (interval_minutes: number) =>
+    request<{ interval_minutes: number }>(
+      `${SAMBA_PREFIX}/orders/auto-sync-interval`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ interval_minutes }),
+      },
+    ),
   dispatchTrackingToMarket: (jobId: string, dryRun = false) =>
     request<{ success: boolean; dryRun?: boolean; channel?: string; courier?: string; tracking?: string; error?: string }>(
       `${SAMBA_PREFIX}/orders/tracking-sync/${jobId}/dispatch?dry_run=${dryRun}`,
@@ -383,6 +399,11 @@ export const orderApi = {
         actionTag?: string | null
       }>
     }>(`${SAMBA_PREFIX}/orders/tracking-sync/by-ids`, {
+      method: 'POST',
+      body: JSON.stringify({ job_ids: jobIds }),
+    }),
+  cancelTrackingSyncBatch: (jobIds: string[]) =>
+    request<{ cancelled: number }>(`${SAMBA_PREFIX}/orders/tracking-sync/cancel-batch`, {
       method: 'POST',
       body: JSON.stringify({ job_ids: jobIds }),
     }),
@@ -624,6 +645,20 @@ export interface RefreshResult {
   details?: RefreshDetail[]
 }
 
+export interface BrandScanResult {
+  categories: { categoryCode: string; path: string; count: number; category1: string; category2: string; category3: string }[]
+  total: number
+  groupCount: number
+}
+
+export interface BrandScanProgress {
+  job_id: string
+  status: 'running' | 'done' | 'error'
+  result?: BrandScanResult | null
+  error?: string | null
+  meta?: Record<string, unknown>
+}
+
 export const collectorApi = {
   // Filters
   listFilters: () => request<SambaSearchFilter[]>(`${SAMBA_PREFIX}/collector/filters`),
@@ -666,12 +701,29 @@ export const collectorApi = {
   gsshopScanProgress: () =>
     request<{ stage: string; keyword?: string; page?: number; products?: number; detail_ok?: number; detail_fail?: number; detail_total?: number }>(
       `${SAMBA_PREFIX}/collector/gsshop-scan-progress`),
-  brandScan: (brand: string, gf?: string, keyword?: string, source_site?: string, selected_brands?: string[], brand_ids?: string[], brand_total?: number, options?: Record<string, boolean>) =>
-    request<{ categories: { categoryCode: string; path: string; count: number; category1: string; category2: string; category3: string }[]; total: number; groupCount: number }>(
+  // SSG 는 비동기 job 응답 ({job_id, status}) — Cloudflare 100s origin timeout 우회.
+  // 그 외 사이트는 기존 동기 응답 ({categories, total, groupCount}).
+  // brandScan 호출자는 항상 BrandScanResult 를 받음 — job_id 응답이면 polling 으로 변환.
+  brandScan: async (brand: string, gf?: string, keyword?: string, source_site?: string, selected_brands?: string[], brand_ids?: string[], brand_total?: number, options?: Record<string, boolean>): Promise<BrandScanResult> => {
+    const res = await request<BrandScanResult | { job_id: string; status: 'running' }>(
       `${SAMBA_PREFIX}/collector/brand-scan`,
       { method: "POST", body: JSON.stringify({ brand, gf: gf || 'A', keyword: keyword || '', source_site: source_site || 'MUSINSA', selected_brands: selected_brands || [], brand_ids: brand_ids || [], brand_total: brand_total || 0, options: options || {} }) },
       { timeoutMs: 600_000 },
-    ),
+    )
+    if (!('job_id' in res)) return res
+    // 2s 간격 polling. 최대 600s 대기.
+    const jobId = res.job_id
+    const maxAttempts = 300
+    for (let attempts = 0; attempts < maxAttempts; attempts += 1) {
+      await new Promise<void>(r => setTimeout(r, 2000))
+      const p = await request<BrandScanProgress>(
+        `${SAMBA_PREFIX}/collector/brand-scan-progress/${encodeURIComponent(jobId)}`,
+      )
+      if (p.status === 'done' && p.result) return p.result
+      if (p.status === 'error') throw new Error(p.error || '스캔 실패')
+    }
+    throw new Error('스캔 시간 초과 (600초)')
+  },
   brandCreateGroups: (data: { brand: string; brand_name?: string; gf?: string; categories: { categoryCode: string; path: string; count: number }[]; requested_count_per_group?: number; real_total?: number; applied_policy_id?: string; options?: Record<string, boolean>; source_site?: string; selected_brands?: string[]; brand_ids?: string[] }) =>
     request<{ created: number; groups: { id: string; name: string; count: number; path: string }[] }>(
       `${SAMBA_PREFIX}/collector/brand-create-groups`,
@@ -2369,10 +2421,89 @@ export const sourcingAccountApi = {
     request<{ ok: boolean }>(`${SAMBA_PREFIX}/sourcing-accounts/${id}`, { method: 'DELETE' }),
   getBalance: (id: string) =>
     request<{ balance: number; mileage: number; balance_updated_at: string; has_cookie: boolean }>(`${SAMBA_PREFIX}/sourcing-accounts/${id}/balance`),
+  revealPassword: (id: string) =>
+    request<{ password: string }>(`${SAMBA_PREFIX}/sourcing-accounts/${id}/reveal-password`),
   requestBalanceCheck: () =>
     request<{ ok: boolean }>(`${SAMBA_PREFIX}/sourcing-accounts/request-balance-check`, { method: 'POST' }),
   requestChromeProfileSync: () =>
     request<{ ok: boolean }>(`${SAMBA_PREFIX}/sourcing-accounts/request-chrome-profile-sync`, { method: 'POST' }),
+}
+
+// ── Rewards (적립금 자동 적립) ──
+
+export interface RewardActionMeta {
+  id: string
+  site: string
+  label: string
+}
+
+export interface RewardAccountRow {
+  id: string
+  site_name: string
+  account_label: string
+  username: string
+  is_active: boolean
+  is_login_default: boolean
+  balance: number | null
+  balance_updated_at: string | null
+  mileage: number | null
+  last_musinsa_attendance_at: string | null
+  last_musinsa_attendance_reward: number | null
+  musinsa_attendance_streak: number | null
+  last_musinsa_snap_like_at: string | null
+  last_musinsa_snap_reward: number | null
+  last_abcmart_attendance_at: string | null
+  abcmart_stamp_count: number | null
+  abcmart_stamp_score: number | null
+  // 리뷰 자동작성 누적
+  last_musinsa_review_at: string | null
+  musinsa_review_total: number | null
+  last_musinsa_review_count: number | null
+  last_abcmart_review_at: string | null
+  abcmart_review_total: number | null
+  last_abcmart_review_count: number | null
+  last_ssg_review_at: string | null
+  ssg_review_total: number | null
+  last_ssg_review_count: number | null
+  last_gs_review_at: string | null
+  gs_review_total: number | null
+  last_gs_review_count: number | null
+  last_lotteon_review_at: string | null
+  lotteon_review_total: number | null
+  last_lotteon_review_count: number | null
+  last_naver_review_at: string | null
+  naver_review_total: number | null
+  last_naver_review_count: number | null
+  last_kream_review_at: string | null
+  kream_review_total: number | null
+  last_kream_review_count: number | null
+  cookie_expired: boolean
+}
+
+export interface RewardsStatus {
+  actions: RewardActionMeta[]
+  accounts: RewardAccountRow[]
+  auto_interval_hours: number
+  last_auto_run_at: string | null
+}
+
+export const rewardsApi = {
+  status: () => request<RewardsStatus>(`${SAMBA_PREFIX}/sourcing-accounts/rewards/status`),
+  runNow: (actions?: string[]) =>
+    request<{ ok: boolean; summary: unknown[] }>(`${SAMBA_PREFIX}/sourcing-accounts/rewards/run-now`, {
+      method: 'POST',
+      body: JSON.stringify({ actions: actions ?? null }),
+    }),
+  runAccount: (accountId: string, actions?: string[]) =>
+    request<{ ok: boolean; account_id: string; enqueued: unknown[] }>(
+      `${SAMBA_PREFIX}/sourcing-accounts/rewards/run-account/${accountId}`,
+      { method: 'POST', body: JSON.stringify({ actions: actions ?? null }) },
+    ),
+  setAutoSettings: (intervalHours: number) =>
+    request<{ ok: boolean; interval_hours: number }>(`${SAMBA_PREFIX}/sourcing-accounts/rewards/auto-settings`, {
+      method: 'POST',
+      body: JSON.stringify({ interval_hours: intervalHours }),
+    }),
 }
 
 // ── Tenant (티어/사용량) ──

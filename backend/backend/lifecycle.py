@@ -340,6 +340,10 @@ _lottehome_qa_poller_task: asyncio.Task | None = None
 _tetris_sync_task: asyncio.Task | None = None
 _sourcing_job_cleanup_task: asyncio.Task | None = None
 _tetris_sync_last_run: float = 0.0
+_order_auto_sync_task: asyncio.Task | None = None
+_order_auto_sync_last_run: float = 0.0
+_reward_auto_task: asyncio.Task | None = None
+_reward_auto_last_run: float = 0.0
 
 
 async def _tetris_sync_loop() -> None:
@@ -569,6 +573,234 @@ async def _start_tetris_sync_scheduler() -> None:
     logging.getLogger("backend.lifecycle").info(
         "[lifecycle] 테트리스 sync 스케줄러 시작"
     )
+
+
+async def _order_auto_sync_loop() -> None:
+    """주문 자동수집 인터벌 루프 — 1분마다 설정 확인 후 조건 충족 시:
+    1) order_sync 잡 생성 (전체 활성 계정, 최근 7일)
+    2) 잡 완료 대기
+    3) tracking_sync_bulk 호출 (미발송 송장 수집·전송)
+    """
+    global _order_auto_sync_last_run
+    import time
+
+    _log = logging.getLogger("backend.lifecycle")
+    while True:
+        await asyncio.sleep(60)
+        try:
+            from backend.db.orm import get_read_session, get_write_session
+
+            async with get_read_session() as rs:
+                from backend.api.v1.routers.samba.proxy._helpers import _get_setting
+
+                val = await _get_setting(rs, "order_auto_sync_interval_minutes")
+                try:
+                    interval_min = int(val) if val is not None else 0
+                except (TypeError, ValueError):
+                    interval_min = 0
+
+            if interval_min <= 0:
+                continue
+
+            now = time.time()
+            if now - _order_auto_sync_last_run < interval_min * 60:
+                continue
+
+            _log.info(f"[주문 auto sync] 인터벌 {interval_min}분 도달 — 시작")
+
+            # 1) 활성 마켓 계정 전체 ID 조회 후 order_sync 잡 생성
+            from sqlalchemy import text as _sa_text
+            from backend.domain.samba.job.model import JobStatus, SambaJob
+
+            async with get_write_session() as ws:
+                rows = await ws.execute(
+                    _sa_text(
+                        "SELECT id FROM samba_market_account WHERE is_active = TRUE"
+                    )
+                )
+                account_ids = [row[0] for row in rows.all()]
+
+                if not account_ids:
+                    _log.info("[주문 auto sync] 활성 계정 없음 — 스킵")
+                    _order_auto_sync_last_run = now
+                    continue
+
+                # 같은 tenant 동시 order_sync 1개 제한이 있으므로 중복 시 그대로 진행
+                from sqlmodel import select, col
+
+                active = (
+                    (
+                        await ws.execute(
+                            select(SambaJob)
+                            .where(
+                                SambaJob.job_type == "order_sync",
+                                col(SambaJob.status).in_(
+                                    [JobStatus.PENDING, JobStatus.RUNNING]
+                                ),
+                                SambaJob.tenant_id.is_(None),
+                            )
+                            .order_by(SambaJob.created_at.desc())
+                            .limit(1)
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if active:
+                    job_id = active.id
+                    _log.info(f"[주문 auto sync] 기존 잡 재연결 {job_id}")
+                else:
+                    new_job = SambaJob(
+                        job_type="order_sync",
+                        status=JobStatus.PENDING,
+                        payload={"days": 7, "account_ids": account_ids},
+                    )
+                    ws.add(new_job)
+                    await ws.flush()
+                    await ws.commit()
+                    job_id = new_job.id
+                    _log.info(f"[주문 auto sync] order_sync 잡 생성 {job_id}")
+
+            # 2) 잡 완료 대기 (최대 30분)
+            deadline = time.time() + 30 * 60
+            while time.time() < deadline:
+                await asyncio.sleep(5)
+                async with get_read_session() as rs2:
+                    job = (
+                        await rs2.execute(
+                            _sa_text("SELECT status FROM samba_jobs WHERE id = :jid"),
+                            {"jid": job_id},
+                        )
+                    ).first()
+                    status = job[0] if job else None
+                if status in ("completed", "failed", "cancelled"):
+                    _log.info(f"[주문 auto sync] order_sync 잡 종료: {status}")
+                    break
+
+            # 3) 송장수집 큐 적재
+            try:
+                from backend.domain.samba.tracking_sync.service import (
+                    enqueue_pending_orders,
+                )
+
+                result = await enqueue_pending_orders(
+                    tenant_id=None, limit=500, days=7, force=True
+                )
+                _log.info(f"[주문 auto sync] 송장수집 큐 적재 완료: {result}")
+            except Exception as e:
+                _log.error(f"[주문 auto sync] 송장수집 큐 적재 오류: {e}")
+
+            _order_auto_sync_last_run = now
+
+        except Exception as e:
+            logging.getLogger("backend.lifecycle").error(
+                f"[주문 auto sync 루프] 오류: {e}"
+            )
+
+
+async def _start_order_auto_sync_scheduler() -> None:
+    global _order_auto_sync_task
+
+    _order_auto_sync_task = asyncio.create_task(_order_auto_sync_loop())
+    logging.getLogger("backend.lifecycle").info(
+        "[lifecycle] 주문 auto sync 스케줄러 시작"
+    )
+
+
+async def _reward_auto_loop() -> None:
+    """적립금 자동 적립 인터벌 루프 — 1분마다 설정 확인 후 인터벌 도달 시
+    활성 소싱처 계정(MUSINSA/ABCmart) 전체에 reward 잡 적재.
+
+    각 액션은 라우터의 `_enqueue_reward_for_account` 내부에서 24h 가드를 다시 체크하므로
+    여기서는 인터벌 도달 여부만 판단한다.
+    """
+    global _reward_auto_last_run
+    import time
+
+    _log = logging.getLogger("backend.lifecycle")
+    while True:
+        await asyncio.sleep(60)
+        try:
+            from backend.api.v1.routers.samba.proxy._helpers import (
+                _get_setting,
+                _set_setting,
+            )
+            from backend.db.orm import get_read_session, get_write_session
+
+            async with get_read_session() as rs:
+                val = await _get_setting(rs, "reward_auto_run_interval_hours")
+                try:
+                    interval_h = int(val) if val is not None else 0
+                except (TypeError, ValueError):
+                    interval_h = 0
+
+            if interval_h <= 0:
+                continue
+
+            now = time.time()
+            if now - _reward_auto_last_run < interval_h * 3600:
+                continue
+
+            _log.info(f"[적립금 auto] 인터벌 {interval_h}시간 도달 — 시작")
+
+            from backend.api.v1.routers.samba.sourcing_account import (
+                _enqueue_reward_for_account,
+            )
+            from backend.domain.samba.sourcing_account.model import (
+                SambaSourcingAccount,
+            )
+            from sqlmodel import select as _select
+
+            async with get_read_session() as rs2:
+                stmt = _select(SambaSourcingAccount).where(
+                    SambaSourcingAccount.site_name.in_(  # type: ignore[attr-defined]
+                        [
+                            "MUSINSA",
+                            "ABCmart",
+                            "SSG",
+                            "GSShop",
+                            "LOTTEON",
+                            "NAVERSTORE",
+                            "KREAM",
+                        ]
+                    ),
+                    SambaSourcingAccount.is_active == True,  # noqa: E712
+                )
+                rows = (await rs2.execute(stmt)).scalars().all()
+
+            count = 0
+            for a in rows:
+                try:
+                    enq = await _enqueue_reward_for_account(a)
+                    count += sum(1 for e in enq if "request_id" in e)
+                except Exception as ee:
+                    _log.warning(f"[적립금 auto] 계정 처리 실패 {a.id}: {ee}")
+
+            _log.info(f"[적립금 auto] 적재 완료: 잡 {count}건 ({len(rows)}개 계정)")
+
+            # 마지막 실행 시각 저장 (페이지 표시용)
+            from datetime import datetime as _dt, timezone as _tz
+
+            try:
+                async with get_write_session() as ws:
+                    await _set_setting(
+                        ws,
+                        "reward_auto_run_last_at",
+                        _dt.now(_tz.utc).isoformat(),
+                    )
+            except Exception as ee:
+                _log.warning(f"[적립금 auto] last_at 저장 실패: {ee}")
+
+            _reward_auto_last_run = now
+
+        except Exception as e:
+            _log.error(f"[적립금 auto 루프] 오류: {e}")
+
+
+async def _start_reward_auto_scheduler() -> None:
+    global _reward_auto_task
+    _reward_auto_task = asyncio.create_task(_reward_auto_loop())
+    logging.getLogger("backend.lifecycle").info("[lifecycle] 적립금 auto 스케줄러 시작")
 
 
 async def _start_order_poller() -> None:
@@ -824,6 +1056,8 @@ async def lifespan(app: FastAPI):
         await _start_order_poller()
         await _start_lottehome_qa_poller()
         await _start_tetris_sync_scheduler()
+        await _start_order_auto_sync_scheduler()
+        await _start_reward_auto_scheduler()
         await _start_sourcing_job_cleanup()
         await _start_lotteon_ghost_reconciler()
         await _start_elevenst_ghost_reconciler()
@@ -846,6 +1080,8 @@ async def lifespan(app: FastAPI):
         await _cancel_task(_order_poller_task)
         await _cancel_task(_lottehome_qa_poller_task)
         await _cancel_task(_tetris_sync_task)
+        await _cancel_task(_order_auto_sync_task)
+        await _cancel_task(_reward_auto_task)
         await _cancel_task(_lotteon_ghost_reconciler_task)
         await _cancel_task(_elevenst_ghost_reconciler_task)
         await _shutdown_worker_runtime(worker_runtime)

@@ -263,6 +263,28 @@ async def get_sourcing_account(
     return mask_model_secrets(account.model_dump())
 
 
+@router.get("/{account_id}/reveal-password")
+async def reveal_sourcing_account_password(
+    account_id: str,
+    session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
+):
+    """소싱처 계정 평문 password 반환 — 운영자 본인 확인용.
+
+    JWT 인증된 사용자 + 자기 테넌트 계정만 조회 가능.
+    UI는 토글 버튼(눈 아이콘) 클릭 시에만 호출. 평문은 응답 후 즉시 폼에 표시되고
+    저장되지 않음. DB에 평문 저장된 자격증명을 그대로 전달 — 새로운 보안 위험 없음.
+    """
+    svc = _read_service(session)
+    account = await svc.get_account(account_id)
+    if not account:
+        raise HTTPException(404, "소싱처 계정을 찾을 수 없습니다")
+    # IDOR 방지: 테넌트 소유권 검증
+    if tenant_id is not None and account.tenant_id != tenant_id:
+        raise HTTPException(403, "해당 계정에 대한 권한이 없습니다")
+    return {"password": account.password or ""}
+
+
 @router.post("", status_code=201)
 async def create_sourcing_account(
     body: SourcingAccountCreate,
@@ -294,7 +316,13 @@ async def update_sourcing_account(
             raise HTTPException(404, "소싱처 계정을 찾을 수 없습니다")
         if existing.tenant_id != tenant_id:
             raise HTTPException(403, "해당 계정에 대한 권한이 없습니다")
-    result = await svc.update_account(account_id, body.model_dump(exclude_unset=True))
+    # [중요] GET 응답의 마스킹값(****xxxx)을 사용자가 그대로 PUT으로 돌려보낸 경우,
+    # DB의 진짜 password를 마스킹값으로 덮어쓰는 사고 차단. 이미 인프라(sanitize_top_level_secrets)
+    # 존재했으나 라우터에서 호출 안 되어 병기 계정 password가 '****74@@'로 저장되는 사고 발생(2026-05-16).
+    from backend.utils.masking import sanitize_top_level_secrets
+
+    incoming = sanitize_top_level_secrets(body.model_dump(exclude_unset=True))
+    result = await svc.update_account(account_id, incoming)
     if not result:
         raise HTTPException(404, "소싱처 계정을 찾을 수 없습니다")
     return result
@@ -609,6 +637,372 @@ async def get_balance(
     }
 
 
+# ==================== 적립금 자동 적립 (rewards) ====================
+
+
+# 적립 액션 메타 — 프론트/백 공용 (id, label, supportedSite)
+REWARD_ACTIONS_META = [
+    {"id": "musinsa_attendance", "site": "MUSINSA", "label": "무신사 출석체크"},
+    {"id": "musinsa_snap_like", "site": "MUSINSA", "label": "무신사 스냅 좋아요"},
+    {"id": "musinsa_balance", "site": "MUSINSA", "label": "무신사 잔액 갱신"},
+    {"id": "musinsa_review", "site": "MUSINSA", "label": "무신사 리뷰 자동작성"},
+    {"id": "abcmart_attendance", "site": "ABCmart", "label": "ABC마트 출석체크"},
+    {"id": "abcmart_review", "site": "ABCmart", "label": "ABC마트 리뷰 자동작성"},
+    {"id": "ssg_review", "site": "SSG", "label": "SSG 리뷰 자동작성"},
+    {"id": "gs_review", "site": "GSShop", "label": "GS샵 리뷰 자동작성"},
+    {"id": "lotteon_review", "site": "LOTTEON", "label": "롯데ON 리뷰 자동작성"},
+    {"id": "naver_review", "site": "NAVERSTORE", "label": "네이버 리뷰 자동작성"},
+    {"id": "kream_review", "site": "KREAM", "label": "크림 리뷰 자동작성"},
+]
+
+
+def _account_to_reward_row(account) -> dict:
+    extra = dict(account.additional_fields or {})
+    return {
+        "id": account.id,
+        "site_name": account.site_name,
+        "account_label": account.account_label,
+        "username": account.username,
+        "is_active": account.is_active,
+        "is_login_default": account.is_login_default,
+        "balance": account.balance,
+        "balance_updated_at": (
+            account.balance_updated_at.isoformat()
+            if account.balance_updated_at
+            else None
+        ),
+        "mileage": extra.get("mileage"),
+        "last_musinsa_attendance_at": extra.get("last_musinsa_attendance_at"),
+        "last_musinsa_attendance_reward": extra.get("last_musinsa_attendance_reward"),
+        "musinsa_attendance_streak": extra.get("musinsa_attendance_streak"),
+        "last_musinsa_snap_like_at": extra.get("last_musinsa_snap_like_at"),
+        "last_musinsa_snap_reward": extra.get("last_musinsa_snap_reward"),
+        "last_abcmart_attendance_at": extra.get("last_abcmart_attendance_at"),
+        "abcmart_stamp_count": extra.get("abcmart_stamp_count"),
+        "abcmart_stamp_score": extra.get("abcmart_stamp_score"),
+        "last_musinsa_review_at": extra.get("last_musinsa_review_at"),
+        "musinsa_review_total": extra.get("musinsa_review_total"),
+        "last_musinsa_review_count": extra.get("last_musinsa_review_count"),
+        "last_abcmart_review_at": extra.get("last_abcmart_review_at"),
+        "abcmart_review_total": extra.get("abcmart_review_total"),
+        "last_abcmart_review_count": extra.get("last_abcmart_review_count"),
+        "last_ssg_review_at": extra.get("last_ssg_review_at"),
+        "ssg_review_total": extra.get("ssg_review_total"),
+        "last_ssg_review_count": extra.get("last_ssg_review_count"),
+        "last_gs_review_at": extra.get("last_gs_review_at"),
+        "gs_review_total": extra.get("gs_review_total"),
+        "last_gs_review_count": extra.get("last_gs_review_count"),
+        "last_lotteon_review_at": extra.get("last_lotteon_review_at"),
+        "lotteon_review_total": extra.get("lotteon_review_total"),
+        "last_lotteon_review_count": extra.get("last_lotteon_review_count"),
+        "last_naver_review_at": extra.get("last_naver_review_at"),
+        "naver_review_total": extra.get("naver_review_total"),
+        "last_naver_review_count": extra.get("last_naver_review_count"),
+        "last_kream_review_at": extra.get("last_kream_review_at"),
+        "kream_review_total": extra.get("kream_review_total"),
+        "last_kream_review_count": extra.get("last_kream_review_count"),
+        "cookie_expired": bool(extra.get("cookie_expired")),
+    }
+
+
+@router.get("/rewards/status")
+async def get_rewards_status(
+    session: AsyncSession = Depends(get_read_session_dependency),
+):
+    """적립금 페이지 데이터 — 활성 소싱처 계정 + 적립 이력 + 자동 인터벌 설정값."""
+    from backend.api.v1.routers.samba.proxy._helpers import _get_setting
+    from backend.domain.samba.sourcing_account.model import SambaSourcingAccount
+
+    stmt = (
+        select(SambaSourcingAccount)
+        .where(
+            SambaSourcingAccount.site_name.in_(  # type: ignore[attr-defined]
+                [
+                    "MUSINSA",
+                    "ABCmart",
+                    "SSG",
+                    "GSShop",
+                    "LOTTEON",
+                    "NAVERSTORE",
+                    "KREAM",
+                ]
+            ),
+            SambaSourcingAccount.is_active == True,  # noqa: E712
+        )
+        .order_by(SambaSourcingAccount.site_name, SambaSourcingAccount.account_label)
+    )
+    result = await session.execute(stmt)
+    accounts = result.scalars().all()
+
+    interval_val = await _get_setting(session, "reward_auto_run_interval_hours")
+    try:
+        interval_hours = int(interval_val) if interval_val is not None else 0
+    except (TypeError, ValueError):
+        interval_hours = 0
+
+    last_run_val = await _get_setting(session, "reward_auto_run_last_at")
+
+    return {
+        "actions": REWARD_ACTIONS_META,
+        "accounts": [_account_to_reward_row(a) for a in accounts],
+        "auto_interval_hours": interval_hours,
+        "last_auto_run_at": last_run_val,
+    }
+
+
+class RewardRunRequest(BaseModel):
+    actions: Optional[list[str]] = None  # None이면 사이트별 전체 액션
+
+
+async def _enqueue_reward_for_account(
+    account, actions: Optional[list[str]] = None
+) -> list[dict]:
+    """소싱처 계정 1개에 대해 reward 잡 적재. 24h 내 동일 액션은 스킵."""
+    from backend.domain.samba.proxy.sourcing_queue import (
+        SITE_REWARD_ACTIONS,
+        SourcingQueue,
+    )
+
+    site = account.site_name
+    supported = SITE_REWARD_ACTIONS.get(site, [])
+    target_actions = [a for a in (actions or supported) if a in supported]
+
+    extra = account.additional_fields or {}
+    now = datetime.now(timezone.utc)
+    enqueued: list[dict] = []
+
+    for action in target_actions:
+        # 24h 가드: 같은 액션 24h 이내면 스킵 (사용자 수동 호출은 force=True로 우회 가능하게)
+        key = f"last_{action}_at"
+        last_iso = extra.get(key)
+        if last_iso:
+            try:
+                last_dt = datetime.fromisoformat(last_iso)
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=timezone.utc)
+                if (now - last_dt).total_seconds() < 23 * 3600:
+                    enqueued.append(
+                        {"action": action, "skipped": True, "reason": "24h 가드"}
+                    )
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+        try:
+            request_id, _ = await SourcingQueue.add_reward_job(
+                site=site,
+                action=action,
+                sourcing_account_id=account.id,
+            )
+            enqueued.append({"action": action, "request_id": request_id})
+        except Exception as e:
+            logger.warning(f"[적립금] 잡 적재 실패 acct={account.id} {action}: {e}")
+            enqueued.append({"action": action, "error": str(e)})
+
+    return enqueued
+
+
+@router.post("/rewards/run-now")
+async def run_rewards_now(
+    body: RewardRunRequest,
+    session: AsyncSession = Depends(get_read_session_dependency),
+):
+    """수동 1회 실행 — 활성 소싱처 계정 전체에 reward 잡 적재."""
+    from backend.domain.samba.sourcing_account.model import SambaSourcingAccount
+
+    stmt = select(SambaSourcingAccount).where(
+        SambaSourcingAccount.site_name.in_(  # type: ignore[attr-defined]
+            ["MUSINSA", "ABCmart", "SSG", "GSShop", "LOTTEON", "NAVERSTORE", "KREAM"]
+        ),
+        SambaSourcingAccount.is_active == True,  # noqa: E712
+    )
+    result = await session.execute(stmt)
+    accounts = result.scalars().all()
+
+    summary: list[dict] = []
+    for a in accounts:
+        enq = await _enqueue_reward_for_account(a, actions=body.actions)
+        summary.append(
+            {
+                "account_id": a.id,
+                "site_name": a.site_name,
+                "account_label": a.account_label,
+                "enqueued": enq,
+            }
+        )
+
+    logger.info(f"[적립금] 수동 실행: {len(summary)}개 계정에 잡 적재")
+    return {"ok": True, "summary": summary}
+
+
+@router.post("/rewards/run-account/{account_id}")
+async def run_rewards_for_account(
+    account_id: str,
+    body: RewardRunRequest,
+    session: AsyncSession = Depends(get_read_session_dependency),
+):
+    """특정 계정만 즉시 실행. 24h 가드 무시(사용자 수동 의도)."""
+    from backend.domain.samba.proxy.sourcing_queue import (
+        SITE_REWARD_ACTIONS,
+        SourcingQueue,
+    )
+    from backend.domain.samba.sourcing_account.model import SambaSourcingAccount
+
+    account = await session.get(SambaSourcingAccount, account_id)
+    if not account:
+        raise HTTPException(404, "계정을 찾을 수 없습니다")
+
+    site = account.site_name
+    supported = SITE_REWARD_ACTIONS.get(site, [])
+    target_actions = [a for a in (body.actions or supported) if a in supported]
+
+    enqueued: list[dict] = []
+    for action in target_actions:
+        try:
+            request_id, _ = await SourcingQueue.add_reward_job(
+                site=site,
+                action=action,
+                sourcing_account_id=account.id,
+            )
+            enqueued.append({"action": action, "request_id": request_id})
+        except Exception as e:
+            enqueued.append({"action": action, "error": str(e)})
+
+    logger.info(
+        f"[적립금] 수동 실행(단일): {account.account_label} 액션 {len(enqueued)}건"
+    )
+    return {"ok": True, "account_id": account.id, "enqueued": enqueued}
+
+
+class RewardAutoSettingsRequest(BaseModel):
+    interval_hours: int = 0  # 0이면 비활성
+
+
+@router.post("/rewards/auto-settings")
+async def set_rewards_auto_settings(
+    body: RewardAutoSettingsRequest,
+    session: AsyncSession = Depends(get_write_session_dependency),
+):
+    """자동 실행 인터벌(시간) 저장. 0이면 비활성."""
+    from backend.api.v1.routers.samba.proxy._helpers import _set_setting
+
+    val = max(0, int(body.interval_hours or 0))
+    await _set_setting(session, "reward_auto_run_interval_hours", str(val))
+    logger.info(f"[적립금] 자동 실행 인터벌 변경: {val}시간")
+    return {"ok": True, "interval_hours": val}
+
+
+class RewardResultRequest(BaseModel):
+    request_id: Optional[str] = None
+    account_id: str
+    site_name: str
+    action: str  # musinsa_attendance | musinsa_snap_like | musinsa_balance | abcmart_attendance
+    success: bool = True
+    already_done: bool = False
+    reward: float = 0
+    streak_count: int = 0
+    money: Optional[float] = None
+    mileage: Optional[float] = None
+    stamp_count: Optional[int] = None
+    stamp_score: Optional[int] = None
+    error: Optional[str] = None
+
+
+@extension_router.post("/extension/reward-result")
+async def receive_reward_result(
+    body: RewardResultRequest,
+    session: AsyncSession = Depends(get_write_session_dependency),
+):
+    """확장앱이 적립 결과 콜백 → 소싱처 계정 additional_fields 갱신."""
+    from backend.domain.samba.sourcing_account.model import SambaSourcingAccount
+
+    account = await session.get(SambaSourcingAccount, body.account_id)
+    if not account:
+        logger.warning(f"[적립금] 결과 수신 — 계정 없음 acct={body.account_id}")
+        raise HTTPException(404, "계정을 찾을 수 없습니다")
+
+    extra = dict(account.additional_fields or {})
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+
+    if body.action == "musinsa_attendance":
+        extra["last_musinsa_attendance_at"] = now_iso
+        if body.reward:
+            extra["last_musinsa_attendance_reward"] = body.reward
+        if body.streak_count:
+            extra["musinsa_attendance_streak"] = body.streak_count
+    elif body.action == "musinsa_snap_like":
+        extra["last_musinsa_snap_like_at"] = now_iso
+        if body.reward:
+            extra["last_musinsa_snap_reward"] = body.reward
+    elif body.action == "musinsa_balance":
+        # 잔액 갱신만 (출석/스냅 X)
+        if body.money is not None or body.mileage is not None:
+            extra["mileage"] = (
+                body.mileage if body.mileage is not None else extra.get("mileage")
+            )
+    elif body.action == "abcmart_attendance":
+        extra["last_abcmart_attendance_at"] = now_iso
+        if body.stamp_count is not None:
+            extra["abcmart_stamp_count"] = body.stamp_count
+        if body.stamp_score is not None:
+            extra["abcmart_stamp_score"] = body.stamp_score
+    elif body.action.endswith("_review"):
+        # 리뷰 자동작성 — site별 누적 카운트
+        site_key = body.action.replace(
+            "_review", ""
+        )  # musinsa/abcmart/ssg/gs/lotteon/naver
+        extra[f"last_{site_key}_review_at"] = now_iso
+        # body.stamp_count 필드를 review 작성 건수로 재활용 (확장앱이 reviewCount 보냄)
+        if body.stamp_count is not None:
+            prev = int(extra.get(f"{site_key}_review_total") or 0)
+            extra[f"{site_key}_review_total"] = prev + body.stamp_count
+            extra[f"last_{site_key}_review_count"] = body.stamp_count
+
+    # balance 동시 갱신 (확장앱이 한 화면에서 money/mileage 둘 다 수집한 경우)
+    update_kwargs: dict = {"additional_fields": extra}
+    if body.money is not None:
+        update_kwargs["balance"] = body.money
+        update_kwargs["balance_updated_at"] = now
+
+    account.additional_fields = extra
+    if body.money is not None:
+        account.balance = body.money
+        account.balance_updated_at = now
+    account.updated_at = now
+    session.add(account)
+
+    # SambaSourcingJob 상태/에러도 함께 마킹 — 디버깅용. request_id 없으면 스킵(과거 호환).
+    # 기존엔 SambaSourcingAccount.additional_fields 만 업데이트했고 SambaSourcingJob 는 그대로
+    # 남아 expired 처리되거나 상태 불명으로 'failed' 라벨링 되어 실패 사유 추적 불가했음.
+    if body.request_id:
+        from backend.domain.samba.sourcing_job.model import SambaSourcingJob
+
+        job = await session.get(SambaSourcingJob, body.request_id)
+        if job:
+            job.status = "completed" if body.success else "failed"
+            job.result = {
+                "success": body.success,
+                "already_done": body.already_done,
+                "reward": body.reward,
+                "stamp_count": body.stamp_count,
+                "money": body.money,
+                "mileage": body.mileage,
+            }
+            job.error = body.error or None
+            job.completed_at = now
+            session.add(job)
+
+    await session.commit()
+
+    logger.info(
+        f"[적립금] 결과 수신 {body.site_name}/{body.action} acct={account.account_label} "
+        f"success={body.success} reward={body.reward} stamp={body.stamp_count} "
+        f"req={body.request_id or '-'} error={(body.error or '')[:120]}"
+    )
+    return {"ok": True}
+
+
 # ==================== 확장앱 전용 엔드포인트 (extension_router) ====================
 
 
@@ -768,6 +1162,75 @@ async def get_login_credential(
         "account_label": account.account_label,
         "username": account.username,
         "password": account.password,
+    }
+
+
+@extension_router.get("/find-by-username")
+async def find_account_by_username(
+    site_name: str = Query(..., description="사이트 ID (예: MUSINSA, LOTTEON)"),
+    username: str = Query(
+        ..., description="현재 브라우저에 로그인된 사용자 식별자 (아이디/이메일/닉네임)"
+    ),
+    session: AsyncSession = Depends(get_read_session_dependency),
+):
+    """확장앱 전용 — 현재 로그인된 username을 SambaSourcingAccount의 account_id로 매핑.
+
+    송장수집 시 확장앱이 현재 로그인 계정을 식별 후 매칭 잡을 우선 처리하려면
+    "현재 로그인된 username 문자열" → "백엔드 account_id" 변환이 필요.
+    이 엔드포인트는 site_name + username 으로 단건 매칭 후 account_id를 반환.
+
+    조회 우선순위:
+      1. 정확 매칭 (account.username == username)
+      2. account_label 매칭 (사용자가 라벨에 username을 적어두는 케이스 대응)
+
+    찾지 못하면 404. is_active 무관 (만료 계정도 매칭 허용 — 일단 식별만이 목적).
+    """
+    from sqlalchemy import select as sa_select, or_
+    from backend.domain.samba.sourcing_account.model import SambaSourcingAccount
+
+    if not username.strip():
+        raise HTTPException(400, "username 비어있음")
+
+    normalized_site_name = _normalize_sourcing_site_name(site_name)
+    site_candidates = [
+        candidate
+        for candidate in dict.fromkeys(
+            [
+                site_name,
+                normalized_site_name,
+                site_name.upper(),
+                site_name.lower(),
+            ]
+        )
+        if candidate
+    ]
+
+    stmt = (
+        sa_select(SambaSourcingAccount)
+        .where(SambaSourcingAccount.site_name.in_(site_candidates))
+        .where(
+            or_(
+                SambaSourcingAccount.username == username,
+                SambaSourcingAccount.account_label == username,
+            )
+        )
+        .order_by(
+            SambaSourcingAccount.is_active.desc(),
+            SambaSourcingAccount.updated_at.desc(),
+        )
+        .limit(1)
+    )
+    account = (await session.execute(stmt)).scalars().first()
+    if not account:
+        raise HTTPException(
+            404,
+            f"매칭 계정 없음: site={site_name} username={username}",
+        )
+    return {
+        "id": account.id,
+        "site_name": account.site_name,
+        "account_label": account.account_label,
+        "username": account.username,
     }
 
 

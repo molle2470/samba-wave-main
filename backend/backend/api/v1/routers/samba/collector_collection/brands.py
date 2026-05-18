@@ -464,6 +464,53 @@ async def gsshop_scan_progress():
     return GsShopSourcingClient.scan_progress or {"stage": "idle"}
 
 
+async def _run_ssg_brand_scan(
+    job_id: str, keyword: str, body: "BrandScanRequest"
+) -> None:
+    """SSG brand-scan 백그라운드 실행 — ScanJobStore 에 결과/에러 기록."""
+    from backend.domain.samba.collector.refresher import get_collect_proxies
+    from backend.domain.samba.job.worker import _add_collect_log
+    from backend.domain.samba.plugins.sourcing.ssg import SSGPlugin
+    from backend.domain.samba.scan_jobs import ScanJobStore
+
+    try:
+        _proxy_list = get_collect_proxies()
+        plugin = SSGPlugin()
+        selected = body.selected_brands or [keyword]
+        result = await plugin.scan_categories(
+            keyword,
+            selected_brands=selected,
+            brand_ids=body.brand_ids or None,
+            brand_total=body.brand_total,
+            log_fn=_add_collect_log,
+            proxy_urls=_proxy_list or None,
+        )
+        ScanJobStore.complete(job_id, result)
+    except Exception as e:
+        logger.exception(f"[SSG] brand-scan job 실패 ({job_id}): {e}")
+        ScanJobStore.fail(job_id, str(e))
+
+
+@router.get("/brand-scan-progress/{job_id}")
+async def brand_scan_progress(job_id: str):
+    """brand-scan 비동기 job 의 진행 상태/결과 polling.
+
+    응답: {status: running|done|error, result?: {...}, error?: str, meta: {...}}
+    """
+    from backend.domain.samba.scan_jobs import ScanJobStore
+
+    job = ScanJobStore.get(job_id)
+    if job is None:
+        raise HTTPException(404, f"job 없음: {job_id}")
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "result": job.get("result"),
+        "error": job.get("error"),
+        "meta": job.get("meta", {}),
+    }
+
+
 _BRAND_COLLECT_ALL_SITES = {"MUSINSA", "ABCmart", "SSG", "GSShop"}
 
 
@@ -574,22 +621,21 @@ async def brand_scan(
         return await plugin.scan_categories(keyword)
 
     if body.source_site == "SSG":
-        from backend.domain.samba.collector.refresher import get_collect_proxies
-        from backend.domain.samba.job.worker import _add_collect_log
-        from backend.domain.samba.plugins.sourcing.ssg import SSGPlugin
+        # SSG 카테고리 스캔은 ~170s 까지 소요 (47개 세분류 × ~3.5s, concurrency=1).
+        # Cloudflare 100s origin response timeout 을 우회하기 위해 job_id 즉시 반환 +
+        # background task 패턴 사용. frontend 는 /brand-scan-progress polling.
+        from backend.domain.samba.scan_jobs import ScanJobStore
 
-        # 수집 용도 활성 프록시 URL 목록 — DB 설정 페이지(/samba/settings) 기반
-        _proxy_list = get_collect_proxies()
-        plugin = SSGPlugin()
-        selected = body.selected_brands or [keyword]
-        return await plugin.scan_categories(
-            keyword,
-            selected_brands=selected,
-            brand_ids=body.brand_ids or None,
-            brand_total=body.brand_total,
-            log_fn=_add_collect_log,
-            proxy_urls=_proxy_list or None,
+        job_id = ScanJobStore.create(
+            kind="brand-scan",
+            meta={
+                "source_site": "SSG",
+                "keyword": keyword,
+                "selected_brands": body.selected_brands or [keyword],
+            },
         )
+        asyncio.create_task(_run_ssg_brand_scan(job_id, keyword, body))
+        return {"job_id": job_id, "status": "running"}
 
     if body.source_site == "FashionPlus":
         from backend.domain.samba.plugins.sourcing.fashionplus import FashionPlusPlugin

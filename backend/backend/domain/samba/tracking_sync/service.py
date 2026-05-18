@@ -32,6 +32,7 @@ from backend.domain.samba.tracking_sync.model import (
     STATUS_PENDING,
     STATUS_SCRAPED,
     STATUS_SENT,
+    STATUS_WRONG_ACCOUNT,
     SambaTrackingSyncJob,
 )
 from backend.utils.logger import logger
@@ -53,7 +54,8 @@ def build_tracking_url(site: str, sourcing_order_number: str) -> str:
         # 주문상세 페이지로 진입 → 확장앱이 "배송 조회" 버튼 클릭 → trace 페이지로 navigation.
         return f"https://www.musinsa.com/order/order-detail/{ord_no}"
     if s == "LOTTEON":
-        return f"https://www.lotteon.com/p/order/claim/orderDetail?odNo={ord_no}"
+        # orderDetail 페이지는 조회 실패(선물/직배 무관) → giftBoxDetail?type=snd 통일
+        return f"https://www.lotteon.com/p/order/claim/giftBoxDetail?odNo={ord_no}&type=snd"
     if s == "SSG":
         return f"https://pay.ssg.com/myssg/orderInfoDetail.ssg?orordNo={ord_no}"
     if s == "ABCMART":
@@ -365,14 +367,37 @@ async def enqueue_for_order(order_id: str, *, force: bool = False) -> dict[str, 
                 }
         else:
             # 기존 PENDING/DISPATCHED 잡을 FAILED 로 닫고 신규 잡 생성 — 중복 누적 방지
+            # PENDING 만 만료 — DISPATCHED(확장앱이 이미 받아 처리 중)는 보호해서 끝까지 처리.
+            # 무신사 잡은 직렬화 + SPA 응답 60~120초 걸리므로 진행 중 잡 닫으면 결과 손실.
+            # 사용자가 송장수집 빠르게 다시 누를 때 진행 중 잡까지 만료되던 회귀 차단.
             stale_stmt = select(SambaTrackingSyncJob).where(
                 SambaTrackingSyncJob.order_id == order_id,
-                SambaTrackingSyncJob.status.in_([STATUS_PENDING, STATUS_DISPATCHED]),
+                SambaTrackingSyncJob.status == STATUS_PENDING,
             )
+            stale_existed = False
             for stale in (await session.execute(stale_stmt)).scalars().all():
                 stale.status = STATUS_FAILED
                 stale.last_error = "강제 재큐잉으로 만료 처리"
                 stale.updated_at = datetime.now(_UTC)
+                stale_existed = True
+            # DISPATCHED 잡이 이미 있으면 중복 큐잉 안 함 (진행 중 보호)
+            dispatched_stmt = (
+                select(SambaTrackingSyncJob)
+                .where(
+                    SambaTrackingSyncJob.order_id == order_id,
+                    SambaTrackingSyncJob.status == STATUS_DISPATCHED,
+                )
+                .limit(1)
+            )
+            dispatched = (await session.execute(dispatched_stmt)).scalars().first()
+            if dispatched:
+                return {
+                    "success": True,
+                    "skipped": True,
+                    "reason": "이미 처리 중인 잡이 있어 강제 재큐잉 스킵",
+                    "jobId": dispatched.id,
+                }
+            _ = stale_existed  # 컨벤션 유지용
 
         # owner_device_id 미사용 — 어느 PC가 폴링하든 잡을 가져갈 수 있게 None 으로 적재.
         # 확장앱이 받아 현재 로그인 계정으로 시도 → 다른 계정 주문이면 패스(NO_TRACKING).
@@ -392,7 +417,7 @@ async def enqueue_for_order(order_id: str, *, force: bool = False) -> dict[str, 
         except ValueError as exc:
             return {"success": False, "error": str(exc)}
 
-        request_id, _future = SourcingQueue.add_tracking_job(
+        request_id, _future = await SourcingQueue.add_tracking_job(
             site=actual_site,
             url=url,
             order_id=order.id,
@@ -486,7 +511,13 @@ async def enqueue_pending_orders(
                 ~SambaOrder.status.in_(EXCLUDED_ORDER_STATUSES),
                 ~action_tag_expr.like("%,kkadaegi,%"),
             )
-            .order_by(date_col.desc())
+            # 계정별 그룹화 적재 — 확장앱이 같은 계정 잡을 연속으로 받게 해서
+            # ensureLoggedIn 자동 스왑 횟수를 "계정 수"만큼만 발생시킨다.
+            # NULLS LAST 로 계정 미지정 잡은 뒤로 밀어둠.
+            .order_by(
+                SambaOrder.sourcing_account_id.asc().nulls_last(),
+                date_col.desc(),
+            )
             .limit(limit)
         )
         for kw in SHIPPED_SHIPPING_STATUS_KEYWORDS:
@@ -519,6 +550,75 @@ async def enqueue_pending_orders(
     )
     return {
         "success": True,
+        "queued": queued,
+        "skipped": skipped,
+        "errors": errors[:20],
+        "job_ids": job_ids,
+    }
+
+
+async def retry_failed_jobs(
+    tenant_id: Optional[str] = None,
+    days: int = 7,
+) -> dict[str, Any]:
+    """WRONG_ACCOUNT / FAILED / DISPATCH_FAILED 잡들을 재큐잉.
+
+    enqueue_pending_orders 와 다른 점:
+    - 송장 미입력 주문이 아니라 "송장 잡이 실패 상태" 인 주문만 대상
+    - SCRAPED 상태 잡은 dispatch_pending_to_market 로 별도 처리
+    """
+    from sqlalchemy import select as sa_select
+
+    retry_target_statuses = [
+        STATUS_WRONG_ACCOUNT,
+        STATUS_FAILED,
+        STATUS_DISPATCH_FAILED,
+    ]
+
+    _KST = timezone(timedelta(hours=9))
+    _today_kst = datetime.now(_KST).replace(hour=0, minute=0, second=0, microsecond=0)
+    since = (_today_kst - timedelta(days=days - 1)).astimezone(_UTC)
+
+    queued = 0
+    skipped = 0
+    errors: list[str] = []
+    job_ids: list[str] = []
+
+    async with get_write_session() as session:
+        stmt = (
+            sa_select(SambaTrackingSyncJob.order_id)
+            .where(
+                SambaTrackingSyncJob.status.in_(retry_target_statuses),
+                SambaTrackingSyncJob.created_at >= since,
+            )
+            .distinct()
+        )
+        if tenant_id:
+            stmt = stmt.where(SambaTrackingSyncJob.tenant_id == tenant_id)
+        order_ids = [row[0] for row in (await session.execute(stmt)).all()]
+
+    for order_id in order_ids:
+        try:
+            res = await enqueue_for_order(order_id, force=True)
+            jid = res.get("jobId")
+            if jid:
+                job_ids.append(jid)
+            if res.get("skipped"):
+                skipped += 1
+            elif res.get("success"):
+                queued += 1
+            else:
+                errors.append(f"{order_id}: {res.get('error')}")
+        except Exception as exc:
+            errors.append(f"{order_id}: {exc}")
+
+    logger.info(
+        f"[송장동기화] 실패 재수집: target={len(order_ids)} queued={queued} "
+        f"skipped={skipped} errors={len(errors)}"
+    )
+    return {
+        "success": True,
+        "target": len(order_ids),
         "queued": queued,
         "skipped": skipped,
         "errors": errors[:20],
@@ -566,6 +666,13 @@ async def apply_tracking_result(
             logger.warning(f"[송장동기화] request_id 매칭 실패: {request_id}")
             return {"success": False, "error": "잡을 찾을 수 없습니다"}
 
+        # 모달 닫기 등으로 이미 취소된 잡은 결과 폐기 — 상태 덮어쓰기 차단
+        if job.status == STATUS_CANCELLED:
+            logger.info(
+                f"[송장동기화] 취소된 잡 결과 폐기: request_id={request_id} job_id={job.id}"
+            )
+            return {"success": False, "status": STATUS_CANCELLED, "reason": "취소된 잡"}
+
         job.attempts = (job.attempts or 0) + 1
         job.updated_at = datetime.now(_UTC)
 
@@ -588,19 +695,85 @@ async def apply_tracking_result(
             return {"success": False, "status": job.status, "reason": "원주문 취소"}
 
         if not success or not tracking_number:
-            # 캡챠/미발송/실패 — 재시도 여지 두기
+            # 캡챠/미발송/계정불일치/실패 — 재시도 여지 두기
             reason = (error or "송장번호 없음")[:500]
             job.last_error = reason
+            reason_lc = reason.lower()
+            # 계정불일치 — 확장앱이 현재 로그인된 소싱처 계정으로 해당 주문 못 찾음
+            # 운영자가 해당 계정 PC에서 재시도하거나 다른 PC 폴링 대기 필요
             if (
-                "captcha" in reason.lower()
+                "wrong_account" in reason_lc
+                or "not_my_order" in reason_lc
+                or "account_mismatch" in reason_lc
+                or "계정불일치" in reason
+                or "다른 계정" in reason
+            ):
+                job.status = STATUS_WRONG_ACCOUNT
+                # 메시지 표준화 — 운영자가 모달에서 보고 즉시 매핑 확인 가능하게 명확화.
+                # [정책 2026-05-16] 자동 다른 계정 순회 안 함 (무신사 보안 차단 위험).
+                job.last_error = (
+                    "⚠ 계정불일치 — 등록된 소싱처 계정 매핑이 잘못됐을 가능성. "
+                    "운영자가 주문관리에서 진짜 무신사 계정 확인 후 sourcing_account_id 재매핑 필요."
+                )
+            elif (
+                "captcha" in reason_lc
                 or "미발송" in reason
-                or "no_tracking" in reason.lower()
+                or "배송대기" in reason
+                or "no_tracking" in reason_lc
             ):
                 job.status = STATUS_NO_TRACKING
+                # 메시지 표준화 — UI 오류/메모 컬럼에 "배송대기중" 같은 raw 에러 대신 명확한 한국어.
+                if "captcha" in reason_lc:
+                    job.last_error = "캡챠 발생 — 수동 처리 필요"
+                else:
+                    job.last_error = "미발송 — 소싱처 송장 미도착"
             else:
                 job.status = STATUS_FAILED
             session.add(job)
             await session.commit()
+
+            # [자동 재큐잉 2026-05-16] timeout/unexpected_page/abnormal_access 등 일시적 오류는
+            # 최대 3회까지 자동 재큐잉 (1시간 내 FAILED 카운트 기반). 무신사 SPA 가 산발적으로
+            # 응답 안 하거나 다른 페이지로 자동 리다이렉트되는 케이스 자동 복구.
+            # wrong_account 는 매핑 오류 가능성 커서 자동 재시도 제외 (운영자 매핑 확인 필요).
+            # 폭주 방지: 같은 order 의 1시간 이내 FAILED 잡이 3건 이상이면 재큐잉 차단.
+            _retryable = (
+                "timeout" in reason_lc
+                or "unexpected_page" in reason_lc
+                or "abnormal_access" in reason_lc
+                or "trace 페이지 진입" in reason
+            )
+            if job.status == STATUS_FAILED and _retryable:
+                from sqlalchemy import func as _func
+
+                _recent_failed_stmt = select(_func.count()).where(
+                    SambaTrackingSyncJob.order_id == job.order_id,
+                    SambaTrackingSyncJob.status == STATUS_FAILED,
+                    SambaTrackingSyncJob.created_at
+                    >= datetime.now(_UTC) - timedelta(hours=1),
+                )
+                async with get_write_session() as _retry_session:
+                    _failed_cnt = (
+                        await _retry_session.execute(_recent_failed_stmt)
+                    ).scalar() or 0
+
+                if _failed_cnt < 3:
+                    logger.info(
+                        f"[송장동기화] 자동 재큐잉 ({_failed_cnt}/3): "
+                        f"order={job.order_id} reason='{reason[:60]}'"
+                    )
+                    try:
+                        await enqueue_for_order(job.order_id, force=True)
+                    except Exception as exc:
+                        logger.warning(
+                            f"[송장동기화] 자동 재큐잉 실패: order={job.order_id} err={exc}"
+                        )
+                else:
+                    logger.warning(
+                        f"[송장동기화] 자동 재큐잉 차단 (1h 내 FAILED {_failed_cnt}회): "
+                        f"order={job.order_id} — 운영자 확인 필요"
+                    )
+
             return {"success": False, "status": job.status, "reason": reason}
 
         normalized_courier = normalize_courier_name(courier_name)
@@ -742,49 +915,20 @@ async def dispatch_to_market(
             await session.commit()
             return {"success": True, "dryRun": True, **result}
 
-        # 실전송 분기
+        # [통일 2026-05-16] 마켓별 분기 인라인 → dispatch_service.send_invoice_to_market 으로 이관.
+        # ship_order 라우터(수동)와 자동 dispatch 가 동일 service 사용 → 자격증명/필드 차이 사고 차단.
+        from backend.domain.samba.order.dispatch_service import send_invoice_to_market
+
         try:
-            if channel_source == "smartstore":
-                from backend.domain.samba.proxy.smartstore import SmartStoreClient
-
-                client = SmartStoreClient()
-                api_resp = await client.ship_product_order(
-                    product_order_id=order.ext_order_number or "",
-                    delivery_company=job.scraped_courier or "",
-                    tracking_number=job.scraped_tracking,
-                )
-                result["api"] = api_resp
-            elif channel_source == "coupang":
-                from backend.domain.samba.proxy.coupang import CoupangClient
-
-                client = CoupangClient()
-                # 쿠팡은 shipmentBoxId(int) + 코드(string) 사용 — order.ext_order_number에 박스ID 저장 가정
-                shipment_box_id = int(order.ext_order_number or 0)
-                api_resp = await client.update_shipping(
-                    shipment_box_id=shipment_box_id,
-                    delivery_company_code=job.scraped_courier or "",
-                    invoice_number=job.scraped_tracking,
-                )
-                result["api"] = api_resp
-            elif channel_source == "playauto":
-                api_resp = await _dispatch_playauto_invoice(order, job)
-                result["api"] = api_resp
-                if not api_resp.get("ok"):
-                    raise RuntimeError(
-                        api_resp.get("error") or "플레이오토 송장 전송 실패"
-                    )
-            elif channel_source == "lottehome":
-                api_resp = await _dispatch_lottehome_invoice(order, job)
-                result["api"] = api_resp
-                if not api_resp.get("ok"):
-                    raise RuntimeError(
-                        api_resp.get("error") or "롯데홈쇼핑 송장 전송 실패"
-                    )
-            else:
-                # 미지원 채널 — DISPATCH_FAILED 로 명시
-                raise RuntimeError(
-                    f"미지원 채널: {channel_source} (마켓 송장 전송 미구현)"
-                )
+            market_sent, market_msg = await send_invoice_to_market(
+                order,
+                job.scraped_courier or "",
+                job.scraped_tracking,
+                session,
+            )
+            result["api"] = {"market_sent": market_sent, "message": market_msg}
+            if not market_sent:
+                raise RuntimeError(market_msg or "마켓 송장 전송 실패")
 
             job.status = STATUS_SENT
             job.dispatched_to_market_at = datetime.now(_UTC)

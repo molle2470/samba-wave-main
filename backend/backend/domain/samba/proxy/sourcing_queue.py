@@ -17,7 +17,43 @@ from backend.shutdown_state import is_shutting_down
 from backend.utils.logger import logger
 
 _UTC = timezone.utc
-_JOB_TTL_SEC: dict[str, int] = {"search": 600, "detail": 180, "tracking": 3600}
+_JOB_TTL_SEC: dict[str, int] = {
+    "search": 600,
+    "detail": 180,
+    "tracking": 3600,
+    "reward": 3600,
+}
+
+# 적립 액션별 진입 URL — 확장앱이 잡 받으면 이 URL의 탭을 열고 content script 주입.
+REWARD_ACTION_URLS: dict[str, str] = {
+    "musinsa_attendance": "https://www.musinsa.com/events/attendance",
+    "musinsa_snap_like": "https://www.musinsa.com/mission?tab=snap-daily-like",
+    "musinsa_balance": "https://www.musinsa.com/mypage",
+    "musinsa_review": "https://www.musinsa.com/mypage/myreview",
+    "abcmart_attendance": "https://member.a-rt.com/p/attendance-check",
+    "abcmart_review": "https://abcmart.a-rt.com/mypage/claim/claim-order-main?orderPrdtStatCodeClick=10007",
+    "ssg_review": "https://www.ssg.com/myssg/activityMng/pdtEvalList.ssg?quick=pdtEvalList",
+    "gs_review": "https://www.gsshop.com/ord/dlvcursta/ordList.gs",
+    "lotteon_review": "https://www.lotteon.com/p/review/myLotte/reviewWriteListTab",
+    "naver_review": "https://shopping.naver.com/my/writable-reviews",
+    "kream_review": "https://kream.co.kr/my/reviews?tab=to_write",
+}
+
+# 사이트별 지원 액션 (자동 적립 매트릭스)
+SITE_REWARD_ACTIONS: dict[str, list[str]] = {
+    "MUSINSA": [
+        "musinsa_attendance",
+        "musinsa_snap_like",
+        "musinsa_balance",
+        "musinsa_review",
+    ],
+    "ABCmart": ["abcmart_attendance", "abcmart_review"],
+    "SSG": ["ssg_review"],
+    "GSShop": ["gs_review"],
+    "LOTTEON": ["lotteon_review"],
+    "NAVERSTORE": ["naver_review"],
+    "KREAM": ["kream_review"],
+}
 
 
 async def _db_insert_job(
@@ -248,7 +284,7 @@ class SourcingQueue:
         return request_id, future
 
     @classmethod
-    def add_tracking_job(
+    async def add_tracking_job(
         cls,
         site: str,
         url: str,
@@ -262,6 +298,10 @@ class SourcingQueue:
 
         결과는 별도 라우터 `/proxy/sourcing/tracking-result` 로 수신되어
         tracking_sync_service.apply_tracking_result()로 라우팅됨.
+
+        [통일 2026-05-16] async + await — 이전 asyncio.create_task background 로
+        N건 적재 시 INSERT 순서가 호출 순서와 달라져 created_at 뒤섞임 → ORDER BY
+        그룹화 깨지던 회귀 차단. 단건씩 sequential 적재로 같은 계정 잡 연속 보장.
         """
         cls._ensure_accepting_jobs()
         request_id = str(uuid.uuid4())[:8]
@@ -281,10 +321,58 @@ class SourcingQueue:
             "sourcingAccountId": sourcing_account_id or "",
         }
         cls.resolvers[request_id] = future
-        asyncio.create_task(_db_insert_job(job, "tracking"))
+        await _db_insert_job(job, "tracking")
         _owner_tag = f" owner={owner_device_id[:8]}" if owner_device_id else ""
         logger.info(
             f"[소싱큐] 송장조회 추가: {site} ord={sourcing_order_number} "
+            f"(id={request_id}){_owner_tag}"
+        )
+        return request_id, future
+
+    @classmethod
+    async def add_reward_job(
+        cls,
+        site: str,
+        action: str,
+        sourcing_account_id: str,
+        *,
+        owner_device_id: str | None = None,
+    ) -> tuple[str, asyncio.Future[Any]]:
+        """적립금 자동 적립 작업 큐에 추가.
+
+        action: 'musinsa_attendance' | 'musinsa_snap_like' | 'musinsa_balance' | 'abcmart_attendance'
+        결과는 라우터 `/sourcing-accounts/extension/reward-result` 로 수신되어
+        `additional_fields.last_{action}_at` / balance 갱신에 사용된다.
+
+        송장조회와 동일하게 sequential 적재로 같은 계정 잡 연속 처리 보장.
+        """
+        cls._ensure_accepting_jobs()
+        url = REWARD_ACTION_URLS.get(action)
+        if not url:
+            raise ValueError(f"지원하지 않는 적립 액션: {action}")
+        request_id = str(uuid.uuid4())[:8]
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+        if owner_device_id is None:
+            owner_device_id = get_autotune_owner(site)
+        # reward 잡은 owner 안 박음 — 대신 get_next_job 에서 X-Ext-Version 헤더로
+        # 옛 확장앱(reward 분기 모름) 필터링. "가장 최근 폴링 PC = 사용자 PC" 가정은
+        # 멀티PC 환경에서 다른 PC가 폴링 더 자주 하면 깨짐 → 검증 실패.
+
+        job: dict[str, Any] = {
+            "requestId": request_id,
+            "site": site,
+            "type": "reward",
+            "action": action,
+            "url": url,
+            "sourcingAccountId": sourcing_account_id,
+            "ownerDeviceId": owner_device_id or "",
+        }
+        cls.resolvers[request_id] = future
+        await _db_insert_job(job, "reward")
+        _owner_tag = f" owner={owner_device_id[:8]}" if owner_device_id else ""
+        logger.info(
+            f"[소싱큐] 적립 추가: {site} action={action} acct={sourcing_account_id} "
             f"(id={request_id}){_owner_tag}"
         )
         return request_id, future
@@ -294,6 +382,7 @@ class SourcingQueue:
         cls,
         device_id: str | None = None,
         allowed_sites: list[str] | None = None,
+        ext_version: str | None = None,
     ) -> dict[str, Any]:
         """DB에서 다음 작업 가져오기 (확장앱 폴링용).
 
@@ -304,6 +393,8 @@ class SourcingQueue:
           - None  = 전체 처리 (단일 PC 디폴트)
           - []    = 아무것도 처리 안 함
           - [...] = 해당 사이트만
+        ext_version: 확장앱 버전. reward 잡은 v2.13.27 미만 PC에 안 줌
+          (옛 PC는 reward 분기 모름 → '파싱 실패' 반환 회피).
         """
         if is_shutting_down():
             return {"hasJob": False, "shuttingDown": True}
@@ -322,6 +413,19 @@ class SourcingQueue:
                 "expires_at > now()",
             ]
             params: dict[str, Any] = {}
+
+            # reward 잡은 v2.13.27+ 확장앱만 처리 — 옛 확장앱은 type=reward 분기 코드
+            # 자체가 없어서 일반 가격수집 잡으로 잘못 라우팅 → '파싱 실패' 사고
+            def _ver_tuple(v: str) -> tuple[int, ...]:
+                try:
+                    return tuple(int(x) for x in v.split(".") if x.isdigit())
+                except Exception:
+                    return (0, 0, 0)
+
+            min_reward_ver = (2, 13, 27)
+            client_ver = _ver_tuple(ext_version or "")
+            if client_ver < min_reward_ver:
+                conditions.append("job_type != 'reward'")
 
             # owner 필터
             if device_id:
@@ -342,10 +446,18 @@ class SourcingQueue:
                     params[f"site_{i}"] = s
 
             where = " AND ".join(conditions)
+            # [중요] sourcing_account_id 우선 정렬 — 같은 계정 잡을 연속으로 dequeue 해서
+            # 자동 로그인 스왑 횟수 최소화. 송장수집 자동 로그아웃 → 로그인 후 같은 계정
+            # 잡들을 한 번에 처리하는 흐름 보장. (payload->>'sourcingAccountId' JSONB 접근)
+            # NULL 또는 빈 값은 가장 뒤로 (NULLS LAST).
+            # 같은 계정 안에서는 created_at ASC 로 FIFO.
             sql = text(
                 f"SELECT request_id, payload FROM samba_sourcing_job "
                 f"WHERE {where} "
-                f"ORDER BY created_at ASC LIMIT 1 "
+                f"ORDER BY "
+                f"  NULLIF(payload->>'sourcingAccountId', '') ASC NULLS LAST, "
+                f"  created_at ASC "
+                f"LIMIT 1 "
                 f"FOR UPDATE SKIP LOCKED"
             )
 
@@ -355,13 +467,16 @@ class SourcingQueue:
                     return {"hasJob": False}
 
                 request_id, payload = row
+                # owner_device_id가 NULL/빈 잡(reward 등)은 클레이밍 device_id를 기록 —
+                # 어느 PC가 잡 가져갔는지 추적용. 기존 소유자 잡은 owner 유지.
                 await session.execute(
                     text(
                         "UPDATE samba_sourcing_job "
-                        "SET status = 'dispatched', dispatched_at = now() "
+                        "SET status = 'dispatched', dispatched_at = now(), "
+                        "    owner_device_id = COALESCE(NULLIF(owner_device_id, ''), :did) "
                         "WHERE request_id = :rid"
                     ),
-                    {"rid": request_id},
+                    {"rid": request_id, "did": device_id or None},
                 )
                 await session.commit()
 

@@ -98,7 +98,13 @@ class SambaTetrisService:
         brand_name: str,
         market_account_id: str,
     ) -> list[str]:
-        """해당 브랜드 상품 중 해당 계정에 미등록된 상품 ID 목록 반환."""
+        """해당 브랜드 상품 중 해당 계정에 미등록된 상품 ID 목록 반환.
+
+        안전망: 동일 (cp, account) 전송 실패가 3회 이상 누적된 상품은 제외.
+        plugin 응답 추출 실패로 A칸(registered_accounts) 동기화가 깨져 무한 재등록
+        도는 사고 방지 (issue #187 — 같은 cp가 마켓에 N번 중복 등록되는 케이스).
+        failure_count는 전송 성공 시 sent_snapshot 덮어쓰기로 자동 클리어됨.
+        """
         rows = await self._session.execute(
             text("""
                 SELECT id FROM samba_collected_product
@@ -109,6 +115,10 @@ class SambaTetrisService:
                     registered_accounts IS NULL
                     OR NOT (registered_accounts::jsonb ? :account_id)
                   )
+                  AND COALESCE(
+                    (last_sent_data -> :account_id ->> 'failure_count')::int,
+                    0
+                  ) < 3
             """),
             {
                 "tid": tenant_id,

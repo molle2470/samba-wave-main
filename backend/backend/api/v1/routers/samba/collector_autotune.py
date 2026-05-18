@@ -88,6 +88,14 @@ _pending_cost_increase: dict[str, float] = {}
 SITE_EMPTY_SKIP_THRESHOLD = 3  # N회 연속 빈 결과 시 해당 소싱처 60초 제외
 _site_empty_skip_until: dict[str, float] = {}  # {소싱처: 제외 해제 시각(time.time())}
 
+# 오토튠 진행도 글로벌 카운터 — 로그 [n/total] 표시용
+# 사이클당 200건 배치이지만, 분자/분모는 "이번 회전의 전체 대상" 기준으로 누적 표시.
+# 한 바퀴 회전(분자 ≥ 분모) 시 0부터 다시 시작.
+_autotune_global_idx: dict[tuple[str, str], int] = {}  # (device_id, site) → 처리누계
+_autotune_global_total: dict[
+    tuple[str, str], int
+] = {}  # (device_id, site) → 전체 대상수
+
 # Watchdog
 STUCK_TIMEOUT_SECONDS = 300  # 5분간 heartbeat 없으면 stuck 판정
 MAX_RESTART_COUNT = 50  # 코디네이터 재시작 상한선
@@ -580,12 +588,29 @@ async def _site_autotune_loop(device_id: str, site: str):
 
                     if products:
                         filtered_count = len(products)
+                        # 진행도 표시용 전체 대상 COUNT — 같은 WHERE 사용 (판매처 필터 SQL 미적용분은 분모가 약간 클 수 있음)
+                        try:
+                            _count_stmt = (
+                                select(func.count()).select_from(_CP).where(*_where)
+                            )
+                            _total_global_res = await session.execute(_count_stmt)
+                            _total_global = int(_total_global_res.scalar() or 0)
+                        except Exception:
+                            _total_global = filtered_count
+                        _gkey = (device_id, site)
+                        # 한 바퀴 회전 완료(분자 ≥ 분모) 또는 분모 변동 시 0부터 재시작
+                        _prev_idx = _autotune_global_idx.get(_gkey, 0)
+                        if _prev_idx >= _total_global or _total_global <= 0:
+                            _autotune_global_idx[_gkey] = 0
+                        _autotune_global_total[_gkey] = _total_global
                         log.info(
-                            "[오토튠][디버그][%s][%s] 사이클 #%d SELECT 완료: %d건 대상 (elapsed=%.1fs)",
+                            "[오토튠][디버그][%s][%s] 사이클 #%d SELECT 완료: %d건 대상 / 전체 %d건 (진행 %d) (elapsed=%.1fs)",
                             device_id[:8],
                             site,
                             _cycle_seq,
                             filtered_count,
+                            _total_global,
+                            _autotune_global_idx.get(_gkey, 0),
                             time.time() - _cycle_started_ts,
                         )
 
@@ -831,8 +856,18 @@ async def _site_autotune_loop(device_id: str, site: str):
                                     if _site_pid
                                     else _name_part
                                 )
+                                # 진행도 표시 — 사이클 배치(200) 기준이 아닌 "전체 대상" 누계 기준
+                                _autotune_global_idx[_gkey] = (
+                                    _autotune_global_idx.get(_gkey, 0) + 1
+                                )
+                                _g_idx = _autotune_global_idx[_gkey]
+                                _g_total = _autotune_global_total.get(_gkey, 0)
                                 _idx_prefix = (
-                                    f"[{idx:,}/{total:,}] " if idx and total else ""
+                                    f"[{_g_idx:,}/{_g_total:,}] "
+                                    if _g_idx and _g_total
+                                    else (
+                                        f"[{idx:,}/{total:,}] " if idx and total else ""
+                                    )
                                 )
 
                                 # 원가: 항상 최신 계산값 사용

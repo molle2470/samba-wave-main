@@ -932,40 +932,32 @@ async def dashboard_stats(
         else:
             reg_count_map[d_str] = max(running, 0)
 
-    # 일별 누적 수집상품수
-    #   - 오늘: 현재 시점 전체 수집상품수
-    #   - 과거 6일: 해당일 24시(KST) 기준 누적 카운트 = count(*) WHERE created_at < (해당일+1일 00시 KST)
-    collected_total_q = select(func.count(SambaCollectedProduct.id))
+    # 일별 신규 수집상품수 (그 날 created_at 으로 들어온 행의 개수, 누적 아님)
+    # 기존 누적 카운트(매일 거의 동일한 값)를 GROUP BY 1쿼리 일별 신규로 교체.
+    # 7번 풀스캔 → 1번 범위 스캔으로 응답시간 단축.
+    created_kst = SambaCollectedProduct.created_at + text("INTERVAL '9 hours'")
+    collected_daily_q = (
+        select(
+            func.date(created_kst).label("day"),
+            func.count().label("cnt"),
+        )
+        .where(
+            SambaCollectedProduct.created_at != None,  # noqa: E711
+            created_kst >= week_ago,
+        )
+        .group_by(func.date(created_kst))
+    )
     if tenant_id is not None:
-        collected_total_q = collected_total_q.where(
+        collected_daily_q = collected_daily_q.where(
             or_(
                 SambaCollectedProduct.tenant_id == tenant_id,
                 SambaCollectedProduct.tenant_id == None,  # noqa: E711
             )
         )
-    collected_total = int((await session.execute(collected_total_q)).scalar() or 0)
-
-    collected_count_map: dict[str, int] = {today_str: collected_total}
-
-    # 해당일 24시(KST) = created_at(KST) < 다음날 00시(KST) = created_at + 9h < 다음날 00시
-    created_kst = SambaCollectedProduct.created_at + text("INTERVAL '9 hours'")
-    for i in range(6):
-        d_str = past_dates[i]
-        next_day_str = (week_ago + timedelta(days=i + 1)).strftime("%Y-%m-%d")
-        cutoff_q = select(func.count(SambaCollectedProduct.id)).where(
-            SambaCollectedProduct.created_at != None,  # noqa: E711
-            created_kst < text(f"TIMESTAMP '{next_day_str} 00:00:00'"),
-        )
-        if tenant_id is not None:
-            cutoff_q = cutoff_q.where(
-                or_(
-                    SambaCollectedProduct.tenant_id == tenant_id,
-                    SambaCollectedProduct.tenant_id == None,  # noqa: E711
-                )
-            )
-        collected_count_map[d_str] = int(
-            (await session.execute(cutoff_q)).scalar() or 0
-        )
+    collected_rows = (await session.execute(collected_daily_q)).all()
+    collected_count_map: dict[str, int] = {
+        str(r.day): int(r.cnt) for r in collected_rows
+    }
 
     for w in weekly:
         w["newRegistered"] = int(new_reg_map.get(w["date"], 0))
@@ -1005,7 +997,9 @@ async def dashboard_stats(
         "monthly": monthly,
         "marketRegisteredCount": int(market_registered_count),
     }
-    await cache.set(_cache_key, result, ttl=60)
+    # 캐시 TTL 5분 — 첫 로드는 무거우나 후속 로드는 즉시. 매출 집계는 1분 단위
+    # 변화 의미 없고, 매 새로고침마다 풀스캔 도는 게 더 큰 비용.
+    await cache.set(_cache_key, result, ttl=300)
     return result
 
 
@@ -1309,6 +1303,23 @@ async def dispatch_tracking_bulk(dry_run: bool = False) -> dict:
     return await dispatch_pending_to_market(dry_run=dry_run)
 
 
+@router.post("/tracking-sync/retry-failed")
+async def retry_failed_tracking_jobs(
+    days: int = 7,
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
+) -> dict:
+    """WRONG_ACCOUNT / FAILED / DISPATCH_FAILED 잡들을 자동 재큐잉.
+
+    송장수집이 실패한 주문들만 모아서 다시 자동 로그인 + 송장 추출 시도.
+    송장 미입력 주문 전체 재큐잉(sync-tracking/bulk)과 다른 점:
+    - 미발송으로 끝난 잡은 제외 (실패한 것만)
+    - 한 번에 빠르게 retry 트리거 가능
+    """
+    from backend.domain.samba.tracking_sync.service import retry_failed_jobs
+
+    return await retry_failed_jobs(tenant_id=tenant_id, days=days)
+
+
 @router.post("/tracking-sync/{job_id}/dispatch")
 async def dispatch_tracking_to_market(job_id: str, dry_run: bool = False) -> dict:
     """추출 완료된(SCRAPED) 잡의 운송장을 마켓으로 push.
@@ -1542,6 +1553,51 @@ async def list_tracking_sync_jobs_by_ids(body: dict) -> dict:
     return {"counts": counts, "recent": items}
 
 
+@router.post("/tracking-sync/cancel-batch")
+async def cancel_tracking_sync_batch(body: dict) -> dict:
+    """송장수집 모달 닫기 시 배치 잡 일괄 취소.
+
+    PENDING/DISPATCHED 상태의 잡만 CANCELLED 로 전환. 이미 SCRAPED/SENT 등
+    완료된 잡은 변경 안 함 (결과 보존). 확장앱이 in-flight 로 들고 있는 잡은
+    apply_tracking_result 진입 시 상태가 CANCELLED 면 결과 폐기.
+    """
+    from sqlalchemy import update
+    from datetime import datetime, timezone
+    from backend.db.orm import get_write_session
+    from backend.domain.samba.tracking_sync.model import (
+        SambaTrackingSyncJob,
+        STATUS_PENDING,
+        STATUS_DISPATCHED,
+        STATUS_CANCELLED,
+    )
+
+    raw_ids = body.get("job_ids") or []
+    if not isinstance(raw_ids, list):
+        raise HTTPException(400, "job_ids 는 배열이어야 합니다")
+    job_ids: list[str] = [str(x) for x in raw_ids if x]
+    if not job_ids:
+        return {"cancelled": 0}
+    if len(job_ids) > 1000:
+        job_ids = job_ids[:1000]
+
+    async with get_write_session() as session:
+        stmt = (
+            update(SambaTrackingSyncJob)
+            .where(
+                SambaTrackingSyncJob.id.in_(job_ids),
+                SambaTrackingSyncJob.status.in_([STATUS_PENDING, STATUS_DISPATCHED]),
+            )
+            .values(
+                status=STATUS_CANCELLED,
+                last_error="모달 닫기로 배치 취소",
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        result = await session.execute(stmt)
+        await session.commit()
+        return {"cancelled": result.rowcount or 0}
+
+
 @router.get("/cancel-alert-count")
 async def get_cancel_alert_count(
     session: AsyncSession = Depends(get_read_session_dependency),
@@ -1599,6 +1655,39 @@ async def save_alarm_settings(
         },
     )
     return {"ok": True}
+
+
+@router.get("/auto-sync-interval")
+async def get_auto_sync_interval(
+    session: AsyncSession = Depends(get_read_session_dependency),
+) -> dict:
+    """주문 자동수집 인터벌 설정 조회 (분 단위, 0=OFF)."""
+    from backend.api.v1.routers.samba.proxy import _get_setting
+
+    val = await _get_setting(session, "order_auto_sync_interval_minutes")
+    try:
+        minutes = int(val) if val is not None else 0
+    except (TypeError, ValueError):
+        minutes = 0
+    return {"interval_minutes": minutes}
+
+
+@router.post("/auto-sync-interval")
+async def set_auto_sync_interval(
+    body: dict,
+    session: AsyncSession = Depends(get_write_session_dependency),
+) -> dict:
+    """주문 자동수집 인터벌 설정 저장 (분 단위, 0 이하면 OFF)."""
+    from backend.api.v1.routers.samba.proxy import _set_setting
+
+    try:
+        minutes = int(body.get("interval_minutes", 0))
+    except (TypeError, ValueError):
+        minutes = 0
+    if minutes < 0:
+        minutes = 0
+    await _set_setting(session, "order_auto_sync_interval_minutes", minutes)
+    return {"interval_minutes": minutes}
 
 
 @router.get("/{order_id}", response_model=SambaOrder)
@@ -3108,215 +3197,21 @@ async def ship_order(
         },
     )
 
-    # 마켓 송장 전송
-    market_sent = False
-    market_msg = ""
+    # 마켓 송장 전송 — 통일 service (자동 dispatch_to_market 도 같은 함수 호출).
+    # [통일 2026-05-16] 이전엔 이곳과 dispatch_to_market 가 마켓별 분기를 중복 구현 →
+    # 자동 dispatch 가 자격증명 누락/필드 차이로 실패하던 회귀 차단. 단일 진실의 출처.
+    from backend.domain.samba.order.dispatch_service import send_invoice_to_market
 
-    try:
-        if order.channel_id and order.order_number:
-            from backend.domain.samba.account.repository import (
-                SambaMarketAccountRepository,
-            )
+    market_sent, market_msg = await send_invoice_to_market(
+        order, body.shipping_company, body.tracking_number, session
+    )
 
-            account_repo = SambaMarketAccountRepository(session)
-            account = await account_repo.get_async(order.channel_id)
-
-            if account and account.market_type == "lotteon":
-                from backend.domain.samba.proxy.lotteon import LotteonClient
-                from backend.domain.samba.forbidden.repository import (
-                    SambaSettingsRepository,
-                )
-
-                lo_api_key = (
-                    (account.additional_fields or {}).get("apiKey", "")
-                    or account.api_key
-                    or ""
-                )
-                if not lo_api_key:
-                    _lo_repo = SambaSettingsRepository(session)
-                    _lo_row = await _lo_repo.find_by_async(key="store_lotteon")
-                    if _lo_row and isinstance(_lo_row.value, dict):
-                        lo_api_key = _lo_row.value.get("apiKey", "")
-                if lo_api_key:
-                    client = LotteonClient(lo_api_key)
-                    await client.test_auth()
-                    sent = await client.ship_order(
-                        od_no=order.od_no or order.order_number,
-                        od_seq=order.od_seq or "1",
-                        proc_seq=order.proc_seq or "1",
-                        sitm_no=order.sitm_no or order.shipment_id or "",
-                        spd_no=order.product_id or "",
-                        quantity=order.quantity or 1,
-                        shipping_company=body.shipping_company,
-                        tracking_number=body.tracking_number,
-                    )
-                    if sent:
-                        market_sent = True
-                        market_msg = "롯데ON 송장 등록 완료"
-                        await svc.update_order(
-                            order_id,
-                            {"shipping_status": "송장전송완료", "status": "shipping"},
-                        )
-                    else:
-                        market_msg = "롯데ON 송장 등록 실패 (로그 확인)"
-
-            elif account and account.market_type == "smartstore":
-                from backend.domain.samba.proxy.smartstore import SmartStoreClient
-                from backend.domain.samba.forbidden.repository import (
-                    SambaSettingsRepository,
-                )
-
-                _ss_extras = account.additional_fields or {}
-                ss_client_id = _ss_extras.get("clientId", "") or account.api_key or ""
-                ss_client_secret = (
-                    _ss_extras.get("clientSecret", "") or account.api_secret or ""
-                )
-                if not ss_client_id or not ss_client_secret:
-                    _ss_repo = SambaSettingsRepository(session)
-                    _ss_row = await _ss_repo.find_by_async(key="store_smartstore")
-                    if _ss_row and isinstance(_ss_row.value, dict):
-                        ss_client_id = ss_client_id or _ss_row.value.get("clientId", "")
-                        ss_client_secret = ss_client_secret or _ss_row.value.get(
-                            "clientSecret", ""
-                        )
-                if ss_client_id and ss_client_secret:
-                    client = SmartStoreClient(ss_client_id, ss_client_secret)
-                    await client.ship_product_order(
-                        order.order_number,
-                        body.shipping_company,
-                        body.tracking_number,
-                    )
-                    market_sent = True
-                    market_msg = "스마트스토어 송장 전송 완료"
-                    await svc.update_order(
-                        order_id, {"shipping_status": "송장전송완료"}
-                    )
-
-            elif account and account.market_type == "11st":
-                from backend.domain.samba.proxy.elevenst import (
-                    ElevenstClient,
-                )
-
-                _CARRIER_MAP = {
-                    "CJ대한통운": "00034",
-                    "대한통운": "00034",
-                    "롯데택배": "00012",
-                    "한진택배": "00011",
-                    "우체국택배": "00002",
-                    "로젠택배": "00017",
-                    "GS포스트박스": "00015",
-                    "경동택배": "00004",
-                    "합동택배": "00005",
-                    "딜리박스": "00133",
-                    # 직접배송 → 11번가는 dlvMthdCd=03 (직접/화물배달) 사용, 택배사 코드는 기타(00099)
-                    "직접배송": "00099",
-                    "직접 배송": "00099",
-                }
-                api_key = account.api_key or ""
-                if not api_key and isinstance(account.additional_fields, dict):
-                    api_key = account.additional_fields.get("apiKey", "") or ""
-
-                if not api_key:
-                    market_msg = "11번가 API Key가 없습니다. 설정을 확인해주세요."
-                else:
-                    dlv_no = order.shipment_id or ""
-                    if not dlv_no:
-                        market_msg = "배송번호(dlvNo)가 없습니다. 주문을 다시 수집 후 시도해주세요."
-                    else:
-                        dlv_etprs_cd = _CARRIER_MAP.get(
-                            body.shipping_company, body.shipping_company
-                        )
-                        # 직접배송 선택 시 배송방식 03(직접/화물배달), 그 외 01(택배)
-                        _is_direct = (body.shipping_company or "").replace(
-                            " ", ""
-                        ) == "직접배송"
-                        _11st_client = ElevenstClient(api_key)
-                        sent = await _11st_client.ship_order(
-                            dlv_no=dlv_no,
-                            invc_no=body.tracking_number,
-                            dlv_etprs_cd=dlv_etprs_cd,
-                            dlv_mthd_cd="03" if _is_direct else "01",
-                        )
-                        if sent:
-                            market_sent = True
-                            market_msg = "11번가 송장 전송 완료"
-                            await svc.update_order(
-                                order_id,
-                                {
-                                    "shipping_status": "송장전송완료",
-                                    "status": "shipping",
-                                },
-                            )
-                        else:
-                            market_msg = "11번가 송장 전송 실패 (로그 확인)"
-
-            elif account and account.market_type == "ebay":
-                from backend.domain.samba.proxy.ebay import (
-                    EbayApiError,
-                    EbayClient,
-                )
-
-                extras = account.additional_fields or {}
-                app_id = (
-                    extras.get("clientId")
-                    or extras.get("appId")
-                    or account.api_key
-                    or ""
-                )
-                cert_id = (
-                    extras.get("clientSecret")
-                    or extras.get("certId")
-                    or account.api_secret
-                    or ""
-                )
-                refresh_token = (
-                    extras.get("oauthToken") or extras.get("authToken", "") or ""
-                )
-                if app_id and cert_id and refresh_token:
-                    ebay_client = EbayClient(
-                        app_id=app_id,
-                        dev_id="",
-                        cert_id=cert_id,
-                        refresh_token=refresh_token,
-                        sandbox=bool(extras.get("sandbox", False)),
-                    )
-                    # 배송사 한글→eBay carrier code 매핑
-                    # eBay US는 한국 택배사 미지원 — 전부 KoreaPost로 매핑
-                    # (USPS/UPS/FedEx/DHL만 공식 지원, 한국 택배사는 KoreaPost가 유일)
-                    carrier_map = {
-                        "USPS": "USPS",
-                        "UPS": "UPS",
-                        "FedEx": "FEDEX",
-                        "DHL": "DHL",
-                    }
-                    ebay_carrier = carrier_map.get(body.shipping_company, "KoreaPost")
-                    try:
-                        # ext_order_number에 orderId, order_number에 legacyOrderId
-                        ebay_order_id = order.ext_order_number or order.order_number
-                        await ebay_client.ship_order(
-                            order_id=ebay_order_id,
-                            tracking_number=body.tracking_number,
-                            carrier_code=ebay_carrier,
-                        )
-                        market_sent = True
-                        market_msg = "eBay 송장 전송 완료"
-                        await svc.update_order(
-                            order_id,
-                            {
-                                "shipping_status": "송장전송완료",
-                                "status": "shipping",
-                            },
-                        )
-                    except EbayApiError as e:
-                        market_msg = f"eBay 송장 실패: {e}"
-
-            elif account and account.market_type == "playauto":
-                # 플레이오토 주문은 마켓 전송 없이 DB 저장만 수행 (사용자 요청)
-                # 실제 마켓(스스/11번가/쿠팡 등) 송장 입력은 플레이오토 원본 마켓 측에서 별도 처리
-                market_msg = "플레이오토 주문 — 송장번호 저장만 완료 (마켓 전송 생략)"
-    except Exception as e:
-        market_msg = f"송장 전송 실패: {e}"
-        logger.warning(f"[송장전송] {order.order_number}: {e}")
+    # 마켓 송장 전송 성공 시 status를 '국내배송중'으로 일괄 변경
+    if market_sent:
+        await svc.update_order(
+            order_id,
+            {"shipping_status": "송장전송완료", "status": "shipping"},
+        )
 
     return {
         "ok": True,
@@ -3679,6 +3574,10 @@ async def sync_orders_from_markets(
         seller_id = account["seller_id"]
         label = f"{account['market_name']}({seller_id})"
 
+        # 마켓 클라이언트들의 httpx keepalive 좀비 차단 — 매 계정 처리 후 명시적 aclose.
+        # 미회수 시 hang 한 번에 다음 계정·다른 마켓 호출까지 영향(2026-05-15 사고).
+        _clients_to_close: list[Any] = []
+
         try:
             orders_data: list[dict[str, Any]] = []
             unconfirmed_ids: list[str] = []
@@ -3705,6 +3604,7 @@ async def sync_orders_from_markets(
                     )
                     continue
                 client = SmartStoreClient(client_id, client_secret)
+                _clients_to_close.append(client)
                 raw_orders = _raw_cache.get(account["id"])
                 if raw_orders is None:
                     raw_orders = await client.get_orders(days=body.days)
@@ -3821,6 +3721,7 @@ async def sync_orders_from_markets(
                     )
                     continue
                 lotteon_client = LotteonClient(api_key)
+                _clients_to_close.append(lotteon_client)
                 await lotteon_client.test_auth()
                 raw_orders = _raw_cache.get(account["id"])
                 if raw_orders is None:
@@ -4370,6 +4271,7 @@ async def sync_orders_from_markets(
                 )
                 _has_lottehome = _lottehome_row.first() is not None
                 pa_client = PlayAutoClient(api_key)
+                _clients_to_close.append(pa_client)
                 try:
                     start_date = (
                         datetime.now(UTC) - timedelta(days=body.days)
@@ -4444,6 +4346,7 @@ async def sync_orders_from_markets(
                     continue
 
                 client = CoupangClient(access_key, secret_key, vendor_id)
+                _clients_to_close.append(client)
                 try:
                     raw_orders = _raw_cache.get(account["id"])
                     if raw_orders is None:
@@ -4528,6 +4431,7 @@ async def sync_orders_from_markets(
                     continue
 
                 _11st_client = ElevenstClient(api_key)
+                _clients_to_close.append(_11st_client)
                 _confirm_targets: list[dict[str, str]] = []
                 _confirmed = 0
                 _fmt = "%Y%m%d%H%M"
@@ -4648,6 +4552,7 @@ async def sync_orders_from_markets(
                     )
 
                     _exchange_client = ElevenstExchangeClient(api_key)
+                    _clients_to_close.append(_exchange_client)
                     (
                         _cancel_claims,
                         _return_claims,
@@ -4788,6 +4693,7 @@ async def sync_orders_from_markets(
                     refresh_token=refresh_token,
                     sandbox=bool(extras.get("sandbox", False)),
                 )
+                _clients_to_close.append(ebay_client)
                 raw_orders = _raw_cache.get(account["id"])
                 if raw_orders is None:
                     try:
@@ -4957,6 +4863,7 @@ async def sync_orders_from_markets(
                     continue
 
                 _ssg_client = SSGClient(_ssg_api_key)
+                _clients_to_close.append(_ssg_client)
                 # 정산 API 호출: (ordNo, ordItemSeq) → settIAmt(정산금액), sellFeeRt(수수료율)
                 _ssg_settle_map: dict[str, dict] = {}
                 try:
@@ -5044,6 +4951,7 @@ async def sync_orders_from_markets(
 
                 await session.commit()
                 lh_client = LotteHomeClient(lh_user_id, lh_password, lh_agnc_no, lh_env)
+                _clients_to_close.append(lh_client)
 
                 from datetime import datetime as _dt, timedelta as _td, UTC as _UTC
 
@@ -5741,6 +5649,20 @@ async def sync_orders_from_markets(
                             "취소완료",
                         ):
                             update_fields["shipping_status"] = new_ship_status
+                    # shipping_status 가 "국내배송중"으로 진입 시 status 드롭다운도 함께 동기화.
+                    # 라벨/드롭다운이 어긋난 채 wait_ship 으로 남아 페이지 필터를 통과해 노출되던 사고 방지.
+                    _new_ss_final = update_fields.get(
+                        "shipping_status", existing.shipping_status
+                    )
+                    if _new_ss_final == "국내배송중" and existing.status in (
+                        "pending",
+                        "preparing",
+                        "wait_ship",
+                        "arrived",
+                        "processing",
+                        "shipped",
+                    ):
+                        update_fields["status"] = "shipping"
                     # 정산금액(revenue) / 수수료율 갱신
                     new_revenue = order_data.get("revenue")
                     new_fee_rate = order_data.get("fee_rate")
@@ -6056,6 +5978,19 @@ async def sync_orders_from_markets(
             await session.rollback()  # 세션 복구 — 다음 계정 연쇄 실패 방지
             logger.error(f"[주문동기화] {label} 실패: {e}")
             results.append({"account": label, "status": "error", "message": str(e)})
+        finally:
+            # 마켓 클라이언트 httpx keepalive 좀비 정리 — 다음 계정 hang 도미노 차단.
+            # CancelledError(상위 wait_for timeout) 시에도 이 finally 가 먼저 실행되므로
+            # connection pool 즉시 회수됨.
+            for _c in _clients_to_close:
+                try:
+                    _aclose = getattr(_c, "aclose", None)
+                    if _aclose is not None:
+                        await _aclose()
+                except Exception as _ce:
+                    logger.warning(
+                        f"[주문동기화] {label} 클라이언트 aclose 실패(무시): {_ce}"
+                    )
 
     # DB 기반 원주문 shipping_status 일괄 동기화
     # samba_return 레코드가 있고 진행 중인 주문의 shipping_status를 강제 업데이트
@@ -6689,9 +6624,11 @@ def _parse_playauto_order(
         "신규주문": "pending",
         "송장출력": "wait_ship",
         "송장입력": "processing",
-        "출고": "shipped",
-        "배송중": "shipped",
-        "국내배송중": "shipped",
+        # shipping_status 가 "국내배송중"일 때 status 드롭다운도 "국내배송중"(shipping)으로 보이도록 동기화.
+        # 과거에 "shipped"로 매핑되어 프론트 STATUS_MAP 에 없는 enum 으로 저장되던 버그도 같이 닫힘.
+        "출고": "shipping",
+        "배송중": "shipping",
+        "국내배송중": "shipping",
         "수취확인": "delivered",
         "정산완료": "delivered",
         "주문확인": "pending",
@@ -6733,14 +6670,14 @@ def _parse_playauto_order(
 
     # 주소 분리 — 플레이오토는 RecipientAddress 한 필드에 도로명+상세를 통째로 내려줌
     # (openapi.json 확인: 별도 상세주소 필드 없음). 휴리스틱으로 기본/상세 분리.
-    # 우선순위:
-    #  패턴0: 끝 메타괄호 `(법정동/건물명)` + 그 앞 `동/호/층/호실` 패턴
+    # 우선순위 (프론트 splitCustomerAddress 와 동일 — 괄호 안 콤마로 잘리지 않도록):
+    #  패턴A: 끝 메타괄호 `(법정동/건물명)` + 그 앞 `동/호/층/호실` 패턴
     #         → base = 도로주소 + 메타괄호, detail = 동/호 토큰
-    #         (예) "서울 노원구 마들로 111 월계미륭아파트,월계삼호아파트 30동 304호 (월계동 13 / ...)"
-    #             → base="서울 노원구 마들로 111 (월계동 13 / ...)", detail="월계미륭아파트,월계삼호아파트 30동 304호"
-    #  패턴1: ", "로 명시 구분 ("디지털로26길 123, 14층 플레이오토")
-    #  패턴2: 도로명(...대로/로/길) + 본번(숫자 또는 숫자-숫자) 뒤 공백 기준 분리
-    #         ("대구 동구 아양로 218 113동 201호(효목1동 45-1)")
+    #  패턴B: 마지막 `)` 뒤에 내용이 있으면 그 지점으로 split (괄호 안 콤마 무시)
+    #         (예) "...압구정로 403(압구정동, 한양아파트) 81동 1207호"
+    #             → base="...압구정로 403(압구정동, 한양아파트)", detail="81동 1207호"
+    #  패턴C: 괄호가 없으면 ", " 명시 구분 ("디지털로26길 123, 14층 플레이오토")
+    #  패턴D: 도로명(...대로/로/길) + 본번 뒤 공백 기준 분리
     import re as _re_addr
 
     _addr_full = str(ro.get("RecipientAddress", "") or "").strip()
@@ -6748,7 +6685,7 @@ def _parse_playauto_order(
     _addr_detail = ""
     if _addr_full:
         _matched = False
-        # 패턴0: 끝 메타괄호 + 동/호 패턴
+        # 패턴A: 끝 메타괄호 + 동/호 패턴 (전체가 `(...)$` 로 끝나는 경우)
         _meta_m = _re_addr.match(r"^(.*?)\s*(\([^)]*\))\s*$", _addr_full)
         if _meta_m:
             _before_meta = _meta_m.group(1).strip()
@@ -6763,11 +6700,23 @@ def _parse_playauto_order(
                 _addr_base = f"{_dongho_m.group(1).strip()} {_meta}".strip()
                 _addr_detail = _dongho_m.group(2).strip()
                 _matched = True
+        # 패턴B: 마지막 `)` 기준 분리 — `, ` 보다 우선.
+        # 괄호 안 콤마("(압구정동, 한양아파트)")로 base/detail 가 잘못 잘리지 않도록.
         if not _matched:
-            if ", " in _addr_full:
+            _last_paren = _addr_full.rfind(")")
+            if 0 < _last_paren < len(_addr_full) - 1:
+                _after = _addr_full[_last_paren + 1 :].strip()
+                if _after:
+                    _addr_base = _addr_full[: _last_paren + 1].strip()
+                    _addr_detail = _after
+                    _matched = True
+        if not _matched:
+            # 패턴C: 괄호 없는 도로명주소 — ", " 단순 분리
+            if "(" not in _addr_full and ", " in _addr_full:
                 _b, _, _d = _addr_full.partition(", ")
                 _addr_base, _addr_detail = _b.strip(), _d.strip()
             else:
+                # 패턴D: 도로명 + 본번 뒤 공백 기준
                 _m = _re_addr.match(
                     r"^(.+?(?:대로|로|길)\s+\d+(?:-\d+)?)\s+(.+)$", _addr_full
                 )

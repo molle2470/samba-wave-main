@@ -152,6 +152,32 @@ async function _spaDirectLogin(siteKey, username, password) {
   const site = AUTO_LOGIN_SITES[siteKey]
   if (!site) return false
 
+  // [계정 전환] 정식 로그아웃 URL 호출 → 서버가 세션 expire + Set-Cookie 로 클라 쿠키 정리.
+  // 쿠키 직접 삭제는 서버 세션 잔존 + localStorage 잔여 + 무신사 보안 비정상 패턴 감지 위험.
+  const _LOGOUT_URLS = {
+    musinsa: 'https://www.musinsa.com/auth/logout',
+    ssg: 'https://www.ssg.com/comm/login/logout.ssg',
+    lotteon: 'https://www.lotteon.com/p/member/logout',
+    abcmart: 'https://abcmart.a-rt.com/member/logout',
+  }
+  const _logoutUrl = _LOGOUT_URLS[siteKey]
+  if (_logoutUrl) {
+    let logoutTabId = null
+    try {
+      const logoutTab = await chrome.tabs.create({ url: _logoutUrl, active: false })
+      logoutTabId = logoutTab.id
+      try { await waitForTabLoad(logoutTabId, 15000) } catch {}
+      await wait(1500)  // 로그아웃 처리 + Set-Cookie 적용 대기
+      console.log(`[자동로그인][SPA] ${site.name} 정식 로그아웃 완료 (계정 전환 위해)`)
+    } catch (e) {
+      console.warn(`[자동로그인][SPA] 로그아웃 호출 실패: ${e?.message || e}`)
+    } finally {
+      if (logoutTabId) {
+        try { await chrome.tabs.remove(logoutTabId) } catch {}
+      }
+    }
+  }
+
   let tabId = null
   let tabCreated = false
 
@@ -163,6 +189,31 @@ async function _spaDirectLogin(siteKey, username, password) {
 
     try { await waitForTabLoad(tabId, 30000) } catch {}
     await wait(2000)
+
+    // SPA 사이트는 input이 동적 렌더링 — input 등장까지 폴링 (최대 10초)
+    // 무신사는 /auth/login → member.one.musinsa.com/login 리다이렉트 후 SPA 렌더링됨
+    const SPA_INPUT_WAIT_SITES = ['musinsa', 'lotteon']
+    if (SPA_INPUT_WAIT_SITES.includes(siteKey)) {
+      const spaStart = Date.now()
+      const SPA_WAIT_MAX = 10000
+      while (Date.now() - spaStart < SPA_WAIT_MAX) {
+        try {
+          const [r] = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: () => {
+              const id = document.querySelector('input[type="email"], input[type="text"]:not([type="hidden"])')
+              const pw = document.querySelector('input[type="password"]')
+              return !!(id && id.offsetParent !== null && pw && pw.offsetParent !== null)
+            },
+          })
+          if (r?.result) {
+            console.log(`[자동로그인][SPA] ${site.name} input 렌더링 감지 (${Date.now() - spaStart}ms)`)
+            break
+          }
+        } catch {}
+        await wait(300)
+      }
+    }
 
     // alert dialog 자동 닫기 핸들러 — chrome.debugger Page.handleJavaScriptDialog
     // (가짜 자격증명 또는 잘못된 자격증명 시 alert로 에러 메시지 노출됨, freeze 방지용)
@@ -204,16 +255,51 @@ async function _spaDirectLogin(siteKey, username, password) {
               pw: ['#inp_pw', 'input[type="password"]'],
               btnId: '#loginBtn, #btn_login, .btn_login, button[type="submit"]',
             },
+            musinsa: {
+              // member.one.musinsa.com/login — SPA, selector 실측 불가 → 흔한 패턴 다 등록
+              // 첫 매칭 input 사용. 첫 실행 시 콘솔 로그에서 어떤 selector가 매칭됐는지 확인.
+              id: [
+                '#id', '#userId', '#loginId', '#email',
+                'input[name="id"]', 'input[name="userId"]', 'input[name="loginId"]', 'input[name="email"]', 'input[name="memberId"]',
+                'input[type="email"]', 'input[type="text"]:not([type="hidden"])',
+              ],
+              pw: ['#password', '#userPw', '#loginPw', 'input[name="password"]', 'input[name="pw"]', 'input[type="password"]'],
+              btnId: 'button[type="submit"], button.login-btn, button.btn-login, #loginBtn',
+              btnText: '로그인',
+            },
           }
           const sel = SELECTORS[siteKeyArg]
           if (!sel) return { success: false, error: 'unsupported site' }
 
-          // ID/PW 필드 찾기 — 첫 매칭 셀렉터 사용
+          // ID/PW 필드 찾기 — 첫 매칭 셀렉터 사용 + 디버그 로그
           let idField = null
-          for (const s of sel.id) { idField = document.querySelector(s); if (idField) break }
+          let idSelMatched = null
+          for (const s of sel.id) {
+            const el = document.querySelector(s)
+            if (el) { idField = el; idSelMatched = s; break }
+          }
           let pwField = null
-          for (const s of sel.pw) { pwField = document.querySelector(s); if (pwField) break }
-          if (!idField || !pwField) return { success: false, error: 'fields not found', idFound: !!idField, pwFound: !!pwField }
+          let pwSelMatched = null
+          for (const s of sel.pw) {
+            const el = document.querySelector(s)
+            if (el) { pwField = el; pwSelMatched = s; break }
+          }
+          if (!idField || !pwField) {
+            // 디버그 — 페이지의 input 목록 dump
+            const allInputs = Array.from(document.querySelectorAll('input')).map(i => ({
+              id: i.id, name: i.name, type: i.type, placeholder: i.placeholder,
+              visible: i.offsetParent !== null,
+            }))
+            return {
+              success: false,
+              error: 'fields not found',
+              idFound: !!idField,
+              pwFound: !!pwField,
+              allInputs: allInputs.slice(0, 20),
+              currentUrl: location.href,
+            }
+          }
+          console.log(`[자동로그인][SPA] selector 매칭: id="${idSelMatched}" pw="${pwSelMatched}"`)
 
           // Vue 3 reactive 필드는 .value 직접 설정이 v-model에 안 잡힘.
           // native setter로 값 주입 후 input 이벤트 dispatch — Vue/React 공통 패턴.
@@ -228,15 +314,16 @@ async function _spaDirectLogin(siteKey, username, password) {
           pwField.dispatchEvent(new Event('input', { bubbles: true }))
           pwField.dispatchEvent(new Event('change', { bubbles: true }))
 
-          // 로그인 버튼 찾기 — id 셀렉터 또는 버튼 텍스트로
+          // 로그인 버튼 찾기 — id 셀렉터 우선, 미발견 시 텍스트 매칭 폴백
           let btn = null
           if (sel.btnId) {
             btn = document.querySelector(sel.btnId)
-          } else if (sel.btnText) {
-            btn = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"]'))
+          }
+          if (!btn && sel.btnText) {
+            btn = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a[role="button"]'))
               .find(b => {
                 const txt = (b.textContent || b.value || '').trim()
-                return b.type === 'submit' && txt === sel.btnText && b.offsetParent !== null
+                return txt === sel.btnText && b.offsetParent !== null
               })
           }
           if (!btn) return { success: false, error: 'login button not found' }
@@ -252,24 +339,67 @@ async function _spaDirectLogin(siteKey, username, password) {
 
       const r = scriptResult?.result
       if (!r?.success) {
-        console.log(`[자동로그인][SPA] ${site.name} 스크립트 실행 실패:`, r)
+        console.log(`[자동로그인][SPA] ${site.name} 스크립트 실행 실패:`, JSON.stringify(r))
         chrome.debugger.onEvent.removeListener(dialogHandler)
         return false
       }
-      console.log(`[자동로그인][SPA] ${site.name} .value 설정 + click() 완료 — 응답 폴링`)
+      console.log(`[자동로그인][SPA] ${site.name} .value 설정 + click() 완료 (id=${r.idValue}자, pw=${r.pwLen}자) — 응답 폴링`)
 
       // 응답 폴링 — URL 변경 감지 (로그인 성공 시 isLoginPage=false)
       const POLL_INTERVAL = 1500
       const TIMEOUT = 15000
       const startTime = Date.now()
+      // 자격증명 오류로 간주할 alert 메시지 — 다단어 구문만 사용.
+      // 단독 키워드("비밀번호"/"확인" 등)는 부수 alert("비밀번호를 변경해 주세요" 등)에
+      // 걸려 false-positive 알람을 유발하므로 사용 금지.
+      const CREDENTIAL_ERROR_PHRASES = [
+        '일치하지 않',
+        '일치하는 회원',
+        '아이디 또는',
+        '비밀번호가 일치',
+        '비밀번호를 잘못',
+        '비밀번호를 다시',
+        '비밀번호가 틀',
+        '비밀번호를 확인',
+        '아이디를 잘못',
+        '아이디를 다시',
+        '아이디를 확인',
+        '존재하지 않',
+        '잘못 입력',
+        '잘못되었',
+        '재입력',
+        '5회 이상',
+        '5회를 초과',
+        '캡차',
+        'captcha',
+        '보안문자',
+        '로그인 정보가',
+        '회원이 아닙',
+      ]
       while (Date.now() - startTime < TIMEOUT) {
         await wait(POLL_INTERVAL)
 
-        // alert로 에러 떴으면 즉시 실패 (가짜/잘못된 자격증명)
-        if (dialogMessage && dialogMessage.length > 0) {
-          console.log(`[자동로그인][SPA] ${site.name} 자격증명 오류 alert: "${dialogMessage.substring(0, 60)}"`)
+        // URL이 로그인 페이지를 벗어났으면 alert 유무와 관계없이 성공으로 처리
+        // (부수 alert가 떴어도 실제 로그인은 이미 완료됨)
+        let tabInfo = null
+        try { tabInfo = await chrome.tabs.get(tabId) } catch {
           chrome.debugger.onEvent.removeListener(dialogHandler)
           return false
+        }
+        const urlLeftLoginPage = !site.isLoginPage(tabInfo.url || '')
+
+        // 자격증명 오류 alert만 실패로 간주 (URL이 로그인 페이지에 남아있을 때만)
+        if (dialogMessage && dialogMessage.length > 0 && !urlLeftLoginPage) {
+          const msgLower = dialogMessage.toLowerCase()
+          const looksLikeCredentialError = CREDENTIAL_ERROR_PHRASES.some(p => msgLower.includes(p.toLowerCase()))
+          if (looksLikeCredentialError) {
+            console.log(`[자동로그인][SPA] ${site.name} 자격증명 오류 alert: "${dialogMessage.substring(0, 60)}"`)
+            chrome.debugger.onEvent.removeListener(dialogHandler)
+            return false
+          }
+          // 부수 alert는 메시지만 초기화하고 계속 대기
+          console.log(`[자동로그인][SPA] ${site.name} 부수 alert 무시: "${dialogMessage.substring(0, 60)}"`)
+          dialogMessage = null
         }
 
         // 오토튠 진행 중 취소 감지
@@ -281,8 +411,7 @@ async function _spaDirectLogin(siteKey, username, password) {
         }
 
         try {
-          const tabInfo = await chrome.tabs.get(tabId)
-          if (!site.isLoginPage(tabInfo.url || '')) {
+          if (urlLeftLoginPage) {
             // LOTTEON: URL 이탈만으로 부족 — #memInfo.mbNo 실제 확인 (비로그인 리다이렉트 오판 방지)
             if (siteKey === 'lotteon') {
               await wait(2000)
@@ -425,6 +554,20 @@ async function _ensureLoggedInImpl(siteKey, accountId) {
     }
   }
 
+  // 계정별 최근 성공 캐시 체크 — 같은 계정으로 10분 이내 로그인 확인됐으면 스킵
+  // (송장수집 100건 잡 돌릴 때 매 주문마다 ensureLoggedIn 트리거되는 비용 + alert 폭주 차단)
+  const ACCOUNT_LOGIN_TTL_MS = 10 * 60 * 1000
+  try {
+    const cache = globalThis._lastAutoLoginSuccessAt?.[siteKey]
+    const accKey = accountId || '_default'
+    const lastTs = (cache && typeof cache === 'object') ? (cache[accKey] || 0) : 0
+    if (lastTs && (Date.now() - lastTs) < ACCOUNT_LOGIN_TTL_MS) {
+      const ageSec = Math.round((Date.now() - lastTs) / 1000)
+      console.log(`[자동로그인] ${site.name}(${accKey}) ${ageSec}초 전 성공 — 스킵`)
+      return true
+    }
+  } catch {}
+
   autoLoginState.inProgress[siteKey] = true
   autoLoginState.lastAttemptAt[siteKey] = Date.now()
 
@@ -449,31 +592,36 @@ async function _ensureLoggedInImpl(siteKey, accountId) {
     if (ok) {
       autoLoginState.failedAttempts[siteKey] = 0
       autoLoginState.cooldownUntil[siteKey] = 0
-      // 자동로그인 성공 시각 기록 — sourcing detail의 _detectLoginStatus false-positive 방지용
-      // (LOTTEON 상세페이지처럼 헤더 셀렉터로 로그인 판정 어려운 사이트의 무한 트리거 차단)
-      // storage에도 저장 — 서비스 워커 재시작 후에도 1시간 이내 성공 이력 유지
-      try { globalThis._lastAutoLoginSuccessAt = globalThis._lastAutoLoginSuccessAt || {} } catch {}
+      // 자동로그인 성공 시각 기록 — [siteKey][accountId] 2계층 구조.
+      // 같은 사이트라도 계정이 다르면 별도 캐시. accountId 없으면 '_default' 키로 저장.
+      // storage 동기화로 서비스 워커 재시작 후에도 캐시 복원.
       try {
-        globalThis._lastAutoLoginSuccessAt[siteKey] = Date.now()
-        const stored = {}
-        for (const k of Object.keys(globalThis._lastAutoLoginSuccessAt || {})) {
-          stored[k] = globalThis._lastAutoLoginSuccessAt[k]
-        }
-        chrome.storage.local.set({ _lastAutoLoginSuccessAt: stored }).catch(() => {})
+        globalThis._lastAutoLoginSuccessAt = globalThis._lastAutoLoginSuccessAt || {}
+        const accKey = accountId || '_default'
+        const prevSite = globalThis._lastAutoLoginSuccessAt[siteKey]
+        // 기존에 number(구버전)였으면 객체로 마이그레이션
+        const siteMap = (prevSite && typeof prevSite === 'object') ? prevSite : {}
+        siteMap[accKey] = Date.now()
+        globalThis._lastAutoLoginSuccessAt[siteKey] = siteMap
+        chrome.storage.local.set({ _lastAutoLoginSuccessAt: globalThis._lastAutoLoginSuccessAt }).catch(() => {})
       } catch {}
       console.log(`[자동로그인] ✅ ${site.name} 성공 — 폴링 자동 재개`)
     } else {
       autoLoginState.failedAttempts[siteKey] = (autoLoginState.failedAttempts[siteKey] || 0) + 1
       autoLoginState.cooldownUntil[siteKey] = Date.now() + AUTO_LOGIN_COOLDOWN_MS
       console.log(`[자동로그인] ❌ ${site.name} ${AUTO_LOGIN_MAX_RETRIES}회 실패 — ${AUTO_LOGIN_COOLDOWN_MS / 60000}분 쿨다운`)
-      try {
-        chrome.notifications?.create?.(`autologin-fail-${siteKey}-${Date.now()}`, {
-          type: 'basic',
-          iconUrl: 'icon128.png',
-          title: 'SAMBA-WAVE 자동로그인 실패',
-          message: `${site.name} 자동 로그인이 실패했습니다. 브라우저에서 수동 로그인해주세요. (5분 후 자동 재시도)`,
-        })
-      } catch {}
+      // 알람은 라디오 기본 계정 모드(!accountId)만 발송 — accountId 명시 트리거(송장수집)는
+      // 잡당 시도라 실패 알람 폭주 위험. 호출자가 wrong_account 로 분류해서 모달로 보여줌.
+      if (!accountId) {
+        try {
+          chrome.notifications?.create?.(`autologin-fail-${siteKey}-${Date.now()}`, {
+            type: 'basic',
+            iconUrl: 'icon128.png',
+            title: 'SAMBA-WAVE 자동로그인 실패',
+            message: `${site.name} 자동 로그인이 실패했습니다. 브라우저에서 수동 로그인해주세요. (5분 후 자동 재시도)`,
+          })
+        } catch {}
+      }
     }
     return ok
   } finally {
@@ -495,12 +643,12 @@ async function _ensureLoggedInSingle(siteKey, accountId) {
   // [SPA 분기] LOTTEON / ABCmart / SSG는 백엔드 라디오 지정 계정으로만 자동로그인
   // 사용자 요구 — 소싱처계정의 username/password를 직접 .value 설정 (Chrome 자동완성 드롭다운 사용 X)
   // 백엔드 자격증명 없으면 즉시 실패. chrome.debugger triple-click 폴백 제거 (드롭다운 노출 방지).
-  const SPA_DIRECT_LOGIN_SITES = ['lotteon', 'abcmart', 'ssg']
+  const SPA_DIRECT_LOGIN_SITES = ['lotteon', 'abcmart', 'ssg', 'musinsa']
   if (SPA_DIRECT_LOGIN_SITES.includes(siteKey)) {
-    // accountId 지정 시 — 현재 세션이 어떤 계정인지 확인 불가하므로 pre-check 스킵하고 강제 로그인.
-    // (잘못된 계정으로 이미 로그인된 상태일 수 있음 → 무조건 지정 계정으로 새 세션 만든다)
+    // accountId 지정 시 — 사용자 요구 = 자동 로그아웃 + 새 계정 로그인 (송장수집 풀 자동화).
+    // 사전 로그인 체크 스킵하고 _spaDirectLogin 진입 (그 함수가 쿠키 삭제 후 새 로그인 수행).
+    // accountId 없을 때만(라디오 기본 모드) 이미 로그인됐는지 체크해서 스킵.
     if (!accountId) {
-      // 라디오 기본 계정 모드 — 이미 로그인 상태면 즉시 반환 (기존 동작 유지)
       let alreadyLoggedIn = false
       let spaCheckTabId = null
       try {
@@ -518,7 +666,7 @@ async function _ensureLoggedInSingle(siteKey, accountId) {
       }
 
       if (alreadyLoggedIn) {
-        console.log(`[자동로그인] ${site.name} 이미 로그인됨 — 자동로그인 스킵`)
+        console.log(`[자동로그인] ${site.name} 이미 로그인됨 — 자동로그인 스킵 (라디오 모드)`)
         return true
       }
     }

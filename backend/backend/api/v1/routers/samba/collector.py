@@ -13,7 +13,11 @@ from sqlalchemy import or_
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from backend.db.orm import get_read_session_dependency, get_write_session_dependency
+from backend.db.orm import (
+    get_read_session,
+    get_read_session_dependency,
+    get_write_session_dependency,
+)
 from backend.domain.samba.cache import cache
 from backend.domain.samba.collector.model import FIXED_REQUESTED_COUNT
 from backend.domain.user.auth_service import get_user_id
@@ -517,10 +521,19 @@ async def delete_filter(
     from backend.domain.samba.collector.model import SambaCollectedProduct as _CP
 
     svc = _get_services(session)
+
+    async def _invalidate_filter_caches() -> None:
+        # /filters (60s), /filters/tree (300s), /filters/tree/counts:* (300s) 모두 invalidate —
+        # 누락 시 UI 가 삭제 직후 몇 분간 stale 그룹 잔존.
+        await cache.delete("collector:filters:v1")
+        await cache.delete("filters:tree:v3")
+        await cache.clear_pattern("filters:tree:counts:*")
+
     sf = await svc.filter_repo.get_async(filter_id)
     if not sf:
         # row 이미 부재 — idempotent 처리. UI stale 캐시 시 "삭제 실패" 사고 차단.
         logger.info(f"필터 삭제 요청 — row 이미 부재: {filter_id} (idempotent)")
+        await _invalidate_filter_caches()
         return {"ok": True, "deleted_products": 0, "already_deleted": True}
 
     # 마켓등록 상품 체크
@@ -540,8 +553,7 @@ async def delete_filter(
         logger.info(f"그룹 삭제: {filter_id} → 상품 {deleted_count}건 연동 삭제")
 
     await svc.delete_filter(filter_id)
-    await cache.delete("filters:tree:v3")
-    await cache.clear_pattern("filters:tree:counts:*")
+    await _invalidate_filter_caches()
     return {"ok": True, "deleted_products": deleted_count}
 
 
@@ -1101,16 +1113,15 @@ async def scroll_products(
 
     # 소싱처 목록 (캐시 TTL 5분)
     sites = await cache.get("products:sites")
-    sites_task = None
+    sites_stmt = None
     if not sites:
         sites_stmt = (
             select(_CP.source_site).distinct().where(_CP.source_site.isnot(None))
         )
-        sites_task = session.execute(sites_stmt)
 
-    # KPI 카운트 (캐시 TTL 30초)
+    # KPI 카운트 (캐시 TTL 5분) — 별도 read 세션으로 병렬 실행
     counts = await cache.get("products:counts")
-    counts_task = None
+    counts_stmt = None
     if not counts:
         from sqlalchemy import case, literal
 
@@ -1126,7 +1137,6 @@ async def scroll_products(
                 "sold_out"
             ),
         ).select_from(_CP)
-        counts_task = session.execute(counts_stmt)
 
     # 데이터 쿼리
     data_stmt = select(*list_cols)
@@ -1152,20 +1162,35 @@ async def scroll_products(
 
     data_stmt = data_stmt.offset(skip).limit(limit)
 
-    # 순차 실행 (같은 세션에서 asyncio.gather 사용 시 asyncpg 충돌 방지)
-    count_result = await session.execute(count_stmt)
-    total = count_result.scalar() or 0
+    # 병렬 실행: 메인 세션은 count + data 직렬, sites/counts는 별도 read 세션
+    # (asyncpg는 같은 세션에서 병렬 쿼리 불가 — 별도 세션으로 우회)
+    async def _main_query() -> tuple[int, list[Any]]:
+        c_res = await session.execute(count_stmt)
+        d_res = await session.execute(data_stmt)
+        return (c_res.scalar() or 0, d_res.mappings().all())
 
-    data_result = await session.execute(data_stmt)
-    rows = data_result.mappings().all()
+    async def _side_query(stmt: Any) -> Any:
+        async with get_read_session() as s:
+            return await s.execute(stmt)
 
-    # 사이트/카운트 결과 수집
-    if sites_task:
-        sites_result = await sites_task
+    tasks: list[Any] = [_main_query()]
+    side_indices: dict[str, int] = {}
+    if sites_stmt is not None:
+        side_indices["sites"] = len(tasks)
+        tasks.append(_side_query(sites_stmt))
+    if counts_stmt is not None:
+        side_indices["counts"] = len(tasks)
+        tasks.append(_side_query(counts_stmt))
+
+    results = await asyncio.gather(*tasks)
+    total, rows = results[0]
+
+    if "sites" in side_indices:
+        sites_result = results[side_indices["sites"]]
         sites = sorted([r[0] for r in sites_result.all() if r[0]])
         await cache.set("products:sites", sites, ttl=300)
-    if counts_task:
-        counts_row = (await counts_task).one()
+    if "counts" in side_indices:
+        counts_row = results[side_indices["counts"]].one()
         counts = {
             "total": counts_row.total,
             "registered": counts_row.registered,
@@ -1336,44 +1361,97 @@ async def product_counts(
 async def product_dashboard_stats(
     session: AsyncSession = Depends(get_read_session_dependency),
 ):
-    """대시보드 현황판 — 소싱처별 수집현황 + 마켓/계정별 등록현황 (브랜드별 breakdown 포함)."""
+    """대시보드 현황판 — 소싱처별 수집현황 + 마켓/계정별 등록현황 (브랜드별 breakdown 포함).
+
+    기존 4개 풀스캔 + 직렬 실행 → 2개 풀스캔 + 별도 세션 병렬화로 응답시간 단축.
+    site_stmt(전체)는 brand_site 집계에서 Python 합산으로 도출. acct 도 동일.
+    """
+    import asyncio
+    from collections import defaultdict
+
+    from backend.db.orm import get_read_session
+    from backend.domain.samba.account.model import SambaMarketAccount as _MA
+    from sqlalchemy import text
+
     cached = await cache.get("products:dashboard-stats-v3")
     if cached:
         return cached
 
-    from collections import defaultdict
+    # 별도 세션 병렬 실행 헬퍼 — asyncpg 동일 세션 gather 금지 (CLAUDE.md).
+    async def _run_brand_site():
+        async with get_read_session() as s:
+            stmt = text("""
+                SELECT source_site,
+                       COALESCE(NULLIF(TRIM(brand), ''), '기타') AS brand_name,
+                       COUNT(*) AS total,
+                       COUNT(*) FILTER (WHERE registered_accounts IS NOT NULL AND registered_accounts != '[]'::jsonb) AS registered,
+                       COUNT(*) FILTER (WHERE sale_status = 'sold_out') AS sold_out
+                FROM samba_collected_product
+                WHERE source_site IS NOT NULL AND source_site != ''
+                GROUP BY source_site, COALESCE(NULLIF(TRIM(brand), ''), '기타')
+                ORDER BY source_site, total DESC
+            """)
+            return (await s.execute(stmt)).all()
 
-    from backend.domain.samba.account.model import SambaMarketAccount as _MA
-    from sqlalchemy import text
+    async def _run_brand_acct():
+        async with get_read_session() as s:
+            stmt = text("""
+                SELECT aid,
+                       source_site,
+                       COALESCE(NULLIF(TRIM(brand), ''), '기타') AS brand_name,
+                       COUNT(*) AS cnt
+                FROM (
+                    SELECT jsonb_array_elements_text(registered_accounts) AS aid,
+                           source_site,
+                           brand
+                    FROM (
+                        SELECT registered_accounts, source_site, brand
+                        FROM samba_collected_product
+                        WHERE registered_accounts IS NOT NULL
+                          AND registered_accounts != '[]'::jsonb
+                          AND jsonb_typeof(registered_accounts) = 'array'
+                    ) safe_rows
+                ) sub
+                GROUP BY aid, source_site, COALESCE(NULLIF(TRIM(brand), ''), '기타')
+                ORDER BY aid, cnt DESC
+            """)
+            return (await s.execute(stmt)).all()
 
-    # 1) 소싱처별 수집현황
-    site_stmt = text("""
-        SELECT source_site,
-               COUNT(*) AS total,
-               COUNT(*) FILTER (WHERE registered_accounts IS NOT NULL AND registered_accounts != '[]'::jsonb) AS registered,
-               COUNT(*) FILTER (WHERE sale_status = 'sold_out') AS sold_out
-        FROM samba_collected_product
-        WHERE source_site IS NOT NULL AND source_site != ''
-        GROUP BY source_site
-        ORDER BY total DESC
-    """)
-    site_rows = (await session.execute(site_stmt)).all()
+    async def _run_sold():
+        async with get_read_session() as s:
+            stmt = text("""
+                SELECT channel_id, COUNT(DISTINCT collected_product_id) AS sold_cnt
+                FROM samba_order
+                WHERE collected_product_id IS NOT NULL
+                  AND channel_id IS NOT NULL
+                  AND COALESCE(paid_at, created_at) >= NOW() - INTERVAL '30 days'
+                GROUP BY channel_id
+            """)
+            rows = (await s.execute(stmt)).all()
+            return {r.channel_id: int(r.sold_cnt) for r in rows}
 
-    # 1-b) 소싱처별 브랜드 breakdown
-    brand_site_stmt = text("""
-        SELECT source_site,
-               COALESCE(NULLIF(TRIM(brand), ''), '기타') AS brand_name,
-               COUNT(*) AS total,
-               COUNT(*) FILTER (WHERE registered_accounts IS NOT NULL AND registered_accounts != '[]'::jsonb) AS registered,
-               COUNT(*) FILTER (WHERE sale_status = 'sold_out') AS sold_out
-        FROM samba_collected_product
-        WHERE source_site IS NOT NULL AND source_site != ''
-        GROUP BY source_site, COALESCE(NULLIF(TRIM(brand), ''), '기타')
-        ORDER BY source_site, total DESC
-    """)
-    brand_site_rows = (await session.execute(brand_site_stmt)).all()
+    # 3개 무거운 쿼리 병렬 실행 — return_exceptions 로 부분 실패 허용
+    brand_site_rows, brand_acct_rows, sold_by_acct = await asyncio.gather(
+        _run_brand_site(),
+        _run_brand_acct(),
+        _run_sold(),
+        return_exceptions=True,
+    )
+    if isinstance(brand_site_rows, Exception):
+        logger.warning("대시보드 brand_site 조회 실패: %s", brand_site_rows)
+        brand_site_rows = []
+    if isinstance(brand_acct_rows, Exception):
+        logger.warning("대시보드 brand_acct 조회 실패: %s", brand_acct_rows)
+        brand_acct_rows = []
+    if isinstance(sold_by_acct, Exception):
+        logger.warning("대시보드 sold 조회 실패: %s", sold_by_acct)
+        sold_by_acct = {}
 
+    # 소싱처별 합계는 brand_site 집계에서 Python 합산으로 도출 — 추가 쿼리 불필요
     brand_by_source: dict[str, list[dict]] = defaultdict(list)
+    site_totals: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"total": 0, "registered": 0, "sold_out": 0}
+    )
     for r in brand_site_rows:
         brand_by_source[r.source_site].append(
             {
@@ -1383,88 +1461,43 @@ async def product_dashboard_stats(
                 "sold_out": r.sold_out,
             }
         )
+        site_totals[r.source_site]["total"] += r.total
+        site_totals[r.source_site]["registered"] += r.registered
+        site_totals[r.source_site]["sold_out"] += r.sold_out
 
-    by_source = [
-        {
-            "source_site": r.source_site,
-            "total": r.total,
-            "registered": r.registered,
-            "sold_out": r.sold_out,
-            "brands": brand_by_source.get(r.source_site, []),
-        }
-        for r in site_rows
-    ]
+    by_source = sorted(
+        [
+            {
+                "source_site": site,
+                "total": tot["total"],
+                "registered": tot["registered"],
+                "sold_out": tot["sold_out"],
+                "brands": brand_by_source.get(site, []),
+            }
+            for site, tot in site_totals.items()
+        ],
+        key=lambda x: x["total"],
+        reverse=True,
+    )
 
-    # 2) 마켓/계정별 등록현황 — jsonb_array_elements_text 사용 (cast로 호환)
-    by_account: list[dict] = []
-    try:
-        acct_stmt = text("""
-            SELECT aid, COUNT(*) AS cnt
-            FROM (
-                SELECT jsonb_array_elements_text(registered_accounts) AS aid
-                FROM (
-                    SELECT registered_accounts FROM samba_collected_product
-                    WHERE registered_accounts IS NOT NULL
-                      AND registered_accounts != '[]'::jsonb
-                      AND jsonb_typeof(registered_accounts) = 'array'
-                ) safe_rows
-            ) sub
-            GROUP BY aid
-            ORDER BY cnt DESC
-        """)
-        acct_rows = (await session.execute(acct_stmt)).all()
+    # 계정별 합계도 brand_acct 에서 Python 합산
+    brand_by_acct: dict[str, list[dict]] = defaultdict(list)
+    acct_totals: dict[str, int] = defaultdict(int)
+    for r in brand_acct_rows:
+        brand_by_acct[r.aid].append(
+            {
+                "source_site": r.source_site,
+                "brand": r.brand_name,
+                "registered": r.cnt,
+            }
+        )
+        acct_totals[r.aid] += r.cnt
 
-        # 계정별 브랜드 breakdown
-        brand_acct_stmt = text("""
-            SELECT aid,
-                   source_site,
-                   COALESCE(NULLIF(TRIM(brand), ''), '기타') AS brand_name,
-                   COUNT(*) AS cnt
-            FROM (
-                SELECT jsonb_array_elements_text(registered_accounts) AS aid,
-                       source_site,
-                       brand
-                FROM (
-                    SELECT registered_accounts, source_site, brand
-                    FROM samba_collected_product
-                    WHERE registered_accounts IS NOT NULL
-                      AND registered_accounts != '[]'::jsonb
-                      AND jsonb_typeof(registered_accounts) = 'array'
-                ) safe_rows
-            ) sub
-            GROUP BY aid, source_site, COALESCE(NULLIF(TRIM(brand), ''), '기타')
-            ORDER BY aid, cnt DESC
-        """)
-        brand_acct_rows = (await session.execute(brand_acct_stmt)).all()
-
-        brand_by_acct: dict[str, list[dict]] = defaultdict(list)
-        for r in brand_acct_rows:
-            brand_by_acct[r.aid].append(
-                {
-                    "source_site": r.source_site,
-                    "brand": r.brand_name,
-                    "registered": r.cnt,
-                }
-            )
-
-        # 계정별 30일 고유 판매 상품 수 (같은 상품 여러 번 팔려도 1개로 카운트)
-        sold_stmt = text("""
-            SELECT channel_id, COUNT(DISTINCT collected_product_id) AS sold_cnt
-            FROM samba_order
-            WHERE collected_product_id IS NOT NULL
-              AND channel_id IS NOT NULL
-              AND COALESCE(paid_at, created_at) >= NOW() - INTERVAL '30 days'
-            GROUP BY channel_id
-        """)
-        sold_rows = (await session.execute(sold_stmt)).all()
-        sold_by_acct: dict[str, int] = {
-            r.channel_id: int(r.sold_cnt) for r in sold_rows
-        }
-
-        # 계정 ID → 마켓명/계정라벨 매핑
-        acct_ids = [r.aid for r in acct_rows]
-        acct_map: dict[str, dict[str, str]] = {}
-        if acct_ids:
+    # 계정 ID → 마켓명/계정라벨 매핑 (작은 쿼리, 메인 세션 사용)
+    acct_ids = list(acct_totals.keys())
+    acct_map: dict[str, dict[str, str]] = {}
+    if acct_ids:
+        try:
             ma_stmt = select(_MA.id, _MA.market_name, _MA.account_label).where(
                 _MA.id.in_(acct_ids)
             )
@@ -1474,21 +1507,24 @@ async def product_dashboard_stats(
                     "market_name": m.market_name,
                     "account_label": m.account_label,
                 }
+        except Exception as e:
+            logger.warning("대시보드 계정 매핑 조회 실패: %s", e)
 
-        by_account = [
+    by_account = sorted(
+        [
             {
-                "account_id": r.aid,
-                "market_name": acct_map.get(r.aid, {}).get("market_name", "알 수 없음"),
-                "account_label": acct_map.get(r.aid, {}).get("account_label", ""),
-                "registered": r.cnt,
-                "sold_products": sold_by_acct.get(r.aid, 0),
-                "brands": brand_by_acct.get(r.aid, []),
+                "account_id": aid,
+                "market_name": acct_map.get(aid, {}).get("market_name", "알 수 없음"),
+                "account_label": acct_map.get(aid, {}).get("account_label", ""),
+                "registered": cnt,
+                "sold_products": sold_by_acct.get(aid, 0),
+                "brands": brand_by_acct.get(aid, []),
             }
-            for r in acct_rows
-        ]
-    except Exception as e:
-        logger.warning("대시보드 계정별 통계 조회 실패: %s", e)
-        by_account = []
+            for aid, cnt in acct_totals.items()
+        ],
+        key=lambda x: x["registered"],
+        reverse=True,
+    )
 
     result = {"by_source": by_source, "by_account": by_account}
     await cache.set("products:dashboard-stats-v3", result, ttl=600)

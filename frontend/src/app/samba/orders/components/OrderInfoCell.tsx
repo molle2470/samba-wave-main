@@ -144,9 +144,9 @@ export default function OrderInfoCell(props: Props) {
             <button onClick={() => openMsgModal('kakao', o)} style={{ fontSize: '0.7rem', padding: '0.125rem 0.5rem', background: sentFlags[o.id]?.kakao ? '#3A320F' : 'transparent', border: `1px solid ${sentFlags[o.id]?.kakao ? '#FFD93D' : '#2D2D2D'}`, borderRadius: '4px', color: sentFlags[o.id]?.kakao ? '#FFD93D' : '#B0B0B0', cursor: 'pointer' }}>KAKAO</button>
           </div>
           <div style={{ display: 'flex', gap: '1rem', marginBottom: '0.25rem', fontSize: '0.75rem' }}>
-            <div><span style={{ color: '#666' }}>상품주문번호 </span><span style={{ fontFamily: 'monospace', color: '#E5E5E5' }}>{o.order_number}</span></div>
+            <div><span style={{ color: '#666' }}>상품주문번호 </span>{renderCopyableText(o.order_number, '상품주문번호', { fontFamily: 'monospace' })}</div>
             {o.shipment_id && (
-              <div><span style={{ color: '#666' }}>주문번호 </span><span style={{ fontFamily: 'monospace', color: '#B0B0B0' }}>{o.shipment_id}</span></div>
+              <div><span style={{ color: '#666' }}>주문번호 </span>{renderCopyableText(o.shipment_id, '주문번호', { fontFamily: 'monospace', color: '#B0B0B0' })}</div>
             )}
           </div>
           <div style={{ minWidth: 0 }}>
@@ -315,9 +315,7 @@ export default function OrderInfoCell(props: Props) {
             GrandStage: `https://grandstage.a-rt.com/mypage/order/read-order-detail?orderNo=${srcNo}`,
             Nike: `https://www.nike.com/kr/orders/${srcNo}`,
             SSG: `https://pay.ssg.com/myssg/orderInfoDetail.ssg?orordNo=${encodeURIComponent(srcNo)}&viewType=Ssg`,
-            LOTTEON: isGift
-              ? `https://www.lotteon.com/p/order/claim/giftBoxDetail?odNo=${srcNo}&type=snd`
-              : `https://www.lotteon.com/p/order/claim/orderDetail?odNo=${srcNo}`,
+            LOTTEON: `https://www.lotteon.com/p/order/claim/giftBoxDetail?odNo=${srcNo}&type=snd`,
           }
           const url = orderUrlMap[sourceSiteCode]
           if (!url) { showAlert(`${o.source_site || '알수없는'} 소싱처는 원주문링크를 지원하지 않습니다`, 'info'); return }

@@ -38,9 +38,9 @@ api.samba-wave.co.kr {
         }
     }
 
-    reverse_proxy samba-api:8080 samba-api-staging:8080 {
-        # 첫번째(blue) 우선 — fail 시에만 두번째(green)로 fallback
-        lb_policy first
+    reverse_proxy samba-api:8080 {
+        # staging upstream 제거 (2026-04-26 blue/green 사고 후 docker exec polling 으로 대체)
+        # — staging DNS 영구 실패가 max_fails 도미노 유발해 OPTIONS context canceled 발생
 
         # Active 헬스체크 —
         # - timeout 3s → 5s: 상품수집 페이지 마운트 시 ~10개 동시 요청이 단일 워커를
