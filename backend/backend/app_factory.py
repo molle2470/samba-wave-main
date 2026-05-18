@@ -99,13 +99,20 @@ def create_application() -> FastAPI:
     from fastapi.middleware.gzip import GZipMiddleware
     from backend.middleware.api_gateway import ApiGatewayMiddleware
     from backend.middleware.security_headers import SecurityHeadersMiddleware
+    from backend.middleware.tenant_context_middleware import TenantContextMiddleware
+    from backend.db.tenant_filter import register_tenant_filter_events
+
+    # ORM 자동 tenant 필터 이벤트 등록 (앱 시작 1회)
+    register_tenant_filter_events()
 
     # 미들웨어 순서 (add_middleware 는 LIFO — 나중에 추가할수록 바깥쪽):
-    #   ApiGateway (가장 안쪽) → CORS → SlowAPI → SecurityHeaders → GZip (가장 바깥)
+    #   TenantContext (가장 안쪽) → ApiGateway → CORS → SlowAPI → SecurityHeaders → GZip
+    # - TenantContext 가 JWT의 tid 클레임을 contextvar에 세팅 → ORM 자동 필터 활성
     # - CORS 가 ApiGateway 의 403 응답 위에 ACAO 헤더 부착
     # - SlowAPI 가 레이트 리밋 초과 시 429 반환
     # - SecurityHeaders 가 모든 응답에 보안 헤더 부착 (HSTS/CSP/X-Frame)
     # - GZip 이 가장 바깥 — 모든 응답 본문 압축. minimum_size=500 으로 짧은 응답 skip.
+    app.add_middleware(TenantContextMiddleware)
     app.add_middleware(ApiGatewayMiddleware, api_key=settings.api_gateway_key)
     app.add_middleware(
         CORSMiddleware,

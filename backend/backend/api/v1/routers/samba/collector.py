@@ -571,7 +571,8 @@ async def delete_brand_scope(
     )
     await cache.clear_pattern("products:*")
     await cache.delete("products:counts")
-    await cache.delete("products:dashboard-stats-v4")
+    # 캐시 키 테넌트 분리 — pattern으로 모든 테넌트 캐시 일괄 무효화
+    await cache.clear_pattern("products:dashboard-stats-v5:*")
     await cache.delete("products:category-tree")
     return {"ok": True, **result}
 
@@ -1360,6 +1361,7 @@ async def product_counts(
 @router.get("/products/dashboard-stats")
 async def product_dashboard_stats(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ):
     """대시보드 현황판 — 소싱처별 수집현황 + 마켓/계정별 등록현황 (브랜드별 breakdown 포함).
 
@@ -1373,7 +1375,9 @@ async def product_dashboard_stats(
     from backend.domain.samba.account.model import SambaMarketAccount as _MA
     from sqlalchemy import text
 
-    cached = await cache.get("products:dashboard-stats-v4")
+    # 캐시 키 테넌트 분리 — 운영자/임성희 등이 같은 캐시 공유하면 격리 깨짐
+    cache_key = f"products:dashboard-stats-v5:{tenant_id or 'global'}"
+    cached = await cache.get(cache_key)
     if cached:
         return cached
 
@@ -1398,9 +1402,10 @@ async def product_dashboard_stats(
                        COUNT(*) FILTER (WHERE sale_status = 'sold_out') AS sold_out
                 FROM samba_collected_product
                 WHERE source_site IS NOT NULL AND source_site != ''
+                  AND (:tid IS NULL OR tenant_id = :tid)
                 GROUP BY source_site, COALESCE(NULLIF(TRIM(brand), ''), '기타')
                 ORDER BY source_site, total DESC
-            """)
+            """).bindparams(tid=tenant_id)
             return (await s.execute(stmt)).all()
 
     async def _run_brand_acct():
@@ -1420,11 +1425,12 @@ async def product_dashboard_stats(
                         WHERE registered_accounts IS NOT NULL
                           AND registered_accounts != '[]'::jsonb
                           AND jsonb_typeof(registered_accounts) = 'array'
+                          AND (:tid IS NULL OR tenant_id = :tid)
                     ) safe_rows
                 ) sub
                 GROUP BY aid, source_site, COALESCE(NULLIF(TRIM(brand), ''), '기타')
                 ORDER BY aid, cnt DESC
-            """)
+            """).bindparams(tid=tenant_id)
             return (await s.execute(stmt)).all()
 
     async def _run_sold():
@@ -1435,8 +1441,9 @@ async def product_dashboard_stats(
                 WHERE collected_product_id IS NOT NULL
                   AND channel_id IS NOT NULL
                   AND COALESCE(paid_at, created_at) >= NOW() - INTERVAL '30 days'
+                  AND (:tid IS NULL OR tenant_id = :tid)
                 GROUP BY channel_id
-            """)
+            """).bindparams(tid=tenant_id)
             rows = (await s.execute(stmt)).all()
             return {r.channel_id: int(r.sold_cnt) for r in rows}
 
@@ -1537,7 +1544,7 @@ async def product_dashboard_stats(
     )
 
     result = {"by_source": by_source, "by_account": by_account}
-    await cache.set("products:dashboard-stats-v4", result, ttl=600)
+    await cache.set(cache_key, result, ttl=600)
     return result
 
 
@@ -1632,12 +1639,17 @@ async def get_products_by_ids(
 @router.get("/products/with-orders")
 async def get_product_ids_with_orders(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ):
     """주문 이력이 있는 상품 ID 목록 조회."""
     from sqlmodel import text
 
     result = await session.execute(
-        text("SELECT DISTINCT product_id FROM samba_order WHERE product_id IS NOT NULL")
+        text(
+            "SELECT DISTINCT product_id FROM samba_order "
+            "WHERE product_id IS NOT NULL "
+            "  AND (:tid IS NULL OR tenant_id = :tid)"
+        ).bindparams(tid=tenant_id)
     )
     return [row[0] for row in result.all()]
 
@@ -1709,6 +1721,7 @@ async def create_collected_product(
 async def lookup_by_market_product_no(
     market_product_no: str,
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ):
     """마켓 상품번호로 수집상품 조회 (원문링크/이미지 등 반환)."""
     from sqlalchemy import text as sa_text
@@ -1724,15 +1737,18 @@ async def lookup_by_market_product_no(
     sql = sa_text(
         "SELECT id, source_site, site_product_id, name, images, source_url, market_product_nos "
         "FROM samba_collected_product "
-        "WHERE market_product_nos::text LIKE :pattern ESCAPE '\\' "
-        "   OR market_product_nos::text LIKE :pattern_bare ESCAPE '\\' "
-        "   OR site_product_id = :spid "
-        "   OR REPLACE(site_product_id, '-', '') = :spid_norm "
+        "WHERE (:tid IS NULL OR tenant_id = :tid) AND ("
+        "    market_product_nos::text LIKE :pattern ESCAPE '\\' "
+        " OR market_product_nos::text LIKE :pattern_bare ESCAPE '\\' "
+        " OR site_product_id = :spid "
+        " OR REPLACE(site_product_id, '-', '') = :spid_norm "
+        ") "
         "LIMIT 1"
     )
     result = await session.execute(
         sql,
         {
+            "tid": tenant_id,
             "pattern": f'%"{safe}"%',
             "pattern_bare": f"%{safe}%",
             "spid": market_product_no,
