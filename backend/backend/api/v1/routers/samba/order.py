@@ -3744,6 +3744,10 @@ async def sync_orders_from_markets(
 
                 # last-changed API 권한 제한 보완:
                 # DB에 있는 미완결 주문을 직접 재조회하여 배송완료/취소요청 등 최신 상태 반영
+                # '취소요청' 포함 이유 — 고객이 취소를 철회하면 Naver API는
+                # claimStatus=null + productOrderStatus=PURCHASE_DECIDED 로 응답하지만
+                # last-changed 윈도우(body.days)를 벗어난 주문은 본 쿼리에 포함되지
+                # 않아 영영 '취소요청' 으로 남던 사고 방지 (issue #192)
                 _pending_statuses = {
                     "발주미확인",
                     "발송대기",
@@ -3751,6 +3755,8 @@ async def sync_orders_from_markets(
                     "배송대기중",
                     "송장전송완료",
                     "국내배송중",
+                    "취소요청",
+                    "취소처리중",
                 }
                 _already_fetched = {
                     d["order_number"] for d in orders_data if d.get("order_number")
