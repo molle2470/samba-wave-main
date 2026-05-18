@@ -489,7 +489,9 @@ const ProductCard = React.memo(function ProductCard({
   const marketPriceList = useMemo(() => Object.entries(mp)
     .filter(([, v]) => v.accountId)
     .map(([marketName, v]) => {
-      const r = calcPrice(cost, v.marginRate || marginRate, (v.shippingCost ?? shippingCost) || shippingCost, v.feeRate || 0, extraCharge, minMarginAmount, ssMRate, ssMAmount)
+      const acct = v.accountId ? accMap.get(v.accountId) : undefined
+      const acctFeeRate = Number((acct?.additional_fields as Record<string, unknown> | undefined)?.feeRate || 0)
+      const r = calcPrice(cost, marginRate, (v.shippingCost ?? shippingCost) || shippingCost, acctFeeRate || v.feeRate || feeRate, extraCharge, minMarginAmount, ssMRate, ssMAmount)
       let displayPrice = r.price
       let displayCalcStr = r.calcStr
       // 스마트스토어: 300원 올림 반영 (백엔드 25% 역산과 동일)

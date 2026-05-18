@@ -88,7 +88,7 @@ def calc_market_price(
 
     policy_key = MARKET_TYPE_TO_POLICY_KEY.get(market_type, "")
     mp = (market_policies or {}).get(policy_key, {}) if policy_key else {}
-    m_margin_rate = mp.get("marginRate") or common_margin_rate
+    m_margin_rate = common_margin_rate
     m_shipping = mp.get("shippingCost") or common_shipping
     m_fee = mp.get("feeRate") or common_fee
 
@@ -1598,11 +1598,21 @@ class SambaShipmentService:
                         product_row.tenant_id,
                     )
                     effective_cost = cost_info["convertedCost"]
+                    # 계정 설정탭 feeRate 우선 — policy market_policies.feeRate 오버라이드
+                    _acct_extras = (account.additional_fields or {}) if account else {}
+                    _acct_fee_rate = int(_acct_extras.get("feeRate") or 0)
+                    _effective_market_data = policy_market_data
+                    if _acct_fee_rate:
+                        _pkey = MARKET_TYPE_TO_POLICY_KEY.get(market_type, "")
+                        if _pkey:
+                            _mp_copy = dict(policy_market_data.get(_pkey, {}))
+                            _mp_copy["feeRate"] = _acct_fee_rate
+                            _effective_market_data = {**policy_market_data, _pkey: _mp_copy}
                     calc_price = calc_market_price(
                         effective_cost,
                         policy.pricing,
                         market_type,
-                        policy_market_data,
+                        _effective_market_data,
                         source_site=product_row.source_site or "",
                         is_point_restricted=getattr(
                             product_row, "is_point_restricted", None
