@@ -181,7 +181,8 @@ class BackendSettings(BaseSettings):
 
         return (
             r"^(https?://(localhost(:\d+)?|127\.0\.0\.1(:\d+)?"
-            r"|samba-wave[a-z0-9-]*\.vercel\.app)"
+            r"|samba-wave[a-z0-9-]*\.vercel\.app"
+            r"|([a-z0-9-]+\.)?samba-wave\.co\.kr)"
             r"|" + ext_part + r")$"
         )
 
