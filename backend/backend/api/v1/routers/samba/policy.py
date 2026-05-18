@@ -392,9 +392,7 @@ async def update_policy(
                 status_code=403, detail="해당 정책에 접근 권한이 없습니다"
             )
     try:
-        policy = await svc.update_policy(
-            policy_id, body.model_dump(exclude_unset=True)
-        )
+        policy = await svc.update_policy(policy_id, body.model_dump(exclude_unset=True))
     except PolicyNameDuplicateError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if not policy:

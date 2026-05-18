@@ -1284,12 +1284,14 @@ async def sync_order_tracking(order_id: str, force: bool = False) -> dict:
 async def sync_order_tracking_bulk(
     limit: int = Query(500, ge=1, le=1000),
     days: int = Query(7, ge=1, le=90),
-    force: bool = Query(False),
+    force: bool = Query(True),
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict:
     """미발송 주문 일괄 송장 추출 큐잉 — 최근 N일 + 소싱처 주문번호 있음 + 송장 미입력.
 
-    force=True 면 기존 PENDING/DISPATCHED 잡(만료 좀비 포함)을 FAILED 로 닫고 새로 큐잉.
+    force=True (기본): 트리거 시점에 옛 sourcing_job tracking + 옛 tracking_sync_job PENDING/DISPATCHED 모두
+    리셋 후 새 batch 적재 — 모달 리스트 = 큐 카운트 1:1 매칭 보장.
+    force=False 사용 케이스 없음 (단건 호출은 sync-tracking/<id> 사용).
     """
     from backend.domain.samba.tracking_sync.service import enqueue_pending_orders
 

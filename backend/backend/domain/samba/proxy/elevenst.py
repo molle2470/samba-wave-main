@@ -200,9 +200,7 @@ class ElevenstClient:
             raise ElevenstApiError(f"HTTP {resp.status_code}: {msg}")
         return data
 
-    async def get_category_attributes(
-        self, category_id: str
-    ) -> list[dict[str, str]]:
+    async def get_category_attributes(self, category_id: str) -> list[dict[str, str]]:
         """카테고리별 키속성(필수/선택) 메타 조회.
 
         엔드포인트: GET /rest/cateservice/categoryAttributes/{category_id}
@@ -234,7 +232,9 @@ class ElevenstClient:
         try:
             resp = await client.get(url, headers=headers)
         except Exception as e:
-            logger.warning(f"[11번가] categoryAttributes HTTP 실패 cat={category_id} — {e}")
+            logger.warning(
+                f"[11번가] categoryAttributes HTTP 실패 cat={category_id} — {e}"
+            )
             return []
         logger.info(
             f"[11번가] GET /cateservice/categoryAttributes/{category_id} → {resp.status_code}"

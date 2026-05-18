@@ -81,9 +81,7 @@ class SambaPolicyService:
                     if "tenant_id" in data
                     else (existing.tenant_id if existing else None)
                 )
-                await self._assert_name_unique(
-                    _name, _tenant_id, exclude_id=policy_id
-                )
+                await self._assert_name_unique(_name, _tenant_id, exclude_id=policy_id)
         return await self.repo.update_async(policy_id, **data)
 
     async def delete_policy(self, policy_id: str) -> bool:

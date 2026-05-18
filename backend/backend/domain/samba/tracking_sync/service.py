@@ -464,6 +464,44 @@ async def enqueue_pending_orders(
     # 이번 배치에서 생성/재사용된 잡 id — 프론트가 모달에 고정 표시할 때 사용
     job_ids: list[str] = []
 
+    # 송장수집 트리거 = "리셋 + 새 batch" 시맨틱.
+    # 옛 sourcing_job tracking 잡 + 옛 tracking_sync_job PENDING/DISPATCHED 모두 만료/취소해서
+    # 모달 리스트 = 큐 카운트 = 새 batch 1:1 매칭 보장.
+    # (자동 재큐잉 도미노로 인한 "시작하자마자 FAILED" 회귀 차단)
+    if force:
+        from sqlalchemy import text as _text
+
+        async with get_write_session() as _reset_session:
+            _now = datetime.now(_UTC)
+            # 1) sourcing_job: 옛 tracking pending 모두 expired (확장앱 폴링 큐 비우기)
+            _src_res = await _reset_session.execute(
+                _text(
+                    "UPDATE samba_sourcing_job SET status='expired', "
+                    "completed_at=:now, error='새 batch 시작으로 만료' "
+                    "WHERE job_type='tracking' AND status='pending'"
+                ),
+                {"now": _now},
+            )
+            # 2) tracking_sync_job: 옛 PENDING/DISPATCHED 모두 CANCELLED
+            _tsj_res = await _reset_session.execute(
+                _text(
+                    "UPDATE samba_tracking_sync_job SET status=:cancelled, "
+                    "last_error='새 batch 시작으로 취소', updated_at=:now "
+                    "WHERE status IN (:pending, :dispatched)"
+                ),
+                {
+                    "cancelled": STATUS_CANCELLED,
+                    "pending": STATUS_PENDING,
+                    "dispatched": STATUS_DISPATCHED,
+                    "now": _now,
+                },
+            )
+            await _reset_session.commit()
+            logger.info(
+                f"[송장동기화] 큐 리셋: sourcing_job expired={_src_res.rowcount} "
+                f"tracking_sync_job cancelled={_tsj_res.rowcount}"
+            )
+
     # KST 캘린더 N일 (오늘 포함, 즉 days=7 → 오늘 + 이전 6일)
     _KST = timezone(timedelta(hours=9))
     _today_kst = datetime.now(_KST).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -737,43 +775,10 @@ async def apply_tracking_result(
             # 응답 안 하거나 다른 페이지로 자동 리다이렉트되는 케이스 자동 복구.
             # wrong_account 는 매핑 오류 가능성 커서 자동 재시도 제외 (운영자 매핑 확인 필요).
             # 폭주 방지: 같은 order 의 1시간 이내 FAILED 잡이 3건 이상이면 재큐잉 차단.
-            _retryable = (
-                "timeout" in reason_lc
-                or "unexpected_page" in reason_lc
-                or "abnormal_access" in reason_lc
-                or "trace 페이지 진입" in reason
-            )
-            if job.status == STATUS_FAILED and _retryable:
-                from sqlalchemy import func as _func
-
-                _recent_failed_stmt = select(_func.count()).where(
-                    SambaTrackingSyncJob.order_id == job.order_id,
-                    SambaTrackingSyncJob.status == STATUS_FAILED,
-                    SambaTrackingSyncJob.created_at
-                    >= datetime.now(_UTC) - timedelta(hours=1),
-                )
-                async with get_write_session() as _retry_session:
-                    _failed_cnt = (
-                        await _retry_session.execute(_recent_failed_stmt)
-                    ).scalar() or 0
-
-                if _failed_cnt < 3:
-                    logger.info(
-                        f"[송장동기화] 자동 재큐잉 ({_failed_cnt}/3): "
-                        f"order={job.order_id} reason='{reason[:60]}'"
-                    )
-                    try:
-                        await enqueue_for_order(job.order_id, force=True)
-                    except Exception as exc:
-                        logger.warning(
-                            f"[송장동기화] 자동 재큐잉 실패: order={job.order_id} err={exc}"
-                        )
-                else:
-                    logger.warning(
-                        f"[송장동기화] 자동 재큐잉 차단 (1h 내 FAILED {_failed_cnt}회): "
-                        f"order={job.order_id} — 운영자 확인 필요"
-                    )
-
+            # 자동 재큐잉 영구 제거 (2026-05-18).
+            # 이전에 timeout/unexpected_page 자동 재큐잉을 force=True 로 호출했더니
+            # 같은 order 옛 PENDING이 만료되면서 모달이 "시작하자마자 FAILED 도배" 상태가 됨.
+            # 재시도는 다음 사용자 트리거 / 자동실행 사이클에서 자연스럽게 처리.
             return {"success": False, "status": job.status, "reason": reason}
 
         normalized_courier = normalize_courier_name(courier_name)
