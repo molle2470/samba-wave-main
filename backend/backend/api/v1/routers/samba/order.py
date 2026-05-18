@@ -1545,7 +1545,14 @@ async def list_tracking_sync_jobs_by_ids(body: dict) -> dict:
             .join(O, O.id == SambaTrackingSyncJob.order_id, isouter=True)
             .join(A, A.id == SambaTrackingSyncJob.sourcing_account_id, isouter=True)
             .where(SambaTrackingSyncJob.id.in_(job_ids))
-            .order_by(date_col.asc())
+            # 모달 리스트 = 처리 순서. 소싱처(MUSINSA → LOTTEON → SSG...) → 계정(병기 → 성희 → 귀옥...)
+            # → 결제일 순으로 정렬. 같은 계정 잡이 연속 표시되고 1번부터 순서대로 처리되어
+            # 자동 로그인 swap 횟수 = 계정 수로 최소화.
+            .order_by(
+                SambaTrackingSyncJob.sourcing_site.asc().nulls_last(),
+                SambaTrackingSyncJob.sourcing_account_id.asc().nulls_last(),
+                date_col.asc(),
+            )
         )
         raw_rows = (await session.execute(stmt)).all()
 
