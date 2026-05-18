@@ -28,7 +28,8 @@ _OWNER_TENANT_ID = "tn_01KRX6H1Q97JGPXRPB011985QT"
 
 
 def upgrade() -> None:
-    # idempotent — IF NOT EXISTS 패턴
+    # 컬럼 + 인덱스만 (즉시 끝남). idempotent — IF NOT EXISTS 패턴.
+    # backfill은 배포 후 별도 chunk 스크립트(scripts/backfill_monitor_event.py)로 실행.
     op.execute(
         "ALTER TABLE samba_monitor_event "
         "ADD COLUMN IF NOT EXISTS tenant_id VARCHAR NULL"
@@ -36,11 +37,6 @@ def upgrade() -> None:
     op.execute(
         "CREATE INDEX IF NOT EXISTS ix_samba_monitor_event_tenant_id "
         "ON samba_monitor_event (tenant_id)"
-    )
-    # 운영자 backfill — 기존 NULL 레코드는 운영자 tenant로
-    op.execute(
-        f"UPDATE samba_monitor_event SET tenant_id = '{_OWNER_TENANT_ID}' "
-        "WHERE tenant_id IS NULL"
     )
 
 
