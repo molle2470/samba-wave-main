@@ -231,13 +231,6 @@ const AutotuneLogPanel = memo(function AutotuneLogPanel({ onStatusChange, extern
   )
 })
 
-// 색상 상수
-const PRIORITY_COLORS: Record<string, string> = {
-  hot: '#FF6B6B',
-  warm: '#FFD93D',
-  cold: '#666',
-}
-
 const card: React.CSSProperties = {
   background: 'rgba(30,30,30,0.5)',
   backdropFilter: 'blur(20px)',
@@ -361,21 +354,6 @@ export default function WarroomPage() {
       } catch { /* ignore */ }
     }, 500)
   }, [])
-  // ── 등급 분류(hot/warm/cold) ON/OFF ──
-  const [priorityEnabled, setPriorityEnabled] = useState(true)
-  useEffect(() => {
-    collectorApi.autotuneGetPriority().then(res => {
-      setPriorityEnabled(res.priority_enabled)
-    }).catch(() => {})
-  }, [])
-  const handlePriorityToggle = useCallback(async () => {
-    const next = !priorityEnabled
-    setPriorityEnabled(next)
-    try {
-      await collectorApi.autotuneSetPriority(next)
-    } catch { setPriorityEnabled(!next) }
-  }, [priorityEnabled])
-
   // ── 오토튠 필터 (소싱처/판매처 체크박스) ──
   // 소싱처 체크박스 = AND 조건 (체크된 사이트만 갱신 + 이 PC가 처리):
   //   1) 백엔드 enabled_sources(글로벌 갱신 사이트) 업데이트 → 그 사이트만 큐에 작업 발행
@@ -884,19 +862,6 @@ export default function WarroomPage() {
               cursor: 'pointer',
             }}
             >오토튠 정지</button>
-            <button
-              onClick={handlePriorityToggle}
-              style={{
-                padding: '0.25rem 0.75rem',
-                background: priorityEnabled ? 'rgba(76,154,255,0.12)' : 'rgba(255,255,255,0.06)',
-                border: `1px solid ${priorityEnabled ? 'rgba(76,154,255,0.35)' : 'rgba(255,255,255,0.15)'}`,
-                borderRadius: '6px',
-                color: priorityEnabled ? '#4C9AFF' : '#666',
-                fontSize: '0.8125rem',
-                fontWeight: 600,
-                cursor: 'pointer',
-              }}
-            >등급분류 {priorityEnabled ? 'ON' : 'OFF'}</button>
           </div>
         </div>
         {/* 소싱처 체크박스 */}
@@ -1727,36 +1692,6 @@ export default function WarroomPage() {
             <span>12시</span>
             <span>18시</span>
             <span>23시</span>
-          </div>
-        </div>
-
-      </div>
-
-      {/* E. 우선순위별 분포 */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '1rem' }}>
-        {/* 우선순위별 */}
-        <div style={card}>
-          <div style={{ fontSize: '0.8rem', fontWeight: 600, color: '#FF8C00', marginBottom: '0.75rem' }}>우선순위별 분포</div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
-            {['hot', 'warm', 'cold'].map(p => {
-              const cnt = product_stats.by_priority[p] || 0
-              const maxP = Math.max(...Object.values(product_stats.by_priority), 1)
-              return (
-                <div key={p} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                  <span style={{ fontSize: '0.7rem', color: PRIORITY_COLORS[p], minWidth: '3rem', fontWeight: 600 }}>{p}</span>
-                  <div style={{ flex: 1, height: '14px', background: '#1A1A1A', borderRadius: '3px', overflow: 'hidden' }}>
-                    <div style={{
-                      width: `${(cnt / maxP) * 100}%`,
-                      height: '100%',
-                      background: PRIORITY_COLORS[p],
-                      borderRadius: '3px',
-                      transition: 'width 0.3s',
-                    }} />
-                  </div>
-                  <span style={{ fontSize: '0.7rem', color: '#E5E5E5', minWidth: '2.5rem', textAlign: 'right' }}>{fmtNum(cnt)}</span>
-                </div>
-              )
-            })}
           </div>
         </div>
 

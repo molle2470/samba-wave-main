@@ -955,10 +955,6 @@ export const collectorApi = {
     }>(`${SAMBA_PREFIX}/collector/autotune/filters`),
   autotuneSetFilters: (enabledSources: string[] | null, enabledMarkets: string[] | null) =>
     request<{ ok: boolean }>(`${SAMBA_PREFIX}/collector/autotune/filters`, { method: 'PUT', body: JSON.stringify({ enabled_sources: enabledSources, enabled_markets: enabledMarkets }) }),
-  autotuneGetPriority: () =>
-    request<{ ok: boolean; priority_enabled: boolean }>(`${SAMBA_PREFIX}/collector/autotune/priority`),
-  autotuneSetPriority: (enabled: boolean) =>
-    request<{ ok: boolean; priority_enabled: boolean }>(`${SAMBA_PREFIX}/collector/autotune/priority`, { method: 'POST', body: JSON.stringify({ enabled }) }),
   collectSingleMusinsa: (url: string) =>
     request<{ saved: number; updated: boolean; product_no: string; brand: string; filter_name: string }>(
       `${SAMBA_PREFIX}/collector/collect-single-musinsa`,
@@ -1969,7 +1965,6 @@ export interface DashboardStats {
     total: number
     registered?: number
     by_source: Record<string, number>
-    by_priority: Record<string, number>
     by_sale_status: Record<string, number>
   }
   refresh_stats: {

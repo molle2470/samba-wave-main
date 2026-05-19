@@ -169,21 +169,19 @@ class SambaMonitorService:
             return data
 
     async def _get_product_stats(self) -> Dict[str, Any]:
-        """상품 통계: 전체, 소싱처별, 우선순위별, 상태별 — 단일 쿼리."""
+        """상품 통계: 전체, 소싱처별, 상태별 — 단일 쿼리."""
         from backend.domain.samba.collector.model import SambaCollectedProduct
         from backend.api.v1.routers.samba.collector_common import (
             build_market_registered_conditions,
         )
 
-        # 소싱처·우선순위·상태별 카운트를 한 번에 가져오기
+        # 소싱처·상태별 카운트를 한 번에 가져오기
         combo_stmt = select(
             SambaCollectedProduct.source_site,
-            SambaCollectedProduct.monitor_priority,
             SambaCollectedProduct.sale_status,
             func.count(SambaCollectedProduct.id),
         ).group_by(
             SambaCollectedProduct.source_site,
-            SambaCollectedProduct.monitor_priority,
             SambaCollectedProduct.sale_status,
         )
         combo_result = await self.session.execute(combo_stmt)
@@ -191,12 +189,10 @@ class SambaMonitorService:
 
         total = 0
         by_source: Dict[str, int] = {}
-        by_priority: Dict[str, int] = {}
         by_sale_status: Dict[str, int] = {}
-        for src, pri, status, cnt in rows:
+        for src, status, cnt in rows:
             total += cnt
             by_source[src] = by_source.get(src, 0) + cnt
-            by_priority[pri] = by_priority.get(pri, 0) + cnt
             by_sale_status[status] = by_sale_status.get(status, 0) + cnt
 
         # 마켓등록상품 수 (별도 조건)
@@ -209,7 +205,6 @@ class SambaMonitorService:
             "total": total,
             "registered": registered,
             "by_source": by_source,
-            "by_priority": by_priority,
             "by_sale_status": by_sale_status,
         }
 

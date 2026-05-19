@@ -30,7 +30,6 @@ router = APIRouter(prefix="/collector", tags=["samba-collector"])
 class RefreshRequest(BaseModel):
     product_ids: Optional[List[str]] = None
     search_filter_ids: Optional[List[str]] = None  # 선택된 그룹(검색필터) ID
-    priority: Optional[str] = None  # hot / warm / cold
     auto_retransmit: bool = True
 
 
@@ -82,18 +81,6 @@ async def refresh_products(
                 search_filter_id=sf_id, limit=10000
             )
             products.extend(group_products)
-    elif body.priority:
-        # 우선순위 기반 조회
-        from sqlmodel import select as sel
-        from backend.domain.samba.collector.model import SambaCollectedProduct
-
-        stmt = (
-            sel(SambaCollectedProduct)
-            .where(SambaCollectedProduct.monitor_priority == body.priority)
-            .limit(500)
-        )
-        result = await session.execute(stmt)
-        products = list(result.scalars().all())
     else:
         # 전체 (최대 500건)
         products = await repo.list_async(skip=0, limit=500, order_by="-updated_at")

@@ -17,7 +17,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
-from sqlalchemy import func, case, update as sa_update
+from sqlalchemy import func, update as sa_update
 from sqlalchemy.orm import defer
 from sqlmodel import select
 
@@ -203,13 +203,9 @@ def any_pc_running() -> bool:
     return any(ev.is_set() for ev in _pc_running.values())
 
 
-# 등급 분류 기준 기간 (일)
-CLASSIFY_WINDOW_DAYS = 7
-
 # 오토튠 필터 설정 키 (samba_settings)
 AUTOTUNE_FILTER_SOURCES_KEY = "autotune_enabled_sources"
 AUTOTUNE_FILTER_MARKETS_KEY = "autotune_enabled_markets"
-AUTOTUNE_PRIORITY_ENABLED_KEY = "autotune_priority_enabled"
 
 # 오토튠 전송 글로벌 동시실행 제한 — refresher가 fire-and-forget으로 띄운 transmit task가
 # OOM 일으키지 않도록 상한. 너무 낮으면 backlog, 너무 높으면 메모리 폭주.
@@ -300,75 +296,6 @@ def get_pc_allowed_sites(device_id: str) -> set[str] | None:
         return None
     pcs = get_active_pcs()
     return pcs.get(dev)
-
-
-async def _classify_products(session) -> dict[str, int]:
-    """마켓등록상품 대상 hot/warm/cold 자동 분류 (벌크 SQL 3건).
-
-    hot  = 최근 7일 주문 있음 AND 가격/재고 변동 있음
-    warm = 최근 7일 가격/재고 변동 있음 (주문 없음)
-    cold = 나머지 (마켓등록상품 한정)
-    """
-    from backend.domain.samba.collector.model import SambaCollectedProduct as _CP
-    from backend.domain.samba.order.model import SambaOrder
-
-    log = logging.getLogger("autotune")
-    cutoff = datetime.now(timezone.utc) - timedelta(days=CLASSIFY_WINDOW_DAYS)
-
-    # 마켓등록상품 공통 조건 (collector_common에서 통합 관리)
-    from backend.api.v1.routers.samba.collector_common import (
-        build_market_registered_conditions,
-    )
-
-    registered_cond = build_market_registered_conditions(_CP)
-
-    # 최근 7일 주문이 있는 product_id 서브쿼리
-    order_subq = (
-        select(SambaOrder.product_id)
-        .where(SambaOrder.created_at >= cutoff)
-        .where(SambaOrder.product_id != None)
-        .distinct()
-    )
-
-    # 가격/재고 변동 조건: price_changed_at이 7일 이내
-    has_changes = _CP.price_changed_at >= cutoff
-
-    # 1단계: 마켓등록상품 전체 → cold
-    stmt_cold = (
-        sa_update(_CP)
-        .where(*registered_cond)
-        .where(_CP.monitor_priority != "cold")
-        .values(monitor_priority="cold")
-    )
-    r_cold = await session.execute(stmt_cold)
-
-    # 2단계: 변동 있는 상품 → warm
-    stmt_warm = (
-        sa_update(_CP)
-        .where(*registered_cond, has_changes)
-        .values(monitor_priority="warm")
-    )
-    r_warm = await session.execute(stmt_warm)
-
-    # 3단계: 변동 + 주문 있는 상품 → hot
-    stmt_hot = (
-        sa_update(_CP)
-        .where(*registered_cond, has_changes)
-        .where(_CP.id.in_(order_subq))
-        .values(monitor_priority="hot")
-    )
-    r_hot = await session.execute(stmt_hot)
-
-    await session.commit()
-
-    counts = {"hot": r_hot.rowcount, "warm": r_warm.rowcount, "cold": r_cold.rowcount}
-    log.info(
-        "[오토튠] 등급 분류 완료 — hot %d, warm %d, cold %d",
-        counts["hot"],
-        counts["warm"],
-        counts["cold"],
-    )
-    return counts
 
 
 async def _stream_event(
@@ -500,27 +427,7 @@ async def _site_autotune_loop(device_id: str, site: str):
 
                     market_cond = build_market_registered_conditions(_CP)
 
-                    _priority_enabled = await _get_setting(
-                        session, AUTOTUNE_PRIORITY_ENABLED_KEY
-                    )
-                    _use_priority = (
-                        _priority_enabled
-                        if isinstance(_priority_enabled, bool)
-                        else True
-                    )
-
-                    if _use_priority:
-                        priority_order = case(
-                            (_CP.monitor_priority == "hot", 0),
-                            (_CP.monitor_priority == "warm", 1),
-                            else_=2,
-                        )
-                        _order_clause = (
-                            priority_order,
-                            _CP.last_refreshed_at.asc().nullsfirst(),
-                        )
-                    else:
-                        _order_clause = (_CP.last_refreshed_at.asc().nullsfirst(),)
+                    _order_clause = (_CP.last_refreshed_at.asc().nullsfirst(),)
 
                     _where = [
                         *market_cond,
@@ -2642,23 +2549,6 @@ async def _autotune_loop(device_id: str):
                     if _lt_cookie:
                         set_lotteon_cookie(str(_lt_cookie))
 
-                    # 등급 분류
-                    _priority_enabled = await _get_setting(
-                        session, AUTOTUNE_PRIORITY_ENABLED_KEY
-                    )
-                    _use_priority = (
-                        _priority_enabled
-                        if isinstance(_priority_enabled, bool)
-                        else True
-                    )
-                    if _use_priority:
-                        try:
-                            await _classify_products(session)
-                        except Exception as cls_err:
-                            log.warning(
-                                "[오토튠][%s] 등급 분류 실패: %s", _dev_tag, cls_err
-                            )
-
                     # 활성 소싱처 목록 파악
                     from backend.api.v1.routers.samba.collector_common import (
                         build_market_registered_conditions,
@@ -3400,17 +3290,6 @@ async def autotune_status(device_id: str = ""):
 
     intervals_info = get_site_intervals_info()
 
-    # 등급 분류 ON/OFF
-    priority_enabled = True
-    try:
-        from backend.api.v1.routers.samba.proxy import _get_setting
-
-        async with get_read_session() as rs2:
-            _pv = await _get_setting(rs2, AUTOTUNE_PRIORITY_ENABLED_KEY)
-        priority_enabled = _pv if isinstance(_pv, bool) else True
-    except Exception:
-        pass
-
     dev = (device_id or "").strip()
     _now_hb = time.time()
 
@@ -3485,7 +3364,6 @@ async def autotune_status(device_id: str = ""):
         "breaker_tripped": tripped,
         "site_intervals": intervals_info.get("base_intervals", {}),
         "site_autotune_concurrency": get_effective_autotune_concurrency(),
-        "priority_enabled": priority_enabled,
         "site_loops": _active_site_loops,
         "stuck_timeout": STUCK_TIMEOUT_SECONDS,
         # PC별 분담 현황 (UI 표시용) — 본인 테넌트 device만
@@ -3559,39 +3437,6 @@ async def autotune_breaker_reset(site: str = ""):
         _pending_cost_increase.clear()
         logger.info("[오토튠] 서킷브레이커 전체 해제 (pending 가격 상승 초기화 포함)")
         return {"ok": True, "reset": "all"}
-
-
-# ── 등급 분류(hot/warm/cold) ON/OFF ──
-
-
-@router.get("/autotune/priority")
-async def autotune_get_priority():
-    """등급 분류 ON/OFF 상태 조회."""
-    from backend.db.orm import get_read_session
-    from backend.api.v1.routers.samba.proxy import _get_setting
-
-    async with get_read_session() as session:
-        val = await _get_setting(session, AUTOTUNE_PRIORITY_ENABLED_KEY)
-    enabled = val if isinstance(val, bool) else True
-    return {"ok": True, "priority_enabled": enabled}
-
-
-class AutotunePriorityRequest(BaseModel):
-    enabled: bool
-
-
-@router.post("/autotune/priority")
-async def autotune_set_priority(body: AutotunePriorityRequest):
-    """등급 분류 ON/OFF 설정 변경."""
-    from backend.db.orm import get_write_session
-    from backend.api.v1.routers.samba.proxy import _set_setting
-
-    async with get_write_session() as session:
-        await _set_setting(session, AUTOTUNE_PRIORITY_ENABLED_KEY, body.enabled)
-        await session.commit()
-    label = "ON" if body.enabled else "OFF"
-    logger.info("[오토튠] 등급 분류 %s", label)
-    return {"ok": True, "priority_enabled": body.enabled}
 
 
 # ── 오토튠 필터 (소싱처 / 판매처 선택) ──
