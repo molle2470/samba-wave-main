@@ -5,6 +5,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -426,6 +427,19 @@ async def enrich_product(
 
         try:
             detail = await NikeClient().get_detail(product.site_product_id)
+        except httpx.HTTPStatusError as e:
+            # PDP 404 = Nike Korea 단종 컬러 — [[plugins/sourcing/nike.py refresh]] 동일 매핑
+            if e.response.status_code == 404:
+                updates = {"sale_status": "sold_out"}
+                updated = await svc.update_collected_product(product_id, updates)
+                retransmit = await _retransmit_if_changed(session, product, updates)
+                return {
+                    "success": True,
+                    "enriched_fields": list(updates.keys()),
+                    "product": updated,
+                    **retransmit,
+                }
+            raise HTTPException(502, f"Nike 상세 조회 실패: {e}")
         except Exception as e:
             raise HTTPException(502, f"Nike 상세 조회 실패: {e}")
         if detail.get("error"):
