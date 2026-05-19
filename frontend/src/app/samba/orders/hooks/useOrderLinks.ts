@@ -29,29 +29,9 @@ export function useOrderLinks(accounts: SambaMarketAccount[]) {
         }
       } catch { /* ignore */ }
     }
-    // 4. 상품명에서 소싱처 상품번호 추출 → URL 구성
-    const sourcingUrls: Record<string, string> = {
-      MUSINSA: 'https://www.musinsa.com/products/',
-      KREAM: 'https://kream.co.kr/products/',
-      FashionPlus: 'https://www.fashionplus.co.kr/goods/detail/',
-      ABCmart: 'https://www.a-rt.com/product?prdtNo=',
-      Nike: 'https://www.nike.com/kr/t/',
-    }
-    const name = o.product_name || ''
-    const idMatch = name.match(/\b(\d{6,})\s*$/)
-    if (idMatch && o.source_site && sourcingUrls[o.source_site]) {
-      window.open(sourcingUrls[o.source_site] + idMatch[1], '_blank')
-      return
-    }
-    if (idMatch) {
-      const id = idMatch[1]
-      if (name.includes('운동화') || name.includes('나이키') || name.includes('아디다스')) {
-        window.open('https://www.fashionplus.co.kr/goods/detail/' + id, '_blank')
-        return
-      }
-      window.open('https://www.musinsa.com/products/' + id, '_blank')
-      return
-    }
+    // 4. fallback 금지 — 상품명 끝 숫자(`\d{6,}`)를 상품번호로 가정하면 옵션/스타일코드와
+    // 충돌해 엉뚱한 상품(예: 스파이더 ↔ 푸마) 페이지가 열리는 사고가 반복됨(2026-05-20).
+    // 백엔드 주문동기화에서 source_url을 채우지 못한 케이스는 안전하게 안내만 한다.
     showAlert('소싱처 원문링크 정보가 없습니다', 'info')
   }
 

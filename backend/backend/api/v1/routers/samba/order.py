@@ -5689,9 +5689,12 @@ async def sync_orders_from_markets(
                     if _id_match:
                         _sid = _id_match.group(1)
                         # 1차-A: site_product_id 정확 매칭
+                        # cp.source_url을 직접 끌어와 sourcing_urls 템플릿 기반 추정보다 우선 사용한다
+                        # (2026-05-20: 상품명 끝 숫자로 추정한 URL이 옵션/스타일코드와 충돌해
+                        # 엉뚱한 상품을 열어주던 사고 — 푸마↔스파이더 — 재발 방지).
                         _cp_check = await session.execute(
                             _sa_text(
-                                "SELECT id, source_site, images, site_product_id "
+                                "SELECT id, source_site, images, site_product_id, source_url "
                                 "FROM samba_collected_product "
                                 "WHERE site_product_id = :sid "
                                 "ORDER BY (market_product_nos IS NOT NULL) DESC, created_at ASC "
@@ -5705,7 +5708,7 @@ async def sync_orders_from_markets(
                         if not _cp_row:
                             _cp_pref = await session.execute(
                                 _sa_text(
-                                    "SELECT id, source_site, images, site_product_id "
+                                    "SELECT id, source_site, images, site_product_id, source_url "
                                     "FROM samba_collected_product "
                                     "WHERE site_product_id LIKE :pfx "
                                     "ORDER BY (market_product_nos IS NOT NULL) DESC, created_at ASC "
@@ -5718,13 +5721,18 @@ async def sync_orders_from_markets(
                                 _cp_row = _cp_pref_rows[0]
                         if _cp_row:
                             _matched_spid = _cp_row[3] or _sid
+                            _cp_source_url = _cp_row[4] if len(_cp_row) > 4 else None
                             if not order_data.get("collected_product_id"):
                                 order_data["collected_product_id"] = _cp_row[0]
                             if _can_override_source_site_from_sourcing(order_data):
                                 order_data["source_site"] = _cp_row[1]
-                            order_data["source_url"] = _sourcing_urls.get(
-                                _cp_row[1], ""
-                            ).format(_matched_spid)
+                            # cp.source_url 우선, 없으면 sourcing_urls 템플릿 fallback
+                            order_data["source_url"] = (
+                                _cp_source_url
+                                or _sourcing_urls.get(_cp_row[1], "").format(
+                                    _matched_spid
+                                )
+                            )
                             if (
                                 not order_data.get("product_image")
                                 and _cp_row[2]
