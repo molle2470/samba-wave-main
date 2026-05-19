@@ -140,6 +140,8 @@ class SSGClient:
         if method == "GET":
             resp = await client.get(url, headers=headers, params=params)
         elif method == "POST":
+            import json as _json
+            logger.info(f"[SSG REQ] POST {path} body={_json.dumps(body or {}, ensure_ascii=False)[:500]}")
             resp = await client.post(
                 url, headers=headers, json=body or {}, params=params
             )
@@ -1687,6 +1689,22 @@ class SSGClient:
             "shipping_status": "취소요청",
         }
 
+    async def get_order_detail(self, or_ord_no: str) -> list[dict[str, Any]]:
+        """원주문번호로 주문 상세 조회 — ordItemDiv(021=취소) 등 현재 상태 확인용.
+
+        API: GET /api/claim/v2/order/{orordNo}
+        """
+        data = await self._call_api("GET", f"/api/claim/v2/order/{or_ord_no}")
+        result = data.get("result", {})
+        if not isinstance(result, dict):
+            return []
+        result_data = result.get("resultData", [])
+        if isinstance(result_data, dict):
+            result_data = [result_data]
+        elif not isinstance(result_data, list):
+            return []
+        return result_data
+
     async def confirm_order(self, shpp_no: str, shpp_seq: str) -> dict[str, Any]:
         """발주확인 처리."""
         body = {
@@ -1784,7 +1802,8 @@ class SSGClient:
 
         rl_ord_amt = float(raw.get("rlordAmt", 0) or 0)
         dc_amt = float(raw.get("dcAmt", 0) or 0)
-        sell_price = rl_ord_amt + dc_amt  # 판매가 = 결제금액 + 할인금액
+        sell_price = float(raw.get("sellprc", 0) or 0) or (rl_ord_amt + dc_amt)
+        spl_prc = float(raw.get("splprc", 0) or 0)  # 공급가 = 정산금액
         # 수령인 우선, 없으면 주문자 fallback (str 정규화)
         customer_name = str(raw.get("rcptpeNm", "") or raw.get("ordpeNm", "") or "")
         # 수령인 연락처 우선 (휴대폰 → 집전화 → 주문자 휴대폰)
@@ -1814,10 +1833,11 @@ class SSGClient:
         ord_no = str(raw.get("ordNo", "") or "")
         ord_item_seq = str(raw.get("ordItemSeq", "") or "")
         shpp_no = str(raw.get("shppNo", "") or "")
+        shpp_seq = str(raw.get("shppSeq", "") or ord_item_seq)  # 배송순번 (운송장등록/발주확인에 사용)
         # orordNo: 원주문번호 (신세계몰 주문관리 페이지의 '원주문번호' 항목)
         or_ord_no = str(raw.get("orordNo", "") or "")
 
-        # ordNo가 비어있으면 orordNo → shppNo|ordItemSeq 복합키 순으로 fallback
+        # ordNo가 비어있으면 orordNo → shppNo|shppSeq 복합키 순으로 fallback
         if not ord_no:
             if or_ord_no:
                 ord_no = or_ord_no
@@ -1826,33 +1846,21 @@ class SSGClient:
                     f"order_number={ord_no}, raw_keys={raw_keys}"
                 )
             else:
-                ord_no = f"{shpp_no}|{ord_item_seq}"
+                ord_no = f"{shpp_no}|{shpp_seq}"
                 logger.warning(
                     f"[SSG 주문] ordNo/orordNo 모두 누락으로 복합키 fallback 사용: "
                     f"order_number={ord_no}, raw_keys={raw_keys}"
                 )
         logger.info(
-            f"[SSG 주문 파싱] order_number={ord_no}, shipment_id_parts=({shpp_no}|{ord_item_seq}|{or_ord_no}), "
+            f"[SSG 주문 파싱] order_number={ord_no}, shppNo={shpp_no}, shppSeq={shpp_seq}, ordItemSeq={ord_item_seq}, "
             f"product_id={item_id_str}, status={status}, shppProgStatDtlCd={shpp_prog}"
         )
 
-        # shipment_id에 shppNo|ordItemSeq 형식으로 저장
-        # - shppNo: 배송번호 (발주확인 시 필요)
-        # - ordItemSeq: 주문상품순번 (취소승인 시 필요)
-        # orordNo는 order_number에 이미 저장되므로 중복 제외
-        shipment_id = f"{shpp_no}|{ord_item_seq}"
-
-        # ordCmplDts(주문완료일시) → paid_at, KST → UTC 변환
-        KST = timezone(timedelta(hours=9))
-        paid_at = None
-        _ord_dt_str = str(raw.get("ordCmplDts", "") or raw.get("ordRcpDts", "") or "")
-        if _ord_dt_str:
-            try:
-                paid_at = datetime.strptime(_ord_dt_str, "%Y-%m-%d %H:%M:%S").replace(
-                    tzinfo=KST
-                )
-            except ValueError:
-                pass
+        # shipment_id에 shppNo|shppSeq 형식으로 저장
+        # - shppNo: 배송번호
+        # - shppSeq: 배송순번 (발주확인·운송장등록 시 필요, ordItemSeq와 다를 수 있음)
+        # ordItemSeq는 ord_prd_seq에 별도 저장 (취소승인 시 필요)
+        shipment_id = f"{shpp_no}|{shpp_seq}"
 
         # 결제일(paid_at) — 주문 목록 화면이 paid_at IS NOT NULL 로 필터링하므로
         # 누락되면 SSG 주문이 목록에서 통째로 사라짐. 결제완료>주문일시 우선순위.
@@ -1861,6 +1869,8 @@ class SSGClient:
             or self._parse_ssg_dts(raw.get("pymtDts"))
             or self._parse_ssg_dts(raw.get("ordDts"))
             or self._parse_ssg_dts(raw.get("ordDt"))
+            or self._parse_ssg_dts(raw.get("ordCmplDts"))
+            or self._parse_ssg_dts(raw.get("ordRcpDts"))
         )
         if paid_at is None:
             logger.warning(
@@ -1872,7 +1882,6 @@ class SSGClient:
             "order_number": ord_no,
             "shipment_id": shipment_id,
             "customer_note": str(raw.get("ordMemoCntt", "") or ""),
-            "paid_at": paid_at,
             "channel_id": account_id,
             "channel_name": label,
             "product_id": item_id_str,
@@ -1882,14 +1891,15 @@ class SSGClient:
             "customer_phone": customer_phone,
             "customer_address": customer_address,
             "quantity": raw.get("ordQty", 1) or 1,
-            "sale_price": rl_ord_amt,
+            "sale_price": sell_price,
             "cost": 0,
             "fee_rate": fee_rate,
-            "revenue": round(sell_price / 1.1 * (1 - fee_rate / 100)),
+            "revenue": round(spl_prc * 1.1) if spl_prc > 0 else round(sell_price / 1.1 * (1 - fee_rate / 100)),
             "source": "ssg",
             "status": status,
             "shipping_status": shipping_status,
             "paid_at": paid_at,
+            "ord_prd_seq": ord_item_seq,  # 취소승인 API(approve_cancel)에서 ordItemSeq로 사용
         }
 
     async def confirm_rcov(

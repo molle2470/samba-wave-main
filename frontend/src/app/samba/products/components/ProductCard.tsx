@@ -489,7 +489,10 @@ const ProductCard = React.memo(function ProductCard({
   const marketPriceList = useMemo(() => Object.entries(mp)
     .filter(([, v]) => v.accountId)
     .map(([marketName, v]) => {
-      const r = calcPrice(cost, v.marginRate || marginRate, (v.shippingCost ?? shippingCost) || shippingCost, v.feeRate || 0, extraCharge, minMarginAmount, ssMRate, ssMAmount)
+      const acct = v.accountId ? accMap.get(v.accountId) : undefined
+      const acctFeeRate = Number((acct?.additional_fields as Record<string, unknown> | undefined)?.feeRate || 0)
+      const acctExtraFeeRate = Number((acct?.additional_fields as Record<string, unknown> | undefined)?.extraFeeRate || 0)
+      const r = calcPrice(cost, marginRate, (v.shippingCost ?? shippingCost) || shippingCost, acctFeeRate || v.feeRate || feeRate, extraCharge, minMarginAmount, ssMRate, ssMAmount)
       let displayPrice = r.price
       let displayCalcStr = r.calcStr
       // 스마트스토어: 300원 올림 반영 (백엔드 25% 역산과 동일)
@@ -498,6 +501,21 @@ const ProductCard = React.memo(function ProductCard({
         const diff = displayPrice - r.price
         if (diff > 0) {
           displayCalcStr = `₩${fmt(displayPrice)} = ${r.calcStr.split(' = ')[1]} + 300원올림 +${fmt(diff)}`
+        }
+      }
+      // SSG: 추가수수료율 역산 + 100원 단위 올림
+      if (marketName === '신세계몰(전시)') {
+        if (acctExtraFeeRate > 0) {
+          const before = displayPrice
+          displayPrice = Math.ceil(before / (1 - acctExtraFeeRate / 100))
+          const extraAmt = displayPrice - before
+          const baseCalc = displayCalcStr.split(' = ').slice(1).join(' = ')
+          displayCalcStr = `₩${fmt(displayPrice)} = ${baseCalc} + 추가수수료 ${fmt(extraAmt)}(${acctExtraFeeRate}%)`
+        }
+        const rounded = Math.ceil(displayPrice / 100) * 100
+        if (rounded !== displayPrice) {
+          displayCalcStr = displayCalcStr.replace(/^₩[\d,]+/, `₩${fmt(rounded)}`)
+          displayPrice = rounded
         }
       }
       return { marketName, price: displayPrice, calcStr: displayCalcStr }
