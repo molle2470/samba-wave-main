@@ -1471,15 +1471,28 @@ async function _detectLoginStatus(tabId, site) {
   }
 }
 
+// globalThis 명시 — let은 service worker importScripts 글로벌에 노출 안 됨 (콘솔 검증 불가).
+// 콘솔에서 typeof globalThis._pollSourcingInflight 로 검증 가능.
+globalThis._pollSourcingInflight = false
 async function pollSourcingOnce() {
   // ⚠️ _localAutotuneJoined 가드 절대 추가 금지 ⚠️
   // "다른 PC 편승 차단"을 위해 guard를 붙이면 수동 업데이트(업데이트 버튼)가 깨진다.
-  // 편승 차단은 백엔드 get_next_job()의 ownerDeviceId 매칭이 이미 보장한다:
-  //   - 오토튠 잡: ownerDeviceId="device_A" → device_A만 수신 (다른 PC는 hasJob:false)
-  //   - 수동 잡:   ownerDeviceId=""         → 어떤 PC든 수신 가능 (오토튠 off여도 처리)
-  // 이 guard는 6abafeb4(수동 업데이트 수정)에서 제거 → e9e2c83c(다중PC분담)에서 재추가 →
-  // 다시 제거. 3번째 반복이므로 절대 재추가하지 말 것.
+  // 편승 차단은 백엔드 get_next_job()의 ownerDeviceId 매칭이 이미 보장한다.
   // 백엔드가 배치 크기만큼만 큐에 넣으므로 자연히 그 수만큼 처리됨
+  //
+  // [중요] inflight lock — runFocusPoll(0.5s)과 runPollCycle(30s alarm)이 동시 트리거되어
+  // pollSourcingOnce가 병렬 실행되면 tracking 잡이 여러 batch로 흩어져 1번 잡 처리 중
+  // 4, 6, 8번이 먼저 끝나는 현상 발생 (직렬 처리 무용). 한 번에 한 호출만 허용.
+  if (globalThis._pollSourcingInflight) return false
+  globalThis._pollSourcingInflight = true
+  try {
+    return await _pollSourcingOnceImpl()
+  } finally {
+    globalThis._pollSourcingInflight = false
+  }
+}
+
+async function _pollSourcingOnceImpl() {
   const jobs = []
   for (let i = 0; i < SOURCING_MAX_POLL_LIMIT; i++) {
     try {
