@@ -5040,6 +5040,7 @@ async def sync_orders_from_markets(
                             _ssg_ro, account["id"], label, fee_rate=_ssg_fee_rate
                         )
                         orders_data.append(_ord)
+
                 except Exception as _ssg_e:
                     logger.warning(
                         f"[주문동기화] {label}: SSG 주문 조회 실패 — {_ssg_e}"

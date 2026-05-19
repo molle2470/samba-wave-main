@@ -1784,7 +1784,8 @@ class SSGClient:
 
         rl_ord_amt = float(raw.get("rlordAmt", 0) or 0)
         dc_amt = float(raw.get("dcAmt", 0) or 0)
-        sell_price = rl_ord_amt + dc_amt  # 판매가 = 결제금액 + 할인금액
+        sell_price = float(raw.get("sellprc", 0) or 0) or (rl_ord_amt + dc_amt)
+        spl_prc = float(raw.get("splprc", 0) or 0)  # 공급가 = 정산금액
         # 수령인 우선, 없으면 주문자 fallback (str 정규화)
         customer_name = str(raw.get("rcptpeNm", "") or raw.get("ordpeNm", "") or "")
         # 수령인 연락처 우선 (휴대폰 → 집전화 → 주문자 휴대폰)
@@ -1842,18 +1843,6 @@ class SSGClient:
         # orordNo는 order_number에 이미 저장되므로 중복 제외
         shipment_id = f"{shpp_no}|{ord_item_seq}"
 
-        # ordCmplDts(주문완료일시) → paid_at, KST → UTC 변환
-        KST = timezone(timedelta(hours=9))
-        paid_at = None
-        _ord_dt_str = str(raw.get("ordCmplDts", "") or raw.get("ordRcpDts", "") or "")
-        if _ord_dt_str:
-            try:
-                paid_at = datetime.strptime(_ord_dt_str, "%Y-%m-%d %H:%M:%S").replace(
-                    tzinfo=KST
-                )
-            except ValueError:
-                pass
-
         # 결제일(paid_at) — 주문 목록 화면이 paid_at IS NOT NULL 로 필터링하므로
         # 누락되면 SSG 주문이 목록에서 통째로 사라짐. 결제완료>주문일시 우선순위.
         paid_at = (
@@ -1861,6 +1850,8 @@ class SSGClient:
             or self._parse_ssg_dts(raw.get("pymtDts"))
             or self._parse_ssg_dts(raw.get("ordDts"))
             or self._parse_ssg_dts(raw.get("ordDt"))
+            or self._parse_ssg_dts(raw.get("ordCmplDts"))
+            or self._parse_ssg_dts(raw.get("ordRcpDts"))
         )
         if paid_at is None:
             logger.warning(
@@ -1872,7 +1863,6 @@ class SSGClient:
             "order_number": ord_no,
             "shipment_id": shipment_id,
             "customer_note": str(raw.get("ordMemoCntt", "") or ""),
-            "paid_at": paid_at,
             "channel_id": account_id,
             "channel_name": label,
             "product_id": item_id_str,
@@ -1882,10 +1872,10 @@ class SSGClient:
             "customer_phone": customer_phone,
             "customer_address": customer_address,
             "quantity": raw.get("ordQty", 1) or 1,
-            "sale_price": rl_ord_amt,
+            "sale_price": sell_price,
             "cost": 0,
             "fee_rate": fee_rate,
-            "revenue": round(sell_price / 1.1 * (1 - fee_rate / 100)),
+            "revenue": round(spl_prc * 1.1) if spl_prc > 0 else round(sell_price / 1.1 * (1 - fee_rate / 100)),
             "source": "ssg",
             "status": status,
             "shipping_status": shipping_status,
