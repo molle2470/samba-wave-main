@@ -5703,22 +5703,11 @@ async def sync_orders_from_markets(
                             {"sid": _sid},
                         )
                         _cp_row = _cp_check.fetchone()
-                        # 1차-B: prefix 매칭 (예: SSG itemId '1000807183548'은 _sid '1000807183'로
-                        # 시작 — 정확 매칭 실패 시 prefix로 시도하되, 단 1건일 때만 신뢰)
-                        if not _cp_row:
-                            _cp_pref = await session.execute(
-                                _sa_text(
-                                    "SELECT id, source_site, images, site_product_id, source_url "
-                                    "FROM samba_collected_product "
-                                    "WHERE site_product_id LIKE :pfx "
-                                    "ORDER BY (market_product_nos IS NOT NULL) DESC, created_at ASC "
-                                    "LIMIT 2"
-                                ),
-                                {"pfx": _sid + "%"},
-                            )
-                            _cp_pref_rows = _cp_pref.fetchall()
-                            if len(_cp_pref_rows) == 1:
-                                _cp_row = _cp_pref_rows[0]
+                        # 1차-B prefix 매칭 영구 제거 (2026-05-20).
+                        # 상품명 끝 6자리(_sid='403372')가 무관한 다른 cp의 7자리
+                        # site_product_id(예: '4033721' 스파이더)와 prefix LIKE로 우연
+                        # 일치하여 엉뚱한 상품으로 매칭되는 사고 발생.
+                        # SSG itemId 끝자리 잘림은 정확 매칭만으로 처리하거나 별도 정규화 필요.
                         if _cp_row:
                             _matched_spid = _cp_row[3] or _sid
                             _cp_source_url = _cp_row[4] if len(_cp_row) > 4 else None
