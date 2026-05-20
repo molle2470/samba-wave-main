@@ -1740,7 +1740,9 @@ class SSGClient:
                 "shppDivDtlCds": "21,22",
             }
         }
-        data = await self._call_api("POST", "/api/pd/1/listExchangeTarget.ssg", body=body)
+        data = await self._call_api(
+            "POST", "/api/pd/1/listExchangeTarget.ssg", body=body
+        )
         logger.info(f"[SSG 반품조회] 응답 최상위 키: {list(data.keys())[:10]}")
         # 응답 구조가 다른 API와 다를 수 있음 — result 래퍼 있는 경우와 없는 경우 모두 처리
         result = data.get("result") or data
@@ -1753,7 +1755,9 @@ class SSGClient:
         if isinstance(raw_targets, dict):
             raw_targets = [raw_targets]
         elif not isinstance(raw_targets, list):
-            logger.warning(f"[SSG 반품조회] exchangeTargets 타입 이상: {type(raw_targets)} — {str(raw_targets)[:200]}")
+            logger.warning(
+                f"[SSG 반품조회] exchangeTargets 타입 이상: {type(raw_targets)} — {str(raw_targets)[:200]}"
+            )
             return []
         unwrapped = []
         for t in raw_targets:

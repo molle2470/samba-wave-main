@@ -123,9 +123,7 @@ class ESMPlusClient:
         if self._http_client is None or self._http_client.is_closed:
             self._http_client = httpx.AsyncClient(
                 timeout=self._timeout,
-                limits=httpx.Limits(
-                    max_connections=20, max_keepalive_connections=10
-                ),
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
             )
         return self._http_client
 
@@ -273,11 +271,7 @@ class ESMPlusClient:
             if result_code is None:
                 result_code = 0
         if resp.status_code >= 400 or (body and result_code != 0):
-            msg = (
-                body.get("message")
-                or body.get("Message")
-                or resp.text[:500]
-            )
+            msg = body.get("message") or body.get("Message") or resp.text[:500]
             logger.error(
                 f"[{label}] API 에러 {method} {path}: {resp.status_code} / resultCode={result_code} / {msg}"
             )
@@ -343,9 +337,7 @@ class ESMPlusClient:
                 )
                 await asyncio.sleep(wait)
                 try:
-                    return await self._call_api(
-                        "DELETE", f"/item/v1/goods/{goods_no}"
-                    )
+                    return await self._call_api("DELETE", f"/item/v1/goods/{goods_no}")
                 except RuntimeError as inner:
                     if "F001000" not in str(inner) and "다른 판매자의 주문" not in str(
                         inner
@@ -460,9 +452,7 @@ class ESMPlusClient:
     #   4. set_recommended_options(goods_no, payload) — 상품 등록 후 옵션 추가
     # ------------------------------------------------------------------
 
-    async def get_recommended_opt_groups(
-        self, cat_code: str
-    ) -> list[dict[str, Any]]:
+    async def get_recommended_opt_groups(self, cat_code: str) -> list[dict[str, Any]]:
         """카테고리별 추천옵션그룹 — GET /item/v1/options/recommended-opts?catCode=...
 
         응답 key 'details' (응답 구조 확인: 색상/사이즈/직접입력 등).
@@ -543,9 +533,7 @@ class ESMPlusClient:
             "PUT", f"/item/v1/goods/{goods_no}/recommended-options", data=payload
         )
 
-    async def get_recommended_options(
-        self, goods_no: str
-    ) -> dict[str, Any]:
+    async def get_recommended_options(self, goods_no: str) -> dict[str, Any]:
         """상품 추천옵션 조회 — GET /item/v1/goods/{goodsNo}/recommended-options"""
         return await self._call_api(
             "GET", f"/item/v1/goods/{goods_no}/recommended-options"
@@ -852,19 +840,13 @@ class ESMPlusClient:
 
         상품 등록 시 brand 단순 string → ESM 브랜드 코드 매핑 시 사용.
         """
-        return await self._call_api(
-            "GET", f"/item/v1/catalogs/brands/{brand_name}"
-        )
+        return await self._call_api("GET", f"/item/v1/catalogs/brands/{brand_name}")
 
     async def search_makers(self, maker_name: str) -> dict[str, Any]:
         """제조사 코드 조회 — GET /item/v1/catalogs/makers/{makerName}."""
-        return await self._call_api(
-            "GET", f"/item/v1/catalogs/makers/{maker_name}"
-        )
+        return await self._call_api("GET", f"/item/v1/catalogs/makers/{maker_name}")
 
-    async def get_mainshop_categories(
-        self, shop_cat_code: str = ""
-    ) -> dict[str, Any]:
+    async def get_mainshop_categories(self, shop_cat_code: str = "") -> dict[str, Any]:
         """마니샵 카테고리 조회 — GET /item/v1/catalogs/shop/{shopCatCode}.
 
         자체 쇼핑몰 매핑용. movestory1 권한 401 — 운영자 신청 후 사용.
@@ -897,9 +879,7 @@ class ESMPlusClient:
             "POST", f"/item/v1/goods/{goods_no}/safety-certs", data=data
         )
 
-    async def set_search_tags(
-        self, goods_no: str, tags: list[str]
-    ) -> dict[str, Any]:
+    async def set_search_tags(self, goods_no: str, tags: list[str]) -> dict[str, Any]:
         """검색태그 등록/수정 — POST /item/v1/goods/{goodsNo}/search-tags.
 
         상품 검색 노출 키워드. 권한 별도 신청 필요.
@@ -914,9 +894,7 @@ class ESMPlusClient:
     # 이벤트 홍보 (event-promotions)
     # ------------------------------------------------------------------
 
-    async def create_event_promotion(
-        self, data: dict[str, Any]
-    ) -> dict[str, Any]:
+    async def create_event_promotion(self, data: dict[str, Any]) -> dict[str, Any]:
         """이벤트 홍보 등록 — POST /item/v1/event-promotions.
 
         data: { name, detail, isExposure, isApplyAll, exposureDate: {startDate, endDate} }
@@ -932,17 +910,11 @@ class ESMPlusClient:
             "PUT", f"/item/v1/event-promotions/{promotion_no}", data=data
         )
 
-    async def get_event_promotion(
-        self, promotion_no: int | str
-    ) -> dict[str, Any]:
+    async def get_event_promotion(self, promotion_no: int | str) -> dict[str, Any]:
         """이벤트 홍보 조회."""
-        return await self._call_api(
-            "GET", f"/item/v1/event-promotions/{promotion_no}"
-        )
+        return await self._call_api("GET", f"/item/v1/event-promotions/{promotion_no}")
 
-    async def delete_event_promotion(
-        self, promotion_no: int | str
-    ) -> dict[str, Any]:
+    async def delete_event_promotion(self, promotion_no: int | str) -> dict[str, Any]:
         """이벤트 홍보 삭제."""
         return await self._call_api(
             "DELETE", f"/item/v1/event-promotions/{promotion_no}"
@@ -985,9 +957,7 @@ class ESMPlusClient:
             data=data,
         )
 
-    async def set_cashback(
-        self, goods_no: str, data: dict[str, Any]
-    ) -> dict[str, Any]:
+    async def set_cashback(self, goods_no: str, data: dict[str, Any]) -> dict[str, Any]:
         """판매자 스마일캐시 등록/수정 — POST .../customer-benefit/cashback."""
         return await self._call_api(
             "POST",
@@ -1025,15 +995,11 @@ class ESMPlusClient:
         self, group_no: int | str, data: dict[str, Any]
     ) -> dict[str, Any]:
         """그룹 수정 — PUT /item/v1/groups/{groupNo}."""
-        return await self._call_api(
-            "PUT", f"/item/v1/groups/{group_no}", data=data
-        )
+        return await self._call_api("PUT", f"/item/v1/groups/{group_no}", data=data)
 
     async def delete_group(self, group_no: int | str) -> dict[str, Any]:
         """그룹 삭제."""
-        return await self._call_api(
-            "DELETE", f"/item/v1/groups/{group_no}"
-        )
+        return await self._call_api("DELETE", f"/item/v1/groups/{group_no}")
 
     async def add_group_goods(
         self, group_no: int | str, site_goods_nos: list[str]
@@ -1112,9 +1078,7 @@ class ESMPlusClient:
     # CS / 판매자 문의 (item/v1/communications/...)
     # ------------------------------------------------------------------
 
-    async def search_customer_inquiries(
-        self, params: dict[str, Any]
-    ) -> dict[str, Any]:
+    async def search_customer_inquiries(self, params: dict[str, Any]) -> dict[str, Any]:
         """판매자 문의 조회 — POST /item/v1/communications/customer/bulletin-board.
 
         Required params:
@@ -1156,9 +1120,7 @@ class ESMPlusClient:
             data=body,
         )
 
-    async def search_urgent_alerts(
-        self, params: dict[str, Any]
-    ) -> dict[str, Any]:
+    async def search_urgent_alerts(self, params: dict[str, Any]) -> dict[str, Any]:
         """긴급알리미 조회 — ESM 측 CS 긴급 요청 사항."""
         return await self._call_api(
             "POST",
@@ -1432,15 +1394,15 @@ class ESMPlusClient:
 # ESM Plus 고시정보 그룹 번호 (officialNoticeNo)
 # 검증 출처: GET /item/v1/official-notice/groups (2026-05-15 movestory1 응답)
 _ESM_NOTICE_MAP: dict[str, int] = {
-    "wear": 1,       # 의류
-    "shoes": 2,      # 구두/신발
-    "bag": 3,        # 가방
+    "wear": 1,  # 의류
+    "shoes": 2,  # 구두/신발
+    "bag": 3,  # 가방
     "accessories": 4,  # 패션잡화(모자/벨트/액세서리 등)
     "cosmetic": 18,  # 화장품
-    "food": 20,      # 농수축산물 (가공식품은 21, 건강기능식품은 22)
+    "food": 20,  # 농수축산물 (가공식품은 21, 건강기능식품은 22)
     "electronics": 12,  # 소형전자 (휴대형 통신기기 13, 가정용 전기제품 8 등 세분 가능)
-    "sports": 25,    # 스포츠 용품
-    "etc": 35,       # 기타 재화
+    "sports": 25,  # 스포츠 용품
+    "etc": 35,  # 기타 재화
 }
 
 
@@ -1454,50 +1416,50 @@ def _get_esm_notice_no(group: str) -> int:
 # isExtraMark=true 항목 모두 채워야 ESM 등록 검증 통과. fallback="[상세설명참조]" 안전.
 _ESM_NOTICE_ITEMS: dict[int, list[tuple[str, str]]] = {
     1: [  # 의류
-        ("1-1", "material"),           # 제품소재
-        ("1-2", "color"),               # 색상
-        ("1-3", ""),                    # 치수 (옵션/상세설명 참조)
-        ("1-4", "manufacturer"),       # 제조자/수입자
-        ("1-5", "origin"),              # 제조국
-        ("1-6", "care_instructions"),   # 세탁방법
-        ("1-7", ""),                    # 제조연월
-        ("1-8", "quality_guarantee"),   # 품질보증기준
-        ("1-9", "_as_phone"),           # A/S 책임자/전화
-        ("1-10", ""),                   # 주문후 예상 배송기간
+        ("1-1", "material"),  # 제품소재
+        ("1-2", "color"),  # 색상
+        ("1-3", ""),  # 치수 (옵션/상세설명 참조)
+        ("1-4", "manufacturer"),  # 제조자/수입자
+        ("1-5", "origin"),  # 제조국
+        ("1-6", "care_instructions"),  # 세탁방법
+        ("1-7", ""),  # 제조연월
+        ("1-8", "quality_guarantee"),  # 품질보증기준
+        ("1-9", "_as_phone"),  # A/S 책임자/전화
+        ("1-10", ""),  # 주문후 예상 배송기간
     ],
     2: [  # 구두/신발
-        ("2-1", "material"),           # 제품의 주소재
-        ("2-2", "color"),               # 색상
-        ("2-3", ""),                    # 치수
-        ("2-4", "manufacturer"),       # 제조자/수입자
-        ("2-5", "origin"),              # 제조국
-        ("2-6", "care_instructions"),   # 취급시 주의사항
-        ("2-7", "quality_guarantee"),   # 품질보증기준
-        ("2-8", "_as_phone"),           # A/S
-        ("2-9", ""),                    # 배송기간
+        ("2-1", "material"),  # 제품의 주소재
+        ("2-2", "color"),  # 색상
+        ("2-3", ""),  # 치수
+        ("2-4", "manufacturer"),  # 제조자/수입자
+        ("2-5", "origin"),  # 제조국
+        ("2-6", "care_instructions"),  # 취급시 주의사항
+        ("2-7", "quality_guarantee"),  # 품질보증기준
+        ("2-8", "_as_phone"),  # A/S
+        ("2-9", ""),  # 배송기간
     ],
     3: [  # 가방
-        ("3-1", ""),                    # 종류
-        ("3-2", "material"),           # 소재
-        ("3-3", "color"),               # 색상
-        ("3-4", ""),                    # 크기
-        ("3-5", "manufacturer"),       # 제조자/수입자
-        ("3-6", "origin"),              # 제조국
-        ("3-7", "care_instructions"),   # 취급시 주의사항
-        ("3-8", "quality_guarantee"),   # 품질보증기준
-        ("3-9", "_as_phone"),           # A/S
-        ("3-10", ""),                   # 배송기간
+        ("3-1", ""),  # 종류
+        ("3-2", "material"),  # 소재
+        ("3-3", "color"),  # 색상
+        ("3-4", ""),  # 크기
+        ("3-5", "manufacturer"),  # 제조자/수입자
+        ("3-6", "origin"),  # 제조국
+        ("3-7", "care_instructions"),  # 취급시 주의사항
+        ("3-8", "quality_guarantee"),  # 품질보증기준
+        ("3-9", "_as_phone"),  # A/S
+        ("3-10", ""),  # 배송기간
     ],
     4: [  # 패션잡화 (모자/벨트/액세서리 등)
-        ("4-1", ""),                    # 종류
-        ("4-2", "material"),           # 소재
-        ("4-3", ""),                    # 치수
-        ("4-4", "manufacturer"),       # 제조자/수입자
-        ("4-5", "origin"),              # 제조국
-        ("4-6", "care_instructions"),   # 취급시 주의사항
-        ("4-7", "quality_guarantee"),   # 품질보증기준
-        ("4-8", "_as_phone"),           # A/S
-        ("4-9", ""),                    # 배송기간
+        ("4-1", ""),  # 종류
+        ("4-2", "material"),  # 소재
+        ("4-3", ""),  # 치수
+        ("4-4", "manufacturer"),  # 제조자/수입자
+        ("4-5", "origin"),  # 제조국
+        ("4-6", "care_instructions"),  # 취급시 주의사항
+        ("4-7", "quality_guarantee"),  # 품질보증기준
+        ("4-8", "_as_phone"),  # A/S
+        ("4-9", ""),  # 배송기간
     ],
     35: [  # 기타 재화 — 필수 fields 가이드: '직접입력' 또는 상세설명참조 통일.
         ("999-5", ""),
@@ -1523,9 +1485,7 @@ def _build_esm_notice_items(
     for code, source_key in fields:
         raw = (product.get(source_key) if source_key else "") or ""
         val = str(raw).strip() or fallback
-        items.append(
-            {"officialNoticeItemelementCode": code, "value": val}
-        )
+        items.append({"officialNoticeItemelementCode": code, "value": val})
     return items
 
 
@@ -1731,9 +1691,7 @@ async def _build_combination(
             return None, 0, 0, None
         group, pool = await _resolve_esm_group(client, cat_code, name)
         if not group:
-            logger.warning(
-                f"[ESM] 조합형 축 매칭 실패: samba='{name}' cat={cat_code}"
-            )
+            logger.warning(f"[ESM] 조합형 축 매칭 실패: samba='{name}' cat={cat_code}")
             return None, 0, 0, None
         resolved = [
             ESMPlusClient.match_option_value(v["text"], pool) for v in samba_vals
@@ -1872,9 +1830,7 @@ async def register_esm_options(
             return {
                 "success": False,
                 "matched": 0,
-                "requested": len(
-                    _normalize_samba_option(samba_options[0])[1]
-                ),
+                "requested": len(_normalize_samba_option(samba_options[0])[1]),
                 "message": "매칭된 옵션값 0건 (선택형)",
             }
         matched = len(independent["details"])
