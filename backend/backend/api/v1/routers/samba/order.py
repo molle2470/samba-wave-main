@@ -4237,12 +4237,18 @@ async def sync_orders_from_markets(
                                 )
                                 new_p = cancel_priority.get(cn_ship_status, 0)
                                 if cur_p == 0 or new_p >= cur_p:
+                                    # status도 함께 갱신 — orders_data 분기와 일치 (2026-05-20)
+                                    # 누락 시 status=cancelled인데 ship=교환요청/반품요청 잔존 사고
                                     await svc.update_order(
                                         existing_c.id,
-                                        {"shipping_status": cn_ship_status},
+                                        {
+                                            "shipping_status": cn_ship_status,
+                                            "status": cn_status,
+                                        },
                                     )
                                     logger.info(
-                                        f"[롯데ON][취소클레임] DB 직접 업데이트: {cn_od_no} → {cn_ship_status}"
+                                        f"[롯데ON][취소클레임] DB 직접 업데이트: {cn_od_no} → "
+                                        f"{cn_status}/{cn_ship_status}"
                                     )
                 except Exception as cn_err:
                     logger.warning(f"[롯데ON] 취소 클레임 조회 실패: {cn_err}")
@@ -5107,32 +5113,42 @@ async def sync_orders_from_markets(
 
                     # 반품/교환 회수 대상 조회 → 상태 업데이트
                     try:
-                        _ssg_returns = await _ssg_client.get_return_requests(days=body.days)
+                        _ssg_returns = await _ssg_client.get_return_requests(
+                            days=body.days
+                        )
                         for _ret in _ssg_returns:
-                            _ret_ord_no = str(_ret.get("orordNo") or _ret.get("ordNo") or "")
+                            _ret_ord_no = str(
+                                _ret.get("orordNo") or _ret.get("ordNo") or ""
+                            )
                             if not _ret_ord_no:
                                 continue
                             _div_cd = str(_ret.get("shppDivDtlCd") or "")
                             _status = "return_requested"
-                            _shipping_status = "교환요청" if _div_cd == "22" else "반품요청"
-                            orders_data.append({
-                                "order_number": _ret_ord_no,
-                                "channel_id": account["id"],
-                                "channel_name": label,
-                                "status": _status,
-                                "shipping_status": _shipping_status,
-                                "source": "ssg",
-                                "sale_price": 0.0,
-                                "revenue": 0.0,
-                                "fee_rate": _ssg_fee_rate,
-                                "cost": 0,
-                            })
+                            _shipping_status = (
+                                "교환요청" if _div_cd == "22" else "반품요청"
+                            )
+                            orders_data.append(
+                                {
+                                    "order_number": _ret_ord_no,
+                                    "channel_id": account["id"],
+                                    "channel_name": label,
+                                    "status": _status,
+                                    "shipping_status": _shipping_status,
+                                    "source": "ssg",
+                                    "sale_price": 0.0,
+                                    "revenue": 0.0,
+                                    "fee_rate": _ssg_fee_rate,
+                                    "cost": 0,
+                                }
+                            )
                         if _ssg_returns:
                             logger.info(
                                 f"[주문동기화] {label}: 반품/교환 {len(_ssg_returns)}건 조회"
                             )
                     except Exception as _ssg_re:
-                        logger.warning(f"[주문동기화] {label}: SSG 반품조회 실패 — {_ssg_re}")
+                        logger.warning(
+                            f"[주문동기화] {label}: SSG 반품조회 실패 — {_ssg_re}"
+                        )
 
                     # SSG 취소 상태 전환 감지
                     # 1) 활성 주문 중 listShppDirection에 없는 것 → 취소요청 여부 단건 확인
@@ -6068,9 +6084,15 @@ async def sync_orders_from_markets(
                                 f"[주문동기화] 교환→반품 상태 전환: {order_data.get('order_number')} "
                                 f"{existing.shipping_status} → {new_ship_status}"
                             )
-                        elif (
-                            new_ship_status in ("반품요청", "반품완료", "반품거부")
-                            and existing.shipping_status in ("국내배송중", "배송완료", "구매확정", "송장전송완료")
+                        elif new_ship_status in (
+                            "반품요청",
+                            "반품완료",
+                            "반품거부",
+                        ) and existing.shipping_status in (
+                            "국내배송중",
+                            "배송완료",
+                            "구매확정",
+                            "송장전송완료",
                         ):
                             # 배송 진행 후 반품 접수 허용 (국내배송중/배송완료 → 반품요청)
                             update_fields["shipping_status"] = new_ship_status
