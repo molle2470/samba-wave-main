@@ -542,32 +542,6 @@ class SSGClient:
             "POST", f"/item/0.1/online/{item_id}/sales-status", body=body
         )
 
-    async def get_item_approval_status(
-        self, item_id: str, div_cd: str = "00"
-    ) -> list[dict[str, Any]]:
-        """신상품 승인 정보 조회 (getItemChngDemandList.ssg).
-
-        div_cd: "00"=신상품, "10"=기본정보 수정 등 (commCd I096)
-        chngDemndProcStatCd: 10=MD승인요청(대기), 20=승인완료, 30=MD반려
-        """
-        data = await self._call_api(
-            "GET",
-            "/item/0.1/getItemChngDemandList.ssg",
-            params={"itemId": item_id, "itemrChngDemndDivCd": div_cd},
-        )
-        result = data.get("result") or data if isinstance(data, dict) else {}
-        if not isinstance(result, dict):
-            return []
-        raw_list = result.get("itemChngDemndList") or {}
-        if not isinstance(raw_list, dict):
-            return []
-        items = raw_list.get("itemChngDemnd", [])
-        if isinstance(items, dict):
-            items = [items]
-        elif not isinstance(items, list):
-            items = []
-        return [i for i in items if isinstance(i, dict)]
-
     async def get_product(self, item_id: str) -> dict[str, Any]:
         """상품 조회."""
         return await self._call_api(
