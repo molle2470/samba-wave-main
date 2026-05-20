@@ -228,7 +228,24 @@ async def reply_cs_inquiry(
                         csec = af.get("clientSecret", "") or acc.api_secret or ""
                         if cid and csec:
                             client = SmartStoreClient(cid, csec)
-                # account_id 없거나 SambaMarketAccount 미등록 → SambaSettings 폴백
+                # account_id 없으면 account_name으로 SambaMarketAccount.account_label 매칭
+                # (2026-05-20: 롯데ON과 동일 패턴 — 잘못된 글로벌 키 사용 차단)
+                if client is None and inquiry.account_name:
+                    acc_result = await session.execute(
+                        select(SambaMarketAccount).where(
+                            SambaMarketAccount.market_type == "smartstore",
+                            SambaMarketAccount.account_label == inquiry.account_name,
+                            SambaMarketAccount.is_active == True,  # noqa: E712
+                        )
+                    )
+                    acc = acc_result.scalar_one_or_none()
+                    if acc:
+                        af = acc.additional_fields or {}
+                        cid = af.get("clientId", "") or acc.api_key or ""
+                        csec = af.get("clientSecret", "") or acc.api_secret or ""
+                        if cid and csec:
+                            client = SmartStoreClient(cid, csec)
+                # 그래도 매칭 실패 → SambaSettings 폴백 (마지막 수단)
                 if client is None:
                     settings_result = await session.execute(
                         select(SambaSettings).where(
@@ -361,12 +378,33 @@ async def reply_cs_inquiry(
                 from backend.domain.samba.account.model import SambaMarketAccount
                 from backend.domain.samba.proxy.elevenst import ElevenstClient
 
-                acc_stmt = select(SambaMarketAccount).where(
-                    SambaMarketAccount.market_type == "11st",
-                    SambaMarketAccount.is_active == True,  # noqa: E712
-                )
-                acc_result = await session.execute(acc_stmt)
-                elevenst_acc = acc_result.scalars().first()
+                # account_id → account_name → 첫 계정 폴백 순으로 매칭
+                # (2026-05-20: 잘못된 계정 키로 다른 11번가 매장에 답변 송신 차단)
+                elevenst_acc = None
+                if inquiry.account_id:
+                    acc_result = await session.execute(
+                        select(SambaMarketAccount).where(
+                            SambaMarketAccount.id == inquiry.account_id,
+                            SambaMarketAccount.is_active == True,  # noqa: E712
+                        )
+                    )
+                    elevenst_acc = acc_result.scalar_one_or_none()
+                if elevenst_acc is None and inquiry.account_name:
+                    acc_result = await session.execute(
+                        select(SambaMarketAccount).where(
+                            SambaMarketAccount.market_type == "11st",
+                            SambaMarketAccount.account_label == inquiry.account_name,
+                            SambaMarketAccount.is_active == True,  # noqa: E712
+                        )
+                    )
+                    elevenst_acc = acc_result.scalar_one_or_none()
+                if elevenst_acc is None:
+                    acc_stmt = select(SambaMarketAccount).where(
+                        SambaMarketAccount.market_type == "11st",
+                        SambaMarketAccount.is_active == True,  # noqa: E712
+                    )
+                    acc_result = await session.execute(acc_stmt)
+                    elevenst_acc = acc_result.scalars().first()
                 if elevenst_acc:
                     elevenst_extras = elevenst_acc.additional_fields or {}
                     elevenst_api_key = (
@@ -402,6 +440,16 @@ async def reply_cs_inquiry(
                     acc_result = await session.execute(
                         select(SambaMarketAccount).where(
                             SambaMarketAccount.id == inquiry.account_id,
+                            SambaMarketAccount.is_active == True,  # noqa: E712
+                        )
+                    )
+                    cp_acc = acc_result.scalar_one_or_none()
+                # account_id 없으면 account_name으로 매칭(2026-05-20 추가)
+                if cp_acc is None and inquiry.account_name:
+                    acc_result = await session.execute(
+                        select(SambaMarketAccount).where(
+                            SambaMarketAccount.market_type == "coupang",
+                            SambaMarketAccount.account_label == inquiry.account_name,
                             SambaMarketAccount.is_active == True,  # noqa: E712
                         )
                     )
