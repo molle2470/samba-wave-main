@@ -476,37 +476,42 @@ async def _build_order_filters(
             )
         )
 
-    # 등록필터 — 입력필터와 독립적으로 동작 (이중 선택 가능)
+    # 등록필터 — SSG는 product_image가 항상 채워지므로 collected_product_id 단독 판단.
+    # 타 마켓은 "미등록 입력" UX로 source_url/product_image를 채운 주문도 등록으로 간주.
     if registration_filter == "registered":
-        # collected_product_id가 있거나, "미등록 입력"으로 source_url/product_image를 채운 주문도 등록된 것으로 간주
-        filters.append(
-            or_(
-                SambaOrder.collected_product_id != None,  # noqa: E711
-                and_(
-                    SambaOrder.source_url != None,  # noqa: E711
-                    SambaOrder.source_url != "",
-                ),
-                and_(
-                    SambaOrder.product_image != None,  # noqa: E711
-                    SambaOrder.product_image != "",
-                ),
+        if market_filter == "type:ssg":
+            filters.append(SambaOrder.collected_product_id != None)  # noqa: E711
+        else:
+            filters.append(
+                or_(
+                    SambaOrder.collected_product_id != None,  # noqa: E711
+                    and_(
+                        SambaOrder.source_url != None,  # noqa: E711
+                        SambaOrder.source_url != "",
+                    ),
+                    and_(
+                        SambaOrder.product_image != None,  # noqa: E711
+                        SambaOrder.product_image != "",
+                    ),
+                )
             )
-        )
     elif registration_filter == "unregistered":
-        # collected_product_id가 없고 source_url/product_image도 모두 비어있어야 미등록
-        filters.append(
-            and_(
-                SambaOrder.collected_product_id == None,  # noqa: E711
-                or_(
-                    SambaOrder.source_url == None,  # noqa: E711
-                    SambaOrder.source_url == "",
-                ),
-                or_(
-                    SambaOrder.product_image == None,  # noqa: E711
-                    SambaOrder.product_image == "",
-                ),
+        if market_filter == "type:ssg":
+            filters.append(SambaOrder.collected_product_id == None)  # noqa: E711
+        else:
+            filters.append(
+                and_(
+                    SambaOrder.collected_product_id == None,  # noqa: E711
+                    or_(
+                        SambaOrder.source_url == None,  # noqa: E711
+                        SambaOrder.source_url == "",
+                    ),
+                    or_(
+                        SambaOrder.product_image == None,  # noqa: E711
+                        SambaOrder.product_image == "",
+                    ),
+                )
             )
-        )
 
     normalized_search = search_text.strip()
     if normalized_search:
@@ -5100,6 +5105,35 @@ async def sync_orders_from_markets(
                             f"[주문동기화] {label}: SSG 취소신청 조회 실패 — {_ssg_ce}"
                         )
 
+                    # 반품/교환 회수 대상 조회 → 상태 업데이트
+                    try:
+                        _ssg_returns = await _ssg_client.get_return_requests(days=body.days)
+                        for _ret in _ssg_returns:
+                            _ret_ord_no = str(_ret.get("orordNo") or _ret.get("ordNo") or "")
+                            if not _ret_ord_no:
+                                continue
+                            _div_cd = str(_ret.get("shppDivDtlCd") or "")
+                            _status = "return_requested"
+                            _shipping_status = "교환요청" if _div_cd == "22" else "반품요청"
+                            orders_data.append({
+                                "order_number": _ret_ord_no,
+                                "channel_id": account["id"],
+                                "channel_name": label,
+                                "status": _status,
+                                "shipping_status": _shipping_status,
+                                "source": "ssg",
+                                "sale_price": 0.0,
+                                "revenue": 0.0,
+                                "fee_rate": _ssg_fee_rate,
+                                "cost": 0,
+                            })
+                        if _ssg_returns:
+                            logger.info(
+                                f"[주문동기화] {label}: 반품/교환 {len(_ssg_returns)}건 조회"
+                            )
+                    except Exception as _ssg_re:
+                        logger.warning(f"[주문동기화] {label}: SSG 반품조회 실패 — {_ssg_re}")
+
                     # SSG 취소 상태 전환 감지
                     # 1) 활성 주문 중 listShppDirection에 없는 것 → 취소요청 여부 단건 확인
                     # 2) 취소요청 주문 중 get_cancel_requests+listShppDirection 모두에 없는 것 → 취소완료
@@ -5166,10 +5200,11 @@ async def sync_orders_from_markets(
                                     _detail_items = await _ssg_client.get_order_detail(
                                         _chk_ord_no
                                     )
-                                    if any(
-                                        str(it.get("ordItemDiv", "")) == "021"
+                                    _divs = {
+                                        str(it.get("ordItemDiv", ""))
                                         for it in _detail_items
-                                    ):
+                                    }
+                                    if "021" in _divs:
                                         orders_data.append(
                                             {
                                                 "order_number": _chk_ord_no,
@@ -5187,6 +5222,25 @@ async def sync_orders_from_markets(
                                         _ssg_cancel_found += 1
                                         logger.info(
                                             f"[주문동기화] {label}: SSG 취소 감지 "
+                                            f"— {_chk_ord_no}"
+                                        )
+                                    elif _divs & {"031", "041"}:
+                                        orders_data.append(
+                                            {
+                                                "order_number": _chk_ord_no,
+                                                "channel_id": account["id"],
+                                                "channel_name": label,
+                                                "status": "return_requested",
+                                                "shipping_status": "반품요청",
+                                                "source": "ssg",
+                                                "sale_price": 0.0,
+                                                "revenue": 0.0,
+                                                "fee_rate": _ssg_fee_rate,
+                                                "cost": 0,
+                                            }
+                                        )
+                                        logger.info(
+                                            f"[주문동기화] {label}: SSG 반품 감지 "
                                             f"— {_chk_ord_no}"
                                         )
                                 except Exception as _chk_e:
@@ -6014,6 +6068,16 @@ async def sync_orders_from_markets(
                                 f"[주문동기화] 교환→반품 상태 전환: {order_data.get('order_number')} "
                                 f"{existing.shipping_status} → {new_ship_status}"
                             )
+                        elif (
+                            new_ship_status in ("반품요청", "반품완료", "반품거부")
+                            and existing.shipping_status in ("국내배송중", "배송완료", "구매확정", "송장전송완료")
+                        ):
+                            # 배송 진행 후 반품 접수 허용 (국내배송중/배송완료 → 반품요청)
+                            update_fields["shipping_status"] = new_ship_status
+                            logger.info(
+                                f"[주문동기화] 배송→반품 상태 전환: {order_data.get('order_number')} "
+                                f"{existing.shipping_status} → {new_ship_status}"
+                            )
                         elif existing.shipping_status not in (
                             "송장전송완료",
                             "국내배송중",
@@ -6203,6 +6267,10 @@ async def sync_orders_from_markets(
                     # 연결 주문 조회
                     linked_order = await svc.repo.find_by_async(order_number=order_no)
                     if not linked_order:
+                        logger.warning(
+                            f"[주문동기화] 클레임 연결 주문 없음: order_number={order_no!r} "
+                            f"shipping_status={shipping_status}"
+                        )
                         continue
                     ret = await return_svc.create_return(
                         {
