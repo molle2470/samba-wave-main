@@ -27,7 +27,15 @@ class SambaOrder(SQLModel, table=True):
 
     __tablename__ = "samba_order"
     __table_args__ = (
-        Index("uq_order_tenant_number", "tenant_id", "order_number", unique=True),
+        # 11번가 1주문 다중상품 대응 (issue #208): order_number + ord_prd_seq 조합 unique
+        # ord_prd_seq NULL은 PG가 distinct로 취급 → 타 마켓(NULL) 영향 없음.
+        Index(
+            "uq_order_tenant_number_seq",
+            "tenant_id",
+            "order_number",
+            "ord_prd_seq",
+            unique=True,
+        ),
         Index(
             "ix_samba_order_lotteon_line",
             "tenant_id",

@@ -7388,7 +7388,9 @@ def _parse_elevenst_order(item: dict, account_id: str, label: str) -> dict:
         "channel_name": label,
         "source": "11st",
         "order_number": str(item.get("ordNo", "") or ""),
-        "ord_prd_seq": str(item.get("ordPrdSeq", "") or ""),
+        # 빈 문자열이면 None으로 정규화 — unique (order_number, ord_prd_seq) 인덱스에서
+        # 빈 문자열은 distinct 안 되어 중복 위반, NULL은 distinct로 취급됨 (issue #208).
+        "ord_prd_seq": (str(item.get("ordPrdSeq", "") or "").strip() or None),
         "shipment_id": str(item.get("dlvNo", "") or ""),
         "product_id": str(item.get("prdNo", "") or ""),
         "product_name": str(item.get("prdNm", "") or ""),
