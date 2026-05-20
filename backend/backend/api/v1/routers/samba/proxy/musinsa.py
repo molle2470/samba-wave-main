@@ -203,8 +203,15 @@ async def musinsa_set_cookie(
     2026-04-09부터 settings.musinsa_cookie 갱신 정지가 발생함. JWT 면제 라우터로
     옮겨 X-Api-Key만으로 호출 가능하게 한다. refresher가 사용하는 복수 쿠키 풀
     musinsa_cookies도 함께 갱신해 잔액 페이지 미진입 시에도 풀이 살아있도록 한다.
+
+    (2026-05-20) owner_device_ids 가드 적용 — 포크 확장앱이 원본 백엔드로
+    쿠키 미러 전송하던 누수 차단.
     """
     import json
+
+    from backend.api.v1.routers.samba.sourcing_account import _check_owner_device
+
+    _check_owner_device(request)
 
     client = MusinsaClient(cookie=body.cookie)
     result = await client.set_cookie_and_verify(body.cookie)

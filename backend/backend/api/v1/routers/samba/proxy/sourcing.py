@@ -64,7 +64,15 @@ async def lotteon_set_cookie(
     body: LotteonSetCookieRequest = Body(...),
     write_session: AsyncSession = Depends(get_write_session_dependency),
 ) -> dict[str, Any]:
-    """확장앱에서 롯데ON 쿠키 수신 (인증 불필요 — 확장앱에서 직접 호출)."""
+    """확장앱에서 롯데ON 쿠키 수신.
+
+    (2026-05-20) owner_device_ids 가드 적용 — 포크 확장앱이 원본 백엔드로
+    쿠키 미러 전송하던 누수 차단.
+    """
+    from backend.api.v1.routers.samba.sourcing_account import _check_owner_device
+
+    _check_owner_device(request)
+
     if not body.cookie:
         raise HTTPException(status_code=400, detail="쿠키가 필요합니다.")
     await _set_setting(write_session, "lotteon_cookie", body.cookie)

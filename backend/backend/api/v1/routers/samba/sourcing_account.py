@@ -1274,11 +1274,18 @@ async def find_account_by_username(
 
 @extension_router.post("/sync-chrome-profile")
 async def sync_chrome_profile(
+    request: Request,
     body: SyncChromeProfileRequest,
     session: AsyncSession = Depends(get_write_session_dependency),
 ):
-    """확장앱에서 크롬 프로필 동기화 — email 기반 upsert."""
+    """확장앱에서 크롬 프로필 동기화 — email 기반 upsert.
+
+    (2026-05-20) owner_device_ids 가드 적용 — 포크 확장앱이 원본 백엔드로
+    크롬 계정 이메일을 미러 전송하던 누수 차단.
+    """
     from backend.domain.samba.sourcing_account.model import SambaChromProfile
+
+    _check_owner_device(request)
 
     if not body.email:
         return {"ok": False, "message": "이메일이 비어 있습니다"}
