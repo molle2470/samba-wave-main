@@ -550,6 +550,34 @@ class SSGClient:
             params={"itemId": item_id},
         )
 
+    async def get_item_approval_status(
+        self, item_id: str, div_cd: str = "00"
+    ) -> list[dict[str, Any]]:
+        """신상품 MD 승인 상태 조회.
+
+        SSG Open API: GET /item/0.1/getItemChngDemndList.ssg
+        chngDemndProcStatCd: 10=MD승인요청(대기), 20=승인완료, 30=MD반려
+        itemrChngDemndDivCd: 00=신상품등록, 01=상품수정
+        """
+        params: dict[str, Any] = {"itemId": item_id}
+        if div_cd:
+            params["itemrChngDemndDivCd"] = div_cd
+        resp = await self._call_api(
+            "GET", "/item/0.1/getItemChngDemndList.ssg", params=params
+        )
+        result_obj = resp.get("result", {})
+        raw = result_obj.get("itemChngDemndList", {})
+        if isinstance(raw, dict):
+            item_val = raw.get("itemChngDemnd", [])
+            if isinstance(item_val, dict):
+                return [item_val]
+            if isinstance(item_val, list):
+                return item_val
+            return []
+        if isinstance(raw, list):
+            return raw
+        return []
+
     async def get_product_list(
         self, keyword: str = "", page_size: int = 10
     ) -> dict[str, Any]:
@@ -1709,6 +1737,7 @@ class SSGClient:
                 "perdType": "01",
                 "perdStrDts": start_dt,
                 "perdEndDts": end_dt,
+                "shppDivDtlCds": "21,22",
             }
         }
         data = await self._call_api("POST", "/api/pd/1/listExchangeTarget.ssg", body=body)

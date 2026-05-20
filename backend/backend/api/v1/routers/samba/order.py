@@ -476,11 +476,42 @@ async def _build_order_filters(
             )
         )
 
-    # 등록필터 — collected_product_id 기준으로만 판단 (삼바 등록 여부)
+    # 등록필터 — SSG는 product_image가 항상 채워지므로 collected_product_id 단독 판단.
+    # 타 마켓은 "미등록 입력" UX로 source_url/product_image를 채운 주문도 등록으로 간주.
     if registration_filter == "registered":
-        filters.append(SambaOrder.collected_product_id != None)  # noqa: E711
+        if market_filter == "type:ssg":
+            filters.append(SambaOrder.collected_product_id != None)  # noqa: E711
+        else:
+            filters.append(
+                or_(
+                    SambaOrder.collected_product_id != None,  # noqa: E711
+                    and_(
+                        SambaOrder.source_url != None,  # noqa: E711
+                        SambaOrder.source_url != "",
+                    ),
+                    and_(
+                        SambaOrder.product_image != None,  # noqa: E711
+                        SambaOrder.product_image != "",
+                    ),
+                )
+            )
     elif registration_filter == "unregistered":
-        filters.append(SambaOrder.collected_product_id == None)  # noqa: E711
+        if market_filter == "type:ssg":
+            filters.append(SambaOrder.collected_product_id == None)  # noqa: E711
+        else:
+            filters.append(
+                and_(
+                    SambaOrder.collected_product_id == None,  # noqa: E711
+                    or_(
+                        SambaOrder.source_url == None,  # noqa: E711
+                        SambaOrder.source_url == "",
+                    ),
+                    or_(
+                        SambaOrder.product_image == None,  # noqa: E711
+                        SambaOrder.product_image == "",
+                    ),
+                )
+            )
 
     normalized_search = search_text.strip()
     if normalized_search:
