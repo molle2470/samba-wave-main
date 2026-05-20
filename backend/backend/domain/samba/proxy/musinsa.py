@@ -385,6 +385,23 @@ class MusinsaClient:
             # 무신사 상품페이지 최대혜택가는 선할인(savePoint)까지 포함
             best_benefit_price = display_benefit_price - pre_discount
 
+            # 추가 비로그인 검출 신호: 쿠키 있는데 회원 혜택(등급할인/적립금/선할인)이 전부 0
+            # 5259516 사례 — 쿠폰은 적용됐지만 등급할인/적립금만 누락된 비로그인 응답
+            _anon_zero_benefits = (
+                bool(self.cookie)
+                and grade_discount_rate == 0
+                and raw_point_rate == 0
+                and not is_pre_point
+                and not is_limited_dc
+            )
+            if _anon_zero_benefits:
+                logger.warning(
+                    f"[무신사 인증 의심2] {goods_no}: 쿠키 보유했으나 "
+                    f"등급할인/적립금/선할인 모두 0 — 비로그인 응답 가능성. "
+                    f"price_uncertain=True 마킹하여 잘못된 cost 갱신 차단."
+                )
+                _auth_suspect = True
+
             logger.info(
                 f"[무신사 혜택가] {goods_no}: "
                 f"할인가={s_price}, 쿠폰=-{benefit_coupon_discount}, "
