@@ -1777,6 +1777,74 @@ async def _site_autotune_loop(device_id: str, site: str):
                                     # 호출하므로 트랜잭션이 90~180s 가까이 idle 상태가 될 수
                                     # 있다. 좀비 connection으로 깨지면 (Can't reconnect /
                                     # InvalidRequestError 계열) 새 세션을 받아 1회 재시도한다.
+                                    # 계정별 진행 로그를 완료 즉시 흘리기 위한 사전 인덱싱
+                                    _entry_by_acc = {
+                                        _e_acc: (_e_label, _e_action)
+                                        for (_, _e_acc, _e_label, _e_action) in _entries_list
+                                    }
+                                    _logged_accs: set[str] = set()
+
+                                    async def _on_account_done(_acc_id, _ar):
+                                        """판매처 한 곳 끝나는 즉시 _log_line 발사 — 워룸 로그가
+                                        순차적으로 흐르도록(이전엔 모든 판매처 완료 후 일괄 출력).
+                                        """
+                                        nonlocal _synced_count
+                                        if _acc_id in _logged_accs:
+                                            return
+                                        _label_action = _entry_by_acc.get(_acc_id)
+                                        if not _label_action:
+                                            return
+                                        _e_label, _e_action = _label_action
+                                        _ar_status = (
+                                            _ar.get("status")
+                                            if isinstance(_ar, dict)
+                                            else None
+                                        )
+                                        _ar_err = (
+                                            _ar.get("error")
+                                            if isinstance(_ar, dict)
+                                            else None
+                                        )
+                                        _ar_results = (
+                                            _ar.get("results", {})
+                                            if isinstance(_ar, dict)
+                                            else {}
+                                        )
+                                        _was_deleted = (
+                                            isinstance(_ar_results, dict)
+                                            and _ar_results.get(_acc_id) == "deleted"
+                                        )
+                                        _acc_ok = not _ar_err and _ar_status in (
+                                            "success",
+                                            "completed",
+                                            "skipped",
+                                        )
+                                        if _acc_ok:
+                                            _synced_count += 1
+                                            if _was_deleted:
+                                                _log_line(
+                                                    _site,
+                                                    _pid,
+                                                    f"{_idx_pfx}{_e_label}: {_e_action} → 마켓삭제(품절){_t}",
+                                                )
+                                            else:
+                                                _log_line(
+                                                    _site,
+                                                    _pid,
+                                                    f"{_idx_pfx}{_e_label}: {_e_action} 전송완료{_t}",
+                                                )
+                                        else:
+                                            _fail_msg = (
+                                                str(_ar_err)[:200] if _ar_err else "결과없음"
+                                            )
+                                            _log_line(
+                                                _site,
+                                                _pid,
+                                                f"{_idx_pfx}{_e_label}: {_e_action} 전송실패: {_fail_msg}{_t}",
+                                                "error",
+                                            )
+                                        _logged_accs.add(_acc_id)
+
                                     try:
                                         _tx_result = None
                                         _tx_exc: Exception | None = None
@@ -1798,6 +1866,7 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                             _accs_list,
                                                             skip_unchanged=False,
                                                             skip_refresh=True,
+                                                            on_account_done=_on_account_done,
                                                         )
                                                     )
                                                     # HTTP 끝났으면 즉시 commit — 세션이 idle
@@ -1860,9 +1929,13 @@ async def _site_autotune_loop(device_id: str, site: str):
                                             "completed",
                                         )
 
+                                        # 계정별 성공/실패 로그는 _on_account_done 콜백에서 이미
+                                        # 완료 순서대로 발사됨. 여기선 콜백이 못 잡은 계정만
+                                        # 폴백 처리(예: start_update 자체가 일부만 처리하고 반환).
                                         for _entry in _entries_list:
                                             _, _eacc, _elabel, _eaction = _entry
-                                            # 계정별 결과 추출
+                                            if _eacc in _logged_accs:
+                                                continue
                                             _acc_status = (
                                                 _tx_status_map.get(_eacc)
                                                 if isinstance(_tx_status_map, dict)
@@ -1873,7 +1946,6 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                 if isinstance(_tx_err_map, dict)
                                                 else None
                                             )
-                                            # 마켓삭제 판정: update_result 내 값 확인
                                             _acc_was_deleted = False
                                             if isinstance(_tx_update_map, dict):
                                                 _u = _tx_update_map.get(_eacc)
@@ -1891,7 +1963,6 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                     "soldout_fallback",
                                                 ):
                                                     _acc_was_deleted = True
-                                            # 계정별 ok: status가 명시적으로 실패 아니고 에러 없음
                                             _acc_ok = not _acc_err and (
                                                 _acc_status
                                                 in (None, "success", "completed")
@@ -1926,6 +1997,8 @@ async def _site_autotune_loop(device_id: str, site: str):
                                     except Exception as _fe:
                                         for _entry in _entries_list:
                                             _, _eacc, _elabel, _eaction = _entry
+                                            if _eacc in _logged_accs:
+                                                continue
                                             _log_line(
                                                 _site,
                                                 _pid,
@@ -2129,6 +2202,67 @@ async def _site_autotune_loop(device_id: str, site: str):
                                 _c_err_detail,
                                 _cstats["batches"],
                             )
+                            # scheduler_cycle 이벤트 발행 — 워룸 타임라인용 (한 바퀴 누적 통계)
+                            try:
+                                _c_dur_sec = 0.0
+                                try:
+                                    if _c_started:
+                                        _c_dur_sec = round(
+                                            (
+                                                _now
+                                                - datetime.fromisoformat(_c_started)
+                                            ).total_seconds(),
+                                            1,
+                                        )
+                                except Exception:
+                                    _c_dur_sec = 0.0
+                                _c_rate = (
+                                    round(_cstats["total"] / _c_dur_sec, 1)
+                                    if _c_dur_sec > 0
+                                    else 0.0
+                                )
+                                _c_ended_iso = _now.isoformat()
+                                from backend.domain.samba.warroom.service import (
+                                    SambaMonitorService as _CycleMon,
+                                )
+
+                                async with get_write_session() as _cyc_session:
+                                    _cyc_monitor = _CycleMon(_cyc_session)
+                                    await _cyc_monitor.emit(
+                                        "scheduler_cycle",
+                                        "info",
+                                        summary=f"오토튠[{site}] 사이클 완료 (1바퀴 {_g_total_now:,}건): {_cstats['ok']:,}건 성공, {_cstats['err']:,}건 실패{_c_err_detail} / 배치 {_cstats['batches']:,}회 | {int(_c_dur_sec):,}초, {_c_rate}건/초",
+                                        source_site=site,
+                                        detail={
+                                            "total": _cstats["total"],
+                                            "total_global": _g_total_now,
+                                            "ok": _cstats["ok"],
+                                            "errors": _cstats["err"],
+                                            "no_pid": _cstats["no_pid"],
+                                            "blocked": _cstats["blocked"],
+                                            "timeouts": _cstats["timeout"],
+                                            "other_errors": _cstats["other"],
+                                            "price_transmit": len(
+                                                _cstats["price_pids"]
+                                            ),
+                                            "stock_transmit": len(
+                                                _cstats["stock_pids"]
+                                            ),
+                                            "synced": _cstats["synced"],
+                                            "deleted": _cstats["deleted"],
+                                            "batches": _cstats["batches"],
+                                            "started_at": _c_started,
+                                            "ended_at": _c_ended_iso,
+                                            "duration_sec": _c_dur_sec,
+                                            "rate": _c_rate,
+                                        },
+                                    )
+                                    await _cyc_session.commit()
+                            except Exception as _cyc_emit_err:
+                                log.error(
+                                    "[오토튠] scheduler_cycle 발행 실패: %s",
+                                    _cyc_emit_err,
+                                )
                             # 다음 회전을 위해 통계 리셋
                             _autotune_cycle_stats[_gkey] = _new_cycle_stats()
 

@@ -6,7 +6,7 @@ import asyncio
 import re
 import time
 from datetime import UTC, datetime
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -361,6 +361,9 @@ class SambaShipmentService:
         skip_unchanged: bool = False,
         skip_refresh: bool = False,
         skip_policy_account_filter: bool = False,
+        on_account_done: Optional[
+            Callable[[str, dict[str, Any]], Awaitable[None]]
+        ] = None,
     ) -> dict[str, Any]:
         """여러 상품을 대상 마켓 계정으로 실제 전송. 마켓별 결과 반환."""
 
@@ -391,6 +394,7 @@ class SambaShipmentService:
                     skip_unchanged=skip_unchanged,
                     skip_refresh=skip_refresh,
                     skip_policy_account_filter=skip_policy_account_filter,
+                    on_account_done=on_account_done,
                 )
                 results.append(
                     {
@@ -666,6 +670,9 @@ class SambaShipmentService:
         skip_unchanged: bool = False,
         skip_refresh: bool = False,
         skip_policy_account_filter: bool = False,
+        on_account_done: Optional[
+            Callable[[str, dict[str, Any]], Awaitable[None]]
+        ] = None,
     ) -> SambaShipment:
         """단일 상품에 대한 실제 마켓 전송."""
 
@@ -694,6 +701,7 @@ class SambaShipmentService:
                     skip_unchanged,
                     skip_refresh,
                     skip_policy_account_filter,
+                    on_account_done=on_account_done,
                 ),
                 timeout=180,  # 상품 1건당 최대 180초 (최신화+이미지업로드 포함)
             )
@@ -720,6 +728,9 @@ class SambaShipmentService:
         skip_unchanged: bool = False,
         skip_refresh: bool = False,
         skip_policy_account_filter: bool = False,
+        on_account_done: Optional[
+            Callable[[str, dict[str, Any]], Awaitable[None]]
+        ] = None,
     ) -> SambaShipment:
         """상품 전송 실제 구현 (락 획득 후 호출)."""
 
@@ -1896,9 +1907,17 @@ class SambaShipmentService:
             return res
 
         # 계정별 순차 전송 — 동일 세션 병렬 사용 시 asyncpg 연결 오염 방지
+        # 한 계정 끝나는 즉시 on_account_done 콜백을 발사해 호출자가 진행 로그를
+        # 실시간으로 흘릴 수 있도록 한다(오토튠 워룸 로그 패널이 활용).
         account_results = []
         for _aid in target_account_ids:
-            account_results.append(await _dispatch_one(_aid))
+            _ar = await _dispatch_one(_aid)
+            account_results.append(_ar)
+            if on_account_done is not None:
+                try:
+                    await on_account_done(_aid, _ar)
+                except Exception as _cb_exc:
+                    logger.warning(f"[전송] on_account_done 콜백 실패 (무시): {_cb_exc}")
 
         # 결과 병합 + DB 일괄 업데이트
         merged_nos = dict(product_row.market_product_nos or {})
