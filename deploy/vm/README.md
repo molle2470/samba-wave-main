@@ -86,9 +86,18 @@ gcloud compute firewall-rules create allow-http-https \
    JWT_SECRET_KEY=<시크릿>
    API_GATEWAY_KEY=<시크릿>
 
-   # ESMPlus
-   ESMPLUS_HOSTING_ID=hlccorp
+   # ESMPlus (지마켓/옥션 통합 API — sa2.esmplus.com)
+   # 셀링툴 업체 인증: HOSTING_ID = 셀링툴 마스터 ID (예: hlccorp), SELLER 는 계정별 별도.
+   # 일반 판매자 (셀링툴 미가입) 인증: HOSTING_ID = SELLER_ID 동일 ID 가능.
+   #   - JWT kid = HOSTING_ID, payload.ssi = "G:{SELLER_ID}" or "A:{SELLER_ID}"
+   #   - Secret 은 ESMplus 셀러센터 > 통합 API > 인증키 발급 메뉴에서 확보.
+   ESMPLUS_HOSTING_ID=<마스터_ID>
    ESMPLUS_SECRET_KEY=<시크릿>
+   # 운영 활성화 추가 절차:
+   # 1) samba_market_account 에 market_type='gmarket'/'auction' 계정 등록 (seller_id 필수)
+   # 2) ESM 측에 VM 외부 IP allowlist 등록 요청 (담당자 etapihelp@gmail.com)
+   # 3) 카테고리 트리 일회성 동기화 (지마켓 5,445 + 옥션 4,921 leaf)
+   # 4) Rate limit — 기본 30 req/min (분당). 운영 한도 받으면 후속 PR 에서 조정.
 
    # 카카오 배포 알림 (선택)
    KAKAO_API_KEY=<시크릿>

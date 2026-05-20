@@ -51,14 +51,13 @@ class AuctionPlugin(MarketPlugin):
             }
 
         # 호스팅 인증정보 — 서버 환경변수에서 로드 (셀링툴업체 고정값)
-        from backend.core.config import settings
+        from backend.domain.samba.proxy.esmplus import resolve_esm_credentials
 
-        hosting_id = settings.esmplus_hosting_id
-        secret_key = settings.esmplus_secret_key
+        hosting_id, secret_key = await resolve_esm_credentials(session, account)
         if not hosting_id or not secret_key:
             return {
                 "success": False,
-                "message": "서버 환경변수(ESMPLUS_HOSTING_ID/ESMPLUS_SECRET_KEY)가 설정되지 않았습니다.",
+                "message": "ESM 인증정보 없음 — account.additional_fields / samba_settings.esm_credentials / ESMPLUS_HOSTING_ID env 중 하나 필요.",
             }
 
         client = ESMPlusClient(hosting_id, secret_key, seller_id, site="auction")
@@ -96,15 +95,24 @@ class AuctionPlugin(MarketPlugin):
         if existing_no:
             return await self._update_product(client, existing_no, data, pending_images)
         else:
-            return await self._register_product(client, data, pending_images)
+            samba_options = product.get("options") or []
+            return await self._register_product(
+                client,
+                data,
+                pending_images,
+                samba_options=samba_options,
+                cat_code=category_id,
+            )
 
     async def _register_product(
         self,
         client: Any,
         data: dict[str, Any],
         pending_images: dict | None,
+        samba_options: list[dict] | None = None,
+        cat_code: str = "",
     ) -> dict[str, Any]:
-        """신규 상품 등록."""
+        """신규 상품 등록 + 옵션/이미지 후처리."""
         result = await client.register_product(data)
         goods_no = result.get("goodsNo", "")
         site_goods_no = result.get("siteGoodsNo", "")
@@ -116,6 +124,28 @@ class AuctionPlugin(MarketPlugin):
                 logger.info(f"[옥션] 추가 이미지 설정 완료: goodsNo={goods_no}")
             except Exception as img_e:
                 logger.warning(f"[옥션] 추가 이미지 설정 실패: {img_e}")
+
+        # 추천옵션 등록 — samba options 있고 cat_code 있을 때만.
+        # register_esm_options 가 이미지 propagation polling (0/30/60s, 최대 90s) 자체 처리.
+        if samba_options and goods_no and cat_code:
+            try:
+                from backend.domain.samba.proxy.esmplus import register_esm_options
+
+                opt_result = await register_esm_options(
+                    client, goods_no, cat_code, samba_options, site="auction"
+                )
+                if opt_result.get("success"):
+                    logger.info(
+                        f"[옥션] 옵션 등록 완료: goodsNo={goods_no} matched={opt_result.get('matched')}/{opt_result.get('requested')}"
+                    )
+                else:
+                    logger.warning(
+                        f"[옥션] 옵션 등록 부분 실패: {opt_result.get('message')}"
+                    )
+            except Exception as opt_e:
+                logger.warning(
+                    f"[옥션] 옵션 등록 실패 (상품 등록은 성공 처리): {opt_e}"
+                )
 
         return {
             "success": True,
@@ -173,16 +203,17 @@ class AuctionPlugin(MarketPlugin):
         if not goods_no:
             return {"success": False, "message": "상품번호가 없어 가격/재고 수정 불가"}
 
-        # 등록 API는 PascalCase(Iac), sell-status API는 camelCase(iac) — ESM Plus 스펙
+        # ESM Plus 스펙 — 등록과 sell-status 모두 PascalCase(Iac). 실 호출 검증 결과
+        # 'isSell' camelCase 는 'IsSell 필드가 필요합니다' 응답 → PascalCase 통일.
         price = data.get("itemAddtionalInfo", {}).get("price", {}).get("Iac", 0)
         stock = data.get("itemAddtionalInfo", {}).get("stock", {}).get("Iac", 0)
 
         sell_data: dict[str, Any] = {
-            "isSell": {"iac": True},
+            "IsSell": {"Iac": True},
             "itemBasicInfo": {
-                "price": {"iac": price},
-                "stock": {"iac": stock},
-                "sellingPeriod": {"iac": 0},
+                "price": {"Iac": price},
+                "stock": {"Iac": stock},
+                "sellingPeriod": {"Iac": 0},
             },
         }
 
@@ -218,22 +249,15 @@ class AuctionPlugin(MarketPlugin):
         if not seller_id:
             return {"success": False, "message": "옥션 판매자 ID 없음"}
 
-        from backend.core.config import settings
+        from backend.domain.samba.proxy.esmplus import resolve_esm_credentials
 
-        hosting_id = settings.esmplus_hosting_id
-        secret_key = settings.esmplus_secret_key
+        hosting_id, secret_key = await resolve_esm_credentials(session, account)
         if not hosting_id or not secret_key:
-            return {"success": False, "message": "호스팅 인증정보(환경변수) 없음"}
+            return {"success": False, "message": "ESM 인증정보 없음"}
         client = ESMPlusClient(hosting_id, secret_key, seller_id, site="auction")
 
-        suspend_data = {
-            "isSell": {"iac": False},
-            "itemBasicInfo": {
-                "price": {"iac": 0},
-                "stock": {"iac": 0},
-                "sellingPeriod": {"iac": 0},
-            },
-        }
+        # 판매중지 — 실 호출 검증 schema (PascalCase). 'IsSell' 만으로도 ESM 측 검증 통과.
+        suspend_data = {"IsSell": {"Iac": False}}
         await client.update_sell_status(product_no, suspend_data)
         logger.info(f"[옥션] 판매중지 완료: goodsNo={product_no}")
         return {"success": True, "message": "옥션 판매중지 완료"}

@@ -50,15 +50,14 @@ class GMarketMarketPlugin(MarketPlugin):
                 "message": "지마켓 판매자 ID(apiKey)가 없습니다. 계정 설정에서 입력해주세요.",
             }
 
-        # 호스팅 인증정보 — 서버 환경변수에서 로드 (셀링툴업체 고정값)
-        from backend.core.config import settings
+        # 호스팅 인증정보 — account.additional_fields > samba_settings > env 순.
+        from backend.domain.samba.proxy.esmplus import resolve_esm_credentials
 
-        hosting_id = settings.esmplus_hosting_id
-        secret_key = settings.esmplus_secret_key
+        hosting_id, secret_key = await resolve_esm_credentials(session, account)
         if not hosting_id or not secret_key:
             return {
                 "success": False,
-                "message": "서버 환경변수(ESMPLUS_HOSTING_ID/ESMPLUS_SECRET_KEY)가 설정되지 않았습니다.",
+                "message": "ESM 인증정보 없음 — account.additional_fields / samba_settings.esm_credentials / ESMPLUS_HOSTING_ID env 중 하나 필요.",
             }
 
         client = ESMPlusClient(hosting_id, secret_key, seller_id, site="gmarket")
@@ -97,30 +96,59 @@ class GMarketMarketPlugin(MarketPlugin):
         if existing_no:
             return await self._update_product(client, existing_no, data, pending_images)
         else:
-            return await self._register_product(client, data, pending_images)
+            samba_options = product.get("options") or []
+            return await self._register_product(
+                client,
+                data,
+                pending_images,
+                samba_options=samba_options,
+                cat_code=category_id,
+            )
 
     async def _register_product(
         self,
         client: Any,
         data: dict[str, Any],
         pending_images: dict | None,
+        samba_options: list[dict] | None = None,
+        cat_code: str = "",
     ) -> dict[str, Any]:
-        """신규 상품 등록."""
+        """신규 상품 등록 + 옵션/이미지 후처리."""
         result = await client.register_product(data)
         goods_no = result.get("goodsNo", "")
         site_goods_no = result.get("siteGoodsNo", "")
 
-        # 추가 이미지 설정 (등록 후 2~3분 대기 후 호출 가능 → 비동기 예약은 하지 않음)
-        # 기본 이미지는 등록 시 포함되므로 추가 이미지만 별도 처리
+        # 추가 이미지 설정 (등록 후 propagation 대기 필요 — ESM CDN 캐시)
         if pending_images and goods_no:
             try:
-                # 등록 직후에는 이미지 API 실패할 수 있으므로 재시도
                 await asyncio.sleep(3)
                 await client.update_images(goods_no, {"imageModel": pending_images})
                 logger.info(f"[지마켓] 추가 이미지 설정 완료: goodsNo={goods_no}")
             except Exception as img_e:
                 logger.warning(
                     f"[지마켓] 추가 이미지 설정 실패 (등록 직후 제한): {img_e}"
+                )
+
+        # 추천옵션 등록 — samba options 있고 cat_code 있을 때만.
+        # register_esm_options 가 이미지 propagation polling (0/30/60s, 최대 90s) 자체 처리.
+        if samba_options and goods_no and cat_code:
+            try:
+                from backend.domain.samba.proxy.esmplus import register_esm_options
+
+                opt_result = await register_esm_options(
+                    client, goods_no, cat_code, samba_options, site="gmarket"
+                )
+                if opt_result.get("success"):
+                    logger.info(
+                        f"[지마켓] 옵션 등록 완료: goodsNo={goods_no} matched={opt_result.get('matched')}/{opt_result.get('requested')}"
+                    )
+                else:
+                    logger.warning(
+                        f"[지마켓] 옵션 등록 부분 실패: {opt_result.get('message')}"
+                    )
+            except Exception as opt_e:
+                logger.warning(
+                    f"[지마켓] 옵션 등록 실패 (상품 등록은 성공 처리): {opt_e}"
                 )
 
         return {
@@ -181,16 +209,17 @@ class GMarketMarketPlugin(MarketPlugin):
         if not goods_no:
             return {"success": False, "message": "상품번호가 없어 가격/재고 수정 불가"}
 
-        # 등록 API는 PascalCase(Gmkt), sell-status API는 camelCase(gmkt) — ESM Plus 스펙
+        # ESM Plus 스펙 — 등록과 sell-status 모두 PascalCase(Gmkt). 실 호출 검증 결과
+        # 'isSell' camelCase 는 'IsSell 필드가 필요합니다' 응답 → PascalCase 통일.
         price = data.get("itemAddtionalInfo", {}).get("price", {}).get("Gmkt", 0)
         stock = data.get("itemAddtionalInfo", {}).get("stock", {}).get("Gmkt", 0)
 
         sell_data: dict[str, Any] = {
-            "isSell": {"gmkt": True},
+            "IsSell": {"Gmkt": True},
             "itemBasicInfo": {
-                "price": {"gmkt": price},
-                "stock": {"gmkt": stock},
-                "sellingPeriod": {"gmkt": 0},  # 0=기존 유지
+                "price": {"Gmkt": price},
+                "stock": {"Gmkt": stock},
+                "sellingPeriod": {"Gmkt": 0},  # 0=기존 유지
             },
         }
 
@@ -226,23 +255,15 @@ class GMarketMarketPlugin(MarketPlugin):
         if not seller_id:
             return {"success": False, "message": "지마켓 판매자 ID 없음"}
 
-        from backend.core.config import settings
+        from backend.domain.samba.proxy.esmplus import resolve_esm_credentials
 
-        hosting_id = settings.esmplus_hosting_id
-        secret_key = settings.esmplus_secret_key
+        hosting_id, secret_key = await resolve_esm_credentials(session, account)
         if not hosting_id or not secret_key:
-            return {"success": False, "message": "호스팅 인증정보(환경변수) 없음"}
+            return {"success": False, "message": "ESM 인증정보 없음"}
         client = ESMPlusClient(hosting_id, secret_key, seller_id, site="gmarket")
 
-        # 판매중지
-        suspend_data = {
-            "isSell": {"gmkt": False},
-            "itemBasicInfo": {
-                "price": {"gmkt": 0},
-                "stock": {"gmkt": 0},
-                "sellingPeriod": {"gmkt": 0},
-            },
-        }
+        # 판매중지 — 실 호출 검증 schema (PascalCase). 'IsSell' 만으로도 ESM 측 검증 통과.
+        suspend_data = {"IsSell": {"Gmkt": False}}
         await client.update_sell_status(product_no, suspend_data)
         logger.info(f"[지마켓] 판매중지 완료: goodsNo={product_no}")
         return {"success": True, "message": "지마켓 판매중지 완료"}

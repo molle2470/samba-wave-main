@@ -19,30 +19,31 @@ async def _get_esm_client(
     market: str,
     account_id: str | None,
 ):
-    """계정 정보로 ESMPlusClient 생성. 호스팅 인증정보는 환경변수에서 로드."""
-    from backend.core.config import settings
-    from backend.domain.samba.proxy.esmplus import ESMPlusClient
+    """계정 정보로 ESMPlusClient 생성.
+
+    인증 정보 우선순위 (resolve_esm_credentials):
+      account.additional_fields > samba_settings.esm_credentials > env.
+    """
+    from backend.domain.samba.proxy.esmplus import (
+        ESMPlusClient,
+        resolve_esm_credentials,
+    )
     from sqlalchemy import text
 
     if market not in ("gmarket", "auction"):
         return None
 
-    hosting_id = settings.esmplus_hosting_id
-    secret_key = settings.esmplus_secret_key
-    if not hosting_id or not secret_key:
-        return None
-
     if account_id:
         result = await session.exec(
             text(
-                "SELECT seller_id FROM samba_market_account "
+                "SELECT seller_id, additional_fields FROM samba_market_account "
                 "WHERE id = :aid AND market_type = :mtype AND is_active = true"
             ).bindparams(aid=account_id, mtype=market)
         )
     else:
         result = await session.exec(
             text(
-                "SELECT seller_id FROM samba_market_account "
+                "SELECT seller_id, additional_fields FROM samba_market_account "
                 "WHERE market_type = :mtype AND is_active = true LIMIT 1"
             ).bindparams(mtype=market)
         )
@@ -53,6 +54,16 @@ async def _get_esm_client(
 
     seller_id = row[0] or ""
     if not seller_id:
+        return None
+
+    # account.additional_fields 기반 인증 시도 (없으면 env fallback)
+    class _AccountStub:
+        def __init__(self, additional_fields: dict | None) -> None:
+            self.additional_fields = additional_fields or {}
+
+    account_stub = _AccountStub(row[1] if len(row) > 1 else None)
+    hosting_id, secret_key = await resolve_esm_credentials(session, account_stub)
+    if not hosting_id or not secret_key:
         return None
 
     return ESMPlusClient(hosting_id, secret_key, seller_id, site=market)

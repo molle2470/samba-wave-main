@@ -565,13 +565,12 @@ class CategorySyncMixin:
         if not seller_id:
             raise ValueError(f"{market_type} 판매자 ID가 없습니다")
 
-        from backend.core.config import settings
+        from backend.domain.samba.proxy.esmplus import resolve_esm_credentials
 
-        hosting_id = settings.esmplus_hosting_id
-        secret_key = settings.esmplus_secret_key
+        hosting_id, secret_key = await resolve_esm_credentials(self.session, account)
         if not hosting_id or not secret_key:
             raise ValueError(
-                f"{market_type} 호스팅 인증정보(환경변수 ESMPLUS_HOSTING_ID/ESMPLUS_SECRET_KEY)가 없습니다"
+                f"{market_type} ESM 인증정보 없음 — account.additional_fields / samba_settings.esm_credentials / ESMPLUS_HOSTING_ID env 중 하나 필요"
             )
 
         client = ESMPlusClient(hosting_id, secret_key, seller_id, site=market_type)
