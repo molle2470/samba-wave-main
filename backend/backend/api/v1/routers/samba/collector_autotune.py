@@ -120,6 +120,11 @@ _autotune_cycle_stats: dict[tuple[str, str], dict] = {}
 
 # Watchdog
 STUCK_TIMEOUT_SECONDS = 300  # 5분간 heartbeat 없으면 stuck 판정
+# 사이트별 stuck timeout — LOTTEON은 응답 느려 5분 내 cycle 완료 어려움.
+# 늘려서 cycle 끝까지 가도록 함 → scheduler_tick 이벤트 정상 발행.
+_SITE_STUCK_TIMEOUT_OVERRIDE = {
+    "LOTTEON": 900,  # 15분 (concurrency=1 + WAF 차단 대응)
+}
 MAX_RESTART_COUNT = 50  # 코디네이터 재시작 상한선
 
 
@@ -427,7 +432,13 @@ async def _site_autotune_loop(device_id: str, site: str):
 
                     market_cond = build_market_registered_conditions(_CP)
 
-                    _order_clause = (_CP.last_refreshed_at.asc().nullsfirst(),)
+                    # 정렬 안정성 보장 (issue #206) — id를 secondary sort로 두지 않으면
+                    # last_refreshed_at NULL 행 수천 개 중 매 cycle 동일 200개만 잡혀
+                    # 다른 NULL 행이 영원히 cycle 진입 못 하는 사고 발생.
+                    _order_clause = (
+                        _CP.last_refreshed_at.asc().nullsfirst(),
+                        _CP.id.asc(),
+                    )
 
                     _where = [
                         *market_cond,
@@ -2328,6 +2339,10 @@ async def _site_autotune_loop(device_id: str, site: str):
                                     source_site=site,
                                     detail={
                                         "total": filtered_count,
+                                        "total_global": _total_global,
+                                        "global_idx": _autotune_global_idx.get(
+                                            _gkey, 0
+                                        ),
                                         "refreshed": summary.refreshed,
                                         "ok": _ok_count,
                                         "errors": _err_count,
@@ -2651,12 +2666,16 @@ async def _autotune_loop(device_id: str):
                     if _t.done():
                         continue
                     _last_hb = _heartbeats.get(_s, _now_ts)
-                    if _now_ts - _last_hb > STUCK_TIMEOUT_SECONDS:
+                    _site_stuck_to = _SITE_STUCK_TIMEOUT_OVERRIDE.get(
+                        _s, STUCK_TIMEOUT_SECONDS
+                    )
+                    if _now_ts - _last_hb > _site_stuck_to:
                         log.warning(
-                            "[오토튠][%s][%s] stuck 감지 (%.0f초 무응답) — 강제 재시작",
+                            "[오토튠][%s][%s] stuck 감지 (%.0f초 무응답, 임계 %ds) — 강제 재시작",
                             _dev_tag,
                             _s,
                             _now_ts - _last_hb,
+                            _site_stuck_to,
                         )
                         _t.cancel()
                         del _site_tasks[_s]
@@ -3228,6 +3247,18 @@ async def autotune_status(device_id: str = ""):
                 _my_devices = {d for (d,) in _dev_result.all() if d}
         except Exception:
             _my_devices = set()
+        # Fallback (2026-05-20): samba_extension_key 테이블에 device_id 컬럼
+        # 마이그레이션 누락으로 _my_devices 빈 집합이 되면 "오토튠 정지"로 잘못
+        # 표시되던 사고. OWNER_DEVICE_IDS env 화이트리스트를 본인 device로 인정.
+        if not _my_devices:
+            try:
+                from backend.core.config import settings as _st
+
+                _own_raw = (getattr(_st, "owner_device_ids", "") or "").strip()
+                if _own_raw:
+                    _my_devices = {d.strip() for d in _own_raw.split(",") if d.strip()}
+            except Exception:
+                pass
 
     tripped = {
         site: count

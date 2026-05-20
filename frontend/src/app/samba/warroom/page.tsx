@@ -548,7 +548,7 @@ export default function WarroomPage() {
     // 사이클 완료 시 이벤트 타임라인 갱신
     if (cycles > prevCyclesRef.current) {
       prevCyclesRef.current = cycles
-      monitorApi.recentEvents(30).then(ev => setEvents(ev.map(row => ({
+      monitorApi.recentEvents(200).then(ev => setEvents(ev.map(row => ({
         ...row,
         source_site: normalizeWarroomSourceSite(row.source_site),
       })))).catch(() => {})
@@ -575,7 +575,7 @@ export default function WarroomPage() {
       .catch(() => { /* ignore */ })
       .finally(() => setLoading(false))
 
-    monitorApi.recentEvents(30)
+    monitorApi.recentEvents(200)
       .then(rows => {
         setEvents(rows.map(row => ({
           ...row,
@@ -1030,9 +1030,21 @@ export default function WarroomPage() {
                           <div key={ci} style={{ marginBottom: ci < cycles - 1 ? '0.3rem' : 0, paddingBottom: ci < cycles - 1 ? '0.3rem' : 0, borderBottom: ci < cycles - 1 ? '1px solid #ffffff10' : 'none' }}>
                             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.3rem', alignItems: 'center' }}>
                               {timeRange && <span style={{ fontSize: '0.72rem', color: '#999' }}>{timeRange}</span>}
-                              {total != null && (
-                                <span style={{ fontSize: '0.78rem', color: '#aaa' }}>대상 {fmtNum(total)}</span>
-                              )}
+                              {total != null && (() => {
+                                const totalGlobal = _d?.total_global as number | undefined
+                                const globalIdx = _d?.global_idx as number | undefined
+                                if (totalGlobal != null && totalGlobal > 0) {
+                                  return (
+                                    <span style={{ fontSize: '0.78rem', color: '#aaa' }}>
+                                      대상 {fmtNum(total)}
+                                      {globalIdx != null && (
+                                        <span style={{ color: '#666' }}> ({fmtNum(globalIdx + total)}/{fmtNum(totalGlobal)})</span>
+                                      )}
+                                    </span>
+                                  )
+                                }
+                                return <span style={{ fontSize: '0.78rem', color: '#aaa' }}>대상 {fmtNum(total)}</span>
+                              })()}
                               {ok != null && (
                                 <span style={{ fontSize: '0.78rem', color: '#aaa' }}>성공 {fmtNum(ok)}</span>
                               )}

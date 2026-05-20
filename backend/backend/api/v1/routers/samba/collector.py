@@ -2043,11 +2043,16 @@ async def bulk_reset_registration(
     from backend.domain.samba.collector.model import SambaCollectedProduct
 
     if not body.account_ids:
+        # last_sent_data도 함께 정리 (issue #206) — 누락 시 registered_accounts=NULL인데
+        # last_sent_data엔 송신 이력이 살아있어 "유령 등록상품"으로 표시되던 사고 방지.
         stmt = (
             sa_update(SambaCollectedProduct)
             .where(col(SambaCollectedProduct.id).in_(body.ids))
             .values(
-                registered_accounts=None, market_product_nos=None, status="collected"
+                registered_accounts=None,
+                market_product_nos=None,
+                last_sent_data=None,
+                status="collected",
             )
         )
         result = await session.exec(stmt)  # type: ignore[arg-type]
@@ -2081,6 +2086,12 @@ async def bulk_reset_registration(
             nos.pop(aid, None)
             nos.pop(f"{aid}_origin", None)
         product.market_product_nos = nos or None
+
+        # last_sent_data도 동일하게 정리 (issue #206 유령 등록상품 방지)
+        sent = dict(product.last_sent_data or {})
+        for aid in remove_set:
+            sent.pop(aid, None)
+        product.last_sent_data = sent or None
 
         if not remaining:
             product.status = "collected"

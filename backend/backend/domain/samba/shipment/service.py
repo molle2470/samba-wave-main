@@ -1990,6 +1990,11 @@ class SambaShipmentService:
                             if a not in _failed_db_accs
                         ]
                         _retry_prod.registered_accounts = new_reg if new_reg else None
+                        # last_sent_data도 함께 정리 (issue #206 유령 등록상품 방지)
+                        _new_sent = dict(_retry_prod.last_sent_data or {})
+                        for _fa in _failed_db_accs:
+                            _new_sent.pop(_fa, None)
+                        _retry_prod.last_sent_data = _new_sent or None
                         await _retry_s.commit()
                         logger.info(
                             f"[전송] DB 재시도 성공 — registered_accounts 갱신: {_failed_db_accs}"
