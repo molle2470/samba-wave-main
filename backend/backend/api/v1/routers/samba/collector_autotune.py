@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, update as sa_update
 from sqlalchemy.orm import defer
 from sqlmodel import select
+from sqlmodel.ext.asyncio.session import AsyncSession
 
 from backend.api.v1.routers.samba.collector_common import (
     _trim_history,
@@ -263,26 +264,88 @@ def update_pc_last_seen(device_id: str) -> None:
         _pc_last_seen[device_id.strip()] = time.time()
 
 
-def register_pc_allowed_sites(device_id: str, sites: list[str] | None) -> None:
+PC_ALLOWED_SITES_DB_KEY = "autotune_pc_allowed_sites"
+
+
+def register_pc_allowed_sites(device_id: str, sites: list[str] | None) -> bool:
     """PC 분담 등록/갱신 (UI/폴링용 메타데이터).
 
     sites=None → 등록 제거
     sites=[] → 빈 분담 (이 PC는 아무 사이트 안 받음)
     sites=[...] → 명시 사이트만 받음
 
-    이 등록값은 UI 표시(pc_assignments)와 폴링 X-Allowed-Sites 헤더의 출처일 뿐,
-    실제 오토튠 사이클 active_sites 결정은 시작한 PC의 인스턴스가 자기 사이트만
-    독립적으로 처리하므로 직접적인 영향 없음.
+    실제 변경이 발생했을 때 True 반환 — 호출자가 DB 영속화 필요 여부 판단용.
     """
     dev = (device_id or "").strip()
     if not dev:
-        return
+        return False
     if sites is None:
+        existed = dev in _pc_allowed_sites or dev in _pc_last_seen
         _pc_allowed_sites.pop(dev, None)
         _pc_last_seen.pop(dev, None)
-        return
-    _pc_allowed_sites[dev] = {s.strip() for s in sites if s and s.strip()}
+        return existed
+    new_set = {s.strip() for s in sites if s and s.strip()}
+    prev = _pc_allowed_sites.get(dev)
+    changed = prev != new_set
+    _pc_allowed_sites[dev] = new_set
     _pc_last_seen[dev] = time.time()
+    return changed
+
+
+async def persist_pc_allowed_sites(session: AsyncSession) -> None:
+    """현재 메모리의 PC 분담 dict를 samba_settings에 저장 (재시작 복원용).
+
+    값 형식: {device_id: [sites...]}. 호출자가 변경 발생 시에만 호출해 write 부담 최소화.
+    """
+    _log = logging.getLogger("autotune")
+    try:
+        from backend.api.v1.routers.samba.proxy._helpers import _set_setting
+
+        snapshot = {dev: sorted(sites) for dev, sites in _pc_allowed_sites.items()}
+        await _set_setting(session, PC_ALLOWED_SITES_DB_KEY, snapshot)
+    except Exception as _e:
+        _log.warning("[오토튠] PC 분담 DB 저장 실패(무시): %s", _e)
+
+
+async def restore_pc_allowed_sites_from_db() -> int:
+    """서버 시작 시 samba_settings에서 PC 분담 dict 복원. 복원 건수 반환.
+
+    last_seen은 복원하지 않음 — 24h TTL이 의미를 잃음. 첫 폴링 도착 시 갱신.
+    그러나 분담 매핑 자체는 `get_pc_allowed_sites()`에서 사용되므로 복원 효과 충분.
+    """
+    _log = logging.getLogger("autotune")
+    try:
+        from backend.db.orm import get_read_session
+        from backend.api.v1.routers.samba.proxy._helpers import _get_setting
+
+        async with get_read_session() as _sess:
+            data = await _get_setting(_sess, PC_ALLOWED_SITES_DB_KEY)
+        if not isinstance(data, dict):
+            return 0
+        count = 0
+        now = time.time()
+        for dev, sites in data.items():
+            if not isinstance(dev, str) or not isinstance(sites, list):
+                continue
+            dev_clean = dev.strip()
+            if not dev_clean:
+                continue
+            _pc_allowed_sites[dev_clean] = {
+                s.strip() for s in sites if isinstance(s, str) and s.strip()
+            }
+            # last_seen은 복원 시점으로 표시 — 첫 폴링까지 stale 정리 방지
+            _pc_last_seen[dev_clean] = now
+            count += 1
+        if count:
+            _log.info(
+                "[오토튠] PC 분담 복원: %d PCs (devices=%s)",
+                count,
+                sorted(_pc_allowed_sites.keys()),
+            )
+        return count
+    except Exception as _e:
+        _log.warning("[오토튠] PC 분담 복원 실패(무시): %s", _e)
+        return 0
 
 
 def get_active_pcs() -> dict[str, set[str]]:
@@ -3346,8 +3409,13 @@ class PcAllowedSitesRequest(BaseModel):
 
 @router.post("/autotune/pc-allowed-sites")
 async def autotune_pc_allowed_sites_set(body: PcAllowedSitesRequest):
-    """PC 분담 등록 — 이 PC가 처리할 사이트 목록."""
-    register_pc_allowed_sites(body.device_id, body.sites)
+    """PC 분담 등록 — 이 PC가 처리할 사이트 목록. 변경 시 DB 영속화."""
+    if register_pc_allowed_sites(body.device_id, body.sites):
+        from backend.db.orm import get_write_session
+
+        async with get_write_session() as _sess:
+            await persist_pc_allowed_sites(_sess)
+            await _sess.commit()
     pcs = get_active_pcs()
     return {
         "ok": True,
