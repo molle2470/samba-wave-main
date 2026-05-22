@@ -15,12 +15,9 @@
     if (protocol === 'http:' && hostname === 'localhost') {
       return 'http://localhost:28080'
     }
-    // 프로덕션 페이지 열리면 백엔드 URL을 production으로 자동 복원.
-    // 옛날에 로컬 페이지 한 번 열어서 storage가 localhost로 굳어진 케이스를 자동 복구.
-    // vercel.app(프리뷰 포함) / samba-wave.co.kr 둘 다 production 백엔드로 매핑.
-    if (hostname.endsWith('.vercel.app') || hostname === 'samba-wave.co.kr' || hostname.endsWith('.samba-wave.co.kr')) {
-      return 'https://api.samba-wave.co.kr'
-    }
+    // (2026-05-20) vercel.app/samba-wave.co.kr → api.samba-wave.co.kr 강제 매핑 제거.
+    // 포크 유저가 자기 프런트(vercel.app 도메인 포함)를 열기만 해도 storage.proxyUrl이
+    // 원본 백엔드로 강제 덮어쓰기 되던 누수 차단. 백엔드 URL은 popup에서 명시 입력만.
     return ''
   }
 

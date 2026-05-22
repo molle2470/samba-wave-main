@@ -190,7 +190,10 @@ def get_supported_markets() -> list[str]:
 SUPPORTED_MARKETS = get_supported_markets()
 
 # 미지원 마켓 (공개 API 없음 — 파트너 계약 또는 연동솔루션 필요)
-UNSUPPORTED_MARKETS = ["gmarket", "auction", "homeand", "hmall"]
+# gmarket/auction 은 ESM Plus 통합 API (sa2.esmplus.com) 로 지원 가능 —
+# proxy/esmplus.py + plugins/markets/{gmarket,auction}.py 구현 완료.
+# 활성화 조건: ESMPLUS_HOSTING_ID, ESMPLUS_SECRET_KEY env 주입 + samba_market_account 등록.
+UNSUPPORTED_MARKETS = ["homeand", "hmall"]
 
 
 # ═══════════════════════════════════════════════

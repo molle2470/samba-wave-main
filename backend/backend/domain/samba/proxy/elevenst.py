@@ -968,14 +968,25 @@ class ElevenstClient:
             f"/{send_dt}/{dlv_mthd_cd}/{dlv_etprs_cd}/{invc_no}/{dlv_no}"
         )
         headers = self._headers()
+        # 디버그: 실제 호출 URL 전체 + 응답 raw — -1/-3306/-3307 등 원인 추적용 (issue #207)
+        logger.info(
+            "[11번가][발송처리] REQUEST url=%s send_dt=%s dlv_mthd=%s dlv_etprs=%s invc=%s dlv_no=%s",
+            url,
+            send_dt,
+            dlv_mthd_cd,
+            dlv_etprs_cd,
+            invc_no,
+            dlv_no,
+        )
 
         client = _get_elevenst_http_client(self.api_key)
         resp = await client.get(url, headers=headers)
         logger.info(
-            "[11번가] 발송처리 dlvNo=%s invcNo=%s → %s",
+            "[11번가] 발송처리 dlvNo=%s invcNo=%s → HTTP %s body=%s",
             dlv_no,
             invc_no,
             resp.status_code,
+            resp.text[:500],
         )
 
         if not resp.is_success:

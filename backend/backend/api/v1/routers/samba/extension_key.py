@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sqlalchemy import select, update
@@ -82,11 +82,17 @@ class _KeyIssueResponse(_KeyResponse):
 @router.post("", status_code=201, response_model=_KeyIssueResponse)
 async def issue_key(
     body: _KeyIssueRequest,
+    request: Request,
     ctx: _UserCtx = Depends(_get_user_ctx),
     session: AsyncSession = Depends(get_write_session_dependency),
 ):
-    """테넌트별 확장앱 키 발급. 평문 키는 이 응답에서만 노출."""
+    """테넌트별 확장앱 키 발급. 평문 키는 이 응답에서만 노출.
+
+    X-Device-Id 헤더가 있으면 device_id 컬럼에 저장(2026-05-20) — 오토튠
+    status API의 본인 device 매칭에 사용.
+    """
     raw = secrets.token_hex(32)
+    _device_id = (request.headers.get("X-Device-Id") or "").strip() or None
     record = SambaExtensionKey(
         id=_new_ulid(),
         key_hash=_hash_key(raw),
@@ -94,6 +100,7 @@ async def issue_key(
         user_id=ctx.user_id,
         label=body.label,
         created_at=datetime.now(_UTC),
+        device_id=_device_id,
     )
     session.add(record)
     await session.commit()

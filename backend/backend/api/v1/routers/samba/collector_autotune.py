@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, update as sa_update
 from sqlalchemy.orm import defer
 from sqlmodel import select
+from sqlmodel.ext.asyncio.session import AsyncSession
 
 from backend.api.v1.routers.samba.collector_common import (
     _trim_history,
@@ -120,6 +121,12 @@ _autotune_cycle_stats: dict[tuple[str, str], dict] = {}
 
 # Watchdog
 STUCK_TIMEOUT_SECONDS = 300  # 5분간 heartbeat 없으면 stuck 판정
+# 사이트별 stuck timeout — LOTTEON은 응답 느려 5분 내 cycle 완료 어려움.
+# 늘려서 cycle 끝까지 가도록 함 → scheduler_tick 이벤트 정상 발행.
+_SITE_STUCK_TIMEOUT_OVERRIDE = {
+    "LOTTEON": 900,  # 15분 (concurrency=1 + WAF 차단 대응)
+    "MUSINSA": 600,  # 10분 (IP 차단/로테이션으로 200건 배치 5분 초과 → Watchdog 강제재시작 방지)
+}
 MAX_RESTART_COUNT = 50  # 코디네이터 재시작 상한선
 
 
@@ -257,26 +264,88 @@ def update_pc_last_seen(device_id: str) -> None:
         _pc_last_seen[device_id.strip()] = time.time()
 
 
-def register_pc_allowed_sites(device_id: str, sites: list[str] | None) -> None:
+PC_ALLOWED_SITES_DB_KEY = "autotune_pc_allowed_sites"
+
+
+def register_pc_allowed_sites(device_id: str, sites: list[str] | None) -> bool:
     """PC 분담 등록/갱신 (UI/폴링용 메타데이터).
 
     sites=None → 등록 제거
     sites=[] → 빈 분담 (이 PC는 아무 사이트 안 받음)
     sites=[...] → 명시 사이트만 받음
 
-    이 등록값은 UI 표시(pc_assignments)와 폴링 X-Allowed-Sites 헤더의 출처일 뿐,
-    실제 오토튠 사이클 active_sites 결정은 시작한 PC의 인스턴스가 자기 사이트만
-    독립적으로 처리하므로 직접적인 영향 없음.
+    실제 변경이 발생했을 때 True 반환 — 호출자가 DB 영속화 필요 여부 판단용.
     """
     dev = (device_id or "").strip()
     if not dev:
-        return
+        return False
     if sites is None:
+        existed = dev in _pc_allowed_sites or dev in _pc_last_seen
         _pc_allowed_sites.pop(dev, None)
         _pc_last_seen.pop(dev, None)
-        return
-    _pc_allowed_sites[dev] = {s.strip() for s in sites if s and s.strip()}
+        return existed
+    new_set = {s.strip() for s in sites if s and s.strip()}
+    prev = _pc_allowed_sites.get(dev)
+    changed = prev != new_set
+    _pc_allowed_sites[dev] = new_set
     _pc_last_seen[dev] = time.time()
+    return changed
+
+
+async def persist_pc_allowed_sites(session: AsyncSession) -> None:
+    """현재 메모리의 PC 분담 dict를 samba_settings에 저장 (재시작 복원용).
+
+    값 형식: {device_id: [sites...]}. 호출자가 변경 발생 시에만 호출해 write 부담 최소화.
+    """
+    _log = logging.getLogger("autotune")
+    try:
+        from backend.api.v1.routers.samba.proxy._helpers import _set_setting
+
+        snapshot = {dev: sorted(sites) for dev, sites in _pc_allowed_sites.items()}
+        await _set_setting(session, PC_ALLOWED_SITES_DB_KEY, snapshot)
+    except Exception as _e:
+        _log.warning("[오토튠] PC 분담 DB 저장 실패(무시): %s", _e)
+
+
+async def restore_pc_allowed_sites_from_db() -> int:
+    """서버 시작 시 samba_settings에서 PC 분담 dict 복원. 복원 건수 반환.
+
+    last_seen은 복원하지 않음 — 24h TTL이 의미를 잃음. 첫 폴링 도착 시 갱신.
+    그러나 분담 매핑 자체는 `get_pc_allowed_sites()`에서 사용되므로 복원 효과 충분.
+    """
+    _log = logging.getLogger("autotune")
+    try:
+        from backend.db.orm import get_read_session
+        from backend.api.v1.routers.samba.proxy._helpers import _get_setting
+
+        async with get_read_session() as _sess:
+            data = await _get_setting(_sess, PC_ALLOWED_SITES_DB_KEY)
+        if not isinstance(data, dict):
+            return 0
+        count = 0
+        now = time.time()
+        for dev, sites in data.items():
+            if not isinstance(dev, str) or not isinstance(sites, list):
+                continue
+            dev_clean = dev.strip()
+            if not dev_clean:
+                continue
+            _pc_allowed_sites[dev_clean] = {
+                s.strip() for s in sites if isinstance(s, str) and s.strip()
+            }
+            # last_seen은 복원 시점으로 표시 — 첫 폴링까지 stale 정리 방지
+            _pc_last_seen[dev_clean] = now
+            count += 1
+        if count:
+            _log.info(
+                "[오토튠] PC 분담 복원: %d PCs (devices=%s)",
+                count,
+                sorted(_pc_allowed_sites.keys()),
+            )
+        return count
+    except Exception as _e:
+        _log.warning("[오토튠] PC 분담 복원 실패(무시): %s", _e)
+        return 0
 
 
 def get_active_pcs() -> dict[str, set[str]]:
@@ -427,7 +496,13 @@ async def _site_autotune_loop(device_id: str, site: str):
 
                     market_cond = build_market_registered_conditions(_CP)
 
-                    _order_clause = (_CP.last_refreshed_at.asc().nullsfirst(),)
+                    # 정렬 안정성 보장 (issue #206) — id를 secondary sort로 두지 않으면
+                    # last_refreshed_at NULL 행 수천 개 중 매 cycle 동일 200개만 잡혀
+                    # 다른 NULL 행이 영원히 cycle 진입 못 하는 사고 발생.
+                    _order_clause = (
+                        _CP.last_refreshed_at.asc().nullsfirst(),
+                        _CP.id.asc(),
+                    )
 
                     _where = [
                         *market_cond,
@@ -1822,6 +1897,81 @@ async def _site_autotune_loop(device_id: str, site: str):
                                     # 호출하므로 트랜잭션이 90~180s 가까이 idle 상태가 될 수
                                     # 있다. 좀비 connection으로 깨지면 (Can't reconnect /
                                     # InvalidRequestError 계열) 새 세션을 받아 1회 재시도한다.
+                                    # 계정별 진행 로그를 완료 즉시 흘리기 위한 사전 인덱싱
+                                    _entry_by_acc = {
+                                        _e_acc: (_e_label, _e_action)
+                                        for (
+                                            _,
+                                            _e_acc,
+                                            _e_label,
+                                            _e_action,
+                                        ) in _entries_list
+                                    }
+                                    _logged_accs: set[str] = set()
+
+                                    async def _on_account_done(_acc_id, _ar):
+                                        """판매처 한 곳 끝나는 즉시 _log_line 발사 — 워룸 로그가
+                                        순차적으로 흐르도록(이전엔 모든 판매처 완료 후 일괄 출력).
+                                        """
+                                        nonlocal _synced_count
+                                        if _acc_id in _logged_accs:
+                                            return
+                                        _label_action = _entry_by_acc.get(_acc_id)
+                                        if not _label_action:
+                                            return
+                                        _e_label, _e_action = _label_action
+                                        _ar_status = (
+                                            _ar.get("status")
+                                            if isinstance(_ar, dict)
+                                            else None
+                                        )
+                                        _ar_err = (
+                                            _ar.get("error")
+                                            if isinstance(_ar, dict)
+                                            else None
+                                        )
+                                        _ar_results = (
+                                            _ar.get("results", {})
+                                            if isinstance(_ar, dict)
+                                            else {}
+                                        )
+                                        _was_deleted = (
+                                            isinstance(_ar_results, dict)
+                                            and _ar_results.get(_acc_id) == "deleted"
+                                        )
+                                        _acc_ok = not _ar_err and _ar_status in (
+                                            "success",
+                                            "completed",
+                                            "skipped",
+                                        )
+                                        if _acc_ok:
+                                            _synced_count += 1
+                                            if _was_deleted:
+                                                _log_line(
+                                                    _site,
+                                                    _pid,
+                                                    f"{_idx_pfx}{_e_label}: {_e_action} → 마켓삭제(품절){_t}",
+                                                )
+                                            else:
+                                                _log_line(
+                                                    _site,
+                                                    _pid,
+                                                    f"{_idx_pfx}{_e_label}: {_e_action} 전송완료{_t}",
+                                                )
+                                        else:
+                                            _fail_msg = (
+                                                str(_ar_err)[:200]
+                                                if _ar_err
+                                                else "결과없음"
+                                            )
+                                            _log_line(
+                                                _site,
+                                                _pid,
+                                                f"{_idx_pfx}{_e_label}: {_e_action} 전송실패: {_fail_msg}{_t}",
+                                                "error",
+                                            )
+                                        _logged_accs.add(_acc_id)
+
                                     try:
                                         _tx_result = None
                                         _tx_exc: Exception | None = None
@@ -1836,14 +1986,13 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                     )
 
                                                     _svc = _FSvc(_FRepo(_tx_s), _tx_s)
-                                                    _tx_result = (
-                                                        await _svc.start_update(
-                                                            [_pid],
-                                                            _items,
-                                                            _accs_list,
-                                                            skip_unchanged=False,
-                                                            skip_refresh=True,
-                                                        )
+                                                    _tx_result = await _svc.start_update(
+                                                        [_pid],
+                                                        _items,
+                                                        _accs_list,
+                                                        skip_unchanged=False,
+                                                        skip_refresh=True,
+                                                        on_account_done=_on_account_done,
                                                     )
                                                     # HTTP 끝났으면 즉시 commit — 세션이 idle
                                                     # 상태로 더 머무르지 않도록 transaction 종료
@@ -1905,9 +2054,13 @@ async def _site_autotune_loop(device_id: str, site: str):
                                             "completed",
                                         )
 
+                                        # 계정별 성공/실패 로그는 _on_account_done 콜백에서 이미
+                                        # 완료 순서대로 발사됨. 여기선 콜백이 못 잡은 계정만
+                                        # 폴백 처리(예: start_update 자체가 일부만 처리하고 반환).
                                         for _entry in _entries_list:
                                             _, _eacc, _elabel, _eaction = _entry
-                                            # 계정별 결과 추출
+                                            if _eacc in _logged_accs:
+                                                continue
                                             _acc_status = (
                                                 _tx_status_map.get(_eacc)
                                                 if isinstance(_tx_status_map, dict)
@@ -1918,7 +2071,6 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                 if isinstance(_tx_err_map, dict)
                                                 else None
                                             )
-                                            # 마켓삭제 판정: update_result 내 값 확인
                                             _acc_was_deleted = False
                                             if isinstance(_tx_update_map, dict):
                                                 _u = _tx_update_map.get(_eacc)
@@ -1936,7 +2088,6 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                     "soldout_fallback",
                                                 ):
                                                     _acc_was_deleted = True
-                                            # 계정별 ok: status가 명시적으로 실패 아니고 에러 없음
                                             _acc_ok = not _acc_err and (
                                                 _acc_status
                                                 in (None, "success", "completed")
@@ -1971,6 +2122,8 @@ async def _site_autotune_loop(device_id: str, site: str):
                                     except Exception as _fe:
                                         for _entry in _entries_list:
                                             _, _eacc, _elabel, _eaction = _entry
+                                            if _eacc in _logged_accs:
+                                                continue
                                             _log_line(
                                                 _site,
                                                 _pid,
@@ -2174,6 +2327,72 @@ async def _site_autotune_loop(device_id: str, site: str):
                                 _c_err_detail,
                                 _cstats["batches"],
                             )
+                            # scheduler_cycle 이벤트 발행 — 워룸 타임라인용 (한 바퀴 누적 통계)
+                            try:
+                                _c_dur_sec = 0.0
+                                try:
+                                    if _c_started:
+                                        _c_dur_sec = round(
+                                            (
+                                                _now
+                                                - datetime.fromisoformat(_c_started)
+                                            ).total_seconds(),
+                                            1,
+                                        )
+                                except Exception:
+                                    _c_dur_sec = 0.0
+                                _c_rate = (
+                                    round(_cstats["total"] / _c_dur_sec, 1)
+                                    if _c_dur_sec > 0
+                                    else 0.0
+                                )
+                                _c_ended_iso = _now.isoformat()
+                                from backend.domain.samba.warroom.service import (
+                                    SambaMonitorService as _CycleMon,
+                                )
+
+                                async with get_write_session() as _cyc_session:
+                                    _cyc_monitor = _CycleMon(_cyc_session)
+                                    await _cyc_monitor.emit(
+                                        "scheduler_cycle",
+                                        "info",
+                                        summary=f"오토튠[{site}] 사이클 완료 (1바퀴 {_g_total_now:,}건): {_cstats['ok']:,}건 성공, {_cstats['err']:,}건 실패{_c_err_detail} / 배치 {_cstats['batches']:,}회 | {int(_c_dur_sec):,}초, {_c_rate}건/초",
+                                        source_site=site,
+                                        detail={
+                                            # total = 분모(1바퀴 전체 상품 수)로 고정.
+                                            # UI 카드 "대상 {total}" 자리에 절대 200 같은 배치 단위 숫자가
+                                            # 표시되지 않도록 안전장치.
+                                            "total": _g_total_now,
+                                            "total_global": _g_total_now,
+                                            "processed": _cstats["total"],
+                                            "is_full_cycle": True,
+                                            "ok": _cstats["ok"],
+                                            "errors": _cstats["err"],
+                                            "no_pid": _cstats["no_pid"],
+                                            "blocked": _cstats["blocked"],
+                                            "timeouts": _cstats["timeout"],
+                                            "other_errors": _cstats["other"],
+                                            "price_transmit": len(
+                                                _cstats["price_pids"]
+                                            ),
+                                            "stock_transmit": len(
+                                                _cstats["stock_pids"]
+                                            ),
+                                            "synced": _cstats["synced"],
+                                            "deleted": _cstats["deleted"],
+                                            "batches": _cstats["batches"],
+                                            "started_at": _c_started,
+                                            "ended_at": _c_ended_iso,
+                                            "duration_sec": _c_dur_sec,
+                                            "rate": _c_rate,
+                                        },
+                                    )
+                                    await _cyc_session.commit()
+                            except Exception as _cyc_emit_err:
+                                log.error(
+                                    "[오토튠] scheduler_cycle 발행 실패: %s",
+                                    _cyc_emit_err,
+                                )
                             # 다음 회전을 위해 통계 리셋
                             _autotune_cycle_stats[_gkey] = _new_cycle_stats()
 
@@ -2385,6 +2604,10 @@ async def _site_autotune_loop(device_id: str, site: str):
                                     source_site=site,
                                     detail={
                                         "total": filtered_count,
+                                        "total_global": _total_global,
+                                        "global_idx": _autotune_global_idx.get(
+                                            _gkey, 0
+                                        ),
                                         "refreshed": summary.refreshed,
                                         "ok": _ok_count,
                                         "errors": _err_count,
@@ -2708,12 +2931,16 @@ async def _autotune_loop(device_id: str):
                     if _t.done():
                         continue
                     _last_hb = _heartbeats.get(_s, _now_ts)
-                    if _now_ts - _last_hb > STUCK_TIMEOUT_SECONDS:
+                    _site_stuck_to = _SITE_STUCK_TIMEOUT_OVERRIDE.get(
+                        _s, STUCK_TIMEOUT_SECONDS
+                    )
+                    if _now_ts - _last_hb > _site_stuck_to:
                         log.warning(
-                            "[오토튠][%s][%s] stuck 감지 (%.0f초 무응답) — 강제 재시작",
+                            "[오토튠][%s][%s] stuck 감지 (%.0f초 무응답, 임계 %ds) — 강제 재시작",
                             _dev_tag,
                             _s,
                             _now_ts - _last_hb,
+                            _site_stuck_to,
                         )
                         _t.cancel()
                         del _site_tasks[_s]
@@ -3090,42 +3317,7 @@ async def autotune_start(
     request: Request = None,
 ):
     """오토튠 무한 루프 시작 — 메인 이벤트 루프에서 실행."""
-    # 티어 제한 체크 — 오토튠 접근 권한
-    try:
-        from backend.db.orm import get_read_session
-        from backend.domain.samba.tenant.middleware import (
-            check_autotune_access,
-        )
-
-        if request:
-            async with get_read_session() as session:
-                # JWT에서 tenant_id 추출 시도
-                auth_header = request.headers.get("Authorization") or ""
-                if auth_header.startswith("Bearer "):
-                    token = auth_header.split(" ", 1)[1]
-                    try:
-                        from backend.core.config import settings
-                        import jwt as _jwt
-
-                        payload = _jwt.decode(
-                            token,
-                            settings.jwt_secret_key,
-                            algorithms=[settings.jwt_algorithm],
-                        )
-                        user_id = payload.get("sub", "")
-                        if user_id:
-                            from backend.domain.samba.user.model import SambaUser
-
-                            stmt = select(SambaUser).where(SambaUser.id == user_id)
-                            result = (await session.execute(stmt)).scalars().first()
-                            tid = getattr(result, "tenant_id", None) if result else None
-                            if tid:
-                                await check_autotune_access(tid, session)
-                    except Exception:
-                        pass  # 인증 실패 시 기존 동작 유지
-    except Exception:
-        pass  # 모듈 로드 실패 시 기존 동작 유지
-
+    # 플랜 제한(check_autotune_access) 영구 제거 (2026-05-20)
     from backend.domain.samba.collector.refresher import clear_bulk_cancel
 
     dev = (body.device_id or "").strip()
@@ -3274,8 +3466,13 @@ class PcAllowedSitesRequest(BaseModel):
 
 @router.post("/autotune/pc-allowed-sites")
 async def autotune_pc_allowed_sites_set(body: PcAllowedSitesRequest):
-    """PC 분담 등록 — 이 PC가 처리할 사이트 목록."""
-    register_pc_allowed_sites(body.device_id, body.sites)
+    """PC 분담 등록 — 이 PC가 처리할 사이트 목록. 변경 시 DB 영속화."""
+    if register_pc_allowed_sites(body.device_id, body.sites):
+        from backend.db.orm import get_write_session
+
+        async with get_write_session() as _sess:
+            await persist_pc_allowed_sites(_sess)
+            await _sess.commit()
     pcs = get_active_pcs()
     return {
         "ok": True,
@@ -3320,6 +3517,18 @@ async def autotune_status(device_id: str = ""):
                 _my_devices = {d for (d,) in _dev_result.all() if d}
         except Exception:
             _my_devices = set()
+        # Fallback (2026-05-20): samba_extension_key 테이블에 device_id 컬럼
+        # 마이그레이션 누락으로 _my_devices 빈 집합이 되면 "오토튠 정지"로 잘못
+        # 표시되던 사고. OWNER_DEVICE_IDS env 화이트리스트를 본인 device로 인정.
+        if not _my_devices:
+            try:
+                from backend.core.config import settings as _st
+
+                _own_raw = (getattr(_st, "owner_device_ids", "") or "").strip()
+                if _own_raw:
+                    _my_devices = {d.strip() for d in _own_raw.split(",") if d.strip()}
+            except Exception:
+                pass
 
     tripped = {
         site: count

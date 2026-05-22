@@ -64,7 +64,15 @@ async def lotteon_set_cookie(
     body: LotteonSetCookieRequest = Body(...),
     write_session: AsyncSession = Depends(get_write_session_dependency),
 ) -> dict[str, Any]:
-    """확장앱에서 롯데ON 쿠키 수신 (인증 불필요 — 확장앱에서 직접 호출)."""
+    """확장앱에서 롯데ON 쿠키 수신.
+
+    (2026-05-20) owner_device_ids 가드 적용 — 포크 확장앱이 원본 백엔드로
+    쿠키 미러 전송하던 누수 차단.
+    """
+    from backend.api.v1.routers.samba.sourcing_account import _check_owner_device
+
+    _check_owner_device(request)
+
     if not body.cookie:
         raise HTTPException(status_code=400, detail="쿠키가 필요합니다.")
     await _set_setting(write_session, "lotteon_cookie", body.cookie)
@@ -112,9 +120,10 @@ async def sourcing_collect_queue(request: Request) -> Any:
         pass
 
     # PC 분담 last_seen 갱신 + allowed_sites 동기화
-    # 서버 재시작 후 폴링이 재개되면 _pc_allowed_sites 자동 복원
+    # 서버 재시작 후엔 startup 단계에서 DB로 복원되며, 폴링 헤더로도 보조 동기화.
     try:
         from backend.api.v1.routers.samba.collector_autotune import (
+            persist_pc_allowed_sites,
             register_pc_allowed_sites,
             update_pc_last_seen,
         )
@@ -125,7 +134,13 @@ async def sourcing_collect_queue(request: Request) -> Any:
             sites_for_reg = [
                 s.strip() for s in raw_sites_for_reg.split(",") if s.strip()
             ]
-            register_pc_allowed_sites(device_id, sites_for_reg)
+            # 변경 발생 시에만 DB 영속화 — 매 폴링 write 부담 회피
+            if register_pc_allowed_sites(device_id, sites_for_reg):
+                from backend.db.orm import get_write_session
+
+                async with get_write_session() as _persist_sess:
+                    await persist_pc_allowed_sites(_persist_sess)
+                    await _persist_sess.commit()
     except Exception:
         pass
     # X-Allowed-Sites 헤더 의미:

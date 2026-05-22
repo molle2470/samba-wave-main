@@ -85,12 +85,18 @@ async def list_recent_events(
 
     async def _factory():
         repo = SambaMonitorEventRepository(session)
-        recent, ticks = (
+        recent, ticks, cycles = (
             await repo.list_recent(limit),
             await repo.list_latest_per_site("scheduler_tick", per_site_limit=2),
+            await repo.list_latest_per_site("scheduler_cycle", per_site_limit=2),
         )
         seen = {e.id for e in recent}
-        merged = list(recent) + [t for t in ticks if t.id not in seen]
+        tick_ids = {t.id for t in ticks}
+        merged = (
+            list(recent)
+            + [t for t in ticks if t.id not in seen]
+            + [c for c in cycles if c.id not in seen and c.id not in tick_ids]
+        )
         merged.sort(key=lambda e: e.created_at, reverse=True)
         return [
             {

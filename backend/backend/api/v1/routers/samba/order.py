@@ -3917,6 +3917,9 @@ async def sync_orders_from_markets(
                 lotte_dc_map: dict[
                     tuple[str, str], int
                 ] = {}  # 당사부담할인 (prSfcoShrAmtSum)
+                slr_dc_map: dict[
+                    tuple[str, str], int
+                ] = {}  # 셀러부담할인 (sptDcPgmCmsnSum + 셀러즉시) — 2026-05-20 추가
                 ch_no_map: dict[
                     str, str
                 ] = {}  # 채널번호 (chNo) — 주문 단위라 odNo 키 유지
@@ -3941,6 +3944,11 @@ async def sync_orders_from_markets(
                     _fvr = _pick(ro, "fvrAmtSum")
                     _actual = _pick(ro, "actualAmt")
                     _lotte_dc = _pick(ro, "prSfcoShrAmtSum")
+                    # 셀러 부담 할인 — 정산 화면 "상품할인(셀러부담)" 5,922원이 누락되던 사고(2026-05-20)
+                    # sptDcPgmCmsnSum(지원할인 PGM 셀러부담) + 셀러즉시할인(slrDcAmt 계열)
+                    _slr_dc = _pick(ro, "sptDcPgmCmsnSum") + _pick(
+                        ro, "slrDcAmt", "slrDcSptAmt", "slrImdDcAmt"
+                    )
                     _ch_no = str(ro.get("chNo") or "")
                     # 라인(odSeq) 단위 저장 — 같은 odNo의 다른 옵션/수량이 서로 덮어쓰지 않도록.
                     if _slamt > sl_amt_map.get(_line_key, 0):
@@ -3951,6 +3959,8 @@ async def sync_orders_from_markets(
                         actual_amt_map[_line_key] = _actual
                     if _lotte_dc > lotte_dc_map.get(_line_key, 0):
                         lotte_dc_map[_line_key] = _lotte_dc
+                    if _slr_dc > slr_dc_map.get(_line_key, 0):
+                        slr_dc_map[_line_key] = _slr_dc
                     if _ch_no:
                         ch_no_map[_od_no] = _ch_no
                 logger.info(
@@ -4227,12 +4237,18 @@ async def sync_orders_from_markets(
                                 )
                                 new_p = cancel_priority.get(cn_ship_status, 0)
                                 if cur_p == 0 or new_p >= cur_p:
+                                    # status도 함께 갱신 — orders_data 분기와 일치 (2026-05-20)
+                                    # 누락 시 status=cancelled인데 ship=교환요청/반품요청 잔존 사고
                                     await svc.update_order(
                                         existing_c.id,
-                                        {"shipping_status": cn_ship_status},
+                                        {
+                                            "shipping_status": cn_ship_status,
+                                            "status": cn_status,
+                                        },
                                     )
                                     logger.info(
-                                        f"[롯데ON][취소클레임] DB 직접 업데이트: {cn_od_no} → {cn_ship_status}"
+                                        f"[롯데ON][취소클레임] DB 직접 업데이트: {cn_od_no} → "
+                                        f"{cn_status}/{cn_ship_status}"
                                     )
                 except Exception as cn_err:
                     logger.warning(f"[롯데ON] 취소 클레임 조회 실패: {cn_err}")
@@ -5097,32 +5113,42 @@ async def sync_orders_from_markets(
 
                     # 반품/교환 회수 대상 조회 → 상태 업데이트
                     try:
-                        _ssg_returns = await _ssg_client.get_return_requests(days=body.days)
+                        _ssg_returns = await _ssg_client.get_return_requests(
+                            days=body.days
+                        )
                         for _ret in _ssg_returns:
-                            _ret_ord_no = str(_ret.get("orordNo") or _ret.get("ordNo") or "")
+                            _ret_ord_no = str(
+                                _ret.get("orordNo") or _ret.get("ordNo") or ""
+                            )
                             if not _ret_ord_no:
                                 continue
                             _div_cd = str(_ret.get("shppDivDtlCd") or "")
                             _status = "return_requested"
-                            _shipping_status = "교환요청" if _div_cd == "22" else "반품요청"
-                            orders_data.append({
-                                "order_number": _ret_ord_no,
-                                "channel_id": account["id"],
-                                "channel_name": label,
-                                "status": _status,
-                                "shipping_status": _shipping_status,
-                                "source": "ssg",
-                                "sale_price": 0.0,
-                                "revenue": 0.0,
-                                "fee_rate": _ssg_fee_rate,
-                                "cost": 0,
-                            })
+                            _shipping_status = (
+                                "교환요청" if _div_cd == "22" else "반품요청"
+                            )
+                            orders_data.append(
+                                {
+                                    "order_number": _ret_ord_no,
+                                    "channel_id": account["id"],
+                                    "channel_name": label,
+                                    "status": _status,
+                                    "shipping_status": _shipping_status,
+                                    "source": "ssg",
+                                    "sale_price": 0.0,
+                                    "revenue": 0.0,
+                                    "fee_rate": _ssg_fee_rate,
+                                    "cost": 0,
+                                }
+                            )
                         if _ssg_returns:
                             logger.info(
                                 f"[주문동기화] {label}: 반품/교환 {len(_ssg_returns)}건 조회"
                             )
                     except Exception as _ssg_re:
-                        logger.warning(f"[주문동기화] {label}: SSG 반품조회 실패 — {_ssg_re}")
+                        logger.warning(
+                            f"[주문동기화] {label}: SSG 반품조회 실패 — {_ssg_re}"
+                        )
 
                     # SSG 취소 상태 전환 감지
                     # 1) 활성 주문 중 listShppDirection에 없는 것 → 취소요청 여부 단건 확인
@@ -5621,12 +5647,13 @@ async def sync_orders_from_markets(
                 # 매칭 검증용 임시 키 제거 (DB 저장 직전, 모델에 없는 필드)
                 order_data.pop("_pa_site_id", None)
                 order_data.pop("_pa_master_code", None)
-                # 롯데ON 예상 정산금액 계산 (롯데ON 공식 정산공식, 2026-04-30 재확인)
-                #   pymtAmt = actualAmt − (bseCmsn + pcsCmsn + dvCmsn − ajstDcAmt)
-                # raw 응답엔 수수료 필드가 없으므로:
-                #   기본수수료 = slAmt × 카테고리 fee_rate
-                #   PCS수수료  = slAmt × 2% (가격비교 채널 유입 주문만)
-                #   조정(환급) = prSfcoShrAmtSum (당사부담할인)
+                # 롯데ON 예상 정산금액 계산 (롯데ON 공식 정산공식, 2026-05-20 셀러부담 할인 반영)
+                # 공식(SettleItmdSales):
+                #   pymtAmt = slAmt - (셀러즉시 + 셀러부담 + 롯데부담)            # 고객결제 → actualAmt
+                #             + 배송비정산 - 배송비할인
+                #             - (기본수수료 + PCS수수료 + 배송비수수료 - 조정할인)   # 조정 = 롯데부담
+                # 정리하면(배송비 0 가정): pymtAmt = slAmt − 셀러부담할인 − 기본수수료 − PCS수수료
+                #   (당사부담할인은 고객결제 차감과 수수료 환급으로 상쇄됨)
                 # 정산 API(SettleItmdSales) 매칭으로 이미 revenue가 세팅됐으면 확정값이므로 건드리지 않음.
                 if order_data.get("source") == "lotteon":
                     _od_no = str(order_data.get("od_no") or "")
@@ -5635,6 +5662,7 @@ async def sync_orders_from_markets(
                     _slamt = int(sl_amt_map.get(_line_key, 0))
                     _actual = int(actual_amt_map.get(_line_key, 0))
                     _lotte_dc = int(lotte_dc_map.get(_line_key, 0))
+                    _slr_dc = int(slr_dc_map.get(_line_key, 0))
                     _ch_no = ch_no_map.get(_od_no, "")
 
                     # 가격비교 채널 = PCS 수수료 부과 대상
@@ -5643,12 +5671,17 @@ async def sync_orders_from_markets(
                     _pcs_rate = 2.0 if _ch_no in _PRICE_COMPARE_CHANNELS else 0.0
 
                     if _slamt > 0:
-                        # 고객결제금액 우선 actualAmt 사용, 없으면 slAmt − fvrAmtSum 폴백
-                        _customer_paid = (
-                            _actual
-                            if _actual > 0
-                            else max(0, _slamt - int(fvr_amt_map.get(_line_key, 0)))
-                        )
+                        # 고객결제금액 = actualAmt 우선, 없으면 slAmt − fvrAmtSum 폴백
+                        # actualAmt가 slAmt와 같게 들어오는 케이스(=할인 미반영) 방지 위해
+                        # slr_dc 있으면 fallback 강제: slAmt − fvr (할인 반영된 실결제)
+                        _fvr = int(fvr_amt_map.get(_line_key, 0))
+                        if _actual > 0 and _actual < _slamt:
+                            _customer_paid = _actual
+                        elif _fvr > 0:
+                            _customer_paid = max(0, _slamt - _fvr)
+                        else:
+                            # raw에 할인합도 없음 — 셀러부담+롯데부담만으로 계산
+                            _customer_paid = max(0, _slamt - _slr_dc - _lotte_dc)
                         order_data["total_payment_amount"] = _customer_paid
 
                         if not order_data.get("revenue"):
@@ -5662,11 +5695,16 @@ async def sync_orders_from_markets(
                             _fee = get_fee_rate_for_category(_cat_for_fee)
                             _bse_cmsn = int(_slamt * _fee / 100)
                             _pcs_cmsn = int(_slamt * _pcs_rate / 100)
-                            _net_cmsn = max(0, _bse_cmsn + _pcs_cmsn - _lotte_dc)
-                            _revenue = max(0, _customer_paid - _net_cmsn)
+                            # 셀러 정산공식: slAmt − 셀러부담할인 − 기본수수료 − PCS수수료
+                            # (당사부담할인은 수수료 환급으로 상쇄, 별도 차감 X)
+                            _revenue = max(0, _slamt - _slr_dc - _bse_cmsn - _pcs_cmsn)
                             order_data["revenue"] = _revenue
+                            # 화면 수수료율 — (총수수료 − 환급) / 실결제 기준 (롯데ON 화면 정의와 동일)
+                            _net_cmsn_display = max(
+                                0, _bse_cmsn + _pcs_cmsn - _lotte_dc
+                            )
                             order_data["fee_rate"] = (
-                                round(_net_cmsn / _customer_paid * 100, 2)
+                                round(_net_cmsn_display / _customer_paid * 100, 2)
                                 if _customer_paid > 0
                                 else 0
                             )
@@ -6046,9 +6084,15 @@ async def sync_orders_from_markets(
                                 f"[주문동기화] 교환→반품 상태 전환: {order_data.get('order_number')} "
                                 f"{existing.shipping_status} → {new_ship_status}"
                             )
-                        elif (
-                            new_ship_status in ("반품요청", "반품완료", "반품거부")
-                            and existing.shipping_status in ("국내배송중", "배송완료", "구매확정", "송장전송완료")
+                        elif new_ship_status in (
+                            "반품요청",
+                            "반품완료",
+                            "반품거부",
+                        ) and existing.shipping_status in (
+                            "국내배송중",
+                            "배송완료",
+                            "구매확정",
+                            "송장전송완료",
                         ):
                             # 배송 진행 후 반품 접수 허용 (국내배송중/배송완료 → 반품요청)
                             update_fields["shipping_status"] = new_ship_status
@@ -7344,7 +7388,9 @@ def _parse_elevenst_order(item: dict, account_id: str, label: str) -> dict:
         "channel_name": label,
         "source": "11st",
         "order_number": str(item.get("ordNo", "") or ""),
-        "ord_prd_seq": str(item.get("ordPrdSeq", "") or ""),
+        # 빈 문자열이면 None으로 정규화 — unique (order_number, ord_prd_seq) 인덱스에서
+        # 빈 문자열은 distinct 안 되어 중복 위반, NULL은 distinct로 취급됨 (issue #208).
+        "ord_prd_seq": (str(item.get("ordPrdSeq", "") or "").strip() or None),
         "shipment_id": str(item.get("dlvNo", "") or ""),
         "product_id": str(item.get("prdNo", "") or ""),
         "product_name": str(item.get("prdNm", "") or ""),

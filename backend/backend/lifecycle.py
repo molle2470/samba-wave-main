@@ -334,8 +334,14 @@ async def _start_worker_runtime() -> WorkerRuntime:
 
 
 async def _start_autotune_if_enabled() -> None:
-    from backend.api.v1.routers.samba.collector_autotune import auto_start_if_enabled
+    from backend.api.v1.routers.samba.collector_autotune import (
+        auto_start_if_enabled,
+        restore_pc_allowed_sites_from_db,
+    )
 
+    # PC 분담 매핑(_pc_allowed_sites)을 DB에서 복원 — 재시작 직후 두 PC가 동일 사이트를
+    # 동시에 띄우는 중복 사이클 문제 방지. 복원 실패해도 폴링 헤더로 채워지므로 무시 가능.
+    await restore_pc_allowed_sites_from_db()
     await auto_start_if_enabled()
 
 

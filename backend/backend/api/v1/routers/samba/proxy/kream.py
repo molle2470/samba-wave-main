@@ -90,7 +90,14 @@ async def kream_set_cookie(
     body: KreamSetCookieRequest = Body(...),
     write_session: AsyncSession = Depends(get_write_session_dependency),
 ) -> dict[str, Any]:
-    """확장앱에서 KREAM 쿠키 수신."""
+    """확장앱에서 KREAM 쿠키 수신.
+
+    (2026-05-20) owner_device_ids 가드 적용 — 포크 확장앱 미러 전송 차단.
+    """
+    from backend.api.v1.routers.samba.sourcing_account import _check_owner_device
+
+    _check_owner_device(request)
+
     if not body.cookie:
         raise HTTPException(status_code=400, detail="쿠키가 필요합니다.")
     await _set_setting(write_session, "kream_cookie", body.cookie)

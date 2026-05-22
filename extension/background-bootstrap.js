@@ -168,29 +168,18 @@ async function syncChromeProfile() {
     })
     const headers = { 'Content-Type': 'application/json' }
 
-    // 클라우드 서버에 전송
+    // (2026-05-20) CLOUD_URL 미러 전송 영구 제거 — 포크 유저 크롬 이메일이
+    // 원본 백엔드로 자동 미러되던 누수 사고 차단. PROXY_URL(본인 백엔드)에만 전송.
     try {
-      await apiFetch(
-        `${CLOUD_URL}/api/v1/samba/sourcing-accounts/sync-chrome-profile`,
+      const res = await apiFetch(
+        `${PROXY_URL}/api/v1/samba/sourcing-accounts/sync-chrome-profile`,
         { method: 'POST', headers, body }
       )
-    } catch (e) {
-      console.warn('[프로필동기화] 클라우드 전송 실패:', e.message)
-    }
-
-    // 로컬 서버에도 전송 (로컬 개발 환경)
-    if (PROXY_URL !== CLOUD_URL) {
-      try {
-        const res = await apiFetch(
-          `${PROXY_URL}/api/v1/samba/sourcing-accounts/sync-chrome-profile`,
-          { method: 'POST', headers, body }
-        )
-        if (res.ok) {
-          console.log('[프로필동기화] 완료')
-        }
-      } catch (e) {
-        console.log('[프로필동기화] 로컬 서버 없음 (무시):', e.message)
+      if (res.ok) {
+        console.log('[프로필동기화] 완료')
       }
+    } catch (e) {
+      console.log('[프로필동기화] 전송 실패 (무시):', e.message)
     }
   } catch (e) {
     console.log(`[프로필동기화] 오류 (무시): ${e.message}`)

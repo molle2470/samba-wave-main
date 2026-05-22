@@ -12,7 +12,6 @@ from sqlmodel import select
 from backend.db.orm import get_read_session_dependency, get_write_session_dependency
 from backend.domain.samba.tenant.middleware import (
     get_optional_tenant_id,
-    check_sourcing_limit,
 )
 from backend.dtos.samba.sourcing_account import (
     SourcingAccountCreate,
@@ -291,9 +290,7 @@ async def create_sourcing_account(
     session: AsyncSession = Depends(get_write_session_dependency),
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ):
-    # 티어 제한 체크 — 소싱 계정 수
-    if tenant_id:
-        await check_sourcing_limit(tenant_id, session)
+    # 플랜 제한 영구 제거 (2026-05-20)
     data = body.model_dump(exclude_unset=True)
     # tenant_id가 있으면 신규 소싱처 계정에 테넌트 정보 설정
     if tenant_id is not None:
@@ -1274,11 +1271,18 @@ async def find_account_by_username(
 
 @extension_router.post("/sync-chrome-profile")
 async def sync_chrome_profile(
+    request: Request,
     body: SyncChromeProfileRequest,
     session: AsyncSession = Depends(get_write_session_dependency),
 ):
-    """확장앱에서 크롬 프로필 동기화 — email 기반 upsert."""
+    """확장앱에서 크롬 프로필 동기화 — email 기반 upsert.
+
+    (2026-05-20) owner_device_ids 가드 적용 — 포크 확장앱이 원본 백엔드로
+    크롬 계정 이메일을 미러 전송하던 누수 차단.
+    """
     from backend.domain.samba.sourcing_account.model import SambaChromProfile
+
+    _check_owner_device(request)
 
     if not body.email:
         return {"ok": False, "message": "이메일이 비어 있습니다"}

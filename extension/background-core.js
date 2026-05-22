@@ -118,20 +118,9 @@
   }
 
   async function sendSiteCookieToProxy({ proxyUrl, site, cookieStr }) {
+    // (2026-05-20) CLOUD_URL 미러 전송 영구 제거 — 포크 유저 쿠키가 원본
+    // 백엔드로 자동 미러되던 누수 사고 차단. proxyUrl(본인 백엔드)에만 전송.
     const endpoint = `${API_PREFIX}/${site}/set-cookie`
-
-    if (proxyUrl !== CLOUD_URL) {
-      try {
-        await apiFetch(`${CLOUD_URL}${endpoint}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ cookie: cookieStr }),
-        })
-      } catch {
-        // ignore cloud mirror failures
-      }
-    }
-
     const res = await apiFetch(`${proxyUrl}${endpoint}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

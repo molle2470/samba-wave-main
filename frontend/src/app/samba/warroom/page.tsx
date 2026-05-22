@@ -78,6 +78,13 @@ const AutotuneLogPanel = memo(function AutotuneLogPanel({ onStatusChange, extern
 
   useEffect(() => { filterSourcesRef.current = filterSources }, [filterSources])
 
+  // externalRunning(부모의 10초 status 폴링 결과)이 false로 떨어지면 panel 자체 감지값도 클리어.
+  // 폴링 루프에서 autotuneStatus 호출을 빼면서 selfDetectedRunning을 명시적으로 해제할 곳이
+  // 사라졌기 때문 — 부모를 단일 진실원으로 사용한다.
+  useEffect(() => {
+    if (!externalRunning) setSelfDetectedRunning(false)
+  }, [externalRunning])
+
   useEffect(() => {
     // 마운트 직후 서버 상태 확인 — running이면 자동 폴링 시작
     collectorApi.autotuneStatus().then(st => {
@@ -114,17 +121,10 @@ const AutotuneLogPanel = memo(function AutotuneLogPanel({ onStatusChange, extern
       if (pollingRef.current) return
       pollingRef.current = true
       try {
-        const atStatus = await collectorApi.autotuneStatus().catch(() => null)
-        if (atStatus) {
-          if (onStatusChange) onStatusChange(atStatus.running, atStatus.cycle_count, atStatus.last_tick, atStatus.refreshed_count || 0)
-          if (atStatus.running) {
-            selfFalseCountRef.current = 0
-          } else {
-            selfFalseCountRef.current++
-            if (selfFalseCountRef.current >= 3) setSelfDetectedRunning(false)
-          }
-        }
-        // running 상태와 무관하게 로그 폴링 유지 (별도 스레드 타이밍 차이 대응)
+        // 오토튠 status는 주기적으로 안 가져온다 — 한번 실행되면 사용자 액션 외엔 바뀔 일 없음.
+        // 마운트 시 1회 + 비실행 상태 10초 recovery 폴링으로 충분. 여기서 매 tick 호출하면
+        // 무거운 status 쿼리(samba_extension_key + count(samba_collected_product 24h))가
+        // 500ms마다 read 풀을 점유해 refreshLogs가 직렬 await에 막혀 1분+ 지연 발생.
         const idx = sinceIdxRef.current
         const res = await monitorApi.refreshLogs(idx)
         if (res.current_idx < idx) {
@@ -299,6 +299,7 @@ export default function WarroomPage() {
   const [singleProductNo, setSingleProductNo] = useState('')
   const [, setAutotuneLastTick] = useState<string | null>(null)
   const prevCyclesRef = useRef(0)
+  const prevEventsFetchedAtRef = useRef(0)
   const falseCountRef = useRef(0)
   // 자동 재등록 쿨다운 (백엔드 재시작 시 무한 루프 방지) — 60초
   const autoRejoinAtRef = useRef(0)
@@ -545,10 +546,17 @@ export default function WarroomPage() {
     setAutotuneRunning(running)
     setAutotuneCycles(cycles)
     setAutotuneLastTick(lastTick)
-    // 사이클 완료 시 이벤트 타임라인 갱신
-    if (cycles > prevCyclesRef.current) {
+    // 이벤트 타임라인 갱신 조건:
+    //  (1) 사이클 증가 시 — 정상 동작 시 트리거
+    //  (2) Watchdog 강제재시작으로 cycles=0 리셋된 경우엔 (1)이 영영 안 와서
+    //      마지막 fetch로부터 60초 경과 시 강제 갱신
+    const _nowMs = Date.now()
+    const _cyclesAdvanced = cycles > prevCyclesRef.current
+    const _staleFetch = _nowMs - prevEventsFetchedAtRef.current > 60_000
+    if (_cyclesAdvanced || _staleFetch) {
       prevCyclesRef.current = cycles
-      monitorApi.recentEvents(30).then(ev => setEvents(ev.map(row => ({
+      prevEventsFetchedAtRef.current = _nowMs
+      monitorApi.recentEvents(100).then(ev => setEvents(ev.map(row => ({
         ...row,
         source_site: normalizeWarroomSourceSite(row.source_site),
       })))).catch(() => {})
@@ -575,7 +583,7 @@ export default function WarroomPage() {
       .catch(() => { /* ignore */ })
       .finally(() => setLoading(false))
 
-    monitorApi.recentEvents(30)
+    monitorApi.recentEvents(100)
       .then(rows => {
         setEvents(rows.map(row => ({
           ...row,
@@ -691,16 +699,19 @@ export default function WarroomPage() {
     return () => clearInterval(poll)
   }, [load])
 
-  // 이벤트 필터링 — scheduler_tick 소싱처별 최신 2건 표시
+  // 이벤트 필터링 — scheduler_cycle(1바퀴 단위) 소싱처별 최신 2건 표시
+  // scheduler_tick(200건 배치 단위)은 타임라인에서 숨김 — 디버깅용 DB 잔존
   const filteredEvents = (() => {
-    const mapped = events.map(e => ({
-      ...e,
-      summary: e.summary?.replace(/오토튠\(registered\)\s*—\s*/, '') ?? e.summary,
-    }))
-    // scheduler_tick 소싱처별 최신 2건만 유지
+    const mapped = events
+      .filter(e => e.event_type !== 'scheduler_tick')
+      .map(e => ({
+        ...e,
+        summary: e.summary?.replace(/오토튠\(registered\)\s*—\s*/, '') ?? e.summary,
+      }))
+    // scheduler_cycle 소싱처별 최신 2건만 유지
     const tickCountBySite: Record<string, number> = {}
     const deduped = mapped.filter(e => {
-      if (e.event_type === 'scheduler_tick') {
+      if (e.event_type === 'scheduler_cycle') {
         const siteKey = normalizeWarroomSourceSite(e.source_site) || '_none'
         tickCountBySite[siteKey] = (tickCountBySite[siteKey] || 0) + 1
         if (tickCountBySite[siteKey] > 2) return false
@@ -710,9 +721,9 @@ export default function WarroomPage() {
     return deduped
   })()
 
-  // scheduler_tick 이벤트를 소싱처별로 그룹핑
+  // scheduler_cycle 이벤트를 소싱처별로 그룹핑
   const tickEventsBySite = (() => {
-    const ticks = filteredEvents.filter(e => e.event_type === 'scheduler_tick')
+    const ticks = filteredEvents.filter(e => e.event_type === 'scheduler_cycle')
     const groups: Record<string, typeof ticks> = {}
     for (const e of ticks) {
       const siteKey = e.source_site || '기타'
@@ -1003,6 +1014,13 @@ export default function WarroomPage() {
                           border: `1px solid ${siteColor}30`,
                           flexShrink: 0,
                         }}>{siteName}</span>
+                        <span style={{
+                          fontSize: '0.7rem', color: '#51CF66',
+                          padding: '0.08rem 0.3rem', borderRadius: '3px',
+                          background: '#51CF6615',
+                          border: '1px solid #51CF6630',
+                          flexShrink: 0,
+                        }}>1바퀴 완료</span>
 
                         <span style={{ fontSize: '0.78rem', color: '#666', marginLeft: 'auto' }}>
                           {cycles > 1 ? `최근 ${fmtNum(cycles)}사이클` : ''}
@@ -1018,6 +1036,8 @@ export default function WarroomPage() {
                         const priceTx = _d?.price_transmit as number | undefined
                         const stockTx = _d?.stock_transmit as number | undefined
                         const deleted = _d?.deleted as number | undefined
+                        const processed = _d?.processed as number | undefined
+                        const batches = _d?.batches as number | undefined
                         const startedAt = _d?.started_at as string | undefined
                         const endedAt = _d?.ended_at as string | undefined
                         const fmtTime = (iso?: string) => {
@@ -1030,8 +1050,26 @@ export default function WarroomPage() {
                           <div key={ci} style={{ marginBottom: ci < cycles - 1 ? '0.3rem' : 0, paddingBottom: ci < cycles - 1 ? '0.3rem' : 0, borderBottom: ci < cycles - 1 ? '1px solid #ffffff10' : 'none' }}>
                             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.3rem', alignItems: 'center' }}>
                               {timeRange && <span style={{ fontSize: '0.72rem', color: '#999' }}>{timeRange}</span>}
-                              {total != null && (
-                                <span style={{ fontSize: '0.78rem', color: '#aaa' }}>대상 {fmtNum(total)}</span>
+                              {total != null && (() => {
+                                const totalGlobal = _d?.total_global as number | undefined
+                                const globalIdx = _d?.global_idx as number | undefined
+                                if (totalGlobal != null && totalGlobal > 0) {
+                                  return (
+                                    <span style={{ fontSize: '0.78rem', color: '#aaa' }}>
+                                      대상 {fmtNum(total)}
+                                      {globalIdx != null && (
+                                        <span style={{ color: '#666' }}> ({fmtNum(globalIdx + total)}/{fmtNum(totalGlobal)})</span>
+                                      )}
+                                    </span>
+                                  )
+                                }
+                                return <span style={{ fontSize: '0.78rem', color: '#aaa' }}>대상 {fmtNum(total)}</span>
+                              })()}
+                              {batches != null && batches > 0 && (
+                                <span style={{ fontSize: '0.72rem', color: '#888' }}>배치 {fmtNum(batches)}회</span>
+                              )}
+                              {processed != null && processed > 0 && (
+                                <span style={{ fontSize: '0.78rem', color: '#aaa' }}>처리 {fmtNum(processed)}</span>
                               )}
                               {ok != null && (
                                 <span style={{ fontSize: '0.78rem', color: '#aaa' }}>성공 {fmtNum(ok)}</span>

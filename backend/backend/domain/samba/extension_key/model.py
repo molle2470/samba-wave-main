@@ -46,3 +46,8 @@ class SambaExtensionKey(SQLModel, table=True):
         default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
     )
     note: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
+    # 확장앱이 키 발급 시 보낸 X-Device-Id (collector_autotune.autotune_status 본인 device 매칭용)
+    # 2026-05-20 추가 — 누락 시 _is_mine 매핑 실패로 "오토튠 정지" 오표시.
+    device_id: Optional[str] = Field(
+        default=None, sa_column=Column(String(80), nullable=True, index=True)
+    )

@@ -1743,6 +1743,8 @@ async def lookup_by_market_product_no(
     # 강제하기 위해 escape 후 ESCAPE '\\' 절 명시. 단순 substring/JSON-quoted 두
     # 패턴 모두 적용.
     safe = escape_like(market_product_no)
+    # tid는 None 가능 → asyncpg 타입 추론 위해 .bindparams로 명시 (issue #202).
+    # 동일 파일 다른 함수(dashboard-stats 등)의 패턴과 통일.
     sql = sa_text(
         "SELECT id, source_site, site_product_id, name, images, source_url, market_product_nos "
         "FROM samba_collected_product "
@@ -1753,11 +1755,10 @@ async def lookup_by_market_product_no(
         " OR REPLACE(site_product_id, '-', '') = :spid_norm "
         ") "
         "LIMIT 1"
-    )
+    ).bindparams(tid=tenant_id)
     result = await session.execute(
         sql,
         {
-            "tid": tenant_id,
             "pattern": f'%"{safe}"%',
             "pattern_bare": f"%{safe}%",
             "spid": market_product_no,
@@ -2042,11 +2043,16 @@ async def bulk_reset_registration(
     from backend.domain.samba.collector.model import SambaCollectedProduct
 
     if not body.account_ids:
+        # last_sent_data도 함께 정리 (issue #206) — 누락 시 registered_accounts=NULL인데
+        # last_sent_data엔 송신 이력이 살아있어 "유령 등록상품"으로 표시되던 사고 방지.
         stmt = (
             sa_update(SambaCollectedProduct)
             .where(col(SambaCollectedProduct.id).in_(body.ids))
             .values(
-                registered_accounts=None, market_product_nos=None, status="collected"
+                registered_accounts=None,
+                market_product_nos=None,
+                last_sent_data=None,
+                status="collected",
             )
         )
         result = await session.exec(stmt)  # type: ignore[arg-type]
@@ -2080,6 +2086,12 @@ async def bulk_reset_registration(
             nos.pop(aid, None)
             nos.pop(f"{aid}_origin", None)
         product.market_product_nos = nos or None
+
+        # last_sent_data도 동일하게 정리 (issue #206 유령 등록상품 방지)
+        sent = dict(product.last_sent_data or {})
+        for aid in remove_set:
+            sent.pop(aid, None)
+        product.last_sent_data = sent or None
 
         if not remaining:
             product.status = "collected"
