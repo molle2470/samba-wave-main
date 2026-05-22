@@ -170,7 +170,7 @@ async def sourcing_collect_queue(request: Request) -> Any:
 # ====================================================================
 
 # build/release 시 갱신. 데몬이 시작 시 비교하여 신버전이면 자기 종료(다음 시작 시 갱신).
-AUTOTUNE_DAEMON_LATEST_VERSION = "1.0.2"
+AUTOTUNE_DAEMON_LATEST_VERSION = "1.0.3"
 AUTOTUNE_DAEMON_DOWNLOAD_URL = (
     "https://github.com/sbk0674-web/samba-wave/releases/latest/download/"
     "autotune-daemon-setup.exe"
@@ -191,28 +191,29 @@ async def autotune_daemon_latest_version() -> dict[str, Any]:
 
 @sourcing_queue_router.get("/autotune-daemon/health")
 async def autotune_daemon_health(
-    device_id: str = Query(..., description="확인할 데몬 device_id"),
+    device_id: str = Query("", description="(legacy, 무시됨)"),
 ) -> dict[str, Any]:
-    """오토튠 페이지가 본 PC 의 데몬 polling 여부 확인.
+    """데몬 풀 alive 검사 — `samba-daemon-` prefix device 중 60s 내 polling 1개+ 면 alive.
 
-    `_pc_last_seen` 의 마지막 갱신이 60초 이내면 alive.
-    인증 불필요 — device_id 자체가 비공개 식별자.
+    device_id 파라미터는 legacy 호환용 (값 무시). frontend localStorage device_id 와
+    데몬 hostname device_id 가 달라 매칭 실패하던 사고 차단.
+    인증 불필요.
     """
     try:
-        from backend.api.v1.routers.samba.collector_autotune import (
-            _pc_last_seen,
-        )
-
-        last = _pc_last_seen.get(device_id.strip(), 0)
+        from backend.api.v1.routers.samba.collector_autotune import _pc_last_seen
     except Exception:
-        last = 0
+        return {"alive": False, "last_seen": 0.0}
     import time as _time
 
-    alive = bool(last and _time.time() - last < 60)
-    return {
-        "alive": alive,
-        "last_seen": float(last) if last else 0.0,
-    }
+    now = _time.time()
+    latest_last = 0.0
+    for dev, last in _pc_last_seen.items():
+        if not dev.startswith("samba-daemon-"):
+            continue
+        if last > latest_last:
+            latest_last = last
+    alive = bool(latest_last and now - latest_last < 60)
+    return {"alive": alive, "last_seen": float(latest_last)}
 
 
 @sourcing_queue_router.post("/sourcing/collect-result")

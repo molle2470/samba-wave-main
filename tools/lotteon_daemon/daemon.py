@@ -50,7 +50,7 @@ from playwright.async_api import (
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.0.2"
+DAEMON_VERSION = "1.0.3"
 
 
 # ====================================================================
@@ -79,13 +79,51 @@ def _running_from_install_dir() -> bool:
         return False
 
 
-def _register_run_key(exe_path: Path) -> None:
-    """HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run 에 데몬 등록.
+def _register_scheduled_task(exe_path: Path) -> None:
+    """Windows Task Scheduler 에 데몬 등록 — 로그온 자동 시작 + 죽으면 자동 재시작.
 
-    부팅 시 자동 시작. 실패해도 본 실행은 계속 진행한다.
+    PowerShell Register-ScheduledTask 사용. admin 권한 불필요(현재 사용자 token).
+    NSSM/Service 와 동등 안정성 (RestartCount=999 + RestartInterval=1m).
     """
     if os.name != "nt":
         return
+    task_name = _RUN_KEY_NAME
+    # ScheduledTask XML — PowerShell 명령으로 등록. failure restart 옵션 포함.
+    ps_script = (
+        f'$action = New-ScheduledTaskAction -Execute "{exe_path}"; '
+        f'$trigger = New-ScheduledTaskTrigger -AtLogOn; '
+        f'$settings = New-ScheduledTaskSettingsSet '
+        f'-RestartCount 999 '
+        f'-RestartInterval (New-TimeSpan -Minutes 1) '
+        f'-ExecutionTimeLimit (New-TimeSpan -Hours 0) '
+        f'-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries '
+        f'-MultipleInstances IgnoreNew '
+        f'-StartWhenAvailable; '
+        f'$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive; '
+        f'Register-ScheduledTask '
+        f'-TaskName "{task_name}" '
+        f'-Action $action '
+        f'-Trigger $trigger '
+        f'-Settings $settings '
+        f'-Principal $principal '
+        f'-Force | Out-Null'
+    )
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", ps_script],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            logger_print(f"ScheduledTask 등록 완료: {task_name}")
+        else:
+            logger_print(
+                f"ScheduledTask 등록 실패(무시): rc={result.returncode} "
+                f"stderr={result.stderr[:200]}"
+            )
+    except Exception as exc:
+        logger_print(f"ScheduledTask 등록 예외(무시): {exc}")
+
+    # 옛 HKCU\Run 키 제거 (이전 버전 호환 정리)
     try:
         import winreg  # type: ignore
 
@@ -95,13 +133,13 @@ def _register_run_key(exe_path: Path) -> None:
             0,
             winreg.KEY_SET_VALUE,
         )
-        winreg.SetValueEx(
-            key, _RUN_KEY_NAME, 0, winreg.REG_SZ, f'"{exe_path}"'
-        )
+        try:
+            winreg.DeleteValue(key, _RUN_KEY_NAME)
+        except FileNotFoundError:
+            pass
         winreg.CloseKey(key)
-        logger_print(f"Startup 등록 완료: {exe_path}")
-    except Exception as exc:
-        logger_print(f"Startup 등록 실패(무시): {exc}")
+    except Exception:
+        pass
 
 
 def _self_install_and_relaunch() -> None:
@@ -121,7 +159,7 @@ def _self_install_and_relaunch() -> None:
         logger_print(f"설치 복사 실패: {exc}")
         return
 
-    _register_run_key(dst)
+    _register_scheduled_task(dst)
 
     # device_id URL 인자 / 파일명 추출 보존을 위해 원래 argv 그대로 전달
     args = sys.argv[1:]

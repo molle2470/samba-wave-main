@@ -319,8 +319,13 @@ export default function WarroomPage() {
         const alive = Boolean(data?.alive)
         setAutotuneDaemonAlive(alive)
         if (!alive && !autotuneInstallTriggeredRef.current) {
+          // 단 한 번만 자동 다운로드 (브라우저 prof 영구). 이후 alive=false 여도
+          // 빨간 배너만 노출 — 사용자가 "다시 다운로드" 버튼 클릭 시만 재트리거.
           autotuneInstallTriggeredRef.current = true
-          // 자동 다운로드 트리거 — 사용자가 다운로드 폴더에서 1회 실행하면 평생 끝
+          let alreadyDownloaded = false
+          try { alreadyDownloaded = window.localStorage.getItem('samba.autotune.daemon.downloadedOnce') === '1' } catch {}
+          if (alreadyDownloaded) return
+          try { window.localStorage.setItem('samba.autotune.daemon.downloadedOnce', '1') } catch {}
           const a = document.createElement('a')
           a.href = AUTOTUNE_DAEMON_DOWNLOAD_URL
           document.body.appendChild(a)
