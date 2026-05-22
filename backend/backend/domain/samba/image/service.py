@@ -1195,16 +1195,19 @@ class ImageTransformService:
             return html
         import re as _re
 
-        pattern = _re.compile(r'src=(["\'])(https?://[^"\']+)\1', _re.IGNORECASE)
-        candidates: list[str] = []
+        # protocol-relative(//host/...)와 절대(https?://...) 양쪽 매칭
+        pattern = _re.compile(r'src=(["\'])((?:https?:)?//[^"\']+)\1', _re.IGNORECASE)
+        # orig(원본 문자열) -> normalized(https://...) 매핑
+        orig_to_norm: dict[str, str] = {}
         for m in pattern.finditer(html):
             url = m.group(2)
-            if url not in candidates:
-                candidates.append(url)
-        if not candidates:
+            if url in orig_to_norm:
+                continue
+            orig_to_norm[url] = ("https:" + url) if url.startswith("//") else url
+        if not orig_to_norm:
             return html
         _, url_map = await self.mirror_oversized_to_r2(
-            candidates,
+            list(orig_to_norm.values()),
             max_bytes=max_bytes,
             max_dim=max_dim,
             min_dim=min_dim,
@@ -1213,8 +1216,10 @@ class ImageTransformService:
         if not url_map:
             return html
         new_html = html
-        for orig, new in url_map.items():
-            new_html = new_html.replace(orig, new)
+        for orig, norm in orig_to_norm.items():
+            new = url_map.get(norm)
+            if new:
+                new_html = new_html.replace(orig, new)
         return new_html
 
     async def mirror_urls_in_html(self, html: str) -> str:
@@ -1222,28 +1227,38 @@ class ImageTransformService:
 
         detail_html처럼 사전 생성된 HTML 안의 <img src="..."> URL이 미러링을
         우회하여 11번가 서버에 워터마크 응답을 받는 것을 방지.
+
+        protocol-relative URL(`//image.msscdn.net/...`)도 처리 — 무신사
+        goodsContents 배너가 `<img src="//image.msscdn.net/...">` 형식이므로
+        `https?://`만 매칭하면 미러링 우회되어 핫링크 차단으로 깨진 이미지 노출.
         """
         if not html:
             return html
         import re as _re
 
-        # src="...", src='...' 매칭 — 양쪽 따옴표 모두 처리
-        pattern = _re.compile(r'src=(["\'])(https?://[^"\']+)\1', _re.IGNORECASE)
-        candidates: list[str] = []
+        # protocol-relative(//host/...)와 절대(https?://...) 양쪽 매칭
+        pattern = _re.compile(r'src=(["\'])((?:https?:)?//[^"\']+)\1', _re.IGNORECASE)
+        # orig(원본 문자열) -> normalized(https://...) 매핑
+        orig_to_norm: dict[str, str] = {}
         for m in pattern.finditer(html):
             url = m.group(2)
-            if self.is_hotlink_blocked_url(url) and url not in candidates:
-                candidates.append(url)
-        if not candidates:
+            if url in orig_to_norm:
+                continue
+            norm = ("https:" + url) if url.startswith("//") else url
+            if self.is_hotlink_blocked_url(norm):
+                orig_to_norm[url] = norm
+        if not orig_to_norm:
             return html
 
-        _, url_map = await self.mirror_external_to_r2(candidates)
+        _, url_map = await self.mirror_external_to_r2(list(orig_to_norm.values()))
         if not url_map:
             return html
 
         new_html = html
-        for orig, new in url_map.items():
-            new_html = new_html.replace(orig, new)
+        for orig, norm in orig_to_norm.items():
+            new = url_map.get(norm)
+            if new:
+                new_html = new_html.replace(orig, new)
         return new_html
 
     async def transform_single_image(

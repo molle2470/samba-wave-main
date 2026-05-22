@@ -215,7 +215,7 @@ class MusinsaClient:
             detail_images = []
             desc_html = ""
             if not refresh_only:
-                desc_html = d.get("goodsContents", "")
+                desc_html = self._sanitize_desc_html(d.get("goodsContents", ""))
                 detail_images = self._extract_detail_images(desc_html)
 
                 thumbnail_url = d.get("thumbnailImageUrl", "")
@@ -1477,6 +1477,76 @@ class MusinsaClient:
             return best_coupon_discount, True, coupons_total, sg_y_total
 
         return best_coupon_discount, False, coupons_total, sg_y_total
+
+    @staticmethod
+    def _is_msscdn_banner_url(url: str) -> bool:
+        """msscdn URL 중 상품 이미지가 아닌 광고/공지 배너인지 판단.
+
+        상품 이미지 패턴(허용):
+          - /images/goods_img/  : 상품 메인 이미지
+          - /images/prd_img/.../detail_  : 상품 상세컷
+        그 외 msscdn URL(예: /display/images/common/, /images/prd_img/<hash>.jpg)은
+        배너성으로 간주.
+        """
+        if not url:
+            return False
+        lower = url.lower()
+        if "msscdn.net" not in lower:
+            return False
+        if "/images/goods_img/" in lower:
+            return False
+        if "/images/prd_img/" in lower and "/detail_" in lower:
+            return False
+        return True
+
+    @staticmethod
+    def _sanitize_desc_html(desc_html: str) -> str:
+        """무신사 goodsContents에서 msscdn 광고 배너 <img>를 제거.
+
+        - 타 마켓(11번가/쿠팡 등) 상세설명에 무신사 자사 광고 배너 노출 방지
+        - msscdn 외 호스트(cafe24 등)는 다른 경로(이미지 미러)에서 처리하므로 건드리지 않음
+        - 배너 <img>를 감싸기만 한 빈 <a>도 함께 제거
+        """
+        if not desc_html:
+            return desc_html
+        try:
+            from bs4 import BeautifulSoup
+        except Exception as e:  # pragma: no cover
+            logger.warning(f"[무신사 sanitize] bs4 로드 실패, 원본 반환: {e}")
+            return desc_html
+
+        try:
+            soup = BeautifulSoup(desc_html, "html.parser")
+        except Exception as e:
+            logger.warning(f"[무신사 sanitize] HTML 파싱 실패, 원본 반환: {e}")
+            return desc_html
+
+        removed = 0
+        for img in list(soup.find_all("img")):
+            src = (
+                img.get("src")
+                or img.get("data-src")
+                or img.get("data-lazy")
+                or img.get("data-original")
+                or ""
+            )
+            if not MusinsaClient._is_msscdn_banner_url(src):
+                continue
+            parent = img.parent
+            img.decompose()
+            removed += 1
+            # 배너만 감쌌던 <a>는 함께 제거
+            if (
+                parent is not None
+                and getattr(parent, "name", None) == "a"
+                and not parent.find(True)
+                and not (parent.get_text() or "").strip()
+            ):
+                parent.decompose()
+
+        if removed:
+            logger.info(f"[무신사 sanitize] msscdn 배너 {removed}개 제거")
+        return str(soup)
 
     @staticmethod
     def _extract_detail_images(desc_html: str) -> list[str]:

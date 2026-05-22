@@ -6080,14 +6080,20 @@ async def sync_orders_from_markets(
                                 update_fields["shipping_status"] = new_ship_status
                         elif new_ship_status in exchange_statuses:
                             # 교환 상태는 항상 갱신 (배송완료 → 교환요청 등 역행 허용)
-                            # 단, 이미 반품 상태인 주문은 교환으로 되돌리지 않음
+                            # 단, 이미 반품/취소 상태인 주문은 교환으로 되돌리지 않음
+                            # 취소 상태 보호 — samba_return 활성 stale 레코드(type=exchange)로
+                            # 인해 status=cancelled 주문이 매 sync마다 '교환요청'으로 덮어쓰여
+                            # inconsistent state 되는 사고 방지 (issue #224, 롯데ON 6건 사례)
                             if existing.shipping_status in (
                                 "반품요청",
                                 "반품완료",
                                 "반품거부",
+                                "취소요청",
+                                "취소처리중",
+                                "취소완료",
                             ):
                                 logger.info(
-                                    f"[주문동기화] 반품 상태 보호: {order_data.get('order_number')} "
+                                    f"[주문동기화] 반품/취소 상태 보호: {order_data.get('order_number')} "
                                     f"{existing.shipping_status} → {new_ship_status} 차단"
                                 )
                             else:
@@ -6097,6 +6103,22 @@ async def sync_orders_from_markets(
                             and new_ship_status in advanced
                         ):
                             update_fields["shipping_status"] = new_ship_status
+                        elif new_ship_status in (
+                            "반품요청",
+                            "반품완료",
+                            "반품거부",
+                        ) and existing.shipping_status in (
+                            "취소요청",
+                            "취소처리중",
+                            "취소완료",
+                        ):
+                            # 취소 종결/진행 상태는 마켓 진실의 원천 — 반품으로 덮지 않음
+                            # samba_return 활성 stale 레코드(type=return)로 인한
+                            # 매 sync 덮어쓰기 차단 (issue #224)
+                            logger.info(
+                                f"[주문동기화] 취소 상태 보호: {order_data.get('order_number')} "
+                                f"{existing.shipping_status} → {new_ship_status} 차단"
+                            )
                         elif (
                             new_ship_status in ("반품요청", "반품완료", "반품거부")
                             and existing.shipping_status in exchange_statuses
@@ -6136,6 +6158,8 @@ async def sync_orders_from_markets(
                             "반품완료",
                             "반품거부",
                             "회수확정",
+                            "취소요청",
+                            "취소처리중",
                             "취소완료",
                         ):
                             update_fields["shipping_status"] = new_ship_status
@@ -6526,7 +6550,10 @@ async def sync_orders_from_markets(
               AND o.shipping_status NOT IN (
                   '교환요청', '교환회수완료', '교환재배송', '교환완료',
                   '반품요청', '반품완료', '반품거부',
-                  '취소완료',
+                  -- 취소 라벨은 마켓 종결/진행 신호. samba_return type=return/exchange
+                  -- 활성 stale 레코드가 남아있어도 마켓 취소 상태를 반품/교환요청으로
+                  -- 덮지 않음 (issue #224, status=cancelled + ship='교환요청' 사고)
+                  '취소요청', '취소처리중', '취소완료',
                   -- 마켓이 송장/배송 단계로 진행한 주문은 좀비 cancel return으로
                   -- 되돌리지 않음 (송장출력→배송대기중 단계에선 마켓이 이미 셀러
                   -- 수락 후 처리 진행 중이라 취소요청 표시 부적절)
