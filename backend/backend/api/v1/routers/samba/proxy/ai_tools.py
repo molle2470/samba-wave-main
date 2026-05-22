@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, File, Header, Query, UploadFile
@@ -10,6 +10,7 @@ from fastapi.responses import Response
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from backend.db.orm import get_read_session_dependency, get_write_session_dependency
+from backend.domain.samba.tenant.middleware import get_optional_tenant_id
 from backend.utils.logger import logger
 
 from ._helpers import _get_setting, _set_setting
@@ -41,9 +42,10 @@ def _default_tenant_id() -> str | None:
 @router.post("/claude/test")
 async def claude_api_test(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """Claude API 키 유효성 검증 — 최소 메시지 전송 테스트."""
-    creds = await _get_setting(session, "claude")
+    creds = await _get_setting(session, "claude", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "Claude API 설정이 저장되지 않았습니다."}
 
@@ -99,9 +101,10 @@ async def claude_api_test(
 @router.post("/gemini/test")
 async def gemini_api_test(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """Gemini API 키 유효성 검증."""
-    creds = await _get_setting(session, "gemini")
+    creds = await _get_setting(session, "gemini", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "Gemini API 설정이 저장되지 않았습니다."}
 
@@ -146,9 +149,10 @@ async def gemini_api_test(
 @router.post("/r2/test")
 async def r2_test(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """Cloudflare R2 연결 테스트."""
-    creds = await _get_setting(session, "cloudflare_r2")
+    creds = await _get_setting(session, "cloudflare_r2", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "R2 settings not found"}
 
@@ -185,9 +189,10 @@ async def r2_upload_image(
     filename: str = Query(...),
     file: UploadFile = File(...),
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """브라우저 WASM 배경 제거 결과 이미지를 R2에 업로드."""
-    creds = await _get_setting(session, "cloudflare_r2")
+    creds = await _get_setting(session, "cloudflare_r2", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "R2 설정이 저장되지 않았습니다"}
 
@@ -315,9 +320,10 @@ async def image_fetch_proxy(url: str = Query(...)) -> Response:
 @router.get("/fal/status")
 async def fal_ai_status(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """fal.ai 계정 상태 확인 (잔액 부족 여부)."""
-    creds = await _get_setting(session, "fal_ai")
+    creds = await _get_setting(session, "fal_ai", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"status": "no_key", "message": "API 키 미등록"}
 

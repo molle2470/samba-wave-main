@@ -11,6 +11,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from backend.db.orm import get_read_session_dependency
 from backend.domain.samba.proxy.gsshop import GsShopClient
+from backend.domain.samba.tenant.middleware import get_optional_tenant_id
 from backend.utils.logger import logger
 
 from ._helpers import _get_setting
@@ -26,9 +27,10 @@ router = APIRouter(tags=["samba-proxy"])
 @router.post("/11st/auth-test")
 async def elevenst_auth_test(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """11번가 OpenAPI 인증 테스트 — 상품검색 API 호출로 Key 유효성 확인."""
-    creds = await _get_setting(session, "store_11st")
+    creds = await _get_setting(session, "store_11st", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "11번가 설정이 저장되지 않았습니다."}
 
@@ -72,6 +74,7 @@ async def elevenst_auth_test(
 @router.post("/11st/seller-info")
 async def elevenst_seller_info(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """11번가 출고지/반품교환지 주소 조회.
 
@@ -80,7 +83,7 @@ async def elevenst_seller_info(
     """
     from backend.domain.samba.proxy.elevenst import ElevenstClient
 
-    creds = await _get_setting(session, "store_11st")
+    creds = await _get_setting(session, "store_11st", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "11번가 설정이 저장되지 않았습니다."}
     api_key = creds.get("apiKey", "")
@@ -146,9 +149,10 @@ async def elevenst_seller_info(
 @router.post("/coupang/auth-test")
 async def coupang_auth_test(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """쿠팡 Wing API 인증 테스트 — HMAC 서명으로 카테고리 조회."""
-    creds = await _get_setting(session, "store_coupang")
+    creds = await _get_setting(session, "store_coupang", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "쿠팡 설정이 저장되지 않았습니다."}
 
@@ -191,6 +195,7 @@ class CoupangShippingPlacesRequest(BaseModel):
 async def coupang_shipping_places(
     body: CoupangShippingPlacesRequest,
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """쿠팡 출고지/반품지 전체 목록 조회 (계정별).
 
@@ -218,7 +223,7 @@ async def coupang_shipping_places(
 
     # 2) 폴백: store_coupang (단일계정 환경 호환)
     if not creds.get("accessKey"):
-        store = await _get_setting(session, "store_coupang")
+        store = await _get_setting(session, "store_coupang", tenant_id=tenant_id)
         if isinstance(store, dict):
             creds = store
 
@@ -266,9 +271,10 @@ async def coupang_shipping_places(
 @router.post("/lotteon/auth-test")
 async def lotteon_auth_test(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """롯데ON Open API 인증 테스트 — 거래처 정보 조회 + 배송인프라 검증."""
-    creds = await _get_setting(session, "store_lotteon")
+    creds = await _get_setting(session, "store_lotteon", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "롯데ON 설정이 저장되지 않았습니다."}
 
@@ -327,9 +333,10 @@ async def lotteon_auth_test(
 @router.get("/lotteon/delivery-policies")
 async def lotteon_delivery_policies(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """롯데ON 배송비정책 목록 조회."""
-    creds = await _get_setting(session, "store_lotteon")
+    creds = await _get_setting(session, "store_lotteon", tenant_id=tenant_id)
     api_key = ((creds or {}).get("apiKey", "") or "").strip()
     if not api_key:
         return {"success": False, "policies": []}
@@ -373,9 +380,10 @@ async def lotteon_delivery_policies(
 @router.get("/lotteon/warehouses")
 async def lotteon_warehouses(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """롯데ON 출고지/회수지 목록 조회."""
-    creds = await _get_setting(session, "store_lotteon")
+    creds = await _get_setting(session, "store_lotteon", tenant_id=tenant_id)
     api_key = ((creds or {}).get("apiKey", "") or "").strip()
     if not api_key:
         return {"success": False, "departure": [], "return_": []}
@@ -416,9 +424,10 @@ async def lotteon_warehouses(
 @router.post("/ssg/auth-test")
 async def ssg_auth_test(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """SSG Open API 인증 테스트 — 브랜드 목록 조회."""
-    creds = await _get_setting(session, "store_ssg")
+    creds = await _get_setting(session, "store_ssg", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "SSG 설정이 저장되지 않았습니다."}
 
@@ -440,6 +449,7 @@ async def ssg_auth_test(
 @router.get("/ssg/brands")
 async def ssg_brands(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
     account_id: str | None = None,
 ) -> dict[str, Any]:
     """SSG 계약 브랜드 목록 조회 (계정별).
@@ -460,7 +470,7 @@ async def ssg_brands(
                 api_key = account.api_key
 
     if not api_key:
-        creds = await _get_setting(session, "store_ssg")
+        creds = await _get_setting(session, "store_ssg", tenant_id=tenant_id)
         if isinstance(creds, dict):
             api_key = creds.get("apiKey", "")
 
@@ -496,10 +506,11 @@ async def ssg_brands(
 @router.get("/ssg/shipping-policies")
 async def ssg_shipping_policies(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
     account_id: str | None = None,
 ) -> dict[str, Any]:
     """SSG 배송비정책 목록 조회."""
-    creds = await _get_setting(session, "store_ssg")
+    creds = await _get_setting(session, "store_ssg", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "policies": []}
     api_key = creds.get("apiKey", "")
@@ -535,10 +546,11 @@ async def ssg_shipping_policies(
 @router.get("/ssg/addresses")
 async def ssg_addresses(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
     account_id: str | None = None,
 ) -> dict[str, Any]:
     """SSG 출고/반송 주소 목록 조회."""
-    creds = await _get_setting(session, "store_ssg")
+    creds = await _get_setting(session, "store_ssg", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "addresses": []}
     api_key = creds.get("apiKey", "")
@@ -581,9 +593,10 @@ async def ssg_addresses(
 @router.post("/gsshop/auth-test")
 async def gsshop_auth_test(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """GS샵 AES256 인증 테스트 — 개발/운영 환경 모두 검증."""
-    creds = await _get_setting(session, "store_gsshop")
+    creds = await _get_setting(session, "store_gsshop", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "GS샵 설정이 저장되지 않았습니다."}
 
@@ -640,11 +653,12 @@ async def gsshop_auth_test(
 @router.post("/playauto/auth-test")
 async def playauto_auth_test(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """플레이오토 API 인증 테스트 — 실제 API 호출로 연결 및 인증 확인."""
     from backend.domain.samba.proxy.playauto import PlayAutoClient, PlayAutoApiError
 
-    creds = await _get_setting(session, "store_playauto")
+    creds = await _get_setting(session, "store_playauto", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "플레이오토 설정이 저장되지 않았습니다."}
 
@@ -678,9 +692,10 @@ async def playauto_auth_test(
 async def market_auth_test(
     market_key: str,
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """범용 마켓 인증 테스트 — 설정값 존재 여부 확인."""
-    creds = await _get_setting(session, f"store_{market_key}")
+    creds = await _get_setting(session, f"store_{market_key}", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {
             "success": False,

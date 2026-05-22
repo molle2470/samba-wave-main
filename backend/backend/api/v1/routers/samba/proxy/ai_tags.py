@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 from fastapi import APIRouter, Depends
@@ -11,6 +11,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from backend.db.orm import get_write_session_dependency
 from backend.domain.samba.cache import cache
+from backend.domain.samba.tenant.middleware import get_optional_tenant_id
 from backend.utils.logger import logger
 
 from ._helpers import _get_setting
@@ -522,6 +523,7 @@ async def _get_smartstore_tag_client(session: AsyncSession):
 async def generate_ai_tags(
     request: dict[str, Any],
     session: AsyncSession = Depends(get_write_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """선택 상품을 그룹별로 묶어 대표 1개로 AI 태그 생성 후 태그사전 검증 → 그룹 전체에 적용."""
     from backend.domain.samba.collector.repository import (
@@ -540,7 +542,7 @@ async def generate_ai_tags(
 
     # API 키 조회 (method에 따라 분기)
     if method in ("gemma", "gemini"):
-        creds = await _get_setting(session, "gemini")
+        creds = await _get_setting(session, "gemini", tenant_id=tenant_id)
         if not creds or not isinstance(creds, dict) or not creds.get("apiKey"):
             return {"success": False, "message": "Gemini API 설정이 없습니다"}
         api_key = str(creds["apiKey"]).strip()
@@ -549,7 +551,7 @@ async def generate_ai_tags(
         else:
             model = str(creds.get("model", "gemini-2.5-flash"))
     else:
-        creds = await _get_setting(session, "claude")
+        creds = await _get_setting(session, "claude", tenant_id=tenant_id)
         if not creds or not isinstance(creds, dict) or not creds.get("apiKey"):
             return {"success": False, "message": "Claude API 설정이 없습니다"}
         api_key = str(creds["apiKey"]).strip()
@@ -848,6 +850,7 @@ async def generate_ai_tags(
 async def preview_ai_tags(
     request: dict[str, Any],
     session: AsyncSession = Depends(get_write_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """선택 상품의 그룹별 대표 1개로 AI 태그 25개 생성 → 적용하지 않고 미리보기 반환."""
     from backend.domain.samba.collector.repository import (
@@ -866,7 +869,7 @@ async def preview_ai_tags(
 
     # API 키 조회 (method에 따라 분기)
     if method in ("gemma", "gemini"):
-        creds = await _get_setting(session, "gemini")
+        creds = await _get_setting(session, "gemini", tenant_id=tenant_id)
         if not creds or not isinstance(creds, dict) or not creds.get("apiKey"):
             return {"success": False, "message": "Gemini API 설정이 없습니다"}
         api_key = str(creds["apiKey"]).strip()
@@ -875,7 +878,7 @@ async def preview_ai_tags(
         else:
             model = str(creds.get("model", "gemini-2.5-flash"))
     else:
-        creds = await _get_setting(session, "claude")
+        creds = await _get_setting(session, "claude", tenant_id=tenant_id)
         if not creds or not isinstance(creds, dict) or not creds.get("apiKey"):
             return {"success": False, "message": "Claude API 설정이 없습니다"}
         api_key = str(creds["apiKey"]).strip()
