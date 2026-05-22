@@ -222,6 +222,9 @@ class LotteonSourcingPlugin(SourcingPlugin):
             for _opt in detail["options"]:
                 _opt["price"] = _eff_price
 
+        # pbf-only 빠른경로는 best_benefit_price 미수집 → 항상 price_uncertain
+        # 오토튠이 cost 갱신 및 전송 보류 (정가 폴백 차단)
+        detail["price_uncertain"] = True
         return detail
 
     def _parse_pbf_to_detail(self, pbf: dict) -> dict:
@@ -607,6 +610,7 @@ class LotteonSourcingPlugin(SourcingPlugin):
                 detail["_option_stock_live"] = True
 
         # DOM에서 직접 파싱한 "나의 혜택가" — 유일한 혜택가 출처
+        # 추출 실패(DOM 미연결/혜택가 0) 시 price_uncertain=True 마킹 → 오토튠이 cost 갱신 및 전송 보류
         if dom_ext:
             _dom_benefit = dom_ext.get("best_benefit_price") or 0
             if _dom_benefit > 0:
@@ -614,6 +618,17 @@ class LotteonSourcingPlugin(SourcingPlugin):
                 logger.info(
                     f"[LOTTEON] DOM 혜택가 적용: {site_product_id} → {_dom_benefit:,}원"
                 )
+            else:
+                detail["price_uncertain"] = True
+                logger.warning(
+                    f"[LOTTEON][가격불확실] DOM 혜택가 추출 실패: {site_product_id} "
+                    f"→ cost 갱신 및 전송 보류"
+                )
+        else:
+            detail["price_uncertain"] = True
+            logger.warning(
+                f"[LOTTEON][가격불확실] DOM 미응답: {site_product_id} → cost 갱신 및 전송 보류"
+            )
 
         if dom_ext:
             # §12 방어 로깅 — DOM이 다른 상품 긁었을 가능성 조기 감지

@@ -1528,6 +1528,56 @@ async def _site_autotune_loop(device_id: str, site: str):
                                         if acc_last
                                         else False
                                     )
+
+                                    # 초기 cost 교정 — 이전 전송 cost가 정가 폴백(과거 추출실패 잔재)인 경우
+                                    # 새로 정확한 혜택가가 들어와도 "가격변동"으로 인식되어 전송되는 사고 차단.
+                                    # 조건: 이전 acc_last.cost == product.original_price (정가 폴백 의심)
+                                    # AND 새 cost가 정가보다 작음 (혜택가 교정)
+                                    # 처리: 전송 스킵 + last_sent_data.cost만 silent 갱신 (다음 사이클부터 정상)
+                                    _last_cost_pre = (
+                                        int(acc_last.get("cost", 0) or 0)
+                                        if acc_last
+                                        else 0
+                                    )
+                                    _orig_p_int = int(
+                                        getattr(product, "original_price", 0) or 0
+                                    )
+                                    _is_initial_cost_correction = (
+                                        site in ("LOTTEON", "MUSINSA", "SSG")
+                                        and _last_cost_pre > 0
+                                        and _orig_p_int > 0
+                                        and _last_cost_pre == _orig_p_int
+                                        and int(new_cost) > 0
+                                        and int(new_cost) < _last_cost_pre
+                                        and not _has_failed_mark
+                                    )
+                                    if (
+                                        _is_initial_cost_correction
+                                        and expected_price != last_price
+                                    ):
+                                        _nontx_actions.append(
+                                            f"[초기cost] 이전 cost={_last_cost_pre:,}(정가폴백) "
+                                            f"→ 새 cost={int(new_cost):,} 교정, 전송 스킵 → {acc_label}"
+                                        )
+                                        log.info(
+                                            "[오토튠][초기cost] %s acc=%s: "
+                                            "이전 cost=%s(=정가) → 새 cost=%s 교정 → 전송 스킵",
+                                            _prod_label,
+                                            acc_id[:20],
+                                            _last_cost_pre,
+                                            int(new_cost),
+                                        )
+                                        # last_sent_data.cost만 silent 갱신 (다음 사이클부터 정상 비교)
+                                        _new_acc_last = dict(acc_last)
+                                        _new_acc_last["cost"] = int(new_cost)
+                                        _new_last_sent = dict(last_sent)
+                                        _new_last_sent[acc_id] = _new_acc_last
+                                        await _partial_update(
+                                            r.product_id,
+                                            {"last_sent_data": _new_last_sent},
+                                        )
+                                        continue
+
                                     if (
                                         expected_price != last_price or _has_failed_mark
                                     ) and not _price_blocked:
