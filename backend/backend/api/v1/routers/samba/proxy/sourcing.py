@@ -170,27 +170,27 @@ async def sourcing_collect_queue(request: Request) -> Any:
 # ====================================================================
 
 # build/release 시 갱신. 데몬이 시작 시 비교하여 신버전이면 자기 종료(다음 시작 시 갱신).
-LOTTEON_DAEMON_LATEST_VERSION = "1.0.1"
-LOTTEON_DAEMON_DOWNLOAD_URL = (
+AUTOTUNE_DAEMON_LATEST_VERSION = "1.0.2"
+AUTOTUNE_DAEMON_DOWNLOAD_URL = (
     "https://github.com/sbk0674-web/samba-wave/releases/latest/download/"
-    "lotteon-daemon-setup.exe"
+    "autotune-daemon-setup.exe"
 )
 
 
-@sourcing_queue_router.get("/lotteon-daemon/latest-version")
-async def lotteon_daemon_latest_version() -> dict[str, Any]:
+@sourcing_queue_router.get("/autotune-daemon/latest-version")
+async def autotune_daemon_latest_version() -> dict[str, Any]:
     """데몬이 시작 시 호출 — 신버전 감지 시 self-update.
 
     인증 불필요. 응답 = {version, download_url}.
     """
     return {
-        "version": LOTTEON_DAEMON_LATEST_VERSION,
-        "download_url": LOTTEON_DAEMON_DOWNLOAD_URL,
+        "version": AUTOTUNE_DAEMON_LATEST_VERSION,
+        "download_url": AUTOTUNE_DAEMON_DOWNLOAD_URL,
     }
 
 
-@sourcing_queue_router.get("/lotteon-daemon/health")
-async def lotteon_daemon_health(
+@sourcing_queue_router.get("/autotune-daemon/health")
+async def autotune_daemon_health(
     device_id: str = Query(..., description="확인할 데몬 device_id"),
 ) -> dict[str, Any]:
     """오토튠 페이지가 본 PC 의 데몬 polling 여부 확인.

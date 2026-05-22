@@ -40,7 +40,7 @@ _EXEMPT_PREFIXES = (
     "/redoc",
     "/openapi.json",
     "/api/v1/samba/proxy/bg-jobs/",  # bg-worker 내부 호출 — 워커 토큰으로 자체 인증
-    "/api/v1/samba/proxy/lotteon-daemon/",  # 데몬 health/version — 인증無 (오토튠 페이지 + 데몬 부트스트랩)
+    "/api/v1/samba/proxy/autotune-daemon/",  # 데몬 health/version — 인증無 (오토튠 페이지 + 데몬 부트스트랩)
 )
 
 # 테넌트 키 캐시: key_hash → (tenant_id, cached_until_monotonic)

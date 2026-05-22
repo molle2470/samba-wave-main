@@ -9,7 +9,7 @@
 4. Playwright Chromium 영속 프로필 launch → 쿠키 살아있으면 폴링 진입,
    아니면 LOTTEON 로그인 페이지 form fill + submit 자동
 5. `/proxy/sourcing/collect-queue` polling, LOTTEON detail 잡 처리
-6. 백엔드 `_pick_lotteon_daemon_owner` 가 polling 중인 daemon device 풀에서
+6. 백엔드 `_pick_autotune_daemon_owner` 가 polling 중인 daemon device 풀에서
    round-robin 으로 잡 owner 박음 → 여러 PC 동시 운용 자동
 
 운영 위치: 로컬 PC. VM 운영 금지.
@@ -50,15 +50,15 @@ from playwright.async_api import (
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.0.1"
+DAEMON_VERSION = "1.0.2"
 
 
 # ====================================================================
 # Self-install — frozen .exe 가 1번 클릭으로 평생 작동하게 한다
 # ====================================================================
 
-_INSTALL_DIR_NAME = "samba-lotteon-daemon"
-_RUN_KEY_NAME = "SambaLotteonDaemon"
+_INSTALL_DIR_NAME = "samba-autotune-daemon"
+_RUN_KEY_NAME = "SambaAutotuneDaemon"
 
 
 def _install_dir() -> Path:
@@ -105,7 +105,7 @@ def _register_run_key(exe_path: Path) -> None:
 
 
 def _self_install_and_relaunch() -> None:
-    """현재 .exe 를 %APPDATA%\\samba-lotteon-daemon\\daemon.exe 로 복사 후
+    """현재 .exe 를 %APPDATA%\\samba-autotune-daemon\\daemon.exe 로 복사 후
     그 위치에서 detach 실행. 본 프로세스는 즉시 종료(`os._exit`).
 
     이미 install dir 에서 실행 중이면 호출되지 않는다.
@@ -144,11 +144,11 @@ def _self_install_and_relaunch() -> None:
 def logger_print(msg: str) -> None:
     """frozen 초기 부트스트랩 단계 — logging 모듈 set 전이라 print 폴백."""
     try:
-        print(f"[lotteon-daemon] {msg}", file=sys.stderr, flush=True)
+        print(f"[autotune-daemon] {msg}", file=sys.stderr, flush=True)
     except Exception:
         pass
 
-logger = logging.getLogger("lotteon-daemon")
+logger = logging.getLogger("autotune-daemon")
 
 
 LOTTEON_LOGIN_URL = "https://www.lotteon.com/p/member/login/common"
@@ -323,7 +323,7 @@ class DaemonState:
 def _extract_kv_from_argv_or_exename(key: str) -> str | None:
     """`.exe` 파일명 또는 argv 에서 `<key>=<value>` 추출.
 
-    오토튠 페이지가 설치 트리거 시 `lotteon-daemon-setup_did=…_backend=…exe`
+    오토튠 페이지가 설치 트리거 시 `autotune-daemon-setup_did=…_backend=…exe`
     형태로 파일명에 박거나, 인자 `--did=…` `--backend=…` 로 전달.
     포크 호환을 위해 backend URL 도 동적 전달한다.
     """
@@ -398,8 +398,8 @@ async def bootstrap_api_key(
         f"{backend_url}/api/v1/samba/proxy/extension-key",
         headers={
             "X-Device-Id": device_id,
-            "User-Agent": "lotteon-daemon/1.0",
-            "Origin": "chrome-extension://lotteon-daemon",
+            "User-Agent": "autotune-daemon/1.0",
+            "Origin": "chrome-extension://autotune-daemon",
         },
         json={"gaia_id": device_id, "email": ""},
         timeout=20.0,
@@ -756,18 +756,32 @@ async def run_daemon(args: argparse.Namespace) -> int:
             logger.error("API key 부트스트랩 실패: %s", exc)
             return 2
 
+        # launch + new_context(storage_state) — persistent_context 는 headless=True 무시하고
+        # 창 띄우는 알려진 버그가 있어 쿠키만 storage_state.json 영속 저장.
+        storage_state_path = profile_dir / "storage_state.json"
         async with async_playwright() as pw:
-            context: BrowserContext = await pw.chromium.launch_persistent_context(
-                str(profile_dir),
+            browser = await pw.chromium.launch(
                 headless=args.headless,
-                viewport={"width": 1280, "height": 900},
-                user_agent=(
+                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+            )
+            context_kwargs: dict[str, Any] = {
+                "viewport": {"width": 1280, "height": 900},
+                "user_agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/131.0.0.0 Safari/537.36"
                 ),
-            )
-            page = context.pages[0] if context.pages else await context.new_page()
+            }
+            if storage_state_path.exists():
+                context_kwargs["storage_state"] = str(storage_state_path)
+            context: BrowserContext = await browser.new_context(**context_kwargs)
+            page = await context.new_page()
+
+            async def _save_storage_state() -> None:
+                try:
+                    await context.storage_state(path=str(storage_state_path))
+                except Exception as exc:
+                    logger.debug("storage_state 저장 실패(무시): %s", exc)
 
             # 시작 시 로그인 확인 + 필요 시 자동로그인
             if not await ensure_logged_in(
@@ -775,7 +789,9 @@ async def run_daemon(args: argparse.Namespace) -> int:
             ):
                 logger.error("초기 로그인 실패 — 종료 (supervisor 재기동 유도)")
                 await context.close()
+                await browser.close()
                 return 3
+            await _save_storage_state()
 
             idle_logged_at = 0.0
             while True:
@@ -785,6 +801,7 @@ async def run_daemon(args: argparse.Namespace) -> int:
                         state.consecutive_fail,
                     )
                     await context.close()
+                    await browser.close()
                     return 1
 
                 # 로그인 만료 누적 시 재로그인
@@ -797,8 +814,10 @@ async def run_daemon(args: argparse.Namespace) -> int:
                     ):
                         logger.error("재로그인 실패 — 종료")
                         await context.close()
+                        await browser.close()
                         return 4
                     state.reset_login_required()
+                    await _save_storage_state()
 
                 job = await fetch_job(http_client, backend_url, args.device_id)
                 if not job:
@@ -862,7 +881,7 @@ def _parse_args() -> argparse.Namespace:
         "--profile-dir",
         default=os.environ.get(
             "DAEMON_PROFILE_DIR",
-            str(Path.home() / ".lotteon_daemon" / "chromium_profile"),
+            str(Path.home() / ".autotune_daemon" / "chromium_profile"),
         ),
         help="Chromium 영속 프로필 디렉토리",
     )
@@ -897,7 +916,7 @@ async def _check_and_self_update(
     """
     try:
         r = await client.get(
-            f"{backend_url}/api/v1/samba/proxy/lotteon-daemon/latest-version",
+            f"{backend_url}/api/v1/samba/proxy/autotune-daemon/latest-version",
             timeout=10.0,
         )
         if r.status_code != 200:

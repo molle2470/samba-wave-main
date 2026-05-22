@@ -273,17 +273,17 @@ const normalizeWarroomSiteChanges = (
 
 // LOTTEON 데몬 device_id — 본 PC localStorage 영속. 첫 방문 시 자동 생성.
 // 설치 트리거 시 URL 파라미터 ?did=… 로 .exe 다운로드에 전달.
-const LOTTEON_DAEMON_DID_KEY = 'samba.lotteon.daemon.deviceId'
-const getOrCreateLotteonDaemonDeviceId = (): string => {
+const AUTOTUNE_DAEMON_DID_KEY = 'samba.autotune.daemon.deviceId'
+const getOrCreateAutotuneDaemonDeviceId = (): string => {
   if (typeof window === 'undefined') return ''
   try {
-    const cached = window.localStorage.getItem(LOTTEON_DAEMON_DID_KEY)
+    const cached = window.localStorage.getItem(AUTOTUNE_DAEMON_DID_KEY)
     if (cached && cached.startsWith('samba-daemon-')) return cached
     // 8글자 영숫자 random + samba-daemon- prefix
     const rnd = Array.from(window.crypto.getRandomValues(new Uint8Array(6)))
       .map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 12)
     const did = `samba-daemon-${rnd}`
-    window.localStorage.setItem(LOTTEON_DAEMON_DID_KEY, did)
+    window.localStorage.setItem(AUTOTUNE_DAEMON_DID_KEY, did)
     return did
   } catch {
     return ''
@@ -293,36 +293,36 @@ const getOrCreateLotteonDaemonDeviceId = (): string => {
 // 데몬 .exe 다운로드 URL — GitHub Release 직접. 본 메인 backend/CDN 트래픽 0.
 // cross-origin 이라 a.download 무시되지만, 데몬은 hostname 으로 device_id 자동 생성 →
 // 파일명에 정보 박을 필요 없음. backend URL 도 데몬 default 디폴트(env / argv 로 오버라이드 가능).
-const LOTTEON_DAEMON_DOWNLOAD_URL =
-  'https://github.com/sbk0674-web/samba-wave/releases/latest/download/lotteon-daemon-setup.exe'
+const AUTOTUNE_DAEMON_DOWNLOAD_URL =
+  'https://github.com/sbk0674-web/samba-wave/releases/latest/download/autotune-daemon-setup.exe'
 
 export default function WarroomPage() {
   useEffect(() => { document.title = 'SAMBA-오토튠' }, [])
 
   // LOTTEON 데몬 health 체크 — 60s 폴링.
   // 미감지 시 1회 자동 다운로드 트리거 + 토스트 (오토튠 이용 위해 1번 실행 필요).
-  const [lotteonDaemonAlive, setLotteonDaemonAlive] = useState<boolean | null>(null)
-  const lotteonInstallTriggeredRef = useRef(false)
+  const [autotuneDaemonAlive, setAutotuneDaemonAlive] = useState<boolean | null>(null)
+  const autotuneInstallTriggeredRef = useRef(false)
   useEffect(() => {
     let cancelled = false
-    const did = getOrCreateLotteonDaemonDeviceId()
+    const did = getOrCreateAutotuneDaemonDeviceId()
     if (!did) return
     const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.samba-wave.co.kr'
     const tick = async () => {
       try {
         const r = await fetch(
-          `${apiBase}/api/v1/samba/proxy/lotteon-daemon/health?device_id=${encodeURIComponent(did)}`
+          `${apiBase}/api/v1/samba/proxy/autotune-daemon/health?device_id=${encodeURIComponent(did)}`
         )
         if (!r.ok) return
         const data = await r.json()
         if (cancelled) return
         const alive = Boolean(data?.alive)
-        setLotteonDaemonAlive(alive)
-        if (!alive && !lotteonInstallTriggeredRef.current) {
-          lotteonInstallTriggeredRef.current = true
+        setAutotuneDaemonAlive(alive)
+        if (!alive && !autotuneInstallTriggeredRef.current) {
+          autotuneInstallTriggeredRef.current = true
           // 자동 다운로드 트리거 — 사용자가 다운로드 폴더에서 1회 실행하면 평생 끝
           const a = document.createElement('a')
-          a.href = LOTTEON_DAEMON_DOWNLOAD_URL
+          a.href = AUTOTUNE_DAEMON_DOWNLOAD_URL
           document.body.appendChild(a)
           a.click()
           document.body.removeChild(a)
@@ -810,7 +810,7 @@ export default function WarroomPage() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
       {/* LOTTEON 데몬 미감지 안내 — 자동 다운로드 후 1번 실행 안내 */}
-      {lotteonDaemonAlive === false && (
+      {autotuneDaemonAlive === false && (
         <div style={{
           padding: '0.75rem 1.25rem',
           background: '#3D1F1F',
@@ -824,15 +824,15 @@ export default function WarroomPage() {
           gap: '1rem',
         }}>
           <div>
-            <strong style={{ color: '#FF8888' }}>LOTTEON 자동처리기 미감지</strong>
+            <strong style={{ color: '#FF8888' }}>오토튠 데몬 미감지</strong>
             <span style={{ marginLeft: '0.5rem' }}>
-              방금 다운로드된 <code>lotteon-daemon-setup*.exe</code> 를 1번만 실행해 주세요. 이후 자동으로 동작.
+              방금 다운로드된 <code>autotune-daemon-setup*.exe</code> 를 1번만 실행해 주세요. 이후 자동으로 동작.
             </span>
           </div>
           <button
             onClick={() => {
               const a = document.createElement('a')
-              a.href = LOTTEON_DAEMON_DOWNLOAD_URL
+              a.href = AUTOTUNE_DAEMON_DOWNLOAD_URL
               document.body.appendChild(a)
               a.click()
               document.body.removeChild(a)

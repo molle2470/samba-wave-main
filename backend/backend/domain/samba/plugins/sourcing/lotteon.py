@@ -24,21 +24,21 @@ _lotteon_safe_interval: float = 999.0  # 차단 없는 최소 인터벌 기록
 _sitm_no_cache: dict[str, str] = {}
 
 # LOTTEON 데몬 풀 round-robin 카운터
-_lotteon_daemon_rr_counter: int = 0
+_autotune_daemon_rr_counter: int = 0
 
 
-def _pick_lotteon_daemon_owner(settings_obj: object) -> str | None:
+def _pick_autotune_daemon_owner(settings_obj: object) -> str | None:
     """LOTTEON 데몬 풀에서 round-robin 으로 1개 device_id 선택.
 
     선택 우선순위:
     1. DB 풀 — `samba-daemon-` prefix + last_seen 60초 이내 polling 중인 device 들 (자동 등록).
        신규 PC 가 setup.ps1 후 daemon.py 실행만 하면 자동 합류.
-    2. lotteon_daemon_device_ids (env, 콤마 구분) — 풀 명시 폴백.
-    3. lotteon_daemon_device_id (env, 단수, 하위호환) — 풀로 승격.
+    2. autotune_daemon_device_ids (env, 콤마 구분) — 풀 명시 폴백.
+    3. autotune_daemon_device_id (env, 단수, 하위호환) — 풀로 승격.
 
     풀이 비어있으면 None 반환 → 기존 확장앱 흐름 유지.
     """
-    global _lotteon_daemon_rr_counter
+    global _autotune_daemon_rr_counter
 
     # 1. DB 활성 데몬 풀 — 자동 등록 경로
     pool: list[str] = []
@@ -67,21 +67,21 @@ def _pick_lotteon_daemon_owner(settings_obj: object) -> str | None:
     # 2. env 풀 폴백
     if not pool:
         raw_pool = (
-            getattr(settings_obj, "lotteon_daemon_device_ids", "") or ""
+            getattr(settings_obj, "autotune_daemon_device_ids", "") or ""
         ).strip()
         pool = [s.strip() for s in raw_pool.split(",") if s.strip()]
 
     # 3. 단수 env 폴백
     if not pool:
-        legacy = (getattr(settings_obj, "lotteon_daemon_device_id", "") or "").strip()
+        legacy = (getattr(settings_obj, "autotune_daemon_device_id", "") or "").strip()
         if legacy:
             pool = [legacy]
 
     if not pool:
         return None
 
-    idx = _lotteon_daemon_rr_counter % len(pool)
-    _lotteon_daemon_rr_counter += 1
+    idx = _autotune_daemon_rr_counter % len(pool)
+    _autotune_daemon_rr_counter += 1
     return pool[idx]
 
 
@@ -614,9 +614,9 @@ class LotteonSourcingPlugin(SourcingPlugin):
         from backend.domain.samba.proxy.sourcing_queue import SourcingQueue
 
         # 헤드리스 데몬 라우팅 — 환경변수의 데몬 풀에서 round-robin 으로 1개 선택.
-        # lotteon_daemon_device_ids (콤마 구분) 가 우선, 비어있으면 하위호환으로
-        # lotteon_daemon_device_id (단수) 사용. 둘 다 비어있으면 기존 확장앱 흐름.
-        _route_owner: str | None = _pick_lotteon_daemon_owner(settings)
+        # autotune_daemon_device_ids (콤마 구분) 가 우선, 비어있으면 하위호환으로
+        # autotune_daemon_device_id (단수) 사용. 둘 다 비어있으면 기존 확장앱 흐름.
+        _route_owner: str | None = _pick_autotune_daemon_owner(settings)
 
         try:
             _dom_req, _dom_fut = SourcingQueue.add_detail_job(

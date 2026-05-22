@@ -82,11 +82,11 @@ class BackendSettings(BaseSettings):
     원본 백엔드를 가리키는 케이스에서 평문 자격증명/API 키 누출 차단.
     비어있으면 가드 무효(레거시 호환). 운영 환경에서는 반드시 설정."""
 
-    lotteon_daemon_device_id: str = ""
-    """[deprecated] 단일 데몬 deviceId — 하위호환용. 신규는 lotteon_daemon_device_ids 사용.
-    값 있으면 lotteon_daemon_device_ids 의 1번째 원소로 자동 승격된다."""
+    autotune_daemon_device_id: str = ""
+    """[deprecated] 단일 데몬 deviceId — 하위호환용. 신규는 autotune_daemon_device_ids 사용.
+    값 있으면 autotune_daemon_device_ids 의 1번째 원소로 자동 승격된다."""
 
-    lotteon_daemon_device_ids: str = ""
+    autotune_daemon_device_ids: str = ""
     """LOTTEON 헤드리스 데몬 deviceId 풀 (콤마 구분).
     예) "samba-daemon-pc1,samba-daemon-pc2,samba-daemon-pc3"
     설정 시 LOTTEON DOM 위임 잡을 풀에서 round-robin 으로 1개 데몬에 라우팅.
