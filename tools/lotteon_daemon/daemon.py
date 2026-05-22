@@ -50,7 +50,7 @@ from playwright.async_api import (
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.0.3"
+DAEMON_VERSION = "1.0.4"
 
 
 # ====================================================================
@@ -79,51 +79,14 @@ def _running_from_install_dir() -> bool:
         return False
 
 
-def _register_scheduled_task(exe_path: Path) -> None:
-    """Windows Task Scheduler 에 데몬 등록 — 로그온 자동 시작 + 죽으면 자동 재시작.
+def _register_run_key(exe_path: Path) -> None:
+    """HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run 에 데몬 등록.
 
-    PowerShell Register-ScheduledTask 사용. admin 권한 불필요(현재 사용자 token).
-    NSSM/Service 와 동등 안정성 (RestartCount=999 + RestartInterval=1m).
+    로그온 시 자동 시작. admin 권한 불필요.
+    재시작 안정성 = 내장 supervisor (_supervisor_loop) 가 child worker 감시.
     """
     if os.name != "nt":
         return
-    task_name = _RUN_KEY_NAME
-    # ScheduledTask XML — PowerShell 명령으로 등록. failure restart 옵션 포함.
-    ps_script = (
-        f'$action = New-ScheduledTaskAction -Execute "{exe_path}"; '
-        f'$trigger = New-ScheduledTaskTrigger -AtLogOn; '
-        f'$settings = New-ScheduledTaskSettingsSet '
-        f'-RestartCount 999 '
-        f'-RestartInterval (New-TimeSpan -Minutes 1) '
-        f'-ExecutionTimeLimit (New-TimeSpan -Hours 0) '
-        f'-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries '
-        f'-MultipleInstances IgnoreNew '
-        f'-StartWhenAvailable; '
-        f'$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive; '
-        f'Register-ScheduledTask '
-        f'-TaskName "{task_name}" '
-        f'-Action $action '
-        f'-Trigger $trigger '
-        f'-Settings $settings '
-        f'-Principal $principal '
-        f'-Force | Out-Null'
-    )
-    try:
-        result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command", ps_script],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0:
-            logger_print(f"ScheduledTask 등록 완료: {task_name}")
-        else:
-            logger_print(
-                f"ScheduledTask 등록 실패(무시): rc={result.returncode} "
-                f"stderr={result.stderr[:200]}"
-            )
-    except Exception as exc:
-        logger_print(f"ScheduledTask 등록 예외(무시): {exc}")
-
-    # 옛 HKCU\Run 키 제거 (이전 버전 호환 정리)
     try:
         import winreg  # type: ignore
 
@@ -133,13 +96,11 @@ def _register_scheduled_task(exe_path: Path) -> None:
             0,
             winreg.KEY_SET_VALUE,
         )
-        try:
-            winreg.DeleteValue(key, _RUN_KEY_NAME)
-        except FileNotFoundError:
-            pass
+        winreg.SetValueEx(key, _RUN_KEY_NAME, 0, winreg.REG_SZ, f'"{exe_path}"')
         winreg.CloseKey(key)
-    except Exception:
-        pass
+        logger_print(f"Run 키 등록 완료: {exe_path}")
+    except Exception as exc:
+        logger_print(f"Run 키 등록 실패(무시): {exc}")
 
 
 def _self_install_and_relaunch() -> None:
@@ -159,7 +120,7 @@ def _self_install_and_relaunch() -> None:
         logger_print(f"설치 복사 실패: {exc}")
         return
 
-    _register_scheduled_task(dst)
+    _register_run_key(dst)
 
     # device_id URL 인자 / 파일명 추출 보존을 위해 원래 argv 그대로 전달
     args = sys.argv[1:]
@@ -961,8 +922,17 @@ async def _check_and_self_update(
             return False
         data = r.json() or {}
         latest = (data.get("version") or "").strip()
-        if not latest or latest == DAEMON_VERSION:
+        if not latest:
             return False
+
+        def _vt(s: str) -> tuple[int, ...]:
+            try:
+                return tuple(int(x) for x in s.split(".") if x.isdigit())
+            except Exception:
+                return ()
+
+        if _vt(latest) <= _vt(DAEMON_VERSION):
+            return False  # 로컬 = latest 또는 더 신버전
         logger.info(
             "신버전 감지: 현재=%s latest=%s — 자기 종료 → 다음 시작 시 갱신",
             DAEMON_VERSION,
@@ -972,6 +942,68 @@ async def _check_and_self_update(
     except Exception as exc:
         logger.debug("버전 체크 실패(무시): %s", exc)
         return False
+
+
+def _supervisor_loop() -> int:
+    """parent supervisor — 자기 자신을 --worker 모드로 spawn + 죽으면 backoff 재시작.
+
+    NSSM/Service 대체. admin 권한 불필요. UAC 트리거 X.
+    parent (supervisor) = 항상 살아있는 가벼운 process.
+    child (worker) = 실제 Playwright + polling.
+
+    Backoff: 정상 가동 10초 안에 죽으면 즉시 죽은 것으로 간주 →
+    재시작 간격 증가 (5s → 30s → 60s 상한). 정상 가동 ≥10s 시 backoff 리셋.
+    """
+    logger_print(f"supervisor 시작 pid={os.getpid()}")
+    restart_count = 0
+    backoff = 5
+    BACKOFF_MAX = 60
+    HEALTHY_SECS = 10
+    while True:
+        # frozen .exe 모드: sys.executable = daemon.exe, script path 불필요
+        # .py 모드: sys.executable = python.exe, sys.argv[0] (script path) 필요
+        if _is_frozen():
+            cmd = [sys.executable, *sys.argv[1:], "--worker"]
+        else:
+            cmd = [sys.executable, sys.argv[0], *sys.argv[1:], "--worker"]
+        try:
+            creationflags = (
+                0x00000200 if os.name == "nt" else 0
+            )  # CREATE_NEW_PROCESS_GROUP
+            child = subprocess.Popen(cmd, creationflags=creationflags)
+        except Exception as exc:
+            logger_print(f"supervisor: worker spawn 실패: {exc} — {backoff}초 후 재시도")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, BACKOFF_MAX)
+            continue
+        start_ts = time.time()
+        logger_print(
+            f"supervisor: worker spawn pid={child.pid} "
+            f"(총 {restart_count + 1}회, backoff={backoff}s)"
+        )
+        try:
+            rc = child.wait()
+        except KeyboardInterrupt:
+            logger_print("supervisor: KeyboardInterrupt — worker 종료 후 본인도 종료")
+            try:
+                child.terminate()
+            except Exception:
+                pass
+            return 0
+        duration = time.time() - start_ts
+        logger_print(
+            f"supervisor: worker exit rc={rc} duration={duration:.1f}s"
+        )
+        if rc == 0:
+            logger_print("supervisor: worker 정상 종료 — supervisor 도 종료")
+            return 0
+        if duration >= HEALTHY_SECS:
+            backoff = 5  # 정상 가동했으니 backoff 리셋
+        else:
+            backoff = min(backoff * 2, BACKOFF_MAX)
+        restart_count += 1
+        logger_print(f"supervisor: {backoff}초 후 재시작 (총 {restart_count}회)")
+        time.sleep(backoff)
 
 
 def main() -> int:
@@ -984,11 +1016,19 @@ def main() -> int:
         # _self_install_and_relaunch 가 os._exit(0) 호출하므로 이 라인 도달 X
         return 0
 
+    # 2. --worker 인자 없으면 supervisor 모드 (자기를 --worker 로 spawn + watchdog)
+    if "--worker" not in sys.argv:
+        return _supervisor_loop()
+
+    # 3. --worker 인자 있으면 실제 작업 (이 분기에서만 Playwright + polling)
     _setup_logging()
+    # argparse 가 unknown arg 무시하도록 — --worker 만 제거 후 parse
+    sys.argv = [a for a in sys.argv if a != "--worker"]
     args = _parse_args()
     logger.info(
-        "데몬 v%s 시작 (frozen=%s install_dir=%s)",
+        "worker v%s 시작 pid=%d (frozen=%s install_dir=%s)",
         DAEMON_VERSION,
+        os.getpid(),
         _is_frozen(),
         _install_dir() if _is_frozen() else "(개발 모드)",
     )
