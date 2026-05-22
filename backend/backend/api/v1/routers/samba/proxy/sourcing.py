@@ -170,7 +170,7 @@ async def sourcing_collect_queue(request: Request) -> Any:
 # ====================================================================
 
 # build/release 시 갱신. 데몬이 시작 시 비교하여 신버전이면 자기 종료(다음 시작 시 갱신).
-LOTTEON_DAEMON_LATEST_VERSION = "1.0.0"
+LOTTEON_DAEMON_LATEST_VERSION = "1.0.1"
 LOTTEON_DAEMON_DOWNLOAD_URL = (
     "https://github.com/sbk0674-web/samba-wave/releases/latest/download/"
     "lotteon-daemon-setup.exe"

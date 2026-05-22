@@ -50,7 +50,7 @@ from playwright.async_api import (
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.0.0"
+DAEMON_VERSION = "1.0.1"
 
 
 # ====================================================================
@@ -876,10 +876,14 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.environ.get("DAEMON_MAX_CONSECUTIVE_FAIL", "10")),
     )
+    # 기본 headless=True — 사용자 PC 에 Chromium 창 안 뜸 (zero-visual).
+    # WAF 차단 발생 시 --no-headless 로 수동 전환 가능.
     p.add_argument(
-        "--headless",
-        action="store_true",
-        help="헤드리스 모드. LOTTEON 봇 감지 회피 위해 기본은 headed.",
+        "--no-headless",
+        dest="headless",
+        action="store_false",
+        default=True,
+        help="headed 모드로 전환 (LOTTEON WAF 차단 시 디버깅용).",
     )
     return p.parse_args()
 
