@@ -1422,6 +1422,7 @@ async def refresh_products_bulk(
     source: str = "autotune",
     max_concurrency: dict[str, int] | int | None = None,
     on_result: Any = None,
+    global_counter: dict | None = None,
 ) -> tuple[List[RefreshResult], BulkRefreshResult]:
     """여러 상품을 소싱처별로 그룹핑 후 병렬 갱신.
 
@@ -1490,6 +1491,20 @@ async def refresh_products_bulk(
                     )
                 _counter["i"] += 1
                 _idx = _counter["i"]
+                # 사이클 전체 카운터 (호출측에서 주입) — 로그 prefix [idx/total] 분모를
+                # 배치 크기(200) 가 아닌 사이클 전체(N만) 기준으로 통일.
+                if global_counter:
+                    _gk = global_counter.get("key")
+                    _idx_ref = global_counter.get("idx_ref") or {}
+                    _total_ref = global_counter.get("total_ref") or {}
+                    _idx_ref[_gk] = _idx_ref.get(_gk, 0) + 1
+                    _g_idx = _idx_ref[_gk]
+                    _g_total = _total_ref.get(_gk, 0)
+                else:
+                    _g_idx = 0
+                    _g_total = 0
+                _log_idx = _g_idx if (_g_idx and _g_total) else _idx
+                _log_total = _g_total if (_g_idx and _g_total) else _site_total
                 _product_timeout = get_product_timeout(site)
                 try:
                     r = await asyncio.wait_for(
@@ -1503,6 +1518,8 @@ async def refresh_products_bulk(
                         getattr(p, "name", ""),
                         f"전체 처리 타임아웃 ({_product_timeout}초) — 건너뜀",
                         level="warning",
+                        idx=_log_idx,
+                        total=_log_total,
                     )
                     r = RefreshResult(
                         product_id=getattr(p, "id", "unknown"),
@@ -1533,8 +1550,8 @@ async def refresh_products_bulk(
                                 getattr(p, "id", "unknown"),
                                 _rl,
                                 "재시도 성공",
-                                idx=_idx,
-                                total=_site_total,
+                                idx=_log_idx,
+                                total=_log_total,
                             )
                     except asyncio.TimeoutError:
                         pass  # 재시도도 실패 → 원래 에러 유지
@@ -1555,13 +1572,13 @@ async def refresh_products_bulk(
                         _rl,
                         f"실패: {_err_short}",
                         level="warning",
-                        idx=_idx,
-                        total=_site_total,
+                        idx=_log_idx,
+                        total=_log_total,
                     )
                 # 콜백 호출 (리프레시 직후 즉시 전송 등)
                 if on_result and not r.error:
                     try:
-                        await on_result(p, r, _idx, _site_total)
+                        await on_result(p, r, _log_idx, _log_total)
                     except Exception as cb_err:
                         logger.warning("[오토튠] on_result 콜백 오류: %s", cb_err)
                 # 소싱처별 적응형 인터벌 (기본값은 소싱처별 base_interval, 최소 0.1초)

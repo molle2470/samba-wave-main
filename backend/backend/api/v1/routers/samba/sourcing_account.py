@@ -1019,7 +1019,10 @@ def _check_owner_device(request: Request) -> None:
         return  # 가드 미설정 — 레거시 호환
     allowed = {d.strip() for d in raw.split(",") if d.strip()}
     device_id = (request.headers.get("X-Device-Id") or "").strip()
-    if not device_id or device_id not in allowed:
+    # LOTTEON 헤드리스 데몬 prefix 자동 허용 — 신규 PC 마다 owner_device_ids 갱신 부담 제거.
+    # `samba-daemon-<hostname>` 패턴은 본 저장소 scripts/lotteon_daemon 가 생성하는 device_id.
+    _is_daemon = device_id.startswith("samba-daemon-")
+    if not device_id or (device_id not in allowed and not _is_daemon):
         client_ip = request.headers.get("X-Forwarded-For", "") or (
             request.client.host if request.client else ""
         )

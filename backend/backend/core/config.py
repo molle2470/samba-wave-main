@@ -83,9 +83,15 @@ class BackendSettings(BaseSettings):
     비어있으면 가드 무효(레거시 호환). 운영 환경에서는 반드시 설정."""
 
     lotteon_daemon_device_id: str = ""
-    """LOTTEON 헤드리스 데몬 deviceId — 설정 시 LOTTEON DOM 위임 잡을 이 데몬으로만 라우팅.
+    """[deprecated] 단일 데몬 deviceId — 하위호환용. 신규는 lotteon_daemon_device_ids 사용.
+    값 있으면 lotteon_daemon_device_ids 의 1번째 원소로 자동 승격된다."""
+
+    lotteon_daemon_device_ids: str = ""
+    """LOTTEON 헤드리스 데몬 deviceId 풀 (콤마 구분).
+    예) "samba-daemon-pc1,samba-daemon-pc2,samba-daemon-pc3"
+    설정 시 LOTTEON DOM 위임 잡을 풀에서 round-robin 으로 1개 데몬에 라우팅.
     비어있으면 기존 흐름(오토튠 시작 PC 확장앱) 유지 — 즉시 롤백 가능.
-    PoC 단계 한정 임시 게이트, 검증 완료 후 정식 도입 시 제거 예정."""
+    각 데몬은 본인 deviceId 만 picking — 백엔드 get_next_job 가 owner 매칭."""
 
     # ===========================================
     # AI / Anthropic Configuration

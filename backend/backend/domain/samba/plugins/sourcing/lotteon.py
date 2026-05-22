@@ -23,6 +23,67 @@ _lotteon_safe_interval: float = 999.0  # 차단 없는 최소 인터벌 기록
 # {site_product_id: sitmNo} 형태, 프로세스 수명 동안 유지
 _sitm_no_cache: dict[str, str] = {}
 
+# LOTTEON 데몬 풀 round-robin 카운터
+_lotteon_daemon_rr_counter: int = 0
+
+
+def _pick_lotteon_daemon_owner(settings_obj: object) -> str | None:
+    """LOTTEON 데몬 풀에서 round-robin 으로 1개 device_id 선택.
+
+    선택 우선순위:
+    1. DB 풀 — `samba-daemon-` prefix + last_seen 60초 이내 polling 중인 device 들 (자동 등록).
+       신규 PC 가 setup.ps1 후 daemon.py 실행만 하면 자동 합류.
+    2. lotteon_daemon_device_ids (env, 콤마 구분) — 풀 명시 폴백.
+    3. lotteon_daemon_device_id (env, 단수, 하위호환) — 풀로 승격.
+
+    풀이 비어있으면 None 반환 → 기존 확장앱 흐름 유지.
+    """
+    global _lotteon_daemon_rr_counter
+
+    # 1. DB 활성 데몬 풀 — 자동 등록 경로
+    pool: list[str] = []
+    try:
+        import time as _time
+
+        from backend.api.v1.routers.samba.collector_autotune import (
+            _pc_allowed_sites,
+            _pc_last_seen,
+        )
+
+        now = _time.time()
+        for dev, sites in _pc_allowed_sites.items():
+            if not dev.startswith("samba-daemon-"):
+                continue
+            if "LOTTEON" not in sites:
+                continue
+            last = _pc_last_seen.get(dev, 0)
+            if now - last > 60:
+                continue
+            pool.append(dev)
+        pool.sort()
+    except Exception:
+        pool = []
+
+    # 2. env 풀 폴백
+    if not pool:
+        raw_pool = (
+            getattr(settings_obj, "lotteon_daemon_device_ids", "") or ""
+        ).strip()
+        pool = [s.strip() for s in raw_pool.split(",") if s.strip()]
+
+    # 3. 단수 env 폴백
+    if not pool:
+        legacy = (getattr(settings_obj, "lotteon_daemon_device_id", "") or "").strip()
+        if legacy:
+            pool = [legacy]
+
+    if not pool:
+        return None
+
+    idx = _lotteon_daemon_rr_counter % len(pool)
+    _lotteon_daemon_rr_counter += 1
+    return pool[idx]
+
 
 def _select_lotteon_proxy() -> str | None:
     """현재 실행 컨텍스트에 따라 롯데ON 호출용 프록시 URL을 선택.
@@ -552,10 +613,10 @@ class LotteonSourcingPlugin(SourcingPlugin):
         from backend.core.config import settings
         from backend.domain.samba.proxy.sourcing_queue import SourcingQueue
 
-        # 헤드리스 데몬 라우팅 (PoC 게이트) — 환경변수 설정 시 데몬으로만 라우팅,
-        # 비어있으면 기존 확장앱 흐름 유지. 환경변수만 비우면 즉시 롤백 가능.
-        _daemon_dev = (settings.lotteon_daemon_device_id or "").strip()
-        _route_owner: str | None = _daemon_dev or None
+        # 헤드리스 데몬 라우팅 — 환경변수의 데몬 풀에서 round-robin 으로 1개 선택.
+        # lotteon_daemon_device_ids (콤마 구분) 가 우선, 비어있으면 하위호환으로
+        # lotteon_daemon_device_id (단수) 사용. 둘 다 비어있으면 기존 확장앱 흐름.
+        _route_owner: str | None = _pick_lotteon_daemon_owner(settings)
 
         try:
             _dom_req, _dom_fut = SourcingQueue.add_detail_job(

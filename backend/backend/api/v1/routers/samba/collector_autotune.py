@@ -870,11 +870,10 @@ async def _site_autotune_loop(device_id: str, site: str):
                                     if _site_pid
                                     else _name_part
                                 )
-                                # 진행도 표시 — 사이클 배치(200) 기준이 아닌 "전체 대상" 누계 기준
-                                _autotune_global_idx[_gkey] = (
-                                    _autotune_global_idx.get(_gkey, 0) + 1
-                                )
-                                _g_idx = _autotune_global_idx[_gkey]
+                                # 진행도 표시 — 사이클 배치(200) 기준이 아닌 "전체 대상" 누계 기준.
+                                # 카운터 증가는 refresher 가 _limited 진입 시점에 1회 수행 →
+                                # 여기서는 읽기만 (성공/실패 모두 동일 idx 사용, gap 없음).
+                                _g_idx = _autotune_global_idx.get(_gkey, 0)
                                 _g_total = _autotune_global_total.get(_gkey, 0)
                                 _idx_prefix = (
                                     f"[{_g_idx:,}/{_g_total:,}] "
@@ -2171,6 +2170,11 @@ async def _site_autotune_loop(device_id: str, site: str):
                             products,
                             max_concurrency=dict(_SAC),
                             on_result=_on_result_releasing,
+                            global_counter={
+                                "key": _gkey,
+                                "idx_ref": _autotune_global_idx,
+                                "total_ref": _autotune_global_total,
+                            },
                         )
                         log.info(
                             "[오토튠][디버그][%s][%s] 사이클 #%d bulk 종료: "
