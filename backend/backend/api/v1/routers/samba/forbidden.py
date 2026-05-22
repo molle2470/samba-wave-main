@@ -198,11 +198,16 @@ async def get_setting(
 ):
     from backend.domain.samba.forbidden.model import SambaSettings
 
-    # tenant_id가 있으면 테넌트 전용 키(tenant_id:key)로 조회
+    # tenant_id가 있으면 테넌트 전용 키(tenant_id:key) 우선 조회
+    # 멀티테넌트 격리 이전(2026-05-18)에는 bare 키로 저장됨 → 폴백으로 bare 키 시도
     effective_key = f"{tenant_id}:{key}" if tenant_id is not None else key
     stmt = select(SambaSettings).where(SambaSettings.key == effective_key)
     result = await session.execute(stmt)
     row = result.scalars().first()
+    if row is None and tenant_id is not None:
+        stmt = select(SambaSettings).where(SambaSettings.key == key)
+        result = await session.execute(stmt)
+        row = result.scalars().first()
     value = row.value if row else None
     # None이면 빈 dict 반환 (프론트에서 .catch(() => null) 호환)
     return value if value is not None else {}

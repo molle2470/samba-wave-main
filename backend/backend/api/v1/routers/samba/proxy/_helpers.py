@@ -25,6 +25,9 @@ async def _get_setting(
     effective_key = f"{tenant_id}:{key}" if tenant_id else key
     repo = SambaSettingsRepository(session)
     row = await repo.find_by_async(key=effective_key)
+    # 멀티테넌트 격리(2026-05-18) 이전 저장 데이터는 bare 키로 남아있음 → 폴백
+    if row is None and tenant_id:
+        row = await repo.find_by_async(key=key)
     if row:
         val = row.value
         if val and is_encrypted_key(key) and isinstance(val, str):
