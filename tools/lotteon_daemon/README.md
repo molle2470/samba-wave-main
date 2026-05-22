@@ -1,95 +1,83 @@
-# LOTTEON 헤드리스 데몬 (완전 자동)
+# LOTTEON 헤드리스 데몬 — Zero-Install
 
-LOTTEON 가격/재고 DOM 추출 전용 로컬 PC 상주 프로세스. 자동 설치 + 자동 로그인 + 여러 PC 동시 운용 지원(round-robin).
+## 사용자 흐름 (1 click 한 번)
 
-## 자동화 범위
+1. 오토튠 페이지 진입 (`/samba/warroom`)
+2. 데몬 미감지 → 자동으로 `.exe` 다운로드 시작 + 상단 빨간 배너 안내
+3. 다운로드된 `lotteon-daemon-setup_did=<id>.exe` 더블클릭 → SmartScreen "실행"
+4. 끝. 이후 평생 자동 (재부팅 시 자동 시작 + 자동 업데이트 + 자동 로그인 + 잡 처리)
 
-| 단계 | 자동/수동 |
-|------|----------|
-| Python venv + 의존성 + Chromium 설치 | **자동** (setup.ps1) |
-| device_id 생성 (`samba-daemon-<hostname>`) | **자동** |
-| 백엔드 owner_device_ids 가드 통과 | **자동** (백엔드가 `samba-daemon-` prefix 자동 허용) |
-| API 키 발급 | **자동** (`/proxy/extension-key`, 캐시) |
-| LOTTEON 자격증명 조회 | **자동** (`/proxy/login-credential?site_name=LOTTEON`) |
-| LOTTEON 로그인 | **자동** (Playwright form fill + submit) |
-| 데몬 풀 등록 (라우팅 자동 합류) | **자동** (백엔드 `_pick_lotteon_daemon_owner` 가 polling 중인 daemon device 풀에서 round-robin) |
-| 세션 만료 시 재로그인 | **자동** (`login_required` 3회 연속 감지 시 재로그인) |
-| 비정상 종료 재시작 | **자동** (run.ps1 supervisor) |
+전제 1회: 삼바웨이브 화면에서 LOTTEON 라디오 기본 계정(아이디/비번) 등록.
 
-수동 1회: 삼바웨이브 화면에서 LOTTEON 라디오 기본 계정(아이디/비번) 1개 등록.
+## 자동화 매트릭스
 
-## 운영 위치
+| 단계 | 자동 |
+|------|------|
+| `.exe` 다운로드 (오토튠 페이지가 트리거) | O |
+| `%APPDATA%\samba-lotteon-daemon\` 로 self-install | O |
+| `HKCU\...\Run` 자동 시작 등록 | O |
+| Chromium 영속 프로필 launch | O (PyInstaller 번들된 Chromium 사용) |
+| LOTTEON 자동로그인 (`/login-credential` fetch + Playwright form fill) | O |
+| 잡 폴링 + PDP DOM 추출 + 회신 | O |
+| 세션 만료 시 재로그인 | O |
+| 신버전 감지 시 self-restart | O |
 
-- **로컬 PC 전용**. VM 운영 금지 (Playwright Chromium 풀가동 시 VM api 컨테이너 SIGKILL — CLAUDE.md `[배경제거 워커 로컬PC 전용]` 동일 패턴).
-- 메인 작업 PC / 전용 PC / 여러 PC 동시 가능. 백엔드는 polling 중인 daemon device 풀을 자동 round-robin.
+사용자 액션 = **1번 더블클릭, 평생 1회**.
 
-## 설치
+## 빌더/배포자 — 본 디렉토리 사용법
 
-```powershell
-git clone <repo>
-cd samba-wave\tools\lotteon_daemon
-.\setup.ps1
-```
-
-처리:
-- Python venv 생성 → pip 의존성 설치 → Playwright Chromium 다운로드
-- 자동 device_id 출력 (예: `samba-daemon-my-pc`)
-
-## 실행
+### 빌드
 
 ```powershell
-.\run.ps1
+.\build.ps1
 ```
 
-- `daemon.py` 가 무한 supervisor 루프로 동작 (비정상 종료 시 5초 후 자동 재시작).
-- 첫 실행 시 자동으로:
-  1. `/proxy/extension-key` 호출 → API 키 캐시 저장
-  2. Chromium 영속 프로필 launch
-  3. LOTTEON 홈에서 로그인 상태 검증
-  4. 미로그인이면 `/proxy/login-credential` 호출 → 자격증명 받음
-  5. LOTTEON 로그인 페이지 form fill + submit
-  6. 폴링 시작
+`dist\daemon.exe` 단일 파일 생성 (~250MB).
 
-## 옵션 (필요 시만)
+### 배포
 
-- `--backend-url` (기본 `https://api.samba-wave.co.kr`)
-- `--device-id` (기본 `samba-daemon-<hostname>`)
-- `--profile-dir` (기본 `%USERPROFILE%\.lotteon_daemon\chromium_profile`)
-- `--poll-interval` (기본 1.5)
-- `--max-consecutive-fail` (기본 10)
-- `--headless` (LOTTEON 봇 감지 회피 위해 기본 headed)
+```powershell
+.\upload.ps1 -Version 1.0.1
+```
 
-환경변수 동일 키: `DAEMON_BACKEND_URL`, `DAEMON_DEVICE_ID`, `DAEMON_PROFILE_DIR`, `DAEMON_POLL_INTERVAL`, `DAEMON_MAX_CONSECUTIVE_FAIL`.
+R2 bucket `samba-installers` 에 업로드:
+- `lotteon-daemon-setup-v1.0.1.exe` (버전 영구 보존)
+- `lotteon-daemon-setup.exe` (latest, 사용자 다운로드 URL)
 
-## 동작 확인
+다운로드 URL: `https://installer.samba-wave.co.kr/lotteon-daemon-setup.exe`
 
-1. stdout 로그: `처리 시작 req=...` → `완료 req=... 혜택가=N,NNN 옵션=K (N.Ns)` 흐름이면 정상.
-2. DB:
-   ```sql
-   SELECT owner_device_id, status, count(*) FROM samba_sourcing_job
-   WHERE site='LOTTEON' AND created_at > now() - interval '10 min'
-   GROUP BY owner_device_id, status;
-   ```
-   각 daemon 에 잡이 분산되며 `completed` 가 압도적이면 정상.
-3. 워룸 로그에 `LOTTEON 확장앱 미응답 (60s 타임아웃)` 없으면 OK.
+업로드 후 `backend/api/v1/routers/samba/proxy/sourcing.py` 의 `LOTTEON_DAEMON_LATEST_VERSION` 값 갱신 + 백엔드 배포.
 
-## 트러블슈팅
+## 백엔드 변경
 
-| 증상 | 원인 | 조치 |
-|------|------|------|
-| `daemon.py` 시작 직후 종료 + Chromium 안 뜸 | `playwright install chromium` 누락 | `setup.ps1` 재실행 |
-| 초기 로그인 실패 → exit 3 | LOTTEON 라디오 기본 계정 미등록 | 삼바웨이브 화면에서 LOTTEON 계정 추가 + `is_login_default=true` |
-| API key 발급 실패 → exit 2 | 백엔드 `owner_device_ids` 가 `samba-daemon-` prefix 안 허용 | 백엔드 코드 (sourcing_account.py:1006) 동기화 여부 확인 |
-| 자동로그인 실패 (CAPTCHA) | LOTTEON 봇 감지 | `--headless` 제거(기본 headed) / IP 변경 / 수동 1회 로그인 후 쿠키 살리기 |
-| 연속 실패 임계 초과 → exit 1 | LOTTEON WAF 차단 | `--poll-interval` 증가 |
+- `GET /proxy/lotteon-daemon/latest-version` — 데몬 self-update 트리거 (`sourcing.py`)
+- `GET /proxy/lotteon-daemon/health?device_id=…` — 오토튠 페이지가 PC 별 데몬 polling 여부 확인 (`sourcing.py`)
+- `sourcing_account.py::_check_owner_device` — `samba-daemon-` prefix 자동 허용
 
-## 변경 시 주의
+## 프론트 변경
 
-- DOM 추출 JS (`LOTTEON_EXTRACT_JS`) 는 `extension/background-sourcing.js` LOTTEON 분기 포팅. 양쪽 동기화.
-- 로그인 셀렉터 (`LOTTEON_LOGIN_SELECTORS`) 는 `extension/background-autologin.js:242-246` 포팅. 양쪽 동기화.
-- 회신 dict 필드명은 백엔드 `backend/backend/domain/samba/plugins/sourcing/lotteon.py:600-650` 가 그대로 읽음. 키 변경 금지.
+- `frontend/src/app/samba/warroom/page.tsx`:
+  - localStorage `samba-daemon-<random>` device_id 영속
+  - 60초 폴링으로 health 확인 → alive=false 시 자동 `.exe` 다운로드 트리거 + 빨간 배너
 
-## 폴백 / 즉시 롤백
+## 개발자용 직접 실행 (디버깅)
 
-- 데몬 전체 중단 + 확장앱 폴백: VM `.env` 의 `LOTTEON_DAEMON_DEVICE_IDS` 비우고 컨테이너 재시작. 백엔드가 자동으로 확장앱 흐름으로 회귀.
-- DB 활성 daemon 풀이 빈 상태 + env 도 빈 상태면 자동 폴백.
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install playwright httpx
+playwright install chromium
+python daemon.py --device-id samba-daemon-dev --headless
+```
+
+## 코드 변경 시 동기화 필수
+
+- `LOTTEON_EXTRACT_JS` ↔ `extension/background-sourcing.js` LOTTEON 분기
+- `LOTTEON_LOGIN_SELECTORS` ↔ `extension/background-autologin.js:242-246`
+- 회신 dict 필드명 ↔ `backend/backend/domain/samba/plugins/sourcing/lotteon.py:600-650`
+
+## 폴백
+
+- R2 installer 다운로드 실패 / 데몬 빌드 사고 → 오토튠 페이지의 자동 다운로드 트리거 동작 안 함
+- 데몬 운영 전체 중단 → 백엔드 `_pick_lotteon_daemon_owner` 가 None 반환 → 잡 영구 pending (확장앱 폴백 미적용)
+- 진짜 응급 시 백엔드 `_pick_lotteon_daemon_owner` 임시 비활성화 (`return None`) 후 재배포

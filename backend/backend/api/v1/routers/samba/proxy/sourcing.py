@@ -165,6 +165,56 @@ async def sourcing_collect_queue(request: Request) -> Any:
     return job
 
 
+# ====================================================================
+# LOTTEON 헤드리스 데몬 — health + 자동 업데이트 버전 메타
+# ====================================================================
+
+# build/release 시 갱신. 데몬이 시작 시 비교하여 신버전이면 자기 종료(다음 시작 시 갱신).
+LOTTEON_DAEMON_LATEST_VERSION = "1.0.0"
+LOTTEON_DAEMON_DOWNLOAD_URL = (
+    "https://github.com/sbk0674-web/samba-wave/releases/latest/download/"
+    "lotteon-daemon-setup.exe"
+)
+
+
+@sourcing_queue_router.get("/lotteon-daemon/latest-version")
+async def lotteon_daemon_latest_version() -> dict[str, Any]:
+    """데몬이 시작 시 호출 — 신버전 감지 시 self-update.
+
+    인증 불필요. 응답 = {version, download_url}.
+    """
+    return {
+        "version": LOTTEON_DAEMON_LATEST_VERSION,
+        "download_url": LOTTEON_DAEMON_DOWNLOAD_URL,
+    }
+
+
+@sourcing_queue_router.get("/lotteon-daemon/health")
+async def lotteon_daemon_health(
+    device_id: str = Query(..., description="확인할 데몬 device_id"),
+) -> dict[str, Any]:
+    """오토튠 페이지가 본 PC 의 데몬 polling 여부 확인.
+
+    `_pc_last_seen` 의 마지막 갱신이 60초 이내면 alive.
+    인증 불필요 — device_id 자체가 비공개 식별자.
+    """
+    try:
+        from backend.api.v1.routers.samba.collector_autotune import (
+            _pc_last_seen,
+        )
+
+        last = _pc_last_seen.get(device_id.strip(), 0)
+    except Exception:
+        last = 0
+    import time as _time
+
+    alive = bool(last and _time.time() - last < 60)
+    return {
+        "alive": alive,
+        "last_seen": float(last) if last else 0.0,
+    }
+
+
 @sourcing_queue_router.post("/sourcing/collect-result")
 async def sourcing_collect_result(body: dict[str, Any]) -> dict[str, Any]:
     """확장앱이 수집 결과를 전달 (인증 불필요)."""

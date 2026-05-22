@@ -23,11 +23,21 @@ import json
 import logging
 import os
 import re
+import shutil
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+# PyInstaller frozen 모드 — 번들된 Chromium 경로 사전 설정. playwright import 전에 set.
+if getattr(sys, "frozen", False):
+    _meipass = getattr(sys, "_MEIPASS", "")
+    if _meipass:
+        _bundled_browsers = Path(_meipass) / "playwright_browsers"
+        if _bundled_browsers.exists():
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(_bundled_browsers)
 
 import httpx
 from playwright.async_api import (
@@ -35,6 +45,108 @@ from playwright.async_api import (
     Page,
     async_playwright,
 )
+
+
+# ====================================================================
+# 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
+# ====================================================================
+DAEMON_VERSION = "1.0.0"
+
+
+# ====================================================================
+# Self-install — frozen .exe 가 1번 클릭으로 평생 작동하게 한다
+# ====================================================================
+
+_INSTALL_DIR_NAME = "samba-lotteon-daemon"
+_RUN_KEY_NAME = "SambaLotteonDaemon"
+
+
+def _install_dir() -> Path:
+    appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    return Path(appdata) / _INSTALL_DIR_NAME
+
+
+def _is_frozen() -> bool:
+    return getattr(sys, "frozen", False)
+
+
+def _running_from_install_dir() -> bool:
+    if not _is_frozen():
+        return True  # 개발 모드 — install 분기 스킵
+    try:
+        return Path(sys.executable).resolve().parent == _install_dir().resolve()
+    except Exception:
+        return False
+
+
+def _register_run_key(exe_path: Path) -> None:
+    """HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run 에 데몬 등록.
+
+    부팅 시 자동 시작. 실패해도 본 실행은 계속 진행한다.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import winreg  # type: ignore
+
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0,
+            winreg.KEY_SET_VALUE,
+        )
+        winreg.SetValueEx(
+            key, _RUN_KEY_NAME, 0, winreg.REG_SZ, f'"{exe_path}"'
+        )
+        winreg.CloseKey(key)
+        logger_print(f"Startup 등록 완료: {exe_path}")
+    except Exception as exc:
+        logger_print(f"Startup 등록 실패(무시): {exc}")
+
+
+def _self_install_and_relaunch() -> None:
+    """현재 .exe 를 %APPDATA%\\samba-lotteon-daemon\\daemon.exe 로 복사 후
+    그 위치에서 detach 실행. 본 프로세스는 즉시 종료(`os._exit`).
+
+    이미 install dir 에서 실행 중이면 호출되지 않는다.
+    """
+    src = Path(sys.executable).resolve()
+    install_dir = _install_dir()
+    install_dir.mkdir(parents=True, exist_ok=True)
+    dst = install_dir / "daemon.exe"
+
+    try:
+        shutil.copy2(src, dst)
+    except Exception as exc:
+        logger_print(f"설치 복사 실패: {exc}")
+        return
+
+    _register_run_key(dst)
+
+    # device_id URL 인자 / 파일명 추출 보존을 위해 원래 argv 그대로 전달
+    args = sys.argv[1:]
+    try:
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        creationflags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        subprocess.Popen(
+            [str(dst), *args],
+            close_fds=True,
+            creationflags=creationflags if os.name == "nt" else 0,
+        )
+        logger_print(f"설치 완료 → 신규 프로세스 시작: {dst}")
+    except Exception as exc:
+        logger_print(f"신규 프로세스 시작 실패: {exc}")
+
+    os._exit(0)
+
+
+def logger_print(msg: str) -> None:
+    """frozen 초기 부트스트랩 단계 — logging 모듈 set 전이라 print 폴백."""
+    try:
+        print(f"[lotteon-daemon] {msg}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
 
 logger = logging.getLogger("lotteon-daemon")
 
@@ -206,6 +318,56 @@ class DaemonState:
 
     def should_die(self) -> bool:
         return self.consecutive_fail >= self.max_consecutive_fail
+
+
+def _extract_kv_from_argv_or_exename(key: str) -> str | None:
+    """`.exe` 파일명 또는 argv 에서 `<key>=<value>` 추출.
+
+    오토튠 페이지가 설치 트리거 시 `lotteon-daemon-setup_did=…_backend=…exe`
+    형태로 파일명에 박거나, 인자 `--did=…` `--backend=…` 로 전달.
+    포크 호환을 위해 backend URL 도 동적 전달한다.
+    """
+    # 파일명 추출 — URL-safe value (영숫자, 점, 하이픈, 슬래시, 콜론, 언더스코어)
+    try:
+        exe_name = Path(sys.executable).name
+        m = re.search(
+            rf"{re.escape(key)}=([A-Za-z0-9_./:-]+?)(?:_(?:did|backend)=|\.exe$|$)",
+            exe_name,
+        )
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    # argv 에서 추출
+    for arg in sys.argv[1:]:
+        m = re.match(rf"^--?{re.escape(key)}=(.+)$", arg) or re.match(
+            rf"^{re.escape(key)}=(.+)$", arg
+        )
+        if m:
+            return m.group(1)
+    return None
+
+
+def _extract_did_from_argv_or_exename() -> str | None:
+    return _extract_kv_from_argv_or_exename("did")
+
+
+def _extract_backend_from_argv_or_exename() -> str | None:
+    """파일명/argv 에서 backend URL 추출. 포크 사용자도 본인 backend 가리킬 수 있게."""
+    val = _extract_kv_from_argv_or_exename("backend")
+    if not val:
+        return None
+    # URL-encoded 값 복호화 (예: https%3A//api.example.com)
+    try:
+        from urllib.parse import unquote
+
+        val = unquote(val)
+    except Exception:
+        pass
+    # 스킴 보강
+    if val and not val.startswith(("http://", "https://")):
+        val = f"https://{val}"
+    return val
 
 
 def _default_device_id() -> str:
@@ -581,6 +743,10 @@ async def run_daemon(args: argparse.Namespace) -> int:
     )
 
     async with httpx.AsyncClient() as http_client:
+        # 자동 업데이트 체크 — 신버전 감지 시 즉시 종료(supervisor가 신버전 다운로드 트리거)
+        if await _check_and_self_update(http_client, backend_url):
+            return 10  # exit=10 → run.ps1/Run 키 재시작이 신버전 다운로드 트리거
+
         # API key 부트스트랩 (캐시 우선)
         try:
             api_key = await bootstrap_api_key(
@@ -658,18 +824,37 @@ def _setup_logging() -> None:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="LOTTEON 헤드리스 데몬 (완전 자동)")
+    # backend URL 우선순위:
+    # 1. URL/파일명/argv 의 backend= (포크 사용자가 본인 backend 가리킬 때)
+    # 2. DAEMON_BACKEND_URL 환경변수
+    # 3. 본 메인 default
+    _backend_default = (
+        _extract_backend_from_argv_or_exename()
+        or os.environ.get("DAEMON_BACKEND_URL")
+        or "https://api.samba-wave.co.kr"
+    )
     p.add_argument(
         "--backend-url",
-        default=os.environ.get(
-            "DAEMON_BACKEND_URL", "https://api.samba-wave.co.kr"
+        default=_backend_default,
+        help=(
+            "백엔드 base URL. URL/파일명/--backend= 자동 추출. "
+            "포크 사용자는 본인 backend 지정 가능."
         ),
-        help="백엔드 base URL (기본: https://api.samba-wave.co.kr)",
+    )
+    # device_id 우선순위:
+    # 1. URL/파일명/argv 의 did= (오토튠 페이지가 박은 값) — 최우선
+    # 2. DAEMON_DEVICE_ID 환경변수
+    # 3. samba-daemon-<hostname> 폴백
+    _did_default = (
+        _extract_did_from_argv_or_exename()
+        or os.environ.get("DAEMON_DEVICE_ID")
+        or _default_device_id()
     )
     p.add_argument(
         "--device-id",
-        default=os.environ.get("DAEMON_DEVICE_ID", _default_device_id()),
+        default=_did_default,
         help=(
-            "이 데몬의 device_id (자동: samba-daemon-<hostname>). "
+            "이 데몬의 device_id. URL/파일명/--did= 자동 추출. "
             "백엔드 owner_device_ids 가 samba-daemon-* prefix 자동 허용."
         ),
     )
@@ -699,9 +884,53 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+async def _check_and_self_update(
+    client: httpx.AsyncClient, backend_url: str
+) -> bool:
+    """백엔드 버전 체크 → 신버전이면 True 반환(caller 가 종료 → 재시작 시 신버전 다운로드).
+
+    실패 시 False (현 버전 그대로 진행). 네트워크 일시 장애로 자가 종료되는 사고 방지.
+    """
+    try:
+        r = await client.get(
+            f"{backend_url}/api/v1/samba/proxy/lotteon-daemon/latest-version",
+            timeout=10.0,
+        )
+        if r.status_code != 200:
+            return False
+        data = r.json() or {}
+        latest = (data.get("version") or "").strip()
+        if not latest or latest == DAEMON_VERSION:
+            return False
+        logger.info(
+            "신버전 감지: 현재=%s latest=%s — 자기 종료 → 다음 시작 시 갱신",
+            DAEMON_VERSION,
+            latest,
+        )
+        return True
+    except Exception as exc:
+        logger.debug("버전 체크 실패(무시): %s", exc)
+        return False
+
+
 def main() -> int:
+    # 1. frozen 모드 + install dir 아닐 때 → self-install + 재시작 후 종료
+    if _is_frozen() and not _running_from_install_dir():
+        logger_print(
+            f"첫 실행 감지 — {_install_dir()} 로 자기 설치 후 재시작"
+        )
+        _self_install_and_relaunch()
+        # _self_install_and_relaunch 가 os._exit(0) 호출하므로 이 라인 도달 X
+        return 0
+
     _setup_logging()
     args = _parse_args()
+    logger.info(
+        "데몬 v%s 시작 (frozen=%s install_dir=%s)",
+        DAEMON_VERSION,
+        _is_frozen(),
+        _install_dir() if _is_frozen() else "(개발 모드)",
+    )
     try:
         return asyncio.run(run_daemon(args))
     except KeyboardInterrupt:
