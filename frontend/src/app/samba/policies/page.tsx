@@ -1758,7 +1758,7 @@ export default function PoliciesPage() {
           </div>
           {/* 설정된 마켓 목록 */}
           {Object.entries(marketDetailTemplates).map(([mkt, tplId]) => {
-            const mLabel = MARKETS.find(m => m.id === mkt)?.label || mkt
+            const mLabel = mkt === 'ssg' ? '신세계몰' : (MARKETS.find(m => m.id === mkt)?.label || mkt)
             const tplName = detailTemplates.find(t => t.id === tplId)?.name || '(미선택)'
             return (
               <div key={mkt} style={{ marginBottom: '0.5rem', padding: '0.5rem', background: 'rgba(81,207,102,0.05)', border: '1px solid rgba(81,207,102,0.15)', borderRadius: '6px' }}>
@@ -1809,8 +1809,8 @@ export default function PoliciesPage() {
             style={{ ...inputStyle, width: 'auto', fontSize: '0.75rem' }}
           >
             <option value="">+ 마켓 추가</option>
-            {MARKETS.filter(m => !marketDetailTemplates[m.id]).map(m => (
-              <option key={m.id} value={m.id}>{m.label}</option>
+            {MARKETS.filter(m => !marketDetailTemplates[m.id] && !m.categoryOnly).map(m => (
+              <option key={m.id} value={m.id}>{m.id === 'ssg' ? '신세계몰' : m.label}</option>
             ))}
           </select>
         </div>
