@@ -50,7 +50,7 @@ from playwright.async_api import (
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.0.4"
+DAEMON_VERSION = "1.0.5"
 
 
 # ====================================================================
@@ -394,7 +394,7 @@ async def bootstrap_api_key(
             return cached
     logger.info("API key 발급 요청 → /proxy/extension-key")
     r = await client.post(
-        f"{backend_url}/api/v1/samba/proxy/extension-key",
+        f"{backend_url}/api/v1/samba/sourcing-accounts/extension-key",
         headers={
             "X-Device-Id": device_id,
             "User-Agent": "autotune-daemon/1.0",
@@ -424,7 +424,7 @@ async def fetch_lotteon_credential(
 ) -> dict[str, str] | None:
     """등록된 LOTTEON 기본 계정의 username/password 평문 조회."""
     r = await client.get(
-        f"{backend_url}/api/v1/samba/proxy/login-credential",
+        f"{backend_url}/api/v1/samba/sourcing-accounts/login-credential",
         params={"site_name": "LOTTEON"},
         headers={
             "X-Device-Id": device_id,
@@ -579,12 +579,13 @@ async def ensure_logged_in(
 
 
 async def fetch_job(
-    client: httpx.AsyncClient, backend_url: str, device_id: str
+    client: httpx.AsyncClient, backend_url: str, device_id: str, api_key: str
 ) -> dict[str, Any] | None:
     try:
         r = await client.get(
             f"{backend_url}/api/v1/samba/proxy/sourcing/collect-queue",
             headers={
+                "X-Api-Key": api_key,
                 "X-Device-Id": device_id,
                 "X-Allowed-Sites": "LOTTEON",
                 "X-Ext-Version": "99.0.0",
@@ -610,12 +611,14 @@ async def post_result(
     backend_url: str,
     request_id: str,
     data: dict[str, Any],
+    api_key: str,
 ) -> bool:
     url = f"{backend_url}/api/v1/samba/proxy/sourcing/collect-result"
     body = {"requestId": request_id, "data": data}
+    headers = {"X-Api-Key": api_key}
     for attempt in range(len(_RETRY_DELAYS) + 1):
         try:
-            r = await client.post(url, json=body, timeout=15.0)
+            r = await client.post(url, json=body, headers=headers, timeout=15.0)
         except Exception as exc:
             if attempt < len(_RETRY_DELAYS):
                 await asyncio.sleep(_RETRY_DELAYS[attempt])
@@ -663,6 +666,7 @@ async def process_job(
     backend_url: str,
     job: dict[str, Any],
     state: DaemonState,
+    api_key: str,
 ) -> str | None:
     """잡 1개 처리. 반환값:
     - None: 정상 처리(성공/실패와 무관, 회신 완료)
@@ -678,7 +682,7 @@ async def process_job(
         logger.warning("범위 밖 잡 (site=%s type=%s) — 실패 회신", site, jtype)
         await post_result(
             client, backend_url, request_id,
-            {"success": False, "error": f"daemon scope LOTTEON detail only (got {site}/{jtype})"},
+            {"success": False, "error": f"daemon scope LOTTEON detail only (got {site}/{jtype})"}, api_key,
         )
         state.record_failure()
         return None
@@ -693,7 +697,7 @@ async def process_job(
         logger.warning("PDP 추출 타임아웃 req=%s pid=%s", request_id, product_id)
         await post_result(
             client, backend_url, request_id,
-            {"success": False, "error": "daemon PDP 추출 타임아웃"},
+            {"success": False, "error": "daemon PDP 추출 타임아웃"}, api_key,
         )
         state.record_failure()
         return None
@@ -701,12 +705,12 @@ async def process_job(
         logger.exception("PDP 추출 예외 req=%s pid=%s: %s", request_id, product_id, exc)
         await post_result(
             client, backend_url, request_id,
-            {"success": False, "error": f"daemon 예외: {exc}"},
+            {"success": False, "error": f"daemon 예외: {exc}"}, api_key,
         )
         state.record_failure()
         return None
 
-    ok = await post_result(client, backend_url, request_id, data)
+    ok = await post_result(client, backend_url, request_id, data, api_key)
     dt = time.time() - t0
     if ok and data.get("success"):
         bp = data.get("best_benefit_price") or 0
@@ -818,7 +822,7 @@ async def run_daemon(args: argparse.Namespace) -> int:
                     state.reset_login_required()
                     await _save_storage_state()
 
-                job = await fetch_job(http_client, backend_url, args.device_id)
+                job = await fetch_job(http_client, backend_url, args.device_id, api_key)
                 if not job:
                     now = time.time()
                     if now - idle_logged_at > 30:
@@ -831,7 +835,7 @@ async def run_daemon(args: argparse.Namespace) -> int:
                     continue
 
                 await process_job(
-                    page, http_client, backend_url, job, state
+                    page, http_client, backend_url, job, state, api_key
                 )
 
 
