@@ -68,7 +68,7 @@ except ImportError:
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.1.3"
+DAEMON_VERSION = "1.1.4"
 
 
 # ====================================================================
@@ -980,16 +980,32 @@ async def fetch_job(
     device_id: str,
     api_key: str,
     allowed_sites: str = "LOTTEON",
+    poll_site: str = "",
 ) -> dict[str, Any] | None:
+    """잡 1개 폴링.
+
+    allowed_sites: X-Allowed-Sites 헤더 — 이 데몬이 처리 가능한 사이트 '전체'.
+      백엔드 `_pc_allowed_sites` 등록용 → `pick_daemon_owner(site)` 가 이 데몬을
+      모든 활성 사이트의 owner 후보로 인식하게 한다. (전체로 보내야 함)
+    poll_site: X-Poll-Site 헤더 — 이번 폴링이 '실제 가져갈' 단일 사이트.
+      사이트별 병렬 워커가 자기 사이트 잡만 dequeue 하도록 스코프.
+      비어있으면 allowed_sites 전체에서 dequeue (단일 PC 호환).
+    [중요] 등록(allowed_sites)과 잡필터(poll_site)를 분리하지 않으면, 병렬 워커가
+    단일 사이트로 폴링할 때 등록값이 그 사이트로 덮어써져 다른 사이트 owner 매칭이
+    깨진다(LOTTEON env 폴백 → 죽은 디바이스 라우팅 → 60s 타임아웃).
+    """
     try:
+        _headers = {
+            "X-Api-Key": api_key,
+            "X-Device-Id": device_id,
+            "X-Allowed-Sites": allowed_sites,
+            "X-Ext-Version": "99.0.0",
+        }
+        if poll_site:
+            _headers["X-Poll-Site"] = poll_site
         r = await client.get(
             f"{backend_url}/api/v1/samba/proxy/sourcing/collect-queue",
-            headers={
-                "X-Api-Key": api_key,
-                "X-Device-Id": device_id,
-                "X-Allowed-Sites": allowed_sites,
-                "X-Ext-Version": "99.0.0",
-            },
+            headers=_headers,
             timeout=10.0,
         )
         r.raise_for_status()
@@ -1392,12 +1408,17 @@ async def run_daemon(args: argparse.Namespace) -> int:
                 _idle_at = 0.0
                 while not state.should_die():
                     try:
+                        # 등록(allowed_sites)=전체 활성 사이트 → pick_daemon_owner 가
+                        # 모든 사이트의 owner 후보로 이 데몬 인식. 잡 dequeue 스코프
+                        # (poll_site)=이 워커 사이트 하나. 분리 안 하면 등록값이 단일
+                        # 사이트로 덮어써져 owner 매칭 깨짐(LOTTEON 60s 타임아웃 원인).
                         job = await fetch_job(
                             http_client,
                             backend_url,
                             args.device_id,
                             api_key,
-                            allowed_sites=site,
+                            allowed_sites=allowed_sites_header,
+                            poll_site=site,
                         )
                     except asyncio.CancelledError:
                         raise

@@ -152,6 +152,14 @@ async def sourcing_collect_queue(request: Request) -> Any:
         allowed_sites: list[str] | None = None
     else:
         allowed_sites = [s.strip() for s in raw_sites.split(",") if s.strip()]
+    # X-Poll-Site: 이번 폴링이 dequeue 할 단일 사이트 (사이트별 병렬 데몬 워커용).
+    # 등록(X-Allowed-Sites=전체)과 잡필터(X-Poll-Site=단일)를 분리해, 병렬 워커가
+    # 단일 사이트로 폴링해도 _pc_allowed_sites 등록값이 전체로 유지된다.
+    # → pick_daemon_owner(site) 가 모든 사이트에서 이 데몬을 찾음(60s 타임아웃 회귀 차단).
+    # 헤더 미부착(확장앱/단일 PC)이면 기존 X-Allowed-Sites 전체 필터 그대로.
+    _poll_site = (request.headers.get("X-Poll-Site") or "").strip()
+    if _poll_site:
+        allowed_sites = [_poll_site]
     ext_version = request.headers.get("X-Ext-Version", "").strip()
     job = await SourcingQueue.get_next_job(
         device_id=device_id,
