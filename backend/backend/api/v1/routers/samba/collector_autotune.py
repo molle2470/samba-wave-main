@@ -708,6 +708,10 @@ async def _site_autotune_loop(device_id: str, site: str):
                             ).first()
                             _lottehome_creds = (_lh_row.value if _lh_row else {}) or {}
 
+                        # SSG 신상품 MD 승인 상태 일괄 확인
+                        # TODO: SSG API 엔드포인트 확인 후 활성화 (현재 비활성)
+                        # _ssg_acc_map 로직은 service.py/_save_autotune_state 참고
+
                         # SELECT 완료 후 즉시 커밋 + 연결 반납 — refresh HTTP 동안 idle in transaction 방지
                         # expire_on_commit=False이므로 products/_account_cache/_policy_cache 객체는 커밋 후에도 유효
                         # session.close()는 연결만 풀에 반납, 세션 객체는 재사용 가능 (soldout 재시도 블록에서 재획득)
@@ -1715,6 +1719,59 @@ async def _site_autotune_loop(device_id: str, site: str):
                                         _stock_action_txt = f"재고전송({_stock_changes_acc}건) → {acc_label}"
                                         _acc_items.append("stock")
                                         _acc_action_parts.append(_stock_action_txt)
+
+                                    # SSG 판매상태 체크 (sellStatCd 기준)
+                                    # 10=승인대기 → 전송 스킵
+                                    # 05=정보추가필요(반려) → 변동 없어도 강제 재신청
+                                    # 20=판매중 → 기존 로직대로
+                                    if market_type == "ssg":
+                                        _ssg_item_id = _m_nos.get(acc_id, "")
+                                        if _ssg_item_id:
+                                            try:
+                                                from backend.domain.samba.proxy.ssg import (
+                                                    SSGClient as _SSGClient,
+                                                )
+                                                import json as _json
+
+                                                _ssg_af = (
+                                                    getattr(acc, "additional_fields", None) or {}
+                                                )
+                                                if isinstance(_ssg_af, str):
+                                                    _ssg_af = _json.loads(_ssg_af)
+                                                _ssg_api_key = _ssg_af.get("apiKey", "")
+                                                if _ssg_api_key:
+                                                    _ssg_cli = _SSGClient(_ssg_api_key)
+                                                    _sales_resp = await _ssg_cli.get_item_sales_status(
+                                                        _ssg_item_id
+                                                    )
+                                                    _sell_stat = str(
+                                                        _sales_resp.get("result", {})
+                                                        .get("salesStatus", {})
+                                                        .get("sellStatCd", "")
+                                                        or ""
+                                                    )
+                                                    if _sell_stat == "10":  # 승인대기 → 스킵
+                                                        log.info(
+                                                            "[오토튠] %s → SSG 승인대기 중, 전송 스킵",
+                                                            product.id,
+                                                        )
+                                                        _acc_items.clear()
+                                                    elif _sell_stat == "05":  # 반려 → 강제 재신청
+                                                        log.info(
+                                                            "[오토튠] %s → SSG 반려 감지(sellStatCd=05), 재신청",
+                                                            product.id,
+                                                        )
+                                                        if not _acc_items:
+                                                            _acc_items.append("price")
+                                                            _acc_action_parts.append(
+                                                                f"SSG 반려 → 재신청 → {acc_label}"
+                                                            )
+                                            except Exception as _ssg_qa_e:
+                                                log.warning(
+                                                    "[오토튠] %s SSG 판매상태 확인 실패: %s",
+                                                    product.id,
+                                                    _ssg_qa_e,
+                                                )
 
                                     # 가격+재고 합산 단일 전송 (충돌 방지)
                                     if _acc_items:

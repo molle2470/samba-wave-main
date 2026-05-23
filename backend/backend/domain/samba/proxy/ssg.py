@@ -555,7 +555,7 @@ class SSGClient:
     ) -> list[dict[str, Any]]:
         """신상품 MD 승인 상태 조회.
 
-        SSG Open API: GET /item/0.1/getItemChngDemndList.ssg
+        SSG Open API: GET /item/0.1/getItemChngDemandList.ssg
         chngDemndProcStatCd: 10=MD승인요청(대기), 20=승인완료, 30=MD반려
         itemrChngDemndDivCd: 00=신상품등록, 01=상품수정
         """
@@ -563,9 +563,9 @@ class SSGClient:
         if div_cd:
             params["itemrChngDemndDivCd"] = div_cd
         resp = await self._call_api(
-            "GET", "/item/0.1/getItemChngDemndList.ssg", params=params
+            "GET", "/item/0.1/getItemChngDemandList.ssg", params=params
         )
-        result_obj = resp.get("result", {})
+        result_obj = resp.get("responseItemChngDemndList", resp.get("result", {}))
         raw = result_obj.get("itemChngDemndList", {})
         if isinstance(raw, dict):
             item_val = raw.get("itemChngDemnd", [])
@@ -575,7 +575,15 @@ class SSGClient:
                 return item_val
             return []
         if isinstance(raw, list):
-            return raw
+            result = []
+            for item in raw:
+                if isinstance(item, dict):
+                    demnd = item.get("itemChngDemnd")
+                    if isinstance(demnd, dict):
+                        result.append(demnd)
+                    elif isinstance(demnd, list):
+                        result.extend(demnd)
+            return result
         return []
 
     async def get_product_list(
@@ -1539,6 +1547,55 @@ class SSGClient:
     # 주문/반품 관련
     # ------------------------------------------------------------------
 
+    async def get_warehouse_out_orders(self, days: int = 7) -> list[dict[str, Any]]:
+        """출고처리 목록 조회 — 주문확인처리(피킹완료) 된 주문 (최대 180일).
+
+        listShppDirection은 배송지시(11) 상태만 반환하므로,
+        이미 발주확인된 출고대기 주문은 이 API로 별도 조회.
+        """
+        KST = timezone(timedelta(hours=9))
+        now = datetime.now(KST)
+        days = min(days, 180)
+        start_dt = (now - timedelta(days=days)).strftime("%Y%m%d")
+        end_dt = now.strftime("%Y%m%d")
+        body = {
+            "requestWarehouseOut": {
+                "perdType": "03",  # 주문완료일 기준
+                "perdStrDts": start_dt,
+                "perdEndDts": end_dt,
+            }
+        }
+        try:
+            data = await self._call_api(
+                "POST", "/api/pd/1/listWarehouseOut.ssg", body=body
+            )
+        except Exception as e:
+            logger.warning(f"[SSG 출고대기] listWarehouseOut 조회 실패: {e}")
+            return []
+
+        result = data.get("result", {})
+        if not isinstance(result, dict):
+            return []
+
+        warehouse_outs = result.get("warehouseOuts", [])
+        if isinstance(warehouse_outs, dict):
+            warehouse_outs = [warehouse_outs]
+        elif not isinstance(warehouse_outs, list):
+            return []
+
+        orders: list[dict[str, Any]] = []
+        for wo in warehouse_outs:
+            if not isinstance(wo, dict):
+                continue
+            inner = wo.get("warehouseOut")
+            if isinstance(inner, list):
+                orders.extend(i for i in inner if isinstance(i, dict))
+            elif isinstance(inner, dict):
+                orders.append(inner)
+
+        logger.info(f"[SSG 출고대기] listWarehouseOut {len(orders)}건 조회")
+        return orders
+
     async def get_orders(self, days: int = 7) -> list[dict[str, Any]]:
         """주문 목록 조회 — 최근 days일 이내 (최대 180일)."""
         KST = timezone(timedelta(hours=9))
@@ -1964,7 +2021,10 @@ class SSGClient:
     ) -> dict[str, Any]:
         """listShppDirection 응답 1건을 SambaOrder insert 형식으로 변환."""
         ord_item_div = str(raw.get("ordItemDiv", ""))
-        shpp_prog = str(raw.get("shppProgStatDtlCd", ""))
+        # listWarehouseOut은 lastShppProgStatDtlCd, listShppDirection은 shppProgStatDtlCd
+        shpp_prog = str(
+            raw.get("lastShppProgStatDtlCd", "") or raw.get("shppProgStatDtlCd", "")
+        )
 
         # 상태 매핑
         if ord_item_div == "021":
@@ -1975,8 +2035,12 @@ class SSGClient:
             status, shipping_status = "return_requested", "교환요청"
         elif shpp_prog == "11":
             status, shipping_status = "pending", "상품준비중"
-        elif shpp_prog in ("21", "22", "31", "41"):
-            status, shipping_status = "pending", "상품준비중"
+        elif shpp_prog in ("21", "22", "31"):
+            status, shipping_status = "pending", "주문접수"
+        elif shpp_prog == "41":
+            status, shipping_status = "pending", "주문접수"
+        elif shpp_prog == "42":
+            status, shipping_status = "pending", "출고보류"
         elif shpp_prog == "43":
             status, shipping_status = "shipped", "국내배송중"
         elif shpp_prog == "51":
@@ -1987,7 +2051,9 @@ class SSGClient:
         rl_ord_amt = float(raw.get("rlordAmt", 0) or 0)
         dc_amt = float(raw.get("dcAmt", 0) or 0)
         sell_price = float(raw.get("sellprc", 0) or 0) or (rl_ord_amt + dc_amt)
-        spl_prc = float(raw.get("splprc", 0) or 0)  # 공급가 = 정산금액
+        spl_prc = float(
+            raw.get("splprc", 0) or raw.get("splPrc", 0) or 0
+        )  # listWarehouseOut은 splPrc
         # 수령인 우선, 없으면 주문자 fallback (str 정규화)
         customer_name = str(raw.get("rcptpeNm", "") or raw.get("ordpeNm", "") or "")
         # 수령인 연락처 우선 (휴대폰 → 집전화 → 주문자 휴대폰)
