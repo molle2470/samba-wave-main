@@ -68,7 +68,7 @@ except ImportError:
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.1.4"
+DAEMON_VERSION = "1.1.5"
 
 
 # ====================================================================
@@ -404,6 +404,19 @@ LOTTEON_EXTRACT_JS = r"""
 """
 
 
+# LOTTEON 준비 마커 — "나의 혜택가" 텍스트 등장 = 가격·옵션 모두 렌더 완료 신호.
+# 실측(2026-05-24, 웨일 9223, 16상품): 옵션 li 0.64~0.85s, 혜택가 1.13~1.59s 등장.
+# 옵션이 혜택가보다 항상 먼저 떠서 혜택가만 마커로 잡으면 가격·재고 모두 안전.
+# 과거 5_000ms 고정 대기 → 마커로 ~1.3s 조기 추출, 잡당 ~3.7s 절감(원가 무손실 검증됨).
+LOTTEON_MARKER_JS = r"""
+(() => {
+  try {
+    return /([\d,]+)\s*원\s*나의\s*혜택가/.test(document.body?.innerText || '')
+  } catch (_) { return false }
+})()
+"""
+
+
 # LOTTEON 핸들러 등록 — 본 파일 내부 상수 사용.
 SITE_HANDLERS["LOTTEON"] = SiteHandler(
     site="LOTTEON",
@@ -412,8 +425,11 @@ SITE_HANDLERS["LOTTEON"] = SiteHandler(
     login_url=LOTTEON_LOGIN_URL,
     home_url=LOTTEON_HOME_URL,
     login_selectors=LOTTEON_LOGIN_SELECTORS,
-    pre_extract_wait_ms=5_000,
-    pre_extract_marker_js="",
+    # 마커 hit 후 300ms 안정화. 혜택가 없는 상품은 marker_timeout(5s)까지 폴링 후
+    # 추출 — 기존 5초 고정과 동일 floor라 회귀 없음.
+    pre_extract_wait_ms=200,
+    pre_extract_marker_js=LOTTEON_MARKER_JS,
+    pre_extract_marker_timeout_ms=5_000,
     extract_retry_field="best_benefit_price",
 )
 
@@ -1766,7 +1782,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--poll-interval",
         type=float,
-        default=float(os.environ.get("DAEMON_POLL_INTERVAL", "1.5")),
+        default=float(os.environ.get("DAEMON_POLL_INTERVAL", "1.0")),
     )
     p.add_argument(
         "--max-consecutive-fail",

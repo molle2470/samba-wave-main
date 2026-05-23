@@ -248,15 +248,29 @@ _SSG_EXTRACT_JS = r"""
     const originalPrice = norprc || sellprc || salePrice
     const cost = domCardPrice || bestAmt || salePrice
 
+    // 옵션별 실재고: resultItemObj.uitemObjList.usablInvQty 1순위 (확장앱
+    // background-sourcing.js:2833 과 동일). 백엔드 ssg.py 가 uitemOptions 키로
+    // 실재고 보정. uitemObjList 없을 때만 DOM li 폴백(품절 여부만).
     const options = []
+    const uitemOptions = []
     try {
-      const optEls = document.querySelectorAll('.cdtl_opt_list li, [class*="option"] li')
-      optEls.forEach((el) => {
-        const nm = (el.textContent || '').trim().replace(/\s+/g, ' ')
+      const ul = Array.isArray(obj.uitemObjList) ? obj.uitemObjList : []
+      ul.forEach((u) => {
+        const nm = [u.uitemOptnNm1, u.uitemOptnNm2, u.uitemOptnNm3].filter(Boolean).join('/')
+          || u.optnDisplayNm || u.optnNm || u.uitemNm || ''
         if (!nm) return
-        const soldOut = /품절/.test(nm) || el.classList.contains('disabled')
-        options.push({ name: nm.slice(0, 60), stock: soldOut ? 0 : null, isSoldOut: soldOut })
+        const qty = parseInt(u.usablInvQty) || 0
+        uitemOptions.push({ name: nm, usablInvQty: qty, isSoldOut: qty === 0 })
+        options.push({ name: nm, stock: qty, isSoldOut: qty === 0 })
       })
+      if (!options.length) {
+        document.querySelectorAll('.cdtl_opt_list li, [class*="option"] li').forEach((el) => {
+          const nm = (el.textContent || '').trim().replace(/\s+/g, ' ')
+          if (!nm) return
+          const soldOut = /품절/.test(nm) || el.classList.contains('disabled')
+          options.push({ name: nm.slice(0, 60), stock: soldOut ? 0 : null, isSoldOut: soldOut })
+        })
+      }
     } catch (_) {}
 
     const images = []
@@ -279,6 +293,7 @@ _SSG_EXTRACT_JS = r"""
       domSalePrice,
       images,
       options,
+      uitemOptions,
       source_site: 'SSG',
     }
   } catch (e) {
@@ -298,8 +313,10 @@ SITE_HANDLERS: dict[str, SiteHandler] = {
         login_selectors=ABCMART_LOGIN_SELECTORS,
         login_check_js=ABCMART_LOGIN_CHECK_JS,
         pre_extract_marker_js=_ABCMART_MARKER_JS,
-        pre_extract_marker_timeout_ms=10_000,
-        pre_extract_wait_ms=300,
+        # 실측(2026-05-24, 10상품): "최대 혜택가" 텍스트 최대 1.64s 등장.
+        # timeout 6s = floor 대비 넉넉. 혜택가 없는 상품은 timeout 후 API 폴백(_apiBenefit).
+        pre_extract_marker_timeout_ms=6_000,
+        pre_extract_wait_ms=200,
     ),
     "GrandStage": SiteHandler(
         site="GrandStage",
@@ -310,8 +327,8 @@ SITE_HANDLERS: dict[str, SiteHandler] = {
         login_selectors=ABCMART_LOGIN_SELECTORS,
         login_check_js=ABCMART_LOGIN_CHECK_JS,
         pre_extract_marker_js=_ABCMART_MARKER_JS,
-        pre_extract_marker_timeout_ms=10_000,
-        pre_extract_wait_ms=300,
+        pre_extract_marker_timeout_ms=6_000,
+        pre_extract_wait_ms=200,
     ),
     "SSG": SiteHandler(
         site="SSG",
@@ -319,7 +336,9 @@ SITE_HANDLERS: dict[str, SiteHandler] = {
         requires_login=False,
         dialog_policy="accept",
         pre_extract_marker_js=_SSG_MARKER_JS,
-        pre_extract_marker_timeout_ms=15_000,
-        pre_extract_wait_ms=300,
+        # 실측(2026-05-24, 10상품): itemNm·uitemObjList 동시 생성, 최대 1.30s.
+        # 마커(itemNm)가 곧 재고 준비 시점 → 정확성 안전. timeout 6s 넉넉.
+        pre_extract_marker_timeout_ms=6_000,
+        pre_extract_wait_ms=200,
     ),
 }
