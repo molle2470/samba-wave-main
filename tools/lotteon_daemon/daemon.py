@@ -121,6 +121,60 @@ def _register_run_key(exe_path: Path) -> None:
         logger_print(f"Run 키 등록 실패(무시): {exc}")
 
 
+_DAEMON_UPDATE_URL = (
+    "https://github.com/sbk0674-web/samba-wave/releases/latest/download/"
+    "lotteon-daemon-setup.exe"
+)
+
+
+def _perform_self_update() -> bool:
+    """신버전 exe 다운로드 → swap 배치 생성·실행 → True 면 supervisor 종료(배치가 재시작).
+
+    frozen exe 는 실행 중 자기 교체 불가(Windows 파일 잠금) → 배치가 데몬 종료를 기다린 뒤
+    move 후 재시작한다. 키는 install_dir/api_key.txt 캐시 재사용(재발급·재설치 불필요).
+    """
+    if not _is_frozen() or os.name != "nt":
+        return False  # 개발 모드/비윈도우는 자동교체 미지원
+    import urllib.request
+
+    install_dir = _install_dir()
+    exe_path = install_dir / "daemon.exe"
+    new_path = install_dir / "daemon.exe.new"
+    try:
+        logger_print(f"자동 업데이트: 새 exe 다운로드 {_DAEMON_UPDATE_URL}")
+        urllib.request.urlretrieve(_DAEMON_UPDATE_URL, str(new_path))
+    except Exception as exc:
+        logger_print(f"자동 업데이트 다운로드 실패(무시): {exc}")
+        return False
+    # 원래 args 보존(--worker 제외). install-token(_it-)은 파일명에만 있고 캐시 키 우선이라 무관.
+    _args = " ".join(f'"{a}"' for a in sys.argv[1:] if a != "--worker")
+    bat = install_dir / "_self_update.bat"
+    bat_content = (
+        "@echo off\r\n"
+        ":wait\r\n"
+        'tasklist /FI "IMAGENAME eq daemon.exe" 2>nul | find /I "daemon.exe" >nul '
+        "&& (timeout /t 1 >nul & goto wait)\r\n"
+        f'move /Y "{new_path}" "{exe_path}" >nul\r\n'
+        f'start "" "{exe_path}" {_args}\r\n'
+        'del "%~f0"\r\n'
+    )
+    try:
+        bat.write_text(bat_content, encoding="utf-8")
+        creationflags = (
+            (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
+            if os.name == "nt"
+            else 0
+        )
+        subprocess.Popen(
+            ["cmd", "/c", str(bat)], close_fds=True, creationflags=creationflags
+        )
+        logger_print("자동 업데이트 swap 배치 실행 — supervisor 종료(배치가 재시작)")
+        return True
+    except Exception as exc:
+        logger_print(f"swap 배치 실행 실패(무시): {exc}")
+        return False
+
+
 def _self_install_and_relaunch() -> None:
     """현재 .exe 를 %APPDATA%\\samba-autotune-daemon\\daemon.exe 로 복사 후
     그 위치에서 detach 실행. 본 프로세스는 즉시 종료(`os._exit`).
@@ -1624,6 +1678,14 @@ def _supervisor_loop() -> int:
         if rc == 0:
             logger_print("supervisor: worker 정상 종료 — supervisor 도 종료")
             return 0
+        if rc == 10:
+            # 신버전 감지 → 자동 업데이트(새 exe 다운 + swap 배치). 성공 시 supervisor 종료
+            # (배치가 데몬 종료 대기 후 교체·재시작). 실패 시 구버전으로 계속 재시작.
+            logger_print("supervisor: 신버전 감지(rc=10) — 자동 업데이트 시도")
+            if _perform_self_update():
+                logger_print("supervisor: 자동 업데이트 위임 완료 — 종료")
+                return 0
+            logger_print("supervisor: 자동 업데이트 실패 — 구버전으로 계속")
         if duration >= HEALTHY_SECS:
             backoff = 5  # 정상 가동했으니 backoff 리셋
         else:
