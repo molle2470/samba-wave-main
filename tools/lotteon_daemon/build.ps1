@@ -48,6 +48,7 @@ if (Test-Path 'build') { Remove-Item -Recurse -Force 'build' }
   --collect-all PIL `
   --hidden-import asyncio `
   --hidden-import pystray._win32 `
+  --hidden-import site_handlers `
   daemon.py
 
 Write-Step "Build done"

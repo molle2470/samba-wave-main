@@ -39,10 +39,12 @@ class SiteHandler:
 
 ABCMART_LOGIN_URL = "https://abcmart.a-rt.com/login"
 ABCMART_HOME_URL = "https://abcmart.a-rt.com"
+# 실 페이지 검증 결과(2026-05-23) — `#username`/`#password`/`#login` (id 버튼).
+# 버튼은 type=button 으로 form submit 아님. click() 시 abc.login.* JS 핸들러 호출.
 ABCMART_LOGIN_SELECTORS = {
-    "id": ["#loginId", 'input[name="loginId"]', 'input[name="userId"]'],
-    "pw": ["#loginPw", 'input[name="loginPw"]', 'input[type="password"]'],
-    "btn": ['button[type="submit"]', ".btn-login", "#btnLogin"],
+    "id": ["#username", 'input[name="username"]'],
+    "pw": ["#password", 'input[name="password"]'],
+    "btn": ["#login", 'input[type="button"][value*="로그인"]'],
 }
 
 # ABCmart 로그인 체크 JS — 헤더 텍스트 기반.
