@@ -434,6 +434,31 @@ def _default_device_id() -> str:
 # ====================================================================
 
 
+async def _exchange_install_token(
+    client: httpx.AsyncClient, backend_url: str, token: str, device_id: str
+) -> str:
+    """install-token → long-lived 테넌트 키 교환. 실패 시 빈 문자열.
+
+    다운로드 시 파일명에 박힌 1시간 만료 install-token 을 첫 실행 때 1회 교환.
+    토큰이 install-token 이 아니거나(이미 long-lived) 만료면 403 → 빈 문자열 반환.
+    """
+    try:
+        r = await client.post(
+            f"{backend_url}/api/v1/samba/extension-keys/exchange",
+            headers={"X-Api-Key": token},
+            json={"device_id": device_id, "label": f"데몬 {device_id}"},
+            timeout=20.0,
+        )
+        if r.status_code == 200:
+            return (r.json() or {}).get("key", "") or ""
+        logger.info(
+            "install-token 교환 불가 status=%s (long-lived 키로 간주)", r.status_code
+        )
+    except Exception as exc:
+        logger.warning("install-token 교환 호출 실패: %s", exc)
+    return ""
+
+
 async def bootstrap_api_key(
     client: httpx.AsyncClient,
     backend_url: str,
@@ -441,26 +466,36 @@ async def bootstrap_api_key(
     cache_path: Path,
     injected_key: str = "",
 ) -> str:
-    """API key 결정. 우선순위: 주입 키 > 캐시 > /extension-key 발급.
+    """API key 결정. 우선순위: 캐시(long-lived) > 주입 키 교환/사용 > 글로벌 발급(레거시).
 
-    injected_key(--api-key/DAEMON_API_KEY): cannonfort 테넌트 키 직접 주입.
-    주입 시 캐시도 갱신해 다음 실행 일관성 유지(옛 글로벌 키 evict).
-    글로벌 키 발급은 login-credential 403 으로 막혀 더 이상 유효하지 않으므로,
-    운영 시 반드시 테넌트 키를 주입해야 한다.
+    injected_key(--api-key/DAEMON_API_KEY, 파일명 apikey=): 다운로드 시 박힌 install-token.
+    첫 실행 시 /extension-keys/exchange 로 long-lived 키와 교환 후 캐시에 저장.
+    교환 실패(이미 long-lived 거나 무효)면 주입 키를 그대로 사용.
+    재실행 시엔 캐시된 long-lived 키 우선 — install-token 은 일회용이라 재교환 불가.
     """
-    if injected_key:
-        logger.info("주입된 API key 사용 (extension-key 발급 생략) — 캐시 갱신")
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_text(injected_key, encoding="utf-8")
-        except Exception as exc:
-            logger.debug("API key 캐시 저장 실패(무시): %s", exc)
-        return injected_key
+    # 1. 캐시된 long-lived 키 우선 (재실행 — install-token 은 이미 교환·폐기됨)
     if cache_path.exists():
         cached = cache_path.read_text(encoding="utf-8").strip()
         if cached:
             logger.info("API key 캐시 사용: %s", cache_path)
             return cached
+    # 2. 주입 키(install-token) → 첫 실행 1회 교환
+    if injected_key:
+        exchanged = await _exchange_install_token(
+            client, backend_url, injected_key, device_id
+        )
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            if exchanged:
+                logger.info("install-token → long-lived 키 교환 성공 — 캐시 저장")
+                cache_path.write_text(exchanged, encoding="utf-8")
+                return exchanged
+            # 교환 실패 → 주입 키 자체가 long-lived 일 수 있음
+            logger.info("주입 키를 long-lived 로 간주하고 사용 — 캐시 저장")
+            cache_path.write_text(injected_key, encoding="utf-8")
+        except Exception as exc:
+            logger.debug("API key 캐시 저장 실패(무시): %s", exc)
+        return injected_key
     logger.info("API key 발급 요청 → /proxy/extension-key")
     r = await client.post(
         f"{backend_url}/api/v1/samba/sourcing-accounts/extension-key",

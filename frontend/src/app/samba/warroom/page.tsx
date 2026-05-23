@@ -293,8 +293,35 @@ const getOrCreateAutotuneDaemonDeviceId = (): string => {
 // 데몬 .exe 다운로드 URL — GitHub Release 직접. 본 메인 backend/CDN 트래픽 0.
 // cross-origin 이라 a.download 무시되지만, 데몬은 hostname 으로 device_id 자동 생성 →
 // 파일명에 정보 박을 필요 없음. backend URL 도 데몬 default 디폴트(env / argv 로 오버라이드 가능).
-const AUTOTUNE_DAEMON_DOWNLOAD_URL =
-  'https://github.com/sbk0674-web/samba-wave/releases/latest/download/autotune-daemon-setup.exe'
+// 데몬 설치 exe 다운로드 — 백엔드 프록시(JWT) 경유. 백엔드가 로그인 사용자 테넌트로
+// 1시간 만료 install-token 을 발급해 exe 파일명에 박아 내려준다. 데몬은 첫 실행 시
+// 파일명에서 토큰을 추출해 long-lived 키와 교환 → 사용자는 "다운로드 → 실행"만 하면 됨.
+// (기존 GitHub 직접 링크는 cross-origin 이라 파일명에 키를 못 박아 수동 키 주입이 필요했음)
+async function downloadDaemonInstaller(did: string): Promise<boolean> {
+  try {
+    const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.samba-wave.co.kr'
+    const { fetchWithAuth } = await import('@/lib/samba/legacy')
+    const res = await fetchWithAuth(
+      `${apiBase}/api/v1/samba/extension-keys/daemon-installer?device_id=${encodeURIComponent(did)}`,
+    )
+    if (!res.ok) return false
+    const blob = await res.blob()
+    const cd = res.headers.get('Content-Disposition') || ''
+    const m = cd.match(/filename="(.+?)"/)
+    const fname = m?.[1] || 'autotune-daemon-setup.exe'
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = fname
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    setTimeout(() => URL.revokeObjectURL(url), 10_000)
+    return true
+  } catch {
+    return false
+  }
+}
 
 export default function WarroomPage() {
   useEffect(() => { document.title = 'SAMBA-오토튠' }, [])
@@ -326,11 +353,7 @@ export default function WarroomPage() {
           try { alreadyDownloaded = window.localStorage.getItem('samba.autotune.daemon.downloadedOnce') === '1' } catch {}
           if (alreadyDownloaded) return
           try { window.localStorage.setItem('samba.autotune.daemon.downloadedOnce', '1') } catch {}
-          const a = document.createElement('a')
-          a.href = AUTOTUNE_DAEMON_DOWNLOAD_URL
-          document.body.appendChild(a)
-          a.click()
-          document.body.removeChild(a)
+          await downloadDaemonInstaller(did)
         }
       } catch { /* ignore */ }
     }
@@ -835,13 +858,7 @@ export default function WarroomPage() {
             </span>
           </div>
           <button
-            onClick={() => {
-              const a = document.createElement('a')
-              a.href = AUTOTUNE_DAEMON_DOWNLOAD_URL
-              document.body.appendChild(a)
-              a.click()
-              document.body.removeChild(a)
-            }}
+            onClick={() => { downloadDaemonInstaller(getOrCreateAutotuneDaemonDeviceId()) }}
             style={{
               padding: '0.4rem 0.8rem',
               background: '#FF6B6B',

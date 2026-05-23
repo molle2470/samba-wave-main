@@ -82,6 +82,53 @@ export default function SambaLayout({
     return attachDeviceIdListener();
   }, []);
 
+  // 확장앱 키 자동 발급 — content script 가 API_KEY_STATUS(hasKey)를 보내면,
+  // 로그인 상태 + 키 없음일 때만 테넌트 키를 자동 발급해 확장앱에 주입(SAMBA_SET_API_KEY).
+  // 사용자가 /extension-link 버튼을 누를 필요 없이 로그인만 하면 확장앱이 동작한다.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    let issued = false;
+    let issuing = false;
+    const handler = async (e: MessageEvent) => {
+      if (e.source !== window) return;
+      const msg = e.data as { source?: string; type?: string; hasKey?: boolean };
+      if (!msg || typeof msg !== "object") return;
+      if (msg.source !== "samba-extension" || msg.type !== "API_KEY_STATUS") return;
+      if (msg.hasKey || issued || issuing) return;
+      issuing = true;
+      try {
+        const { SAMBA_PREFIX, fetchWithAuth } = await import("@/lib/samba/legacy");
+        const { getAccessToken } = await import("@/lib/api");
+        if (!getAccessToken()) return; // 미로그인 — 발급 불가
+        const { getDeviceId } = await import("@/lib/samba/deviceId");
+        const did = getDeviceId();
+        const headers: Record<string, string> = { "Content-Type": "application/json" };
+        if (did) headers["X-Device-Id"] = did;
+        const res = await fetchWithAuth(`${SAMBA_PREFIX}/extension-keys`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            label: `자동발급 ${new Date().toLocaleDateString("ko-KR")}`,
+          }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          issued = true;
+          window.postMessage(
+            { source: "samba-page", type: "SAMBA_SET_API_KEY", apiKey: data.key },
+            window.location.origin,
+          );
+        }
+      } catch {
+        /* 발급 실패 — 다음 API_KEY_STATUS 에서 재시도 */
+      } finally {
+        issuing = false;
+      }
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  }, []);
+
   // 글로벌 취소요청 폴링 — 주문 페이지 닫혀있어도 동작.
   // 알람 설정(주기/영업시간)을 따르되, 0→>0 으로 변하는 순간만 빨간 모달 강제 노출.
   // 카운트가 1 이상이면 사이드바 "주문" 메뉴 옆에 빨간 뱃지 항시 표시.

@@ -43,9 +43,9 @@ _EXEMPT_PREFIXES = (
     "/api/v1/samba/proxy/autotune-daemon/",  # 데몬 health/version — 인증無 (오토튠 페이지 + 데몬 부트스트랩)
 )
 
-# 테넌트 키 캐시: key_hash → (tenant_id, cached_until_monotonic)
+# 테넌트 키 캐시: key_hash → (tenant_id, is_install_token, cached_until_monotonic)
 # tenant_id = None 은 테넌트 미설정 키 (사용자 발급 후 JWT 에 tid 없는 경우)
-_KEY_CACHE: dict[str, tuple[Optional[str], float]] = {}
+_KEY_CACHE: dict[str, tuple[Optional[str], bool, float]] = {}
 _KEY_CACHE_TTL = 60.0  # 1분
 
 
@@ -53,14 +53,18 @@ def _hash_key(raw: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-async def _lookup_tenant_key(key_hash: str) -> tuple[bool, Optional[str]]:
-    """DB 에서 테넌트 키 조회. (found, tenant_id) 반환. 1분 캐시."""
+async def _lookup_tenant_key(key_hash: str) -> tuple[bool, Optional[str], bool]:
+    """DB 에서 테넌트 키 조회. (found, tenant_id, is_install_token) 반환. 1분 캐시.
+
+    install-token(데몬 다운로드용 1시간 단기 토큰)은 만료 전이어도 exchange
+    엔드포인트에서만 통과시킨다(dispatch 에서 경로 확인). 만료/revoke 된 키는 미발견 처리.
+    """
     now = time.monotonic()
     cached = _KEY_CACHE.get(key_hash)
     if cached is not None:
-        tenant_id, expires = cached
+        tenant_id, is_install, expires = cached
         if now < expires:
-            return True, tenant_id
+            return True, tenant_id, is_install
 
     try:
         from backend.db.orm import get_read_session
@@ -68,8 +72,9 @@ async def _lookup_tenant_key(key_hash: str) -> tuple[bool, Optional[str]]:
         async with get_read_session() as session:
             result = await session.execute(
                 text(
-                    "SELECT tenant_id FROM samba_extension_key "
+                    "SELECT tenant_id, is_install_token FROM samba_extension_key "
                     "WHERE key_hash = :kh AND revoked_at IS NULL "
+                    "AND (expires_at IS NULL OR expires_at > now()) "
                     "LIMIT 1"
                 ),
                 {"kh": key_hash},
@@ -78,13 +83,14 @@ async def _lookup_tenant_key(key_hash: str) -> tuple[bool, Optional[str]]:
 
         if row is not None:
             tenant_id = row[0]
-            _KEY_CACHE[key_hash] = (tenant_id, now + _KEY_CACHE_TTL)
-            return True, tenant_id
+            is_install = bool(row[1])
+            _KEY_CACHE[key_hash] = (tenant_id, is_install, now + _KEY_CACHE_TTL)
+            return True, tenant_id, is_install
 
-        return False, None
+        return False, None, False
     except Exception as exc:
         logger.warning("[api-gateway] 테넌트 키 조회 실패: %s", exc)
-        return False, None
+        return False, None, False
 
 
 class ApiGatewayMiddleware(BaseHTTPMiddleware):
@@ -120,8 +126,20 @@ class ApiGatewayMiddleware(BaseHTTPMiddleware):
         # 1단계: 테넌트 키 체크 (DB 조회, 1분 캐시)
         if request_key:
             key_hash = _hash_key(request_key)
-            found, tenant_id = await _lookup_tenant_key(key_hash)
+            found, tenant_id, is_install = await _lookup_tenant_key(key_hash)
             if found:
+                # install-token 은 exchange 엔드포인트에서만 통과 — 일반 API 거부.
+                if is_install and not request.url.path.endswith("/exchange"):
+                    logger.warning(
+                        "[api-gateway] install-token 일반 API 차단: %s",
+                        request.url.path,
+                    )
+                    return JSONResponse(
+                        status_code=403,
+                        content={
+                            "detail": "install-token 은 키 교환에만 사용 가능합니다."
+                        },
+                    )
                 request.state.tenant_id = tenant_id
                 return await call_next(request)
 

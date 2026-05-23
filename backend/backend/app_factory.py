@@ -61,6 +61,7 @@ from backend.api.v1.routers.samba.sourcing_recipe import (
 from backend.api.v1.routers.samba.store_care import router as samba_store_care_router
 from backend.api.v1.routers.samba.tetris import router as samba_tetris_router
 from backend.api.v1.routers.samba.extension_key import (
+    public_router as samba_extension_key_public_router,
     router as samba_extension_key_router,
 )
 from backend.api.v1.routers.samba.tenant import router as samba_tenant_router
@@ -214,6 +215,8 @@ def create_application() -> FastAPI:
     app.include_router(
         samba_extension_key_router, prefix="/api/v1/samba", dependencies=samba_auth
     )
+    # install-token 교환 — JWT 면제(install-token 자체 인증). 데몬 부트스트랩용.
+    app.include_router(samba_extension_key_public_router, prefix="/api/v1/samba")
     app.include_router(
         samba_job_router, prefix="/api/v1/samba", dependencies=samba_auth
     )
