@@ -1750,12 +1750,11 @@ class SSGClient:
         or_ord_no = str(raw.get("orordNo", "") or "")
         item_id_str = str(raw.get("itemId", "") or "")
         # 미등록 주문에 부정확한 사진이 매칭되던 문제로 product_image 자동 합성 제거.
-        # 판매링크(source_url)는 itemId만으로 SSG 상품 페이지 진입 가능하므로 채워줌.
-        source_url = (
-            f"https://www.ssg.com/item/itemView.ssg?itemId={item_id_str}"
-            if item_id_str
-            else ""
-        )
+        # source_url(소싱처 원문)에는 SSG 판매페이지를 넣지 않는다. itemView.ssg?itemId=
+        # 는 신세계몰 '판매' 리스팅이지 소싱처 원문이 아니므로, 화면 소싱처 배지/원문링크/
+        # 원주문링크가 실제 소싱처(예: ABCmart)를 SSG로 오인하게 만든다. 판매링크는 프론트
+        # handleMarketLink가 product_id로 따로 생성하므로 source_url 불필요.
+        source_url = ""
         return {
             "order_number": ord_no,
             # 형식: "|ordItemSeq" (shppNo 없음, 취소신청에는 배송번호 불필요; orordNo는 order_number에 존재)
@@ -2071,12 +2070,11 @@ class SSGClient:
 
         item_id_str = str(raw.get("itemId", "") or "")
         # 미등록 주문에 부정확한 사진이 매칭되던 문제로 product_image 자동 합성 제거.
-        # 판매링크(source_url)만 itemId 기반으로 채워 SSG 상품 페이지로 이동 가능하게 함.
-        source_url = (
-            f"https://www.ssg.com/item/itemView.ssg?itemId={item_id_str}"
-            if item_id_str
-            else ""
-        )
+        # source_url(소싱처 원문)에는 SSG 판매페이지를 넣지 않는다. itemView.ssg?itemId=
+        # 는 신세계몰 '판매' 리스팅이지 소싱처 원문이 아니므로, 화면 소싱처 배지/원문링크/
+        # 원주문링크가 실제 소싱처(예: ABCmart)를 SSG로 오인하게 만든다. 판매링크는 프론트
+        # handleMarketLink가 product_id로 따로 생성하므로 source_url 불필요.
+        source_url = ""
 
         item_nm = str(raw.get("itemNm", "") or "")
         raw_keys = list(raw.keys())

@@ -9,18 +9,9 @@ import { showAlert } from '@/components/samba/Modal'
 
 export function useOrderLinks(accounts: SambaMarketAccount[]) {
   const handleSourceLink = async (o: SambaOrder) => {
-    const srcUrl = String(o.source_url || '')
-    // SSG 마켓(신세계몰) 주문은 백엔드 파서가 source_url에 '판매페이지'(우리 리스팅)를
-    // itemView.ssg?itemId={판매 itemId} 형식으로 박는다(proxy/ssg.py). 이는 소싱처 원문이
-    // 아니므로 원문링크로 신뢰하면 안 됨 → 수집상품 역추적으로 진짜 소싱 source_url을 사용한다.
-    // 파서가 itemId를 product_id와 동일하게 생성하므로 둘이 같으면 판매페이지로 판정.
-    const ssgSaleItemId = srcUrl.match(
-      /ssg\.com\/item\/itemView\.ssg\?itemId=([^&]+)/i
-    )?.[1]
-    const isSsgSaleUrl = !!ssgSaleItemId && ssgSaleItemId === (o.product_id || '')
-    // 1. source_url 우선 (구 LotteON productDetail.lotte 무효, SSG 판매페이지 제외 — API 역추적으로 fallback)
-    if (srcUrl && !srcUrl.includes('productDetail.lotte') && !isSsgSaleUrl) {
-      window.open(srcUrl, '_blank')
+    // 1. source_url 우선 (구 LotteON productDetail.lotte 형식은 무효 — API 역추적으로 fallback)
+    if (o.source_url && !o.source_url.includes('productDetail.lotte')) {
+      window.open(o.source_url, '_blank')
       return
     }
     // 2. product_id가 URL이면 직접 열기
