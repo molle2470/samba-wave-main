@@ -9,8 +9,15 @@ import { showAlert } from '@/components/samba/Modal'
 
 export function useOrderLinks(accounts: SambaMarketAccount[]) {
   const handleSourceLink = async (o: SambaOrder) => {
-    // 1. source_url 우선 (구 LotteON productDetail.lotte 형식은 무효 — API 역추적으로 fallback)
-    if (o.source_url && !o.source_url.includes('productDetail.lotte')) {
+    // 1. source_url 우선
+    // 단, 판매채널과 동일 사이트 URL이면 소싱처 링크가 아님 → step 3으로 fallback
+    // - productDetail.lotte: 구 LotteON 형식, API 역추적 필요
+    // - ssg.com/item/itemView.ssg: SSG 주문의 경우 판매 URL과 동일 → 소싱처 아님
+    const _accMarket = accounts.find(a => a.id === o.channel_id)?.market_type || ''
+    const _isSelfChannelUrl =
+      o.source_url?.includes('productDetail.lotte') ||
+      (_accMarket === 'ssg' && o.source_url?.includes('ssg.com/item/itemView.ssg'))
+    if (o.source_url && !_isSelfChannelUrl) {
       window.open(o.source_url, '_blank')
       return
     }

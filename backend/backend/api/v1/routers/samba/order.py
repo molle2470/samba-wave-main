@@ -5820,13 +5820,18 @@ async def sync_orders_from_markets(
                                 order_data["collected_product_id"] = _cp_row[0]
                             if _can_override_source_site_from_sourcing(order_data):
                                 order_data["source_site"] = _cp_row[1]
-                            # cp.source_url 우선, 없으면 sourcing_urls 템플릿 fallback
-                            order_data["source_url"] = (
-                                _cp_source_url
-                                or _sourcing_urls.get(_cp_row[1], "").format(
+                            # cp.source_url 우선, 없으면 sourcing_urls 템플릿 fallback.
+                            # 판매채널과 소싱채널이 같으면 순환링크 → 빈 문자열 (예: SSG 주문 + SSG 소싱).
+                            _order_src = order_data.get("source", "").lower()
+                            _src_site_lower = (_cp_row[1] or "").lower()
+                            _tmpl_url = (
+                                ""
+                                if _src_site_lower == _order_src
+                                else _sourcing_urls.get(_cp_row[1], "").format(
                                     _matched_spid
                                 )
                             )
+                            order_data["source_url"] = _cp_source_url or _tmpl_url
                             if (
                                 not order_data.get("product_image")
                                 and _cp_row[2]
