@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Column, DateTime, Index, String, Text
+from sqlalchemy import Boolean, Column, DateTime, Index, String, Text
 from sqlmodel import Field, SQLModel
 
 UTC = timezone.utc
@@ -50,4 +50,11 @@ class SambaExtensionKey(SQLModel, table=True):
     # 2026-05-20 추가 — 누락 시 _is_mine 매핑 실패로 "오토튠 정지" 오표시.
     device_id: Optional[str] = Field(
         default=None, sa_column=Column(String(80), nullable=True, index=True)
+    )
+    # install-token 여부 (2026-05-23) — 데몬 다운로드 시 발급하는 1시간 만료 단기 토큰.
+    # 데몬 첫 실행 시 /extension-keys/exchange 로 long-lived 키와 교환 후 즉시 revoke.
+    # is_install_token=True 인 키는 api_gateway 일반 인증에서 거부, exchange 전용.
+    is_install_token: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default="false"),
     )

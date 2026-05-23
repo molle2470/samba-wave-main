@@ -418,8 +418,14 @@ def _extract_backend_from_argv_or_exename() -> str | None:
 
 
 def _default_device_id() -> str:
-    host = socket.gethostname() or "unknown"
-    sanitized = re.sub(r"[^a-zA-Z0-9-]", "-", host).strip("-").lower() or "unknown"
+    host = socket.gethostname() or ""
+    sanitized = re.sub(r"[^a-zA-Z0-9-]", "-", host).strip("-").lower()
+    if not sanitized or sanitized == "unknown":
+        # hostname 추출 실패(빈값/한글전용/특수문자) → MAC 기반 고유 ID 폴백.
+        # "samba-daemon-unknown" 으로 여러 PC 데몬이 충돌하던 문제 방지.
+        import uuid as _uuid
+
+        sanitized = format(_uuid.getnode(), "012x")
     return f"samba-daemon-{sanitized}"
 
 
@@ -433,8 +439,23 @@ async def bootstrap_api_key(
     backend_url: str,
     device_id: str,
     cache_path: Path,
+    injected_key: str = "",
 ) -> str:
-    """`/proxy/extension-key` 호출하여 API key 발급. 캐시 파일 우선."""
+    """API key 결정. 우선순위: 주입 키 > 캐시 > /extension-key 발급.
+
+    injected_key(--api-key/DAEMON_API_KEY): cannonfort 테넌트 키 직접 주입.
+    주입 시 캐시도 갱신해 다음 실행 일관성 유지(옛 글로벌 키 evict).
+    글로벌 키 발급은 login-credential 403 으로 막혀 더 이상 유효하지 않으므로,
+    운영 시 반드시 테넌트 키를 주입해야 한다.
+    """
+    if injected_key:
+        logger.info("주입된 API key 사용 (extension-key 발급 생략) — 캐시 갱신")
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(injected_key, encoding="utf-8")
+        except Exception as exc:
+            logger.debug("API key 캐시 저장 실패(무시): %s", exc)
+        return injected_key
     if cache_path.exists():
         cached = cache_path.read_text(encoding="utf-8").strip()
         if cached:
@@ -1017,10 +1038,14 @@ async def run_daemon(args: argparse.Namespace) -> int:
         if await _check_and_self_update(http_client, backend_url):
             return 10  # exit=10 → run.ps1/Run 키 재시작이 신버전 다운로드 트리거
 
-        # API key 부트스트랩 (캐시 우선)
+        # API key 부트스트랩 (주입 키 > 캐시 > 발급)
         try:
             api_key = await bootstrap_api_key(
-                http_client, backend_url, args.device_id, api_key_path
+                http_client,
+                backend_url,
+                args.device_id,
+                api_key_path,
+                injected_key=getattr(args, "api_key", "") or "",
             )
         except Exception as exc:
             logger.error("API key 부트스트랩 실패: %s", exc)
@@ -1073,6 +1098,10 @@ async def run_daemon(args: argparse.Namespace) -> int:
                     logger.debug("storage_state 저장 실패(무시): %s", exc)
 
             # 시작 시 로그인 — requires_login 사이트 각각.
+            # 한 사이트 로그인 실패해도 전체 종료하지 않는다(예: ABCmart CAPTCHA).
+            # 실패 사이트만 active 목록에서 제외하고 나머지로 계속 — LOTTEON/SSG 가
+            # ABCmart 하나 때문에 같이 죽던 무한 재시작 루프 방지.
+            _failed_login: list[str] = []
             for _site in login_sites:
                 if not await ensure_logged_in_for_site(
                     page,
@@ -1082,13 +1111,27 @@ async def run_daemon(args: argparse.Namespace) -> int:
                     api_key,
                     SITE_HANDLERS[_site],
                 ):
-                    logger.error(
-                        "%s 초기 로그인 실패 — 종료 (supervisor 재기동 유도)",
+                    logger.warning(
+                        "%s 초기 로그인 실패 — 이 사이트만 제외하고 나머지로 계속",
                         _site,
+                    )
+                    _failed_login.append(_site)
+            if _failed_login:
+                active_sites = [s for s in active_sites if s not in _failed_login]
+                login_sites = [s for s in login_sites if s not in _failed_login]
+                allowed_sites_header = ",".join(active_sites)
+                if not active_sites:
+                    logger.error(
+                        "모든 사이트 로그인 실패 — 종료 (supervisor 재기동 유도)"
                     )
                     await context.close()
                     await browser.close()
                     return 3
+                logger.info(
+                    "로그인 실패 사이트 제외 후 계속: active=%s (실패=%s)",
+                    allowed_sites_header,
+                    ",".join(_failed_login),
+                )
             if login_sites:
                 await _save_storage_state()
 
@@ -1104,9 +1147,11 @@ async def run_daemon(args: argparse.Namespace) -> int:
                     return 1
 
                 # 로그인 만료 누적 시 재로그인 (requires_login 사이트 각각).
+                # 한 사이트 재로그인 실패해도 전체 종료하지 않고 그 사이트만 제외 —
+                # 나머지 사이트는 계속 처리(초기 로그인과 동일 정책).
                 if login_sites and state.consecutive_login_required >= 3:
                     logger.warning("login_required 3회 연속 — 재로그인 시도")
-                    _all_ok = True
+                    _relogin_failed: list[str] = []
                     for _site in login_sites:
                         if not await ensure_logged_in_for_site(
                             page,
@@ -1116,13 +1161,27 @@ async def run_daemon(args: argparse.Namespace) -> int:
                             api_key,
                             SITE_HANDLERS[_site],
                         ):
-                            logger.error("%s 재로그인 실패", _site)
-                            _all_ok = False
-                            break
-                    if not _all_ok:
-                        await context.close()
-                        await browser.close()
-                        return 4
+                            logger.warning("%s 재로그인 실패 — 이 사이트만 제외", _site)
+                            _relogin_failed.append(_site)
+                    if _relogin_failed:
+                        active_sites = [
+                            s for s in active_sites if s not in _relogin_failed
+                        ]
+                        login_sites = [
+                            s for s in login_sites if s not in _relogin_failed
+                        ]
+                        allowed_sites_header = ",".join(active_sites)
+                        if not active_sites:
+                            logger.error(
+                                "모든 사이트 재로그인 실패 — 종료 (supervisor 재기동)"
+                            )
+                            await context.close()
+                            await browser.close()
+                            return 4
+                        logger.info(
+                            "재로그인 실패 사이트 제외 후 계속: active=%s",
+                            allowed_sites_header,
+                        )
                     state.reset_login_required()
                     await _save_storage_state()
 
@@ -1331,6 +1390,23 @@ def _parse_args() -> argparse.Namespace:
             "백엔드 owner_device_ids 가 samba-daemon-* prefix 자동 허용."
         ),
     )
+    # api_key 우선순위:
+    # 1. URL/파일명/argv 의 apikey= (설치 트리거가 박은 값)
+    # 2. DAEMON_API_KEY 환경변수
+    # 3. (미주입) 캐시/글로벌 발급 폴백
+    _apikey_default = (
+        _extract_kv_from_argv_or_exename("apikey")
+        or os.environ.get("DAEMON_API_KEY")
+        or ""
+    )
+    p.add_argument(
+        "--api-key",
+        default=_apikey_default,
+        help=(
+            "cannonfort 테넌트 키 직접 주입. /samba/extension-link 에서 발급. "
+            "주입 시 글로벌 키 발급 생략. login-credential 테넌트 격리 통과에 필수."
+        ),
+    )
     p.add_argument(
         "--profile-dir",
         default=os.environ.get(
@@ -1477,6 +1553,84 @@ def _supervisor_loop() -> int:
         time.sleep(backoff)
 
 
+async def run_seed_session(args: argparse.Namespace) -> int:
+    """--seed-session: headed 브라우저를 띄워 사람이 직접 로그인 → storage_state 저장.
+
+    ABCmart 처럼 헤드리스 자동로그인이 CAPTCHA 로 막히는 사이트를 1회 수동 로그인해
+    세션 쿠키를 심어두면, 이후 헤드리스 데몬이 '세션 살아있음 — 자동로그인 스킵'으로
+    재사용한다. 쿠키 만료 시 다시 한 번 실행하면 된다.
+    """
+    profile_dir = Path(args.profile_dir)
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    storage_state_path = profile_dir / "storage_state.json"
+    raw_sites = (getattr(args, "sites", "") or "LOTTEON").strip()
+    active_sites = [
+        s.strip() for s in raw_sites.split(",") if s.strip() in SITE_HANDLERS
+    ]
+    login_sites = [s for s in active_sites if SITE_HANDLERS[s].requires_login]
+    if not login_sites:
+        logger.info("로그인 필요 사이트 없음 — 세션 시드 불필요")
+        return 0
+    logger.info("=== 세션 시드 모드 시작: %s ===", ",".join(login_sites))
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=False,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        )
+        context_kwargs: dict[str, Any] = {
+            "viewport": {"width": 1280, "height": 900},
+            "user_agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+        }
+        if storage_state_path.exists():
+            context_kwargs["storage_state"] = str(storage_state_path)
+        context: BrowserContext = await browser.new_context(**context_kwargs)
+        opened: list[tuple[str, Page]] = []
+        for _site in login_sites:
+            handler = SITE_HANDLERS[_site]
+            p = await context.new_page()
+            try:
+                await p.goto(
+                    handler.login_url or handler.home_url or "about:blank",
+                    wait_until="domcontentloaded",
+                    timeout=30_000,
+                )
+            except Exception as exc:
+                logger.warning("%s 페이지 로드 실패(무시): %s", _site, exc)
+            opened.append((_site, p))
+            logger.info("%s 로그인 창 열림 — 브라우저에서 직접 로그인하세요", _site)
+
+        logger.info("=== 각 창에서 로그인 완료까지 대기 (최대 5분, 30초마다 확인) ===")
+        for _ in range(10):
+            await asyncio.sleep(30)
+            states: list[bool] = []
+            for _site, p in opened:
+                handler = SITE_HANDLERS[_site]
+                if not handler.login_check_js:
+                    states.append(False)
+                    continue
+                try:
+                    r = await p.evaluate(handler.login_check_js)
+                    states.append(r == "logged_in")
+                except Exception:
+                    states.append(False)
+            if states and all(states):
+                logger.info("모든 사이트 로그인 확인 — 조기 저장")
+                break
+
+        await context.storage_state(path=str(storage_state_path))
+        logger.info("세션 저장 완료: %s", storage_state_path)
+        await context.close()
+        await browser.close()
+    logger.info(
+        "세션 시드 완료. 이제 일반(헤드리스) 모드로 실행하면 세션 재사용됩니다."
+    )
+    return 0
+
+
 def main() -> int:
     # 1. frozen 모드 + install dir 아닐 때 → self-install + 재시작 후 종료
     if _is_frozen() and not _running_from_install_dir():
@@ -1484,6 +1638,18 @@ def main() -> int:
         _self_install_and_relaunch()
         # _self_install_and_relaunch 가 os._exit(0) 호출하므로 이 라인 도달 X
         return 0
+
+    # 1.5. --seed-session: supervisor/worker 없이 headed 브라우저로 1회 수동 로그인
+    #      → storage_state 저장. ABCmart CAPTCHA 회피용 세션 시드.
+    if "--seed-session" in sys.argv:
+        _setup_logging()
+        sys.argv = [a for a in sys.argv if a not in ("--worker", "--seed-session")]
+        args = _parse_args()
+        try:
+            return asyncio.run(run_seed_session(args))
+        except KeyboardInterrupt:
+            logger.info("KeyboardInterrupt — 세션 시드 중단")
+            return 0
 
     # 2. --worker 인자 없으면 supervisor 모드 (자기를 --worker 로 spawn + watchdog)
     if "--worker" not in sys.argv:

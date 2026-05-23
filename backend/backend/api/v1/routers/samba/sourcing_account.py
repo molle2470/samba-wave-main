@@ -1140,12 +1140,24 @@ async def get_login_credential(
 
     _check_owner_device(request)
 
+    # 테넌트 격리 — 소싱처 자격증명(평문 ID/PW)은 본인 테넌트 것만 반환.
+    # 글로벌 키(tenant_id=None)로는 조회 불가(403). 글로벌 키는 어느 테넌트에도
+    # 속하지 않으므로 "첫 활성 default 계정"을 반환하면 남의 테넌트 비번이 유출됨.
+    # 테넌트 키(로그인 후 /samba/extension-link 발급)로만 조회 가능.
+    _tenant_id = getattr(request.state, "tenant_id", None)
+    if _tenant_id is None:
+        raise HTTPException(
+            403,
+            "글로벌 키로는 소싱처 자격증명을 조회할 수 없습니다. "
+            "삼바 로그인 후 /samba/extension-link 에서 테넌트 키를 발급받으세요.",
+        )
+
     account = None
 
-    # 1) account_id 우선 — 주문 매칭 계정으로 단건 조회
+    # 1) account_id 우선 — 주문 매칭 계정으로 단건 조회 (테넌트 일치 필수)
     if account_id:
         account = await session.get(SambaSourcingAccount, account_id)
-        if not account:
+        if not account or account.tenant_id != _tenant_id:
             raise HTTPException(
                 404,
                 f"계정을 찾을 수 없습니다: account_id={account_id}",
@@ -1178,6 +1190,7 @@ async def get_login_credential(
 
     stmt = (
         sa_select(SambaSourcingAccount)
+        .where(SambaSourcingAccount.tenant_id == _tenant_id)
         .where(SambaSourcingAccount.site_name.in_(site_candidates))
         .where(SambaSourcingAccount.is_active.is_(True))
         .where(SambaSourcingAccount.is_login_default.is_(True))
