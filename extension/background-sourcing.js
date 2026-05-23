@@ -1286,6 +1286,16 @@ async function _runLotteonPreLogin() {
 globalThis._setLocalAutotuneJoined = (joined, sourceSites = null) => {
   _localAutotuneJoined = !!joined
   _allowedSourceSites = joined ? sourceSites : null
+  // 폴링 헤더(X-Allowed-Sites)는 chrome.storage.allowedSites를 읽는다(background-core.js).
+  // JOIN 시 오토튠 선택 소싱처를 storage에도 반영 — 페이지→확장앱 SET_ALLOWED_SITES가
+  // content script 타이밍으로 누락돼도, 폴링이 stale 사이트 목록으로 백엔드 PC분담 등록을
+  // 덮어쓰지 않게 한다. (SSG 선택인데 확장앱 stale [MUSINSA]가 등록을 덮어 SSG가
+  // active_sites에서 탈락하던 flip-flop의 근본 원인 차단.)
+  if (joined && Array.isArray(sourceSites)) {
+    try {
+      chrome.storage.local.set({ allowedSites: sourceSites })
+    } catch (_) {}
+  }
   if (joined) {
     _sourcingForceStop = false
     _siteLoginConfirmed.clear()
