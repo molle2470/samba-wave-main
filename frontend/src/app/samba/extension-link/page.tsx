@@ -2,6 +2,7 @@
 
 import { useState } from 'react'
 import { SAMBA_PREFIX, fetchWithAuth } from '@/lib/samba/legacy'
+import { getDeviceId } from '@/lib/samba/deviceId'
 
 export default function ExtensionLinkPage() {
   const [status, setStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle')
@@ -10,9 +11,14 @@ export default function ExtensionLinkPage() {
   async function issueKey() {
     setStatus('loading')
     try {
+      // 확장앱 deviceId 동봉 — 백엔드가 키.device_id 컬럼에 저장해
+      // 오토튠 status "본인 PC 매칭"에 사용 (누락 시 device_id=None 으로 매칭 불가).
+      const deviceId = getDeviceId()
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+      if (deviceId) headers['X-Device-Id'] = deviceId
       const res = await fetchWithAuth(`${SAMBA_PREFIX}/extension-keys`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ label: `확장앱 ${new Date().toLocaleDateString('ko-KR')}` }),
       })
       if (!res.ok) {

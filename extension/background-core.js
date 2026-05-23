@@ -38,35 +38,18 @@
     }
   }
 
-  async function loadApiKey(proxyUrl) {
+  async function loadApiKey() {
+    // 테넌트 키 전용 — storage 에 저장된 키만 사용한다.
+    // 키는 삼바 웹페이지(/samba/extension-link)에서 로그인 후 발급받아
+    // SAMBA_SET_API_KEY 메시지로 주입된다. 글로벌 키 자동발급 경로는 제거됨
+    // (글로벌 키는 tenant 격리가 안 되고 owner-guard 로 막혀 무한 403 유발).
     const cached = await chrome.storage.local.get('apiKey')
-    if (cached.apiKey) return cached.apiKey
-
-    try {
-      const url = proxyUrl || DEFAULT_PROXY_URL
-      // X-Device-Id 동봉 — 백엔드 owner_device_ids 화이트리스트 가드 통과용.
-      // 포크 확장앱은 본인 deviceId 가 아니므로 403 받고 키 발급 차단됨.
-      const deviceId = await getOrCreateDeviceId()
-      const res = await fetch(`${url}/api/v1/samba/sourcing-accounts/extension-key`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Device-Id': deviceId,
-        },
-        body: JSON.stringify({}),
-      })
-      if (res.ok) {
-        const data = await res.json()
-        await chrome.storage.local.set({ apiKey: data.api_key })
-        return data.api_key
-      }
-    } catch {}
-    return ''
+    return cached.apiKey || ''
   }
 
   async function apiFetch(url, init = {}) {
     const proxyData = await chrome.storage.local.get(['proxyUrl', 'allowedSites'])
-    const apiKey = await loadApiKey(proxyData.proxyUrl)
+    const apiKey = await loadApiKey()
     const deviceId = await getOrCreateDeviceId()
     // 사이트 필터 (PC 분담) — chrome.storage.allowedSites:
     //   - undefined/null = 미설정(전체 처리, 디폴트) → 헤더 미부착
@@ -86,20 +69,15 @@
     }
     const res = await fetch(url, { ...init, headers })
     if (res.status === 403) {
-      await chrome.storage.local.remove('apiKey')
-      // 실제 요청 URL의 origin으로 키 재발급 (storage의 proxyUrl이 localhost일 수 있음)
-      const serverBase = new URL(url).origin
-      const newKey = await loadApiKey(serverBase)
-      const retryHeaders = {
-        ...(init.headers || {}),
-        'X-Api-Key': newKey,
-        'X-Device-Id': deviceId,
-        'X-Ext-Version': extVersion,
+      // 키가 무효/만료/revoke 됨. 글로벌 키 재발급 시도는 제거 —
+      // 글로벌 발급은 owner-guard 로 막혀 무한 403 루프를 만들었다.
+      // 사용자가 /samba/extension-link 에서 로그인 후 키를 재발급하면
+      // SAMBA_SET_API_KEY 메시지로 storage 가 갱신된다.
+      if (!apiKey) {
+        console.warn('[SAMBA] API 키 없음 — 삼바 로그인 후 /samba/extension-link 에서 키 발급 필요')
+      } else {
+        console.warn('[SAMBA] API 키 거부(403) — 키 만료/revoke 가능. /samba/extension-link 에서 재발급 필요')
       }
-      if (allowedSites !== null) {
-        retryHeaders['X-Allowed-Sites'] = allowedSites.join(',')
-      }
-      return fetch(url, { ...init, headers: retryHeaders })
     }
     return res
   }
