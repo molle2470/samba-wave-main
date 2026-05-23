@@ -142,6 +142,54 @@ class SSGPlugin(SourcingPlugin):
                 )
 
             if isinstance(_ext_result, dict) and _ext_result.get("success"):
+                # [데몬 분기] 헤드리스 데몬은 확장앱과 응답 형식이 다르다.
+                #   확장앱: html + resultItemObj (원본) 전송 → 아래 파싱 로직이 처리
+                #   데몬:   sale_price/best_benefit_price/domSalePrice (파싱 완료값) 전송, html·resultItemObj 없음
+                # ssg.py 가 확장앱 형식만 읽어 데몬 결과를 통째로 버리고 "파싱 실패"로
+                # 떨어지던 버그 수정 — 데몬 응답이면 파싱필드로 detail 직접 구성.
+                _daemon_sale = int(_ext_result.get("sale_price", 0) or 0)
+                _daemon_benefit = int(_ext_result.get("best_benefit_price", 0) or 0)
+                if (
+                    not _ext_result.get("html")
+                    and not _ext_result.get("resultItemObj")
+                    and (_daemon_sale > 0 or _daemon_benefit > 0)
+                ):
+                    _d_sale = (
+                        int(_ext_result.get("domSalePrice", 0) or 0)
+                        or _daemon_sale
+                        or _daemon_benefit
+                    )
+                    _d_card = int(_ext_result.get("domCardPrice", 0) or 0)
+                    _d_orig = int(_ext_result.get("original_price", 0) or 0) or _d_sale
+                    _d_opts = []
+                    for _o in _ext_result.get("options", []) or []:
+                        _nm = (_o.get("name") or "").strip()
+                        if not _nm:
+                            continue
+                        _so = bool(_o.get("isSoldOut"))
+                        _stk = _o.get("stock")
+                        # 품절=0, 실재고 있으면 그대로, 불명(None)→99 (기본 재고 규칙)
+                        _d_opts.append(
+                            {
+                                "name": _nm,
+                                "price": _d_sale,
+                                "stock": 0
+                                if _so
+                                else (_stk if _stk is not None else 99),
+                                "isSoldOut": _so,
+                            }
+                        )
+                    _all_sold = bool(_d_opts) and all(_o["isSoldOut"] for _o in _d_opts)
+                    # detail 만 구성하고 아래 공통 finalization(가격/원가/옵션/변동판정)으로 흘려보냄.
+                    # 데몬 응답엔 html·resultItemObj 가 없어 아래 확장앱 파싱 블록은 자연히 no-op.
+                    detail = {
+                        "salePrice": _d_sale,
+                        "originalPrice": _d_orig,
+                        "bestBenefitPrice": _d_card or _daemon_benefit or _d_sale,
+                        "options": _d_opts,
+                        "isOutOfStock": _all_sold,
+                        "isSoldOut": _all_sold,
+                    }
                 _html = _ext_result.get("html", "")
                 # 백엔드 폴백 — html 본문 기준 임직원 마커 매칭(확장앱 신호 누락 시 보호)
                 from backend.domain.samba.proxy.ssg_sourcing import _is_staff_only
