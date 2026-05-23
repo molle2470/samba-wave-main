@@ -186,16 +186,42 @@ def _self_install_and_relaunch() -> None:
     install_dir.mkdir(parents=True, exist_ok=True)
     dst = install_dir / "daemon.exe"
 
-    try:
-        shutil.copy2(src, dst)
-    except Exception as exc:
-        logger_print(f"설치 복사 실패: {exc}")
-        return
+    # 옛 데몬이 dst(daemon.exe) 실행 중이면 Windows 파일 잠금 → 복사 실패 → 설치 무산(트레이X).
+    # 현재 프로세스는 다운로드 파일명(autotune-daemon-setup_*.exe)이라 daemon.exe 가 아니므로
+    # taskkill /IM daemon.exe 가 자기 자신을 죽이지 않는다(설치 디렉토리 밖 실행 시에만 호출됨).
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "daemon.exe"],
+                creationflags=CREATE_NO_WINDOW,
+                capture_output=True,
+                timeout=10,
+            )
+        except Exception as exc:
+            logger_print(f"옛 데몬 종료 시도 실패(무시): {exc}")
+
+    # 복사 — 잠금 해제까지 최대 5회 재시도
+    for _attempt in range(5):
+        try:
+            shutil.copy2(src, dst)
+            break
+        except Exception as exc:
+            if _attempt == 4:
+                logger_print(f"설치 복사 실패: {exc}")
+                return
+            time.sleep(1.0)
 
     _register_run_key(dst)
 
-    # device_id URL 인자 / 파일명 추출 보존을 위해 원래 argv 그대로 전달
-    args = sys.argv[1:]
+    # 다운로드 파일명(autotune-daemon-setup_it-<token>_be-<hex>.exe)에 박힌 식별자는
+    # dst('daemon.exe')로 복사되며 사라진다. 재실행 데몬이 _extract_*(파일명/argv)로
+    # 찾도록 argv 에 명시 전달 — 안 하면 install-token 유실 → 글로벌 키 고착(credential 403).
+    args = list(sys.argv[1:])
+    _src_name = src.name
+    for _pat in (r"_it-[0-9a-f]{16,}", r"_be-[0-9a-f]{6,}", r"did=[A-Za-z0-9_.:\-]+"):
+        _m = re.search(_pat, _src_name)
+        if _m and _m.group(0) not in args:
+            args.append(_m.group(0))
     try:
         creationflags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
         subprocess.Popen(

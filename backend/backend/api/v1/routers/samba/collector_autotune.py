@@ -1293,6 +1293,21 @@ async def _site_autotune_loop(device_id: str, site: str):
                                 # DB 먼저 업데이트 (전송 전에 최신 데이터 반영)
                                 await _partial_update(r.product_id, updates)
 
+                                # 인메모리 product 객체도 갱신 — _partial_update 는 DB만 UPDATE 하므로
+                                # product.cost 등이 옛값으로 남는다. 아래 expected_price 계산이
+                                # resolve_cost_for_policy(product) → product.cost 를 읽으므로, 갱신 안 하면
+                                # 새 원가가 무시돼 expected==last → 원가만 바뀐 상품이 전송 스킵되는 버그.
+                                for _k in (
+                                    "cost",
+                                    "cost_excl_held_point",
+                                    "is_point_restricted",
+                                ):
+                                    if _k in updates:
+                                        try:
+                                            setattr(product, _k, updates[_k])
+                                        except Exception:
+                                            pass
+
                                 # ★ 마켓별 최종 판매가 비교 → 전송 판정
                                 new_cost = _cur_cost
                                 reg_accounts = product.registered_accounts or []

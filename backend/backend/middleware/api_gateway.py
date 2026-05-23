@@ -48,9 +48,45 @@ _EXEMPT_PREFIXES = (
 _KEY_CACHE: dict[str, tuple[Optional[str], bool, float]] = {}
 _KEY_CACHE_TTL = 60.0  # 1분
 
+# device_id 백필 완료된 key_hash (프로세스 메모리) — 키당 1회만 기록 시도해 핫패스 부담 최소화
+_DEVICE_BACKFILLED: set[str] = set()
+
 
 def _hash_key(raw: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+async def _backfill_device_id(key_hash: str, device_id: str) -> None:
+    """확장앱이 X-Device-Id 헤더로 보낸 device_id 를 키 행에 1회 백필.
+
+    오토튠 status 의 _is_mine 판정은 samba_extension_key.device_id 로 테넌트 소유
+    device 를 식별한다. 키 발급 시점에 device_id 가 비어 있던 기존 행(컬럼 추가 이전
+    발급분 등)은 확장앱이 인증 요청을 보낼 때 이 함수로 채워진다.
+
+    device_id IS NULL 인 행에만 기록 — 이미 값이 있으면 덮어쓰지 않는다(여러 PC 가
+    같은 키를 공유할 때 device_id 가 PC 마다 뒤바뀌는 flip-flop 방지). 프로세스당
+    key_hash 1회만 시도한다.
+    """
+    if key_hash in _DEVICE_BACKFILLED:
+        return
+    # await 전에 먼저 등록 — 동시 요청이 중복 write 하지 않도록
+    _DEVICE_BACKFILLED.add(key_hash)
+    try:
+        from backend.db.orm import get_write_session
+
+        async with get_write_session() as session:
+            await session.execute(
+                text(
+                    "UPDATE samba_extension_key SET device_id = :dev "
+                    "WHERE key_hash = :kh AND device_id IS NULL"
+                ),
+                {"dev": device_id, "kh": key_hash},
+            )
+            await session.commit()
+    except Exception as exc:
+        # 백필 실패는 요청 처리에 영향 주지 않음 — 재시도 가능하도록 set 에서 제거
+        _DEVICE_BACKFILLED.discard(key_hash)
+        logger.warning("[api-gateway] device_id 백필 실패: %s", exc)
 
 
 async def _lookup_tenant_key(key_hash: str) -> tuple[bool, Optional[str], bool]:
@@ -141,6 +177,12 @@ class ApiGatewayMiddleware(BaseHTTPMiddleware):
                         },
                     )
                 request.state.tenant_id = tenant_id
+                # 확장앱 device_id 백필 — install-token 제외, X-Device-Id 헤더 있을 때만.
+                # _is_mine 판정용 device_id 가 비어 있던 기존 키 행을 채운다.
+                if not is_install:
+                    _dev = (request.headers.get("X-Device-Id") or "").strip()
+                    if _dev:
+                        await _backfill_device_id(key_hash, _dev)
                 return await call_next(request)
 
         # 2단계: 글로벌 키 폴백 (DEPRECATE_GLOBAL_KEY=true 시 건너뜀)
