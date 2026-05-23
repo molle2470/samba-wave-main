@@ -68,7 +68,7 @@ except ImportError:
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.1.2"
+DAEMON_VERSION = "1.1.3"
 
 
 # ====================================================================
@@ -1039,7 +1039,9 @@ async def extract_pdp(
     page: Page, url: str, product_id: str, handler: SiteHandler
 ) -> dict[str, Any]:
     """사이트 핸들러 기반 PDP 추출 — marker 폴링 + extract_js + 재시도."""
-    await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+    # commit — 네비게이션 커밋 즉시 반환. marker 폴링이 준비 판정을 담당하므로
+    # DOMContentLoaded 까지 기다리는 중복 대기 제거.
+    await page.goto(url, wait_until="commit", timeout=30_000)
     await page.evaluate(f"window.__PRD_ID__ = {json.dumps(product_id)}")
 
     if handler.pre_extract_marker_js:
@@ -1302,6 +1304,18 @@ async def run_daemon(args: argparse.Namespace) -> int:
             if storage_state_path.exists():
                 context_kwargs["storage_state"] = str(storage_state_path)
             context: BrowserContext = await browser.new_context(**context_kwargs)
+
+            # 무거운 서브리소스 차단 — 가격은 JSON API + DOM 텍스트, 이미지는 <img> src
+            # 속성에서만 읽으므로 렌더링된 이미지/동영상/폰트 불필요. 콜드 캐시 헤드리스가
+            # 상품마다 전부 재다운로드하던 비용 제거 → PDP 로드 대폭 단축. CSS 는 일부 JS
+            # 레이아웃 측정에 쓰일 수 있어 차단 제외(안전 우선).
+            async def _block_heavy(route):
+                if route.request.resource_type in ("image", "media", "font"):
+                    await route.abort()
+                else:
+                    await route.continue_()
+
+            await context.route("**/*", _block_heavy)
             page = await context.new_page()
 
             # SSG 임직원 alert 자동 dismiss — 띄워두면 페이지 멈춰 다음 잡 차단.

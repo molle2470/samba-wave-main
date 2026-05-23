@@ -3488,51 +3488,54 @@ class AutotuneStopRequest(BaseModel):
 
 @router.post("/autotune/stop")
 async def autotune_stop(body: AutotuneStopRequest = AutotuneStopRequest()):
-    """오토튠 정지 — 이 PC 인스턴스만 정지. 다른 PC는 영향 없음."""
+    """오토튠 정지 — 실행 중인 모든 device 인스턴스를 정지한다.
+
+    프론트 localStorage device_id 와 실제 실행 중 owner device_id 가 불일치하면(예:
+    auto_start_if_enabled 가 DB 저장 owner did 로 복원하면 프론트 did 와 달라짐) 특정
+    dev 하나만 정지 시 엉뚱한 did 를 멈춰 실제 루프는 계속 돌던 사고가 있었다(정지 눌러도
+    실행 중 지속). 자기운영 단일유저 환경이므로, 정지는 실행 중인 모든 device 를 멈추고
+    autotune_enabled 를 무조건 False 로 내려 auto_start_if_enabled 재시작까지 차단한다.
+    """
     from backend.domain.samba.collector.refresher import request_bulk_cancel_all
 
     dev = (body.device_id or "").strip()
-    if not dev:
-        return {"ok": False, "error": "device_id 필수"}
-
-    if not _is_pc_running(dev):
+    # 실행 중인 모든 device(+요청 dev) 정지 대상 — did 불일치해도 확실히 멈춤
+    targets = {d for d, ev in _pc_running.items() if ev.is_set()}
+    if dev:
+        targets.add(dev)
+    if not targets:
+        await _save_autotune_state(False)
         return {"ok": True, "status": "already_stopped"}
 
-    # 다음 폴링 시 이 PC 확장앱에 forceStop 신호 전달
-    _pc_force_stop_set.add(dev)
+    for d in targets:
+        _pc_force_stop_set.add(d)
+        ev = _pc_running.get(d)
+        if ev is not None:
+            ev.clear()
+        _site_tasks = _pc_site_tasks.get(d) or {}
+        for _st in list(_site_tasks.values()):
+            if not _st.done():
+                _st.cancel()
+        _site_tasks.clear()
+        _main = _pc_main_task.get(d)
+        if _main and not _main.done():
+            _main.cancel()
+        _pc_main_task.pop(d, None)
 
-    ev = _pc_running.get(dev)
-    if ev is not None:
-        ev.clear()
+    # 전역 정지 — enabled 무조건 False (auto_start_if_enabled 자동 재시작 차단)
+    request_bulk_cancel_all()
+    try:
+        from backend.domain.samba.proxy.sourcing_queue import SourcingQueue
 
-    # 이 PC의 소싱처 루프 모두 취소
-    _site_tasks = _pc_site_tasks.get(dev) or {}
-    for _st in list(_site_tasks.values()):
-        if not _st.done():
-            _st.cancel()
-    _site_tasks.clear()
+        SourcingQueue.cancel_all("autotune stopped by user")
+    except Exception:
+        pass
+    await _save_autotune_state(False)
 
-    # 메인 코디네이터 태스크 취소
-    _main = _pc_main_task.get(dev)
-    if _main and not _main.done():
-        _main.cancel()
-    _pc_main_task.pop(dev, None)
+    for d in targets:
+        _cleanup_pc_instance(d)
 
-    # 어떤 PC도 안 돌면 전역 bulk cancel + DB 상태 OFF로 표시
-    if not any_pc_running():
-        request_bulk_cancel_all()
-        try:
-            from backend.domain.samba.proxy.sourcing_queue import SourcingQueue
-
-            SourcingQueue.cancel_all("all PCs stopped")
-        except Exception:
-            pass
-        await _save_autotune_state(False)
-
-    # 인스턴스 상태 cleanup
-    _cleanup_pc_instance(dev)
-
-    return {"ok": True, "status": "stopped"}
+    return {"ok": True, "status": "stopped", "stopped_devices": len(targets)}
 
 
 class PcAllowedSitesRequest(BaseModel):

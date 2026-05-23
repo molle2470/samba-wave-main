@@ -299,7 +299,7 @@ SITE_HANDLERS: dict[str, SiteHandler] = {
         login_check_js=ABCMART_LOGIN_CHECK_JS,
         pre_extract_marker_js=_ABCMART_MARKER_JS,
         pre_extract_marker_timeout_ms=10_000,
-        pre_extract_wait_ms=1_000,
+        pre_extract_wait_ms=300,
     ),
     "GrandStage": SiteHandler(
         site="GrandStage",
@@ -311,7 +311,7 @@ SITE_HANDLERS: dict[str, SiteHandler] = {
         login_check_js=ABCMART_LOGIN_CHECK_JS,
         pre_extract_marker_js=_ABCMART_MARKER_JS,
         pre_extract_marker_timeout_ms=10_000,
-        pre_extract_wait_ms=1_000,
+        pre_extract_wait_ms=300,
     ),
     "SSG": SiteHandler(
         site="SSG",
@@ -320,6 +320,6 @@ SITE_HANDLERS: dict[str, SiteHandler] = {
         dialog_policy="accept",
         pre_extract_marker_js=_SSG_MARKER_JS,
         pre_extract_marker_timeout_ms=15_000,
-        pre_extract_wait_ms=1_000,
+        pre_extract_wait_ms=300,
     ),
 }
