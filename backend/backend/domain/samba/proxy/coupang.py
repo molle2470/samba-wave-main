@@ -1333,7 +1333,7 @@ class CoupangClient:
 
     async def get_exchange_requests(
         self,
-        days: int = 30,
+        days: int = 7,
         status: str = "",
         max_per_page: int = 50,
     ) -> list[dict[str, Any]]:
@@ -1341,8 +1341,10 @@ class CoupangClient:
 
         쿠팡 Wing API: GET /v2/.../vendors/{vendorId}/exchangeRequests
         페이징: nextToken 기반 커서 방식
+        주의: 쿠팡 API는 createdAtTo - createdAtFrom이 7일 이내여야 함 (#231)
         """
         now = datetime.now(timezone.utc)
+        days = min(days, 7)
         since = now - timedelta(days=days)
 
         all_exchanges: list[dict[str, Any]] = []

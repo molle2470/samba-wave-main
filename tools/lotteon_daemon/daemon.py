@@ -1,16 +1,20 @@
-"""LOTTEON 헤드리스 데몬 — 로컬 PC 전용. 완전 자동.
+"""오토튠 헤드리스 데몬 — 로컬 PC 전용. 완전 자동.
+
+지원 사이트:
+- LOTTEON: 로그인 필수
+- ABCmart/GrandStage: 로그인 필수(best_benefit_price 정확성)
+- SSG: 로그인 불필요, 임직원 alert 자동 dismiss
+
+`--sites=LOTTEON,ABCmart,SSG` CLI 인자로 멀티 사이트 동시 처리.
 
 자동화 흐름:
 1. device_id = `samba-daemon-<hostname>` 자동 생성
-2. `/proxy/extension-key` 호출 → API key 발급 (X-Device-Id whitelist 통과:
-   백엔드 `_check_owner_device` 가 `samba-daemon-` prefix 허용)
-3. `/proxy/login-credential?site_name=LOTTEON` 호출 → 등록된 기본 LOTTEON
-   계정 username/password 평문 수신
-4. Playwright Chromium 영속 프로필 launch → 쿠키 살아있으면 폴링 진입,
-   아니면 LOTTEON 로그인 페이지 form fill + submit 자동
-5. `/proxy/sourcing/collect-queue` polling, LOTTEON detail 잡 처리
-6. 백엔드 `_pick_autotune_daemon_owner` 가 polling 중인 daemon device 풀에서
-   round-robin 으로 잡 owner 박음 → 여러 PC 동시 운용 자동
+2. `/proxy/extension-key` 호출 → API key 발급
+3. requires_login 사이트 각각 `/proxy/login-credential?site_name=<site>` → 자동 로그인
+4. Playwright Chromium 영속 프로필 launch → 쿠키 살아있으면 폴링 진입
+5. `/proxy/sourcing/collect-queue` polling, X-Allowed-Sites 사이트 detail 처리
+6. 백엔드 `pick_daemon_owner(site)` (`daemon_pool.py`) 가 polling 중인 daemon
+   풀에서 site 별 round-robin 으로 잡 owner 박음 → 여러 PC 동시 운용 자동
 
 운영 위치: 로컬 PC. VM 운영 금지.
 """
@@ -46,18 +50,25 @@ if getattr(sys, "frozen", False):
         if _bundled_browsers.exists():
             os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(_bundled_browsers)
 
-import httpx
-from playwright.async_api import (
+import httpx  # noqa: E402  # playwright env 설정 후 import 필수
+from playwright.async_api import (  # noqa: E402
     BrowserContext,
     Page,
     async_playwright,
 )
 
+# 사이트 핸들러 레지스트리 (ABCmart/GrandStage/SSG). LOTTEON 은 본 파일 하단 등록.
+try:
+    from site_handlers import SITE_HANDLERS, SiteHandler  # type: ignore
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).parent))
+    from site_handlers import SITE_HANDLERS, SiteHandler  # type: ignore
+
 
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.0.6"
+DAEMON_VERSION = "1.1.0"
 
 
 # ====================================================================
@@ -169,6 +180,7 @@ def logger_print(msg: str) -> None:
     except Exception:
         pass
 
+
 logger = logging.getLogger("autotune-daemon")
 
 
@@ -177,8 +189,8 @@ LOTTEON_HOME_URL = "https://www.lotteon.com/p/main"
 
 # LOTTEON 로그인 폼 셀렉터 — extension/background-autologin.js:242-246 와 동일
 LOTTEON_LOGIN_SELECTORS = {
-    "id": ['#inId', 'input[name="inId"]'],
-    "pw": ['#Password', 'input[type="password"]'],
+    "id": ["#inId", 'input[name="inId"]'],
+    "pw": ["#Password", 'input[type="password"]'],
     "btn": '[data-cmpnt-name="login_btn_select"]',
 }
 
@@ -308,6 +320,20 @@ LOTTEON_EXTRACT_JS = r"""
   }
 })()
 """
+
+
+# LOTTEON 핸들러 등록 — 본 파일 내부 상수 사용.
+SITE_HANDLERS["LOTTEON"] = SiteHandler(
+    site="LOTTEON",
+    extract_js=LOTTEON_EXTRACT_JS,
+    requires_login=True,
+    login_url=LOTTEON_LOGIN_URL,
+    home_url=LOTTEON_HOME_URL,
+    login_selectors=LOTTEON_LOGIN_SELECTORS,
+    pre_extract_wait_ms=5_000,
+    pre_extract_marker_js="",
+    extract_retry_field="best_benefit_price",
+)
 
 
 class DaemonState:
@@ -510,9 +536,7 @@ async def is_lotteon_logged_in(page: Page) -> bool:
     return result == "logged_in"
 
 
-async def lotteon_auto_login(
-    page: Page, credential: dict[str, str]
-) -> bool:
+async def lotteon_auto_login(page: Page, credential: dict[str, str]) -> bool:
     """LOTTEON 로그인 페이지 form fill + submit 자동."""
     logger.info("LOTTEON 자동로그인 시작 (계정=%s)", credential["username"][:4] + "***")
     try:
@@ -575,6 +599,163 @@ async def lotteon_auto_login(
     return False
 
 
+async def fetch_credential(
+    client: httpx.AsyncClient,
+    backend_url: str,
+    device_id: str,
+    api_key: str,
+    site_name: str,
+) -> dict[str, str] | None:
+    """등록된 site_name 기본 계정의 username/password 평문 조회."""
+    r = await client.get(
+        f"{backend_url}/api/v1/samba/sourcing-accounts/login-credential",
+        params={"site_name": site_name},
+        headers={
+            "X-Device-Id": device_id,
+            "X-Api-Key": api_key,
+        },
+        timeout=15.0,
+    )
+    if r.status_code == 404:
+        logger.warning(
+            "%s 기본 계정 미등록 — 삼바웨이브 화면에서 소싱처 계정 추가 필요",
+            site_name,
+        )
+        return None
+    if r.status_code != 200:
+        logger.warning(
+            "%s login-credential 실패 status=%s body=%s",
+            site_name,
+            r.status_code,
+            r.text[:200],
+        )
+        return None
+    data = r.json() or {}
+    if not data.get("username") or not data.get("password"):
+        return None
+    return {"username": data["username"], "password": data["password"]}
+
+
+async def is_site_logged_in(page: Page, handler: SiteHandler) -> bool:
+    """handler.home_url 방문 + login_check_js 로 로그인 여부 확정.
+
+    LOTTEON 은 login_check_js 미정의 시 본 파일 내부 is_lotteon_logged_in 위임.
+    """
+    if handler.site == "LOTTEON" and not handler.login_check_js:
+        return await is_lotteon_logged_in(page)
+    if not handler.home_url:
+        return False
+    try:
+        await page.goto(handler.home_url, wait_until="domcontentloaded", timeout=20_000)
+    except Exception as exc:
+        logger.warning("%s home 로드 실패: %s", handler.site, exc)
+        return False
+    await page.wait_for_timeout(3_000)
+    if not handler.login_check_js:
+        return False
+    try:
+        result = await page.evaluate(handler.login_check_js)
+    except Exception as exc:
+        logger.warning("%s login 검사 evaluate 실패: %s", handler.site, exc)
+        return False
+    return result == "logged_in"
+
+
+async def auto_login_site(
+    page: Page, handler: SiteHandler, credential: dict[str, str]
+) -> bool:
+    """handler.login_url + login_selectors 로 form fill + submit + 검증."""
+    logger.info(
+        "%s 자동로그인 시작 (계정=%s)",
+        handler.site,
+        credential["username"][:4] + "***",
+    )
+    try:
+        await page.goto(
+            handler.login_url, wait_until="domcontentloaded", timeout=30_000
+        )
+    except Exception as exc:
+        logger.warning("%s 로그인 페이지 로드 실패: %s", handler.site, exc)
+        return False
+    await page.wait_for_timeout(2_500)
+
+    selectors_payload = json.dumps(handler.login_selectors)
+    cred_payload = json.dumps(credential)
+    fill_js = f"""
+    (() => {{
+      const sel = {selectors_payload}
+      const cred = {cred_payload}
+      const nativeSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype, 'value').set
+      function pick(arr) {{
+        if (typeof arr === 'string') arr = [arr]
+        for (const s of arr) {{
+          const el = document.querySelector(s)
+          if (el) return el
+        }}
+        return null
+      }}
+      const idField = pick(sel.id)
+      const pwField = pick(sel.pw)
+      if (!idField || !pwField) {{
+        return {{ ok: false, reason: 'fields not found' }}
+      }}
+      idField.focus()
+      nativeSetter.call(idField, cred.username)
+      idField.dispatchEvent(new Event('input', {{ bubbles: true }}))
+      idField.dispatchEvent(new Event('change', {{ bubbles: true }}))
+      pwField.focus()
+      nativeSetter.call(pwField, cred.password)
+      pwField.dispatchEvent(new Event('input', {{ bubbles: true }}))
+      pwField.dispatchEvent(new Event('change', {{ bubbles: true }}))
+      const btn = pick(sel.btn)
+      if (!btn) return {{ ok: false, reason: 'btn not found' }}
+      btn.click()
+      return {{ ok: true }}
+    }})()
+    """
+    res = await page.evaluate(fill_js)
+    if not (isinstance(res, dict) and res.get("ok")):
+        logger.warning("%s 로그인 form fill 실패: %s", handler.site, res)
+        return False
+
+    # 로그인 후 세션 안정화 대기. 최대 15초.
+    for _ in range(15):
+        await page.wait_for_timeout(1_000)
+        if await is_site_logged_in(page, handler):
+            logger.info("%s 자동로그인 성공", handler.site)
+            return True
+    logger.warning(
+        "%s 자동로그인 — 15초 후에도 확정 안 됨 (CAPTCHA 의심)", handler.site
+    )
+    return False
+
+
+async def ensure_logged_in_for_site(
+    page: Page,
+    client: httpx.AsyncClient,
+    backend_url: str,
+    device_id: str,
+    api_key: str,
+    handler: SiteHandler,
+) -> bool:
+    """site 별 로그인 상태 확인 → 미로그인 시 1회 자동로그인 시도."""
+    if not handler.requires_login:
+        return True
+    if await is_site_logged_in(page, handler):
+        logger.info("%s 세션 살아있음 — 자동로그인 스킵", handler.site)
+        return True
+    cred = await fetch_credential(client, backend_url, device_id, api_key, handler.site)
+    if not cred:
+        logger.error(
+            "%s 자격증명 미등록 — 삼바웨이브에서 %s 기본 계정 추가 필요",
+            handler.site,
+            handler.site,
+        )
+        return False
+    return await auto_login_site(page, handler, cred)
+
+
 async def ensure_logged_in(
     page: Page,
     client: httpx.AsyncClient,
@@ -582,17 +763,15 @@ async def ensure_logged_in(
     device_id: str,
     api_key: str,
 ) -> bool:
-    """로그인 상태 확인 → 미로그인 시 1회 자동로그인 시도."""
-    if await is_lotteon_logged_in(page):
-        logger.info("LOTTEON 세션 살아있음 — 자동로그인 스킵")
-        return True
-    cred = await fetch_lotteon_credential(client, backend_url, device_id, api_key)
-    if not cred:
-        logger.error(
-            "LOTTEON 자격증명 미등록 — 삼바웨이브에서 LOTTEON 라디오 기본 계정 추가 필요"
-        )
-        return False
-    return await lotteon_auto_login(page, cred)
+    """하위호환 shim — LOTTEON 로그인 확인."""
+    return await ensure_logged_in_for_site(
+        page,
+        client,
+        backend_url,
+        device_id,
+        api_key,
+        SITE_HANDLERS["LOTTEON"],
+    )
 
 
 # ====================================================================
@@ -601,7 +780,11 @@ async def ensure_logged_in(
 
 
 async def fetch_job(
-    client: httpx.AsyncClient, backend_url: str, device_id: str, api_key: str
+    client: httpx.AsyncClient,
+    backend_url: str,
+    device_id: str,
+    api_key: str,
+    allowed_sites: str = "LOTTEON",
 ) -> dict[str, Any] | None:
     try:
         r = await client.get(
@@ -609,7 +792,7 @@ async def fetch_job(
             headers={
                 "X-Api-Key": api_key,
                 "X-Device-Id": device_id,
-                "X-Allowed-Sites": "LOTTEON",
+                "X-Allowed-Sites": allowed_sites,
                 "X-Ext-Version": "99.0.0",
             },
             timeout=10.0,
@@ -657,29 +840,58 @@ async def post_result(
     return False
 
 
-async def extract_lotteon_pdp(
-    page: Page, url: str, product_id: str
+async def extract_pdp(
+    page: Page, url: str, product_id: str, handler: SiteHandler
 ) -> dict[str, Any]:
+    """사이트 핸들러 기반 PDP 추출 — marker 폴링 + extract_js + 재시도."""
     await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
     await page.evaluate(f"window.__PRD_ID__ = {json.dumps(product_id)}")
-    await page.wait_for_timeout(5_000)
-    data = await page.evaluate(LOTTEON_EXTRACT_JS)
+
+    if handler.pre_extract_marker_js:
+        deadline = handler.pre_extract_marker_timeout_ms
+        step = 500
+        elapsed = 0
+        while elapsed < deadline:
+            try:
+                hit = await page.evaluate(handler.pre_extract_marker_js)
+            except Exception:
+                hit = False
+            if hit:
+                break
+            await page.wait_for_timeout(step)
+            elapsed += step
+        await page.wait_for_timeout(handler.pre_extract_wait_ms)
+    else:
+        await page.wait_for_timeout(handler.pre_extract_wait_ms)
+
+    data = await page.evaluate(handler.extract_js)
+    retry_field = handler.extract_retry_field
     if (
-        isinstance(data, dict)
-        and not data.get("best_benefit_price")
+        retry_field
+        and isinstance(data, dict)
+        and not data.get(retry_field)
         and (
             (data.get("sale_price") or 0) > 0
             or (data.get("options") and len(data["options"]) > 0)
         )
     ):
         await page.wait_for_timeout(3_000)
-        data2 = await page.evaluate(LOTTEON_EXTRACT_JS)
-        if isinstance(data2, dict) and data2.get("best_benefit_price"):
+        data2 = await page.evaluate(handler.extract_js)
+        if isinstance(data2, dict) and data2.get(retry_field):
             data = data2
-    return data if isinstance(data, dict) else {
-        "success": False,
-        "error": "evaluate 결과 비dict",
-    }
+    return (
+        data
+        if isinstance(data, dict)
+        else {
+            "success": False,
+            "error": "evaluate 결과 비dict",
+        }
+    )
+
+
+async def extract_lotteon_pdp(page: Page, url: str, product_id: str) -> dict[str, Any]:
+    """하위호환 shim — LOTTEON 핸들러로 위임."""
+    return await extract_pdp(page, url, product_id, SITE_HANDLERS["LOTTEON"])
 
 
 async def process_job(
@@ -700,34 +912,47 @@ async def process_job(
     url = job.get("url", "")
     product_id = job.get("productId", "")
 
-    if site != "LOTTEON" or jtype != "detail":
+    handler = SITE_HANDLERS.get(site)
+    if not handler or jtype != "detail":
         logger.warning("범위 밖 잡 (site=%s type=%s) — 실패 회신", site, jtype)
         await post_result(
-            client, backend_url, request_id,
-            {"success": False, "error": f"daemon scope LOTTEON detail only (got {site}/{jtype})"}, api_key,
+            client,
+            backend_url,
+            request_id,
+            {
+                "success": False,
+                "error": f"daemon scope detail only (got {site}/{jtype})",
+            },
+            api_key,
         )
         state.record_failure()
         return None
 
-    logger.info("처리 시작 req=%s pid=%s", request_id, product_id)
+    logger.info("처리 시작 site=%s req=%s pid=%s", site, request_id, product_id)
     t0 = time.time()
     try:
         data = await asyncio.wait_for(
-            extract_lotteon_pdp(page, url, product_id), timeout=50.0
+            extract_pdp(page, url, product_id, handler), timeout=50.0
         )
     except asyncio.TimeoutError:
         logger.warning("PDP 추출 타임아웃 req=%s pid=%s", request_id, product_id)
         await post_result(
-            client, backend_url, request_id,
-            {"success": False, "error": "daemon PDP 추출 타임아웃"}, api_key,
+            client,
+            backend_url,
+            request_id,
+            {"success": False, "error": "daemon PDP 추출 타임아웃"},
+            api_key,
         )
         state.record_failure()
         return None
     except Exception as exc:
         logger.exception("PDP 추출 예외 req=%s pid=%s: %s", request_id, product_id, exc)
         await post_result(
-            client, backend_url, request_id,
-            {"success": False, "error": f"daemon 예외: {exc}"}, api_key,
+            client,
+            backend_url,
+            request_id,
+            {"success": False, "error": f"daemon 예외: {exc}"},
+            api_key,
         )
         state.record_failure()
         return None
@@ -739,7 +964,11 @@ async def process_job(
         nopt = len(data.get("options") or [])
         logger.info(
             "완료 req=%s pid=%s 혜택가=%s 옵션=%d (%.1fs)",
-            request_id, product_id, f"{bp:,}", nopt, dt,
+            request_id,
+            product_id,
+            f"{bp:,}",
+            nopt,
+            dt,
         )
         state.record_success()
         if data.get("login_required"):
@@ -762,9 +991,25 @@ async def run_daemon(args: argparse.Namespace) -> int:
     profile_dir.mkdir(parents=True, exist_ok=True)
     api_key_path = profile_dir / "api_key.txt"
 
+    # 활성 사이트 — `--sites=LOTTEON,ABCmart,SSG` 콤마 구분. 기본 LOTTEON 하위호환.
+    raw_sites = (getattr(args, "sites", "") or "LOTTEON").strip()
+    active_sites = [
+        s.strip() for s in raw_sites.split(",") if s.strip() in SITE_HANDLERS
+    ]
+    if not active_sites:
+        active_sites = ["LOTTEON"]
+    allowed_sites_header = ",".join(active_sites)
+    login_sites = [s for s in active_sites if SITE_HANDLERS[s].requires_login]
+    dialog_accept_sites = {
+        s for s in active_sites if SITE_HANDLERS[s].dialog_policy == "accept"
+    }
+
     logger.info(
-        "데몬 시작 device_id=%s backend=%s profile=%s",
-        args.device_id, backend_url, profile_dir,
+        "데몬 시작 device_id=%s backend=%s profile=%s sites=%s",
+        args.device_id,
+        backend_url,
+        profile_dir,
+        allowed_sites_header,
     )
 
     async with httpx.AsyncClient() as http_client:
@@ -802,21 +1047,50 @@ async def run_daemon(args: argparse.Namespace) -> int:
             context: BrowserContext = await browser.new_context(**context_kwargs)
             page = await context.new_page()
 
+            # SSG 임직원 alert 자동 dismiss — 띄워두면 페이지 멈춰 다음 잡 차단.
+            if dialog_accept_sites:
+
+                async def _on_dialog(dialog):
+                    try:
+                        logger.info(
+                            "dialog auto-accept type=%s msg=%s",
+                            dialog.type,
+                            (dialog.message or "")[:80],
+                        )
+                        await dialog.accept()
+                    except Exception:
+                        try:
+                            await dialog.dismiss()
+                        except Exception:
+                            pass
+
+                page.on("dialog", lambda d: asyncio.create_task(_on_dialog(d)))
+
             async def _save_storage_state() -> None:
                 try:
                     await context.storage_state(path=str(storage_state_path))
                 except Exception as exc:
                     logger.debug("storage_state 저장 실패(무시): %s", exc)
 
-            # 시작 시 로그인 확인 + 필요 시 자동로그인
-            if not await ensure_logged_in(
-                page, http_client, backend_url, args.device_id, api_key
-            ):
-                logger.error("초기 로그인 실패 — 종료 (supervisor 재기동 유도)")
-                await context.close()
-                await browser.close()
-                return 3
-            await _save_storage_state()
+            # 시작 시 로그인 — requires_login 사이트 각각.
+            for _site in login_sites:
+                if not await ensure_logged_in_for_site(
+                    page,
+                    http_client,
+                    backend_url,
+                    args.device_id,
+                    api_key,
+                    SITE_HANDLERS[_site],
+                ):
+                    logger.error(
+                        "%s 초기 로그인 실패 — 종료 (supervisor 재기동 유도)",
+                        _site,
+                    )
+                    await context.close()
+                    await browser.close()
+                    return 3
+            if login_sites:
+                await _save_storage_state()
 
             idle_logged_at = 0.0
             while True:
@@ -829,36 +1103,50 @@ async def run_daemon(args: argparse.Namespace) -> int:
                     await browser.close()
                     return 1
 
-                # 로그인 만료 누적 시 재로그인
-                if state.consecutive_login_required >= 3:
-                    logger.warning(
-                        "login_required 3회 연속 — 재로그인 시도"
-                    )
-                    if not await ensure_logged_in(
-                        page, http_client, backend_url, args.device_id, api_key
-                    ):
-                        logger.error("재로그인 실패 — 종료")
+                # 로그인 만료 누적 시 재로그인 (requires_login 사이트 각각).
+                if login_sites and state.consecutive_login_required >= 3:
+                    logger.warning("login_required 3회 연속 — 재로그인 시도")
+                    _all_ok = True
+                    for _site in login_sites:
+                        if not await ensure_logged_in_for_site(
+                            page,
+                            http_client,
+                            backend_url,
+                            args.device_id,
+                            api_key,
+                            SITE_HANDLERS[_site],
+                        ):
+                            logger.error("%s 재로그인 실패", _site)
+                            _all_ok = False
+                            break
+                    if not _all_ok:
                         await context.close()
                         await browser.close()
                         return 4
                     state.reset_login_required()
                     await _save_storage_state()
 
-                job = await fetch_job(http_client, backend_url, args.device_id, api_key)
+                job = await fetch_job(
+                    http_client,
+                    backend_url,
+                    args.device_id,
+                    api_key,
+                    allowed_sites=allowed_sites_header,
+                )
                 if not job:
                     now = time.time()
                     if now - idle_logged_at > 30:
                         logger.info(
                             "대기 중 (processed=%d ok=%d fail=%d)",
-                            state.processed, state.succeeded, state.failed,
+                            state.processed,
+                            state.succeeded,
+                            state.failed,
                         )
                         idle_logged_at = now
                     await asyncio.sleep(args.poll_interval)
                     continue
 
-                await process_job(
-                    page, http_client, backend_url, job, state, api_key
-                )
+                await process_job(page, http_client, backend_url, job, state, api_key)
 
 
 def _setup_logging() -> None:
@@ -998,7 +1286,17 @@ def _start_tray_icon() -> None:
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="LOTTEON 헤드리스 데몬 (완전 자동)")
+    p = argparse.ArgumentParser(
+        description="오토튠 헤드리스 데몬 (LOTTEON/ABCmart/SSG)"
+    )
+    p.add_argument(
+        "--sites",
+        default=os.environ.get("DAEMON_SITES", "LOTTEON"),
+        help=(
+            "처리 사이트 콤마구분 (예: LOTTEON,ABCmart,SSG). "
+            "X-Allowed-Sites 헤더로 백엔드에 전달. 기본 LOTTEON 하위호환."
+        ),
+    )
     # backend URL 우선순위:
     # 1. URL/파일명/argv 의 backend= (포크 사용자가 본인 backend 가리킬 때)
     # 2. DAEMON_BACKEND_URL 환경변수
@@ -1063,9 +1361,7 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-async def _check_and_self_update(
-    client: httpx.AsyncClient, backend_url: str
-) -> bool:
+async def _check_and_self_update(client: httpx.AsyncClient, backend_url: str) -> bool:
     """백엔드 버전 체크 → 신버전이면 True 반환(caller 가 종료 → 재시작 시 신버전 다운로드).
 
     실패 시 False (현 버전 그대로 진행). 네트워크 일시 장애로 자가 종료되는 사고 방지.
@@ -1147,7 +1443,9 @@ def _supervisor_loop() -> int:
                 stdin=subprocess.DEVNULL,
             )
         except Exception as exc:
-            logger_print(f"supervisor: worker spawn 실패: {exc} — {backoff}초 후 재시도")
+            logger_print(
+                f"supervisor: worker spawn 실패: {exc} — {backoff}초 후 재시도"
+            )
             time.sleep(backoff)
             backoff = min(backoff * 2, BACKOFF_MAX)
             continue
@@ -1166,9 +1464,7 @@ def _supervisor_loop() -> int:
                 pass
             return 0
         duration = time.time() - start_ts
-        logger_print(
-            f"supervisor: worker exit rc={rc} duration={duration:.1f}s"
-        )
+        logger_print(f"supervisor: worker exit rc={rc} duration={duration:.1f}s")
         if rc == 0:
             logger_print("supervisor: worker 정상 종료 — supervisor 도 종료")
             return 0
@@ -1184,9 +1480,7 @@ def _supervisor_loop() -> int:
 def main() -> int:
     # 1. frozen 모드 + install dir 아닐 때 → self-install + 재시작 후 종료
     if _is_frozen() and not _running_from_install_dir():
-        logger_print(
-            f"첫 실행 감지 — {_install_dir()} 로 자기 설치 후 재시작"
-        )
+        logger_print(f"첫 실행 감지 — {_install_dir()} 로 자기 설치 후 재시작")
         _self_install_and_relaunch()
         # _self_install_and_relaunch 가 os._exit(0) 호출하므로 이 라인 도달 X
         return 0

@@ -228,7 +228,16 @@ class AbcMartPlugin(SourcingPlugin):
                 # GrandStage가 없으면 allowed_set 필터로 잡 자체가 반환 안 됨.
                 # 동일 도메인(a-rt.com)이므로 ABCmart 처리 경로로도 정확히 추출 가능.
                 # URL만 GrandStage URL 사용해 올바른 채널가 수집.
-                _abc_owner = get_autotune_owner("ABCmart") or None
+                # 데몬 풀(X-Allowed-Sites=ABCmart) 우선, 없으면 확장앱 owner 폴백.
+                from backend.domain.samba.proxy.daemon_pool import (
+                    pick_daemon_owner,
+                )
+
+                _abc_owner = (
+                    pick_daemon_owner("ABCmart")
+                    or get_autotune_owner("ABCmart")
+                    or None
+                )
                 if _prefer_grandstage:
                     _gs_url = f"https://grandstage.a-rt.com/product/new?prdtNo={site_product_id}&tChnnlNo=10002"
                     _dom_req, _dom_fut = SourcingQueue.add_detail_job(

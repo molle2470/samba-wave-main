@@ -5070,7 +5070,9 @@ async def sync_orders_from_markets(
                         _ssg_raw_orders = await _ssg_client.get_orders(days=body.days)
                     # 출고대기(피킹완료) 주문 추가 조회 — listShppDirection은 배송지시(11)만 반환
                     # 캐시 여부와 무관하게 항상 호출
-                    _ssg_wo_orders = await _ssg_client.get_warehouse_out_orders(days=body.days)
+                    _ssg_wo_orders = await _ssg_client.get_warehouse_out_orders(
+                        days=body.days
+                    )
                     if _ssg_wo_orders:
                         _ssg_raw_orders = list(_ssg_raw_orders) + _ssg_wo_orders
                     logger.info(

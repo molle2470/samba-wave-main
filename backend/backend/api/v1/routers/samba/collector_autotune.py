@@ -874,18 +874,19 @@ async def _site_autotune_loop(device_id: str, site: str):
                                     if _site_pid
                                     else _name_part
                                 )
-                                # 진행도 표시 — 사이클 배치(200) 기준이 아닌 "전체 대상" 누계 기준.
-                                # 카운터 증가는 refresher 가 _limited 진입 시점에 1회 수행 →
-                                # 여기서는 읽기만 (성공/실패 모두 동일 idx 사용, gap 없음).
-                                _g_idx = _autotune_global_idx.get(_gkey, 0)
-                                _g_total = _autotune_global_total.get(_gkey, 0)
-                                _idx_prefix = (
-                                    f"[{_g_idx:,}/{_g_total:,}] "
-                                    if _g_idx and _g_total
-                                    else (
-                                        f"[{idx:,}/{total:,}] " if idx and total else ""
+                                # 진행도 표시 — refresher._limited 가 작업별로 캡처해 넘긴 idx/total 우선 사용.
+                                # 전역 dict 재조회는 동시성 N 배치에서 모든 in-flight 작업이
+                                # 같은 값을 보게 되어 금지 (예: 4건이 모두 [16/40,004] 표시 버그).
+                                if idx and total:
+                                    _idx_prefix = f"[{idx:,}/{total:,}] "
+                                else:
+                                    _g_idx = _autotune_global_idx.get(_gkey, 0)
+                                    _g_total = _autotune_global_total.get(_gkey, 0)
+                                    _idx_prefix = (
+                                        f"[{_g_idx:,}/{_g_total:,}] "
+                                        if _g_idx and _g_total
+                                        else ""
                                     )
-                                )
 
                                 # 원가: 항상 최신 계산값 사용
                                 if r.new_cost is not None:
@@ -1734,7 +1735,10 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                 import json as _json
 
                                                 _ssg_af = (
-                                                    getattr(acc, "additional_fields", None) or {}
+                                                    getattr(
+                                                        acc, "additional_fields", None
+                                                    )
+                                                    or {}
                                                 )
                                                 if isinstance(_ssg_af, str):
                                                     _ssg_af = _json.loads(_ssg_af)
@@ -1750,13 +1754,17 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                         .get("sellStatCd", "")
                                                         or ""
                                                     )
-                                                    if _sell_stat == "10":  # 승인대기 → 스킵
+                                                    if (
+                                                        _sell_stat == "10"
+                                                    ):  # 승인대기 → 스킵
                                                         log.info(
                                                             "[오토튠] %s → SSG 승인대기 중, 전송 스킵",
                                                             product.id,
                                                         )
                                                         _acc_items.clear()
-                                                    elif _sell_stat == "05":  # 반려 → 강제 재신청
+                                                    elif (
+                                                        _sell_stat == "05"
+                                                    ):  # 반려 → 강제 재신청
                                                         log.info(
                                                             "[오토튠] %s → SSG 반려 감지(sellStatCd=05), 재신청",
                                                             product.id,
@@ -3387,7 +3395,6 @@ async def autotune_start(
     request: Request = None,
 ):
     """오토튠 무한 루프 시작 — 메인 이벤트 루프에서 실행."""
-    # 플랜 제한(check_autotune_access) 영구 제거 (2026-05-20)
     from backend.domain.samba.collector.refresher import clear_bulk_cancel
 
     dev = (body.device_id or "").strip()

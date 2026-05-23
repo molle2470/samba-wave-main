@@ -10,7 +10,6 @@ export {
   wholesaleApi,
   sourcingAccountApi,
   rewardsApi,
-  tenantApi,
   analyticsApi,
 } from '../legacy'
 
@@ -34,8 +33,6 @@ export type {
   RewardActionMeta,
   RewardAccountRow,
   RewardsStatus,
-  TenantInfo,
-  TenantUsage,
   SourcingRoi,
   ProductPerformance,
   BrandSales,

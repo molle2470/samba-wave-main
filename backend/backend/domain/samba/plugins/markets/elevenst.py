@@ -216,6 +216,20 @@ class ElevenstPlugin(MarketPlugin):
                     f"<rtngBsPlc>{_escape_xml(_return_addr)}</rtngBsPlc>"
                 )
 
+                # A/S·교환반품 안내 — 11번가 PUT 시 빈값 재검증 가드
+                # 저장된 값이 빈 경우 경량 PUT 응답 "교환반품 안내는 반드시 입력하셔야 합니다 STATUS[103]"
+                # → 전체 XML 폴백 시 다시 카테고리 권한 에러로 종료되어 자동복구가 못 잡음
+                _as_msg = (
+                    _acct_extras.get("asMessage") or ""
+                ).strip() or "상세페이지 참조"
+                _rtn_exch = (
+                    _acct_extras.get("returnExchangeGuide") or ""
+                ).strip() or "상세페이지 참조"
+                _after_xml = (
+                    f"<asDetail>{_escape_xml(_as_msg)}</asDetail>"
+                    f"<rtngExchDetail>{_escape_xml(_rtn_exch)}</rtngExchDetail>"
+                )
+
                 xml_data = (
                     '<?xml version="1.0" encoding="UTF-8"?>'
                     "<Product>"
@@ -224,6 +238,7 @@ class ElevenstPlugin(MarketPlugin):
                     f"{_brand_xml}"
                     f"{_origin_xml}"
                     f"{_delivery_xml}"
+                    f"{_after_xml}"
                     f"{option_xml}"
                     "</Product>"
                 )
