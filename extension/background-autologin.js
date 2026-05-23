@@ -525,6 +525,14 @@ async function _ensureLoggedInImpl(siteKey, accountId) {
     return false
   }
 
+  // accountId 정상성 가드 — 'etc'(기타) 등 실제 계정 ID(sa_ prefix)가 아니면 자동로그인 대상 아님.
+  // retry 루프(3회·6초) 진입 전에 즉시 차단 — 송장수집 다건이면 건당 6초 낭비 방지.
+  // 현재 로그인 세션 그대로 송장조회 진행 (호출자가 false 처리).
+  if (accountId && !String(accountId).startsWith('sa_')) {
+    console.log(`[자동로그인] ${site.name} accountId='${accountId}' 비정상(기타 등) — 자동로그인 스킵, 현 세션 유지`)
+    return false
+  }
+
   // 오토튠 비활성 상태면 자동로그인 차단 (사용자가 작업 취소했는데 계속 시도되는 것 방지)
   // 단, accountId 명시(송장 자동수집 등 명시적 사용자 트리거)는 오토튠 게이트 우회 — 별도 기능.
   if (!accountId) {
@@ -640,6 +648,14 @@ async function _ensureLoggedInSingle(siteKey, accountId) {
   const site = AUTO_LOGIN_SITES[siteKey]
   if (!site) return false
 
+  // accountId 정상성 가드 — 주문계정이 'etc'(기타) 등 실제 계정 ID(sa_ prefix)가 아니면
+  // 자동로그인 대상이 아님. 백엔드 /login-credential 이 404 → 알림 폭주를 유발하므로
+  // 진입 자체를 막는다. 현재 로그인 세션 그대로 송장조회 진행 (호출자가 false 처리).
+  if (accountId && !String(accountId).startsWith('sa_')) {
+    console.log(`[자동로그인] ${site.name} accountId='${accountId}' 비정상(기타 등) — 자동로그인 스킵, 현 세션 유지`)
+    return false
+  }
+
   // [SPA 분기] LOTTEON / ABCmart / SSG는 백엔드 라디오 지정 계정으로만 자동로그인
   // 사용자 요구 — 소싱처계정의 username/password를 직접 .value 설정 (Chrome 자동완성 드롭다운 사용 X)
   // 백엔드 자격증명 없으면 즉시 실패. chrome.debugger triple-click 폴백 제거 (드롭다운 노출 방지).
@@ -679,14 +695,19 @@ async function _ensureLoggedInSingle(siteKey, accountId) {
     }
     // 폴백 없이 즉시 중단 — 사용자가 설정 페이지에서 라디오 지정 필요
     console.log(`[자동로그인] ❌ ${site.name} 백엔드 자격증명 없음 — 자동로그인 중단. 설정 페이지에서 자동로그인 계정 라디오 지정 필요`)
-    try {
-      chrome.notifications?.create?.(`autologin-no-credential-${siteKey}-${Date.now()}`, {
-        type: 'basic',
-        iconUrl: 'icon128.png',
-        title: 'SAMBA-WAVE 자동로그인 설정 필요',
-        message: `${site.name} 자동로그인 계정이 지정되지 않았습니다. 설정 페이지 → 소싱처 계정에서 라디오 버튼으로 계정을 선택해주세요.`,
-      })
-    } catch {}
+    // 알림은 라디오 기본 계정 모드(!accountId)만 발송. accountId 명시 트리거(송장수집)는
+    // 잡당 시도라 실패 알림 폭주 위험 → 호출자가 wrong_account 로 분류해서 모달로 보여줌.
+    // (line 615 failure 알림 정책과 동일)
+    if (!accountId) {
+      try {
+        chrome.notifications?.create?.(`autologin-no-credential-${siteKey}-${Date.now()}`, {
+          type: 'basic',
+          iconUrl: 'icon128.png',
+          title: 'SAMBA-WAVE 자동로그인 설정 필요',
+          message: `${site.name} 자동로그인 계정이 지정되지 않았습니다. 설정 페이지 → 소싱처 계정에서 라디오 버튼으로 계정을 선택해주세요.`,
+        })
+      } catch {}
+    }
     return false
   }
 

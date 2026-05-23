@@ -411,8 +411,6 @@ async def _build_order_filters(
         elif status_filter == "cancel_return_excluded":
             # status 컬럼만 기준 — shipping_status 는 일절 관여 금지
             filters.append(~SambaOrder.status.in_(EXCLUDED_ORDER_STATUSES))
-        elif status_filter == "pending":
-            filters.append(SambaOrder.status.in_(PENDING_ORDER_STATUSES))
         elif status_filter == "cancel_alert":
             # 알람 카운트와 동일한 조건 — 발주·송장 사고 위험 케이스
             filters.append(_build_cancel_alert_clause())
