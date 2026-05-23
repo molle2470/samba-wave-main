@@ -437,6 +437,17 @@ class SourcingQueue:
             else:
                 conditions.append("(owner_device_id IS NULL OR owner_device_id = '')")
 
+            # 데몬 전용 사이트 가드 — LOTTEON/SSG/ABCmart/GrandStage 는 헤드리스 데몬만 처리.
+            # 확장앱(non-daemon device)엔 이 사이트 잡을 발행하지 않는다 → 확장앱 팝업 0.
+            # (이 사이트들은 가격이 AJAX 로 늦게 채워져 확장앱은 팝업창을 띄워야만 읽힘.
+            #  데몬 headless 만 팝업 없이 처리 가능. 데몬 미설치 시 적체되나 확장앱 팝업은 0.)
+            _DAEMON_ONLY_SITES = ("LOTTEON", "SSG", "ABCmart", "GrandStage")
+            if not device_id.startswith("samba-daemon-"):
+                _dph = ", ".join(f":dsite_{i}" for i in range(len(_DAEMON_ONLY_SITES)))
+                conditions.append(f"site NOT IN ({_dph})")
+                for i, s in enumerate(_DAEMON_ONLY_SITES):
+                    params[f"dsite_{i}"] = s
+
             # site 필터
             if allowed_sites is not None:
                 site_list = [s.strip() for s in allowed_sites if s.strip()]
