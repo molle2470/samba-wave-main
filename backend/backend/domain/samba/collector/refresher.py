@@ -858,6 +858,15 @@ async def _parse_musinsa(product: Any) -> RefreshResult:
         # Retry-After가 있으면 대기 후 1회 재시도 (상한 60초)
         if e.retry_after > 0:
             capped_wait = min(e.retry_after, 60)
+            _log_refresh(
+                "MUSINSA",
+                product.id,
+                getattr(product, "name", ""),
+                f"[차단대기] Retry-After {capped_wait}초 대기 후 재시도 (원본 {e.retry_after}초)",
+                level="warning",
+                idx=_idx,
+                total=_total,
+            )
             logger.warning(
                 f"[refresher] {site_product_id} 차단({e.status}), {capped_wait}초 후 재시도 (원본 Retry-After={e.retry_after})"
             )
@@ -884,6 +893,15 @@ async def _parse_musinsa(product: Any) -> RefreshResult:
                     product_id=product.id, error=f"차단 후 재시도 실패: HTTP {e.status}"
                 )
         else:
+            _log_refresh(
+                "MUSINSA",
+                product.id,
+                getattr(product, "name", ""),
+                f"[차단] HTTP {e.status} — Retry-After 없음, 건너뜀",
+                level="warning",
+                idx=_idx,
+                total=_total,
+            )
             return RefreshResult(product_id=product.id, error=f"차단: HTTP {e.status}")
     except asyncio.TimeoutError:
         # 45초 안에 응답 없음 → 건너뛰기

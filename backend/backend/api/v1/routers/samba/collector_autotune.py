@@ -607,14 +607,11 @@ async def _site_autotune_loop(device_id: str, site: str):
                         except Exception:
                             _total_global = filtered_count
                         _gkey = (device_id, site)
-                        # 한 바퀴 회전 완료(분자 ≥ 분모) 또는 분모 변동 시 0부터 재시작
+                        # 한 바퀴 회전 완료(분자 ≥ 분모) 시 0부터 재시작
+                        # 분모 변동(신규 수집/삭제로 인한 total 증감)은 idx 유지하고 분모만 갱신
+                        # → 사이클 도중 신규 상품 들어와도 진행률이 [N/new_total]로 자연 갱신됨
                         _prev_idx = _autotune_global_idx.get(_gkey, 0)
-                        _prev_total = _autotune_global_total.get(_gkey, 0)
-                        if (
-                            _prev_idx >= _total_global
-                            or _total_global <= 0
-                            or _prev_total != _total_global
-                        ):
+                        if _prev_idx >= _total_global or _total_global <= 0:
                             _autotune_global_idx[_gkey] = 0
                             _autotune_cycle_stats[_gkey] = _new_cycle_stats()
                             _autotune_cycle_stats[_gkey]["started_at"] = now.isoformat()
