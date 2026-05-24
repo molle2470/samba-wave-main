@@ -1288,7 +1288,7 @@ class Cafe24Client:
     ) -> str | None:
         """이미지 바이트를 S3에 업로드하고 공개 URL 반환. S3 미설정 시 None."""
         import asyncio
-        import uuid
+        import hashlib
 
         try:
             from backend.core.config import settings
@@ -1309,20 +1309,30 @@ class Cafe24Client:
                 "image/gif": "gif",
             }
             ext = ext_map.get(content_type, "jpg")
-            s3_key = f"samba/cafe24-images/{uuid.uuid4()}.{ext}"
+            # [2026-05-24] content_hash 기반 결정적 키 + HeadObject 가드
+            # 기존: uuid.uuid4() 키 → 같은 이미지 매번 새 객체 PUT → S3 egress 누수
+            content_hash = hashlib.md5(image_bytes).hexdigest()[:16]
+            s3_key = f"samba/cafe24-images/{content_hash}.{ext}"
+            s3_url = f"https://{bucket}.s3.{region}.amazonaws.com/{s3_key}"
 
             # 동기 boto3를 스레드풀에서 실행 (이벤트 루프 블로킹 방지)
             def _do_upload() -> str:
                 from backend.utils.s3 import get_s3_client
 
                 client = get_s3_client()
+                # 동일 content_hash 객체 이미 존재 시 PUT 스킵
+                try:
+                    client.head_object(Bucket=bucket, Key=s3_key)
+                    return s3_url
+                except Exception:
+                    pass
                 client.put_object(
                     Bucket=bucket,
                     Key=s3_key,
                     Body=image_bytes,
                     ContentType=content_type,
                 )
-                return f"https://{bucket}.s3.{region}.amazonaws.com/{s3_key}"
+                return s3_url
 
             s3_url = await asyncio.to_thread(_do_upload)
             return s3_url

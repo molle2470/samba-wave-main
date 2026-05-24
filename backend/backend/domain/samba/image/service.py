@@ -7,7 +7,6 @@ import hashlib
 import io
 import logging
 import os
-import uuid
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -1846,6 +1845,8 @@ async def _split_single_image(
         y = bottom
 
     # 텍스트 이미지 필터링 후 R2에 업로드
+    # [2026-05-24] content_hash 기반 결정적 키 + HeadObject 가드로 중복 PUT 차단
+    # 기존: uuid.uuid4() 가 키에 박혀 같은 segment 매번 새 객체 PUT → GCP egress 누수 주범
     url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
     uploaded: list[str] = []
     for idx, seg in enumerate(segments):
@@ -1855,18 +1856,30 @@ async def _split_single_image(
         buf = io.BytesIO()
         # 마켓 API 호환을 위해 JPEG로 저장 (WebP는 11번가 등에서 거부됨)
         seg.convert("RGB").save(buf, format="JPEG", quality=88, optimize=True)
-        buf.seek(0)
-        filename = f"split_{url_hash}_{idx}_{uuid.uuid4().hex[:6]}.jpg"
-        await asyncio.to_thread(
-            partial(
-                r2_client.upload_fileobj,
-                buf,
-                bucket_name,
-                f"split/{filename}",
-                ExtraArgs={"ContentType": "image/jpeg"},
-            ),
-        )
-        uploaded.append(f"{public_url}/split/{filename}")
+        seg_bytes = buf.getvalue()
+        content_hash = hashlib.md5(seg_bytes).hexdigest()[:16]
+        filename = f"split_{url_hash}_{idx}_{content_hash}.jpg"
+        key = f"split/{filename}"
+
+        def _exists(_key: str = key) -> bool:
+            try:
+                r2_client.head_object(Bucket=bucket_name, Key=_key)
+                return True
+            except Exception:
+                return False
+
+        if not await asyncio.to_thread(_exists):
+            buf.seek(0)
+            await asyncio.to_thread(
+                partial(
+                    r2_client.upload_fileobj,
+                    buf,
+                    bucket_name,
+                    key,
+                    ExtraArgs={"ContentType": "image/jpeg"},
+                ),
+            )
+        uploaded.append(f"{public_url}/{key}")
 
     logger.info(f"[이미지분할] {url} → {len(uploaded)}장 ({w}x{h})")
     return uploaded
