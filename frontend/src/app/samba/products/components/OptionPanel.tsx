@@ -14,12 +14,14 @@ const OptionPanel = React.memo(function OptionPanel({
   productId,
   sourceSite,
   nameRule,
+  curSym = '₩',
 }: {
   options: unknown[]
   productCost: number
   productId: string
   sourceSite: string
   nameRule?: import('@/lib/samba/api/support').SambaNameRule
+  curSym?: string
 }) {
   const [open, setOpen] = useState(false)
   const [selectAll, setSelectAll] = useState(true)
@@ -221,13 +223,13 @@ const OptionPanel = React.memo(function OptionPanel({
                     </td>
                     <td style={{ padding: '0.5rem', textAlign: 'right', fontSize: '0.875rem', color: '#C5C5C5' }}>
                       {sourceSite === 'KREAM'
-                        ? (Number(o.kreamGeneralPrice || o.kreamNormalPrice || o.price || 0) > 0 ? `₩${fmtNum(Number(o.kreamGeneralPrice || o.kreamNormalPrice || o.price || 0))}` : '-')
-                        : (optionCost > 0 ? `₩${fmtNum(optionCost)}` : '-')
+                        ? (Number(o.kreamGeneralPrice || o.kreamNormalPrice || o.price || 0) > 0 ? `${curSym}${fmtNum(Number(o.kreamGeneralPrice || o.kreamNormalPrice || o.price || 0))}` : '-')
+                        : (optionCost > 0 ? `${curSym}${fmtNum(optionCost)}` : '-')
                       }
                     </td>
                     {sourceSite === 'KREAM' && (
                       <td style={{ padding: '0.5rem', textAlign: 'right', fontSize: '0.875rem', color: '#6B8AFF' }}>
-                        {Number(o.kreamFastPrice || 0) > 0 ? `₩${fmtNum(Number(o.kreamFastPrice))}` : '-'}
+                        {Number(o.kreamFastPrice || 0) > 0 ? `${curSym}${fmtNum(Number(o.kreamFastPrice))}` : '-'}
                       </td>
                     )}
                     <td style={{ padding: '0.5rem', textAlign: 'right', fontSize: '0.875rem', color: '#E5E5E5', whiteSpace: 'nowrap' }}>
@@ -254,7 +256,7 @@ const OptionPanel = React.memo(function OptionPanel({
                         }}
                         style={{ width: '80px', background: 'rgba(255,255,255,0.05)', border: '1px solid #3D3D3D', color: '#E5E5E5', borderRadius: '4px', padding: '2px 6px', textAlign: 'right', fontSize: '0.875rem' }}
                       />
-                      <span style={{ marginLeft: '2px' }}>원</span>
+                      <span style={{ marginLeft: '2px' }}>{curSym === '$' ? '$' : '원'}</span>
                     </td>
                     <td style={{ padding: '0.5rem', textAlign: 'right', fontSize: '0.875rem', color: '#E5E5E5' }}>
                       {stockDisplay}
@@ -301,7 +303,7 @@ const OptionPanel = React.memo(function OptionPanel({
                     }}
                     style={{ flex: 1, padding: '8px 12px', fontSize: '0.85rem', background: '#1A1A1A', border: '1px solid #3D3D3D', color: '#E5E5E5', borderRadius: '6px' }}
                   />
-                  {bulkModal !== 'addOption' && <span style={{ color: '#888', fontSize: '0.8rem' }}>{bulkModal === 'price' ? '원' : '개'}</span>}
+                  {bulkModal !== 'addOption' && <span style={{ color: '#888', fontSize: '0.8rem' }}>{bulkModal === 'price' ? (curSym === '$' ? '$' : '원') : '개'}</span>}
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '16px' }}>
                   <button onClick={() => setBulkModal(null)}
