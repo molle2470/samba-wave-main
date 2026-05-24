@@ -390,6 +390,38 @@ async def transform_images(
     if not product_ids:
         return {"success": False, "message": "No products selected"}
 
+    # 이미 배경제거(__ai_image__) 완료된 상품 재처리 스킵 (이슈 #234)
+    # scope.skip_processed=true 시 product_ids 중 __ai_image__ 태그 보유분을 enqueue 전에 제외.
+    # → total 정확, 워커 디스패치/R2 업로드/rembg CPU 절감.
+    # 주의: __ai_image__는 상품 단위 태그(thumbnail/additional/detail scope 구분 없음).
+    #       썸네일만 처리된 상품도 제외되므로 상세 재처리 용도엔 부적합.
+    if scope.get("skip_processed") and product_ids:
+        from sqlalchemy import select as sa_select, text as _text_jsonb
+
+        from backend.domain.samba.collector.model import SambaCollectedProduct
+
+        _ai_img = _text_jsonb("'[\"__ai_image__\"]'::jsonb")
+        _done_stmt = sa_select(SambaCollectedProduct.id).where(
+            SambaCollectedProduct.id.in_(product_ids),
+            SambaCollectedProduct.tags.op("@>")(_ai_img),
+        )
+        _done_res = await session.execute(_done_stmt)
+        _done_ids = {r[0] for r in _done_res.all()}
+        if _done_ids:
+            product_ids = [pid for pid in product_ids if pid not in _done_ids]
+            logger.info(
+                f"[배경제거][skip_processed] 이미 처리된 {len(_done_ids)}개 제외 → "
+                f"{len(product_ids)}개 처리 대상"
+            )
+        if not product_ids:
+            return {
+                "success": True,
+                "status": "skipped",
+                "message": "모든 상품이 이미 처리됨 (skip_processed)",
+                "total_transformed": 0,
+                "total_failed": 0,
+            }
+
     # 배경제거는 로컬 워커 큐에 등록 (Cloud Run에서 처리 안 함)
     if mode == "background":
         from backend.domain.samba.job.model import SambaJob
