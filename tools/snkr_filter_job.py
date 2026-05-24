@@ -34,8 +34,8 @@ async def main():
                     text(
                         """
                 SELECT id, status, progress, total, error, created_at, updated_at
-                FROM samba_job
-                WHERE source_site='SNKRDUNK' OR search_filter_id IN (
+                FROM samba_jobs
+                WHERE search_filter_id IN (
                     SELECT id FROM samba_search_filter WHERE source_site='SNKRDUNK'
                 )
                 ORDER BY created_at DESC LIMIT 8

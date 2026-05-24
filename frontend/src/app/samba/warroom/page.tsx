@@ -705,8 +705,13 @@ export default function WarroomPage() {
       return { st, dev }
     })()
       .then(async ({ st: atStatus, dev }) => {
-        // 본인 PC 인스턴스 기준 running/cycle 사용
-        handleAutotuneStatus(atStatus.running, atStatus.cycle_count, atStatus.last_tick, atStatus.refreshed_count || 0)
+        // 단일유저·단일테넌트: 코디네이터 owner did 가 본인 확장앱 did 와 달라도
+        // (서버 재시작 시 DB저장 owner 로 자동복원 → 타 PC 가 주인) 본인 테넌트 PC 중
+        // 하나라도 돌면 "실행중"으로 표시. dev-scoped running 단독 판정 시 did 불일치로
+        // "작동중인데 정지" 오표시 + 60초 자동재합류로 실행중↔정지 깜빡임 발생(2026-05-24).
+        // dev-scoped running(atStatus.running) 은 아래 meMissing 자동재합류 판정에서 계속 사용.
+        const _tenantRunning = atStatus.running || (atStatus.running_pcs || []).length > 0
+        handleAutotuneStatus(_tenantRunning, atStatus.cycle_count, atStatus.last_tick, atStatus.refreshed_count || 0)
         setAutotuneRestarts(atStatus.restart_count || 0)
         // 본인 PC가 서버에서 실행 중으로 확인되면 intent='start'로 복원 (페이지 새로고침 대응)
         // 단, 백엔드 enabled=false(사용자가 정지)면 intent를 'stop'으로 내려 자동재합류 차단.
