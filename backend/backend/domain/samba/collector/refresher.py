@@ -517,10 +517,10 @@ def get_refresh_logs(
     if source_filter:
         logs = [l for l in logs if l.get("source") == source_filter]
     if device_id_filter:
-        # 자기 device_id 로그만 표시 — strict. device_id 빈값(글로벌) 로그도 차단.
-        # 빈값 포함 시 다른 PC cycle 컨텍스트 누락 로그(예: 집PC LOTTEON 잡)가 새는
-        # 사고가 있어 strict 로 전환 (2026-05-25 사용자 재요청).
-        logs = [l for l in logs if l.get("device_id") == device_id_filter]
+        # 쉼표 분리 다중 device_id 허용 — 본인 PC 브라우저 + 본인 PC 데몬 둘 다 자기
+        # 로그로 인정. 데몬 잡 로그가 PC 페이지에서 숨겨져 "안 돌아감" 오인하던 문제 해결.
+        allow = {d.strip() for d in device_id_filter.split(",") if d.strip()}
+        logs = [l for l in logs if l.get("device_id") in allow]
     return logs, _refresh_log_total
 
 

@@ -386,13 +386,19 @@ export default function WarroomPage() {
   const [autotuneCycles, setAutotuneCycles] = useState(0)
   const [autotuneRestarts, setAutotuneRestarts] = useState(0)
   // 이 PC device_id — 실시간 로그 PC별 분리(2026-05-25)
+  // 브라우저 device + 본인 PC 데몬 device 둘 다 합쳐 보냄 → 데몬 잡 로그도 본인 PC 로그로 표시.
   const [pcDeviceId, setPcDeviceId] = useState<string>('')
   useEffect(() => {
     (async () => {
       try {
         const { getDeviceId } = await import('@/lib/samba/deviceId')
         const dev = getDeviceId()
-        if (dev) setPcDeviceId(dev)
+        const daemonDev = (typeof window !== 'undefined' && (
+          window.localStorage.getItem('samba.autotune.daemon.deviceId') ||
+          window.localStorage.getItem('samba.lotteon.daemon.deviceId')
+        )) || ''
+        const ids = [dev, daemonDev].filter(Boolean)
+        if (ids.length) setPcDeviceId(ids.join(','))
       } catch { /* ignore */ }
     })()
   }, [])
