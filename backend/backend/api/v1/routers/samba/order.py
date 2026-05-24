@@ -35,9 +35,11 @@ router = APIRouter(prefix="/orders", tags=["samba-orders"])
 
 
 # ── 매칭 캐시(_mpn_cache) 모듈 전역 TTL 캐시 ──
-# 매 sync마다 collected_product 12.6만건 SELECT + 인덱싱(약 7초) 부담을
-# 60초 TTL로 한 번만 빌드해 재사용. 신규 cp 등록은 60초 안에 매칭됨.
-_MPN_CACHE_TTL_SEC = 60.0
+# 매 sync마다 collected_product 12.6만건 SELECT + 인덱싱 부담을
+# TTL로 한 번만 빌드해 재사용. 신규 cp 등록은 TTL 안에 매칭됨.
+# (images 배열 통째 SELECT가 빌드를 ~165초까지 부풀려 60초 TTL이 무용 → read 풀 고갈 유발했음.
+#  images->>0(첫 장만)로 전송량 축소 + TTL을 빌드 시간보다 길게 상향)
+_MPN_CACHE_TTL_SEC = 180.0
 # (by_global, by_account) 튜플 — by_account는 정확 매칭(account_id, product_no) 인덱스
 _mpn_cache_data: tuple[dict[str, dict], dict[str, dict]] | None = None
 _mpn_cache_built_at: float = 0.0
@@ -72,7 +74,7 @@ async def _get_mpn_cache(
         async with get_read_session() as _read_sess:
             _cp_result = await _read_sess.execute(
                 _sa_text(
-                    "SELECT id, source_site, site_product_id, images, market_product_nos, source_url, category "
+                    "SELECT id, source_site, site_product_id, (images->>0) AS thumb, market_product_nos, source_url, category "
                     "FROM samba_collected_product WHERE market_product_nos IS NOT NULL"
                 )
             )
@@ -81,10 +83,11 @@ async def _get_mpn_cache(
         new_by_account: dict[str, dict] = {}
         _ambiguous_count = 0
         for _row in _cp_rows:
-            _cpid, _site, _spid, _imgs, _mpnos, _src_url, _cat = _row
+            _cpid, _site, _spid, _thumb_raw, _mpnos, _src_url, _cat = _row
             if not (_mpnos and isinstance(_mpnos, dict)):
                 continue
-            _thumb = _imgs[0] if _imgs and isinstance(_imgs, list) and _imgs else ""
+            # SELECT에서 (images->>0)로 첫 이미지 URL만 가져옴 (전체 배열 전송 회피)
+            _thumb = _thumb_raw or ""
             _olink = _src_url or (
                 sourcing_urls.get(_site, "").format(_spid)
                 if _site in sourcing_urls and _spid

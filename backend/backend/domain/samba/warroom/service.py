@@ -23,9 +23,10 @@ _emit_counter = 0  # 100회마다 정리 실행
 _emit_counter_lock = asyncio.Lock()  # 코루틴 race 방지: += 연산 보호
 
 # ── 대시보드 결과 인메모리 캐시 ──
-# 30초 폴링 대상 API이므로 30초 TTL 캐시로 대부분의 중복 연산을 회피.
-# (15초였을 때는 폴링 주기와 어긋나 캐시 미스율이 약 50%였음)
-_DASHBOARD_CACHE_TTL = 30.0  # 초
+# 갱신통계 집계 쿼리(_get_refresh_stats의 last_refreshed_at count + registered JSONB 체크)가
+# 10만+ 상품에서 ~50초 걸려 30초 TTL은 무용(채워지기 전 만료 → 매 폴링마다 재실행 → read 풀 18칸 고갈).
+# TTL을 쿼리 시간보다 충분히 길게 잡아 캐시 실효성 확보 (대시보드라 3분 갱신 간격 무방).
+_DASHBOARD_CACHE_TTL = 180.0  # 초
 _dashboard_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
 _dashboard_cache_lock = asyncio.Lock()
 
