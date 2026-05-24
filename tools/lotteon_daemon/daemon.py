@@ -1532,16 +1532,16 @@ async def run_daemon(args: argparse.Namespace) -> int:
     # 활성 사이트 — `--sites=LOTTEON,ABCmart,SSG` 콤마 구분.
     # 기본값은 데몬 전용 사이트 전체(SITE_HANDLERS) — 확장앱 detail 가드가 거는
     # LOTTEON/ABCmart/GrandStage/SSG 를 한 데몬이 모두 처리한다.
-    # 기본 active_sites — detail 지원 사이트만 (MUSINSA 등 송장전용은 명시 --sites 지정 시만).
-    _default_sites = ",".join(s for s in SITE_HANDLERS if SITE_HANDLERS[s].detail_supported)
-    raw_sites = (getattr(args, "sites", "") or _default_sites).strip()
+    # 기본 active_sites — 전체 핸들러(MUSINSA 송장전용 포함). 데몬이 송장 잡도 폴링.
+    raw_sites = (getattr(args, "sites", "") or ",".join(SITE_HANDLERS)).strip()
     active_sites = [
         s.strip() for s in raw_sites.split(",") if s.strip() in SITE_HANDLERS
     ]
     if not active_sites:
-        active_sites = [s for s in SITE_HANDLERS if SITE_HANDLERS[s].detail_supported]
+        active_sites = list(SITE_HANDLERS)
     allowed_sites_header = ",".join(active_sites)
     # startup 로그인은 detail 지원 사이트만 — 송장전용(MUSINSA)은 잡 처리 시 계정별 로그인.
+    # (MUSINSA 를 startup 로그인하면 기본계정 1개만 로그인돼 무의미 + captcha 위험)
     login_sites = [
         s
         for s in active_sites
@@ -1971,14 +1971,11 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--sites",
-        default=os.environ.get(
-            "DAEMON_SITES",
-            ",".join(s for s in SITE_HANDLERS if SITE_HANDLERS[s].detail_supported),
-        ),
+        default=os.environ.get("DAEMON_SITES", ",".join(SITE_HANDLERS)),
         help=(
-            "처리 사이트 콤마구분 (예: LOTTEON,ABCmart,SSG). "
-            "X-Allowed-Sites 헤더로 백엔드에 전달. 기본값은 detail 지원 사이트 전체 "
-            "(MUSINSA 등 송장전용은 명시 지정 필요)."
+            "처리 사이트 콤마구분 (예: LOTTEON,ABCmart,SSG,MUSINSA). "
+            "X-Allowed-Sites 헤더로 백엔드에 전달. 기본값은 전체 핸들러 "
+            "(MUSINSA 는 송장 전용)."
         ),
     )
     # backend URL 우선순위:
