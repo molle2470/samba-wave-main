@@ -243,6 +243,15 @@ def any_pc_running() -> bool:
 AUTOTUNE_FILTER_SOURCES_KEY = "autotune_enabled_sources"
 AUTOTUNE_FILTER_MARKETS_KEY = "autotune_enabled_markets"
 
+# autotune_get_filters available_sources/markets 캐시 (2026-05-24).
+# registered 78k 스캔이 distinct(21초)+registered_accounts 전체 fetch(80초)=~100초라
+# 매 호출 시 프론트 fetch 무한대기 → 그동안 availSources 빈 채 → 소싱처/판매처
+# 체크박스가 화면에서 통째로 사라지던 버그. available_* 는 거의 안 변하므로 TTL 캐시.
+# Lock 으로 동시 cache-miss 시 중복 무거운 쿼리 차단(read 풀 고갈 방지).
+_FILTERS_AVAIL_TTL = 600.0  # 10분
+_filters_avail_cache: dict = {}  # {"sources":[...], "markets":[...], "ts":float}
+_filters_avail_lock = asyncio.Lock()
+
 # 오토튠 전송 글로벌 동시실행 제한 — refresher가 fire-and-forget으로 띄운 transmit task가
 # OOM 일으키지 않도록 상한. 너무 낮으면 backlog, 너무 높으면 메모리 폭주.
 # 정책 변경 직후 폭주 시 backlog는 이벤트 루프가 자연스럽게 흡수 (백프레셔).
@@ -3865,57 +3874,67 @@ class AutotuneFilterRequest(BaseModel):
 
 @router.get("/autotune/filters")
 async def autotune_get_filters():
-    """오토튠 필터 설정 + 실제 존재하는 소싱처/판매처(마켓 단위) 목록 반환."""
-    import json as _json
+    """오토튠 필터 설정 + 실제 존재하는 소싱처/판매처(마켓 단위) 목록 반환.
 
+    available_sources/markets 는 registered 78k 스캔이라 느림(~100초) → TTL 캐시.
+    saved_sources/markets(설정값)는 가벼우므로 매 호출 최신 조회.
+    """
     from backend.db.orm import get_read_session
     from backend.api.v1.routers.samba.proxy import _get_setting
     from backend.domain.samba.collector.model import SambaCollectedProduct as _CP
-    from backend.domain.samba.account.model import SambaMarketAccount
-    from sqlalchemy import distinct
+    from sqlalchemy import distinct, text as _text
 
+    global _filters_avail_cache
+
+    # 저장된 필터(설정) — 가벼움, 매번 최신
     async with get_read_session() as session:
-        # 현재 저장된 필터
         saved_sources = await _get_setting(session, AUTOTUNE_FILTER_SOURCES_KEY)
         saved_markets = await _get_setting(session, AUTOTUNE_FILTER_MARKETS_KEY)
 
-        # 마켓 등록 상품이 있는 소싱처만 (수집만 된 것은 제외)
-        src_stmt = select(distinct(_CP.source_site)).where(
-            _CP.source_site != None,
-            _CP.source_site != "",
-            _CP.status == "registered",
-        )
-        src_result = await session.execute(src_stmt)
-        available_sources = sorted([r[0] for r in src_result.all() if r[0]])
-
-        # 등록된 상품의 registered_accounts → 계정 ID 수집
-        reg_stmt = select(_CP.registered_accounts).where(
-            _CP.status == "registered",
-            _CP.registered_accounts.isnot(None),
-        )
-        reg_result = await session.execute(reg_stmt)
-        _acc_ids: set[str] = set()
-        for row in reg_result.all():
-            val = row[0]
-            if not val:
-                continue
-            # JSON 컬럼이 문자열로 반환될 수 있음
-            if isinstance(val, str):
-                try:
-                    val = _json.loads(val)
-                except Exception:
-                    continue
-            if isinstance(val, list):
-                _acc_ids.update(str(a) for a in val if a)
-
-        # 계정 → market_type 매핑 후 중복 제거 (마켓 단위)
-        available_markets: list[str] = []
-        if _acc_ids:
-            acc_stmt = select(distinct(SambaMarketAccount.market_type)).where(
-                SambaMarketAccount.id.in_(list(_acc_ids))
+    async def _compute_available() -> tuple[list[str], list[str]]:
+        """무거운 available_* 계산 — registered 상품 소싱처/마켓."""
+        async with get_read_session() as session:
+            # 마켓 등록 상품이 있는 소싱처만 (수집만 된 것은 제외)
+            src_stmt = select(distinct(_CP.source_site)).where(
+                _CP.source_site != None,
+                _CP.source_site != "",
+                _CP.status == "registered",
             )
-            acc_result = await session.execute(acc_stmt)
-            available_markets = sorted([r[0] for r in acc_result.all() if r[0]])
+            src_result = await session.execute(src_stmt)
+            srcs = sorted([r[0] for r in src_result.all() if r[0]])
+
+            # 판매처(마켓) — registered_accounts 전체 fetch(80초) 대신 EXISTS + @>
+            # (GIN ix_scp_registered_accounts_gin 활용). 계정수(소수)만큼 containment 프로브.
+            mk_stmt = _text(
+                "SELECT DISTINCT a.market_type FROM samba_market_account a "
+                "WHERE a.market_type IS NOT NULL AND EXISTS ("
+                "SELECT 1 FROM samba_collected_product cp "
+                "WHERE cp.status = 'registered' "
+                "AND cp.registered_accounts @> jsonb_build_array(a.id))"
+            )
+            mk_result = await session.execute(mk_stmt)
+            mkts = sorted([r[0] for r in mk_result.all() if r[0]])
+        return srcs, mkts
+
+    # available_* — TTL 캐시 (cache-miss 시 Lock 으로 중복 무거운 쿼리 차단)
+    cached = _filters_avail_cache
+    if cached and (time.time() - cached.get("ts", 0)) < _FILTERS_AVAIL_TTL:
+        available_sources = cached["sources"]
+        available_markets = cached["markets"]
+    else:
+        async with _filters_avail_lock:
+            # lock 대기 중 다른 요청이 채웠으면 재사용
+            cached = _filters_avail_cache
+            if cached and (time.time() - cached.get("ts", 0)) < _FILTERS_AVAIL_TTL:
+                available_sources = cached["sources"]
+                available_markets = cached["markets"]
+            else:
+                available_sources, available_markets = await _compute_available()
+                _filters_avail_cache = {
+                    "sources": available_sources,
+                    "markets": available_markets,
+                    "ts": time.time(),
+                }
 
     return {
         "enabled_sources": saved_sources if isinstance(saved_sources, list) else None,
