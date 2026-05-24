@@ -31,6 +31,23 @@ class SiteHandler:
     pre_extract_marker_js: str = ""
     pre_extract_marker_timeout_ms: int = 15_000
     extract_retry_field: str = "best_benefit_price"
+    # ── 송장(tracking) 전용 ──
+    # 송장조회 페이지에서 택배사/송장번호를 추출하는 self-contained async IIFE.
+    # 반환: {success, courierName, trackingNumber, error?, cancelled?}
+    # 확장앱 content-tracking-*.js 를 Playwright evaluate 용으로 이식 + 웨일 CDP 실측 검증(2026-05-24).
+    tracking_js: str = ""
+    # 계정 전환용 로그아웃 URL (다른 계정 주문 송장조회 전 세션 정리).
+    logout_url: str = ""
+    # 송장조회는 마이페이지(개인 주문) 접근 → SSG 처럼 가격수집은 무로그인이어도 로그인 필수.
+    tracking_requires_login: bool = True
+    # 2단계(two-hop) 송장: 주문상세 진입 → 버튼 클릭 → 다른 페이지 네비 → 스크랩 (무신사).
+    # tracking_two_hop=True 면 tracking_click_js(클릭) → 네비 대기 → tracking_js(스크랩) 순.
+    tracking_two_hop: bool = False
+    tracking_click_js: str = ""
+    # 2단계 네비 도착 판정용 URL glob (Playwright wait_for_url).
+    tracking_trace_url_glob: str = ""
+    # 가격수집(detail) 지원 여부. False 면 송장 전용 — 기본 active_sites/startup 로그인에서 제외.
+    detail_supported: bool = True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -303,6 +320,159 @@ _SSG_EXTRACT_JS = r"""
 """
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 송장(tracking) 추출 JS — 웨일 CDP 실측 검증(2026-05-24). 확장앱 content-tracking-*.js 이식.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ABCmart/GrandStage — div.status-info .info-desc(택배사) + .info-link(송장)
+_ABCMART_TRACKING_JS = r"""
+(async () => {
+  const href=location.href||'';
+  if(href.indexOf('/member/login')!==-1 || href.indexOf('order-detail')===-1)
+    return {success:false, needsLogin:true, error:'needs_login/redirect'};
+  const t=(document.body?.innerText||'').slice(0,8000);
+  if(/(취소완료|취소처리완료|구매취소완료|주문이\s*취소|취소된\s*주문)/.test(t)) return {success:false,cancelled:true,error:'order_cancelled'};
+  const t0=Date.now(); let c=null;
+  while(Date.now()-t0<10000){ c=document.querySelector('div.status-info .info-desc'); if(c&&(c.textContent||'').trim())break; await new Promise(r=>setTimeout(r,300)); }
+  if(!c) return {success:false, error:'no_tracking: status-info 미로드 (미발송)'};
+  const courierName=c.textContent.trim();
+  const te=document.querySelector('div.status-info .info-link'); const raw=(te?.textContent||'').trim(); const m=raw.match(/\d{8,}/);
+  const trackingNumber=m?m[0]:raw;
+  if(!trackingNumber) return {success:false, error:'no_tracking: 송장번호 미표시', courierName};
+  return {success:true, courierName, trackingNumber};
+})()
+"""
+
+# LOTTEON — "배송상세조회" 버튼 폴링 → 클릭 → dialog 내 택배사/송장
+_LOTTEON_TRACKING_JS = r"""
+(async () => {
+  const href=location.href||'';
+  if(href.indexOf('member.lotteon.com')!==-1 || href.indexOf('/member/login')!==-1)
+    return {success:false, needsLogin:true, error:'needs_login redirect'};
+  // SPA 본문 로드 대기
+  const tw=Date.now();
+  while(Date.now()-tw<25000){ if(location.href.indexOf('lotteon.com')!==-1 && document.readyState!=='loading') break; await new Promise(r=>setTimeout(r,300)); }
+  const txt=(document.body?.innerText||'').slice(0,8000);
+  if(/(취소완료|취소처리완료|구매취소완료|주문이\s*취소|취소된\s*주문)/.test(txt)) return {success:false,cancelled:true,error:'order_cancelled'};
+  let dialog=document.querySelector('dialog[open], [role="dialog"]');
+  if(!dialog){
+    const findBtn=()=>{ for(const b of document.querySelectorAll('button')){ if((b.textContent||'').trim().includes('배송상세조회'))return b; } for(const a of document.querySelectorAll('a')){ if((a.textContent||'').includes('배송상세조회'))return a; } return null; };
+    let el=null; const tb=Date.now();
+    while(Date.now()-tb<15000){ el=findBtn(); if(el)break; await new Promise(r=>setTimeout(r,400)); }
+    if(!el) return {success:false, error:'no_tracking: 배송상세조회 버튼 없음 (미발송/선물주문)'};
+    el.click();
+    const td=Date.now();
+    while(Date.now()-td<8000){ dialog=document.querySelector('dialog[open], [role="dialog"]'); if(dialog)break; await new Promise(r=>setTimeout(r,300)); }
+    if(!dialog) return {success:false, error:'dialog 미열림'};
+  }
+  await new Promise(r=>setTimeout(r,1200));
+  const field=(label)=>{ for(const e of dialog.querySelectorAll('*')){ if((e.textContent||'').trim()===label && e.children.length===0){ const s=e.nextElementSibling; if(!s)continue; const lk=s.querySelector('a')||(s.tagName==='A'?s:null); return (lk?.textContent||s.textContent||'').trim(); } } return ''; };
+  let courierName=field('택배사'); let trackingNumber=field('송장번호');
+  if(!trackingNumber){ for(const lk of dialog.querySelectorAll('a[href*="tracking"], a[href*="InvNo"]')){ const x=lk.textContent.trim(); if(/^\d{8,}$/.test(x)){trackingNumber=x;break;} } }
+  if(!trackingNumber) return {success:false, error:'no_tracking: 송장번호 미표시', courierName};
+  return {success:true, courierName, trackingNumber};
+})()
+"""
+
+LOTTEON_LOGOUT_URL = "https://www.lotteon.com/p/member/logout"
+ABCMART_LOGOUT_URL = "https://abcmart.a-rt.com/member/logout"
+
+# ── SSG 송장 + 로그인 (마이페이지는 가격수집과 달리 로그인 필수) ──
+# 로그인폼 실측(2026-05-24, incognito): #mem_id / #mem_pw / #loginBtn.
+SSG_TRACKING_LOGIN_URL = "https://member.ssg.com/member/login.ssg"
+SSG_HOME_URL = "https://www.ssg.com/"
+SSG_LOGOUT_URL = "https://www.ssg.com/comm/login/logout.ssg"
+SSG_LOGIN_SELECTORS = {
+    "id": ["#mem_id", 'input[name="mbrLoginId"]'],
+    "pw": ["#mem_pw", 'input[name="password"]'],
+    "btn": ["#loginBtn", 'button[type="submit"].cmem_btn'],
+}
+SSG_LOGIN_CHECK_JS = r"""
+(() => {
+  try {
+    const t = (document.querySelector('.gnb_utmenu, .gnb_util, header')?.innerText
+      || (document.body?.innerText || '').slice(0, 500)).replace(/\s+/g, ' ');
+    if (t.includes('로그아웃')) return 'logged_in';
+    if (t.includes('로그인') || t.includes('회원가입')) return 'logged_out';
+    return 'unknown';
+  } catch (e) { return 'unknown'; }
+})()
+"""
+# SSG 송장 스크랩 — .tx_state em (택배사 span + 송장번호 텍스트). 웨일 CDP 실측 검증.
+_SSG_TRACKING_JS = r"""
+(async () => {
+  const href=location.href||'';
+  if(href.indexOf('member.ssg.com')!==-1 || href.indexOf('/member/login')!==-1 || href.indexOf('orderInfoDetail.ssg')===-1)
+    return {success:false, needsLogin:true, error:'needs_login/redirect'};
+  const t=(document.body?.innerText||'').slice(0,8000);
+  if(/(취소완료|취소처리완료|구매취소완료|주문이\s*취소|취소된\s*주문)/.test(t)) return {success:false,cancelled:true,error:'order_cancelled'};
+  const t0=Date.now(); let c=null;
+  while(Date.now()-t0<12000){ c=document.querySelector('.tx_state em'); if(c)break; await new Promise(r=>setTimeout(r,300)); }
+  if(!c) return {success:false, error:'no_tracking: .tx_state 미로드 (미발송)'};
+  const courierName=(c.querySelector('span')?.textContent||'').trim();
+  let trackingNumber=''; for(const n of c.childNodes){ if(n.nodeType===3){ const m=n.textContent.match(/\d{8,}/); if(m){trackingNumber=m[0];break;} } }
+  if(!trackingNumber) return {success:false, error:'no_tracking: 송장번호 미표시', courierName};
+  return {success:true, courierName, trackingNumber};
+})()
+"""
+
+# ── MUSINSA 송장 (2단계) + 로그인 ──
+# 로그인폼 실측(2026-05-24, incognito): member.one.musinsa.com/login SPA.
+#   id=input.login-v2-input__input[type=text], pw=[type=password], btn=button.login-v2-button__item[type=submit]
+MUSINSA_LOGIN_URL = "https://www.musinsa.com/auth/login"
+MUSINSA_HOME_URL = "https://www.musinsa.com/mypage"
+MUSINSA_LOGOUT_URL = "https://www.musinsa.com/auth/logout"
+MUSINSA_LOGIN_SELECTORS = {
+    "id": ['input.login-v2-input__input[type="text"]', 'input[type="text"].login-v2-input__input'],
+    "pw": ['input.login-v2-input__input[type="password"]', 'input[type="password"].login-v2-input__input'],
+    "btn": ['button.login-v2-button__item[type="submit"]', 'button[type="submit"]'],
+}
+MUSINSA_LOGIN_CHECK_JS = r"""
+(() => {
+  try {
+    const h = location.href || '';
+    if (h.indexOf('/auth/login') !== -1 || h.indexOf('member.one.musinsa.com') !== -1) return 'logged_out';
+    if (/\/mypage/.test(h)) return 'logged_in';
+    return 'unknown';
+  } catch (e) { return 'unknown'; }
+})()
+"""
+# 1단계: 주문상세에서 "배송조회" 버튼 폴링 → wrong_account 체크 → 클릭.
+_MUSINSA_TRACKING_CLICK_JS = r"""
+(async () => {
+  const isWrong=()=>{ const t=(document.body?.innerText||'').slice(0,4000); return /주문\s*정보를?\s*찾을\s*수\s*없|잘못된\s*접근/.test(t); };
+  const t=(document.body?.innerText||'').slice(0,8000);
+  if(/(취소완료|취소처리완료|구매취소완료|주문이\s*취소|취소된\s*주문)/.test(t)) return {clicked:false, cancelled:true, error:'order_cancelled'};
+  const t0=Date.now(); let btn=null;
+  while(Date.now()-t0<15000){
+    if(isWrong()) return {clicked:false, error:'wrong_account: 현 로그인 계정에 주문 없음'};
+    const bs=Array.from(document.querySelectorAll('button'));
+    btn=bs.find(b=>{ const x=(b.textContent||'').replace(/\s+/g,'').trim(); return x==='배송조회'; });
+    if(btn && !btn.disabled) break;
+    await new Promise(r=>setTimeout(r,300));
+  }
+  if(!btn) return {clicked:false, error:'no_tracking: 배송조회 버튼 없음 (배송대기/미발송)'};
+  btn.click();
+  return {clicked:true};
+})()
+"""
+# 2단계: trace 페이지에서 택배사/송장 스크랩.
+_MUSINSA_TRACKING_TRACE_JS = r"""
+(async () => {
+  if((document.title||'').toLowerCase().includes('보안 인증')) return {success:false, error:'captcha'};
+  if(/정상적인\s*접근이\s*아닙니다/.test((document.body?.innerText||'').slice(0,2000))) return {success:false, error:'abnormal_access'};
+  const t0=Date.now(); let ce=null;
+  while(Date.now()-t0<20000){ ce=document.querySelector('p.company-name'); if(ce&&(ce.textContent||'').trim())break; await new Promise(r=>setTimeout(r,300)); }
+  if(!ce) return {success:false, error:'no_tracking: 택배사 DOM 미로드 (미발송)'};
+  const courierName=ce.textContent.trim();
+  const te=document.querySelector('button.tracking-number');
+  const trackingNumber=(te?.textContent||'').trim();
+  if(!trackingNumber) return {success:false, error:'no_tracking: 송장번호 없음', courierName};
+  return {success:true, courierName, trackingNumber};
+})()
+"""
+
+
 SITE_HANDLERS: dict[str, SiteHandler] = {
     "ABCmart": SiteHandler(
         site="ABCmart",
@@ -317,6 +487,8 @@ SITE_HANDLERS: dict[str, SiteHandler] = {
         # timeout 6s = floor 대비 넉넉. 혜택가 없는 상품은 timeout 후 API 폴백(_apiBenefit).
         pre_extract_marker_timeout_ms=6_000,
         pre_extract_wait_ms=200,
+        tracking_js=_ABCMART_TRACKING_JS,
+        logout_url=ABCMART_LOGOUT_URL,
     ),
     "GrandStage": SiteHandler(
         site="GrandStage",
@@ -329,16 +501,43 @@ SITE_HANDLERS: dict[str, SiteHandler] = {
         pre_extract_marker_js=_ABCMART_MARKER_JS,
         pre_extract_marker_timeout_ms=6_000,
         pre_extract_wait_ms=200,
+        tracking_js=_ABCMART_TRACKING_JS,
+        logout_url=ABCMART_LOGOUT_URL,
     ),
     "SSG": SiteHandler(
         site="SSG",
         extract_js=_SSG_EXTRACT_JS,
-        requires_login=False,
+        requires_login=False,  # 가격수집(detail)은 무로그인 — 변경 금지
         dialog_policy="accept",
         pre_extract_marker_js=_SSG_MARKER_JS,
         # 실측(2026-05-24, 10상품): itemNm·uitemObjList 동시 생성, 최대 1.30s.
         # 마커(itemNm)가 곧 재고 준비 시점 → 정확성 안전. timeout 6s 넉넉.
         pre_extract_marker_timeout_ms=6_000,
         pre_extract_wait_ms=200,
+        # 송장(tracking)은 마이페이지 접근 → 로그인 필수. login_url/selectors 추가.
+        # requires_login=False 유지 → detail 흐름은 ensure_logged_in_for_site 가 스킵.
+        login_url=SSG_TRACKING_LOGIN_URL,
+        home_url=SSG_HOME_URL,
+        login_selectors=SSG_LOGIN_SELECTORS,
+        login_check_js=SSG_LOGIN_CHECK_JS,
+        tracking_js=_SSG_TRACKING_JS,
+        logout_url=SSG_LOGOUT_URL,
+    ),
+    "MUSINSA": SiteHandler(
+        site="MUSINSA",
+        # MUSINSA 는 데몬 가격수집(detail) 미지원 — 송장 전용 핸들러. extract_js 더미.
+        extract_js="(() => ({success:false, error:'MUSINSA detail 데몬 미지원'}))()",
+        requires_login=True,
+        login_url=MUSINSA_LOGIN_URL,
+        home_url=MUSINSA_HOME_URL,
+        login_selectors=MUSINSA_LOGIN_SELECTORS,
+        login_check_js=MUSINSA_LOGIN_CHECK_JS,
+        logout_url=MUSINSA_LOGOUT_URL,
+        # 2단계: 주문상세 → 배송조회 클릭 → /delivery/trace 네비 → 스크랩
+        tracking_two_hop=True,
+        tracking_click_js=_MUSINSA_TRACKING_CLICK_JS,
+        tracking_js=_MUSINSA_TRACKING_TRACE_JS,
+        tracking_trace_url_glob="**/order-service/my/delivery/trace*",
+        detail_supported=False,  # 송장 전용 — 가격수집 미지원
     ),
 }

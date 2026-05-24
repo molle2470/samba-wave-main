@@ -148,6 +148,9 @@ def main():
         cdp_wait(ws, 1)
         cdp_send(ws, 2, "Runtime.enable")
         cdp_wait(ws, 2)
+        # 배경 탭 렌더 스로틀 회피 — 탭 활성화
+        cdp_send(ws, 3, "Page.bringToFront")
+        cdp_wait(ws, 3)
         # 페이지 로드 대기
         time.sleep(6)
         cdp_send(

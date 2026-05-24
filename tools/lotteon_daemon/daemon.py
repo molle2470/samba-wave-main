@@ -59,16 +59,28 @@ from playwright.async_api import (  # noqa: E402
 
 # 사이트 핸들러 레지스트리 (ABCmart/GrandStage/SSG). LOTTEON 은 본 파일 하단 등록.
 try:
-    from site_handlers import SITE_HANDLERS, SiteHandler  # type: ignore
+    from site_handlers import (  # type: ignore
+        ABCMART_LOGOUT_URL,
+        LOTTEON_LOGOUT_URL,
+        SITE_HANDLERS,
+        SiteHandler,
+        _LOTTEON_TRACKING_JS,
+    )
 except ImportError:
     sys.path.insert(0, str(Path(__file__).parent))
-    from site_handlers import SITE_HANDLERS, SiteHandler  # type: ignore
+    from site_handlers import (  # type: ignore
+        ABCMART_LOGOUT_URL,
+        LOTTEON_LOGOUT_URL,
+        SITE_HANDLERS,
+        SiteHandler,
+        _LOTTEON_TRACKING_JS,
+    )
 
 
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.1.5"
+DAEMON_VERSION = "1.1.6"
 
 
 # ====================================================================
@@ -431,6 +443,8 @@ SITE_HANDLERS["LOTTEON"] = SiteHandler(
     pre_extract_marker_js=LOTTEON_MARKER_JS,
     pre_extract_marker_timeout_ms=5_000,
     extract_retry_field="best_benefit_price",
+    tracking_js=_LOTTEON_TRACKING_JS,
+    logout_url=LOTTEON_LOGOUT_URL,
 )
 
 
@@ -816,11 +830,17 @@ async def fetch_credential(
     device_id: str,
     api_key: str,
     site_name: str,
+    account_id: str = "",
 ) -> dict[str, str] | None:
-    """등록된 site_name 기본 계정의 username/password 평문 조회."""
+    """site 기본 계정(또는 account_id 지정 계정)의 username/password 평문 조회.
+
+    account_id 지정 시 그 계정 단건 조회 (송장조회 = 주문 매칭 계정 로그인).
+    백엔드 엔드포인트가 account_id 우선 처리.
+    """
+    params = {"account_id": account_id} if account_id else {"site_name": site_name}
     r = await client.get(
         f"{backend_url}/api/v1/samba/sourcing-accounts/login-credential",
-        params={"site_name": site_name},
+        params=params,
         headers={
             "X-Device-Id": device_id,
             "X-Api-Key": api_key,
@@ -829,8 +849,9 @@ async def fetch_credential(
     )
     if r.status_code == 404:
         logger.warning(
-            "%s 기본 계정 미등록 — 삼바웨이브 화면에서 소싱처 계정 추가 필요",
+            "%s 계정 미등록 (account_id=%s) — 삼바웨이브에서 소싱처 계정 추가 필요",
             site_name,
+            account_id or "기본",
         )
         return None
     if r.status_code != 200:
@@ -983,6 +1004,227 @@ async def ensure_logged_in(
         api_key,
         SITE_HANDLERS["LOTTEON"],
     )
+
+
+# ====================================================================
+# 송장(tracking) 처리 — 주문 매칭 계정 로그인 + 배송조회 페이지 스크랩
+# ====================================================================
+
+# site → 마지막으로 로그인한 sourcing_account_id (계정 스왑 최소화용).
+# 큐가 sourcingAccountId 순으로 잡을 주므로 같은 계정 연속 → 스왑 횟수 = 계정 수.
+_last_tracking_account: dict[str, str] = {}
+
+
+async def logout_site(page: Page, handler: SiteHandler) -> None:
+    """계정 전환용 정식 로그아웃 — 서버 세션 expire + Set-Cookie 쿠키 정리."""
+    if not handler.logout_url:
+        return
+    try:
+        await page.goto(handler.logout_url, wait_until="domcontentloaded", timeout=20_000)
+        await page.wait_for_timeout(1_500)
+        logger.info("%s 로그아웃 완료 (계정 전환)", handler.site)
+    except Exception as exc:
+        logger.warning("%s 로그아웃 실패(무시): %s", handler.site, str(exc)[:100])
+
+
+async def ensure_logged_in_as_account(
+    page: Page,
+    client: httpx.AsyncClient,
+    backend_url: str,
+    device_id: str,
+    api_key: str,
+    handler: SiteHandler,
+    account_id: str,
+) -> bool:
+    """주문 매칭 계정(account_id)으로 로그인 보장.
+
+    마지막 로그인 계정과 같고 세션 살아있으면 스킵. 다르면 로그아웃 후 그 계정 로그인.
+    account_id 없으면 site 기본 계정으로 로그인(레거시 폴백).
+    """
+    site = handler.site
+    last = _last_tracking_account.get(site, "")
+
+    # 같은 계정 연속 + 세션 살아있으면 스왑 스킵 (빠른 경로)
+    if account_id and last == account_id and await is_site_logged_in(page, handler):
+        logger.info("%s 계정 %s 세션 유지 — 스왑 스킵", site, account_id)
+        return True
+
+    cred = await fetch_credential(
+        client, backend_url, device_id, api_key, site, account_id=account_id
+    )
+    if not cred:
+        logger.error("%s 자격증명 조회 실패 account_id=%s", site, account_id or "기본")
+        return False
+
+    # 다른 계정 로그인 중이면 먼저 로그아웃 (세션 정리)
+    if last and last != account_id:
+        await logout_site(page, handler)
+        _last_tracking_account.pop(site, None)
+
+    ok = await auto_login_site(page, handler, cred)
+    if ok:
+        _last_tracking_account[site] = account_id or "_default"
+    return ok
+
+
+async def extract_tracking(page: Page, url: str, handler: SiteHandler) -> dict[str, Any]:
+    """송장조회 페이지 진입 + 스크랩 → {success, courierName, trackingNumber}.
+
+    단일 페이지(SSG/ABC/LOTTEON): goto → tracking_js evaluate.
+    2단계(MUSINSA): goto 주문상세 → tracking_click_js 클릭 → trace 네비 대기 → tracking_js.
+    """
+    if not handler.tracking_js:
+        return {"success": False, "error": f"{handler.site} tracking_js 미정의"}
+    try:
+        await page.goto(url, wait_until="commit", timeout=30_000)
+    except Exception as exc:
+        return {"success": False, "error": f"송장 페이지 로드 실패: {str(exc)[:120]}"}
+    # 헤드리스 탭 렌더 보장 (배경 스로틀 회피)
+    try:
+        await page.bring_to_front()
+    except Exception:
+        pass
+
+    # ── 2단계(two-hop) 흐름 — MUSINSA: 배송조회 클릭 → trace 페이지 네비 → 스크랩 ──
+    if handler.tracking_two_hop:
+        try:
+            click_res = await page.evaluate(handler.tracking_click_js)
+        except Exception as exc:
+            return {"success": False, "error": f"tracking click 예외: {str(exc)[:120]}"}
+        if not isinstance(click_res, dict) or not click_res.get("clicked"):
+            return {
+                "success": False,
+                "error": (click_res or {}).get("error", "배송조회 클릭 실패"),
+                "cancelled": bool((click_res or {}).get("cancelled")),
+            }
+        # 클릭 후 trace 페이지 도착 대기 (pushState/풀네비 모두 wait_for_url 로 커버)
+        try:
+            await page.wait_for_url(handler.tracking_trace_url_glob, timeout=20_000)
+        except Exception:
+            return {
+                "success": False,
+                "error": f"trace 페이지 미진입 (현재 {page.url})",
+            }
+        try:
+            data = await page.evaluate(handler.tracking_js)
+        except Exception as exc:
+            return {"success": False, "error": f"trace 스크랩 예외: {str(exc)[:120]}"}
+        return data if isinstance(data, dict) else {"success": False, "error": "trace 결과 비dict"}
+
+    # ── 단일 페이지 흐름 ──
+    try:
+        data = await page.evaluate(handler.tracking_js)
+    except Exception as exc:
+        return {"success": False, "error": f"tracking evaluate 예외: {str(exc)[:120]}"}
+    return data if isinstance(data, dict) else {"success": False, "error": "evaluate 결과 비dict"}
+
+
+async def post_tracking_result(
+    client: httpx.AsyncClient,
+    backend_url: str,
+    request_id: str,
+    data: dict[str, Any],
+    api_key: str,
+) -> bool:
+    """송장 결과를 /sourcing/tracking-result 로 전송 (확장앱과 동일 엔드포인트).
+
+    body = {requestId, success, courierName, trackingNumber, error, cancelled}
+    """
+    url = f"{backend_url}/api/v1/samba/proxy/sourcing/tracking-result"
+    body = {
+        "requestId": request_id,
+        "success": bool(data.get("success")),
+        "courierName": data.get("courierName") or "",
+        "trackingNumber": data.get("trackingNumber") or "",
+        "error": data.get("error") or "",
+        "cancelled": bool(data.get("cancelled")),
+    }
+    headers = {"X-Api-Key": api_key}
+    for attempt in range(len(_RETRY_DELAYS) + 1):
+        try:
+            r = await client.post(url, json=body, headers=headers, timeout=15.0)
+        except Exception as exc:
+            if attempt < len(_RETRY_DELAYS):
+                await asyncio.sleep(_RETRY_DELAYS[attempt])
+                continue
+            logger.warning("송장 결과전송 예외 (포기): %s", exc)
+            return False
+        if r.is_success:
+            return True
+        if r.status_code in _RETRY_STATUSES and attempt < len(_RETRY_DELAYS):
+            await asyncio.sleep(_RETRY_DELAYS[attempt])
+            continue
+        logger.warning("송장 결과전송 실패 status=%s body=%s", r.status_code, r.text[:200])
+        return False
+    return False
+
+
+async def process_tracking_job(
+    page: Page,
+    client: httpx.AsyncClient,
+    backend_url: str,
+    job: dict[str, Any],
+    state: DaemonState,
+    api_key: str,
+    device_id: str,
+) -> None:
+    """송장 잡 1개 처리 — 계정 로그인 → 배송조회 스크랩 → tracking-result 회신."""
+    request_id = job.get("requestId", "")
+    site = job.get("site", "")
+    url = job.get("url", "")
+    account_id = job.get("sourcingAccountId", "") or ""
+    # 송장 잡 site 는 대문자(ABCMART/GRANDSTAGE)인데 핸들러 키는 혼합(ABCmart/GrandStage).
+    # 정규화해서 매칭 (detail 잡은 핸들러 키 그대로라 영향 없음).
+    _TRACKING_SITE_ALIAS = {"ABCMART": "ABCmart", "GRANDSTAGE": "GrandStage"}
+    handler_key = _TRACKING_SITE_ALIAS.get(site.upper(), site)
+    handler = SITE_HANDLERS.get(handler_key)
+
+    if not handler or not handler.tracking_js:
+        await post_tracking_result(
+            client, backend_url, request_id,
+            {"success": False, "error": f"daemon tracking 미지원: {site}"}, api_key,
+        )
+        state.record_failure()
+        return
+
+    logger.info("[송장] 처리 시작 site=%s req=%s acc=%s", site, request_id, account_id or "-")
+    t0 = time.time()
+
+    # 1) 주문 매칭 계정 로그인 (송장은 마이페이지라 로그인 필수)
+    login_ok = await ensure_logged_in_as_account(
+        page, client, backend_url, device_id, api_key, handler, account_id
+    )
+    if not login_ok:
+        await post_tracking_result(
+            client, backend_url, request_id,
+            {"success": False, "error": f"{site} 계정 로그인 실패 (acc={account_id})"}, api_key,
+        )
+        state.record_failure()
+        return
+
+    # 2) 송장조회 페이지 스크랩
+    try:
+        data = await asyncio.wait_for(extract_tracking(page, url, handler), timeout=90.0)
+    except asyncio.TimeoutError:
+        data = {"success": False, "error": "daemon 송장 추출 타임아웃"}
+    except Exception as exc:
+        data = {"success": False, "error": f"daemon 송장 예외: {str(exc)[:120]}"}
+
+    # needsLogin 신호면 다음 잡에서 재로그인하도록 캐시 무효화
+    if data.get("needsLogin"):
+        _last_tracking_account.pop(site, None)
+
+    await post_tracking_result(client, backend_url, request_id, data, api_key)
+    dt = time.time() - t0
+    if data.get("success"):
+        logger.info(
+            "[송장] 완료 req=%s %s/%s (%.1fs)",
+            request_id, data.get("courierName"), data.get("trackingNumber"), dt,
+        )
+        state.record_success()
+    else:
+        logger.info("[송장] 미수집 req=%s err=%s (%.1fs)", request_id, data.get("error"), dt)
+        state.record_failure()
 
 
 # ====================================================================
@@ -1161,6 +1403,7 @@ async def process_job(
     job: dict[str, Any],
     state: DaemonState,
     api_key: str,
+    device_id: str = "",
 ) -> str | None:
     """잡 1개 처리. 반환값:
     - None: 정상 처리(성공/실패와 무관, 회신 완료)
@@ -1171,6 +1414,13 @@ async def process_job(
     jtype = job.get("type", "")
     url = job.get("url", "")
     product_id = job.get("productId", "")
+
+    # 송장(tracking) 잡 — 별도 흐름 (계정 로그인 + 배송조회 스크랩)
+    if jtype == "tracking":
+        await process_tracking_job(
+            page, client, backend_url, job, state, api_key, device_id
+        )
+        return None
 
     handler = SITE_HANDLERS.get(site)
     if not handler or jtype != "detail":
@@ -1282,14 +1532,21 @@ async def run_daemon(args: argparse.Namespace) -> int:
     # 활성 사이트 — `--sites=LOTTEON,ABCmart,SSG` 콤마 구분.
     # 기본값은 데몬 전용 사이트 전체(SITE_HANDLERS) — 확장앱 detail 가드가 거는
     # LOTTEON/ABCmart/GrandStage/SSG 를 한 데몬이 모두 처리한다.
-    raw_sites = (getattr(args, "sites", "") or ",".join(SITE_HANDLERS)).strip()
+    # 기본 active_sites — detail 지원 사이트만 (MUSINSA 등 송장전용은 명시 --sites 지정 시만).
+    _default_sites = ",".join(s for s in SITE_HANDLERS if SITE_HANDLERS[s].detail_supported)
+    raw_sites = (getattr(args, "sites", "") or _default_sites).strip()
     active_sites = [
         s.strip() for s in raw_sites.split(",") if s.strip() in SITE_HANDLERS
     ]
     if not active_sites:
-        active_sites = list(SITE_HANDLERS)
+        active_sites = [s for s in SITE_HANDLERS if SITE_HANDLERS[s].detail_supported]
     allowed_sites_header = ",".join(active_sites)
-    login_sites = [s for s in active_sites if SITE_HANDLERS[s].requires_login]
+    # startup 로그인은 detail 지원 사이트만 — 송장전용(MUSINSA)은 잡 처리 시 계정별 로그인.
+    login_sites = [
+        s
+        for s in active_sites
+        if SITE_HANDLERS[s].requires_login and SITE_HANDLERS[s].detail_supported
+    ]
     dialog_accept_sites = {
         s for s in active_sites if SITE_HANDLERS[s].dialog_policy == "accept"
     }
@@ -1457,7 +1714,8 @@ async def run_daemon(args: argparse.Namespace) -> int:
                         continue
                     try:
                         await process_job(
-                            wpage, http_client, backend_url, job, state, api_key
+                            wpage, http_client, backend_url, job, state, api_key,
+                            args.device_id,
                         )
                     except asyncio.CancelledError:
                         raise
@@ -1713,10 +1971,14 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--sites",
-        default=os.environ.get("DAEMON_SITES", ",".join(SITE_HANDLERS)),
+        default=os.environ.get(
+            "DAEMON_SITES",
+            ",".join(s for s in SITE_HANDLERS if SITE_HANDLERS[s].detail_supported),
+        ),
         help=(
             "처리 사이트 콤마구분 (예: LOTTEON,ABCmart,SSG). "
-            "X-Allowed-Sites 헤더로 백엔드에 전달. 기본값은 데몬 전용 사이트 전체."
+            "X-Allowed-Sites 헤더로 백엔드에 전달. 기본값은 detail 지원 사이트 전체 "
+            "(MUSINSA 등 송장전용은 명시 지정 필요)."
         ),
     )
     # backend URL 우선순위:

@@ -518,6 +518,17 @@ export default function PoliciesPage() {
       // 나머지 병렬 실행 (상품명규칙 + 삭제어 + 금지어 + 목록갱신)
       const parallel: Promise<unknown>[] = [policyApi.list().then(list => setPolicies(list)).catch(() => {})]
 
+      // 롯데홈쇼핑 섹션 설정(brandMappings·MD상품군 등)도 정책 저장 시 함께 저장.
+      // 기존엔 별도 섹션 저장 버튼을 눌러야만 /lottehome/policy 에 저장돼 누락이 잦았음(이중 저장 구조).
+      // 로드 전 기본값(빈 brandMappings)으로 기존 저장본을 덮어쓰지 않도록, 실제 내용이 있을 때만 POST.
+      if (lottePolicy.mdGsgrNo || lottePolicy.brandMappings.length > 0) {
+        parallel.push(
+          request(`${API_BASE}/api/v1/samba/proxy/lottehome/policy`, {
+            method: 'POST', body: JSON.stringify(lottePolicy),
+          }).catch(() => {})
+        )
+      }
+
       if (selectedNameRuleId) {
         const rule = nameRulesRef.current.find(x => x.id === selectedNameRuleId)
         if (rule) {

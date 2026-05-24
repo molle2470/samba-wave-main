@@ -39,7 +39,7 @@ router = APIRouter(prefix="/orders", tags=["samba-orders"])
 # 캐시가 안 채워지고 무한 재스캔 → read 풀 고갈 사고.
 # 현재: updated_at(ix_scp_updated_at_desc) 변경분만 증분 머지 + 주기적 전체 재빌드.
 _MPN_CACHE_TTL_SEC = 180.0  # 증분 적용 최소 간격(초)
-_MPN_FULL_REBUILD_SEC = 1800.0  # 전체 재빌드 주기(초) — 삭제·등록해제 staleness 정리
+_MPN_FULL_REBUILD_SEC = 21600.0  # 전체 재빌드 주기(초, 6h) — 삭제·등록해제 staleness 정리. 증분이 신선도 담당하므로 드물게
 # (by_global, by_account) 튜플 — by_account는 정확 매칭(account_id, product_no) 인덱스
 _mpn_cache_data: tuple[dict[str, dict], dict[str, dict]] | None = None
 _mpn_cache_built_at: float = 0.0  # 마지막 빌드/증분 monotonic
@@ -53,11 +53,12 @@ def _index_mpn_row(_row, by_global: dict, by_account: dict, sourcing_urls: dict)
 
     전체 빌드와 증분 머지 둘 다 이 함수를 재사용 — 인덱싱 규칙을 1곳에 모은다.
     """
-    _cpid, _site, _spid, _thumb_raw, _mpnos, _src_url, _cat = _row
+    _cpid, _site, _spid, _mpnos, _src_url, _cat = _row
     if not (_mpnos and isinstance(_mpnos, dict)):
         return 0
-    # SELECT에서 (images->>0)로 첫 이미지 URL만 가져옴 (전체 배열 전송 회피)
-    _thumb = _thumb_raw or ""
+    # 썸네일은 bulk 스캔에서 제외(images TOAST 비용 회피) — 표시용이라 빈값.
+    # 필요 시 /fetch-product-image 지연조회 또는 마켓 자동채움이 보완.
+    _thumb = ""
     _olink = _src_url or (
         sourcing_urls.get(_site, "").format(_spid)
         if _site in sourcing_urls and _spid
@@ -135,8 +136,11 @@ def _index_mpn_row(_row, by_global: dict, by_account: dict, sourcing_urls: dict)
     return _ambiguous_new
 
 
+# images(JSON 배열, TOAST)는 SELECT에서 제외 — 포함 시 전체 스캔이 61초→337초로 폭증해
+# 빌드가 per-account 타임아웃(180~300초)에 매번 killed → 캐시 영영 미생성 사고.
+# product_image는 표시용일 뿐(마켓 자동채움 + /fetch-product-image 지연조회 존재)이라 빈값으로 둔다.
 _MPN_SELECT_COLS = (
-    "SELECT id, source_site, site_product_id, (images->>0) AS thumb, "
+    "SELECT id, source_site, site_product_id, "
     "market_product_nos, source_url, category FROM samba_collected_product "
     "WHERE market_product_nos IS NOT NULL"
 )
