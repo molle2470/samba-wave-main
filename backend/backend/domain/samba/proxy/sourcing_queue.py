@@ -222,7 +222,7 @@ class SourcingQueue:
             job["maxCount"] = max_count
         cls.resolvers[request_id] = future
         asyncio.create_task(_db_insert_job(job, "search"))
-        _owner_tag = f" owner={owner_device_id[:8]}" if owner_device_id else ""
+        _owner_tag = f" owner={owner_device_id}" if owner_device_id else ""
         logger.info(
             f"[소싱큐] 검색 추가: {site} '{keyword}' (id={request_id}){_owner_tag}"
         )
@@ -276,7 +276,7 @@ class SourcingQueue:
             job.update(extra)
         cls.resolvers[request_id] = future
         asyncio.create_task(_db_insert_job(job, "detail", priority=priority))
-        _owner_tag = f" owner={owner_device_id[:8]}" if owner_device_id else ""
+        _owner_tag = f" owner={owner_device_id}" if owner_device_id else ""
         _prio_tag = " [우선]" if priority else ""
         logger.info(
             f"[소싱큐] 상세 추가: {site} #{product_id} (id={request_id}){_owner_tag}{_prio_tag}"
@@ -322,7 +322,7 @@ class SourcingQueue:
         }
         cls.resolvers[request_id] = future
         await _db_insert_job(job, "tracking")
-        _owner_tag = f" owner={owner_device_id[:8]}" if owner_device_id else ""
+        _owner_tag = f" owner={owner_device_id}" if owner_device_id else ""
         logger.info(
             f"[소싱큐] 송장조회 추가: {site} ord={sourcing_order_number} "
             f"(id={request_id}){_owner_tag}"
@@ -370,7 +370,7 @@ class SourcingQueue:
         }
         cls.resolvers[request_id] = future
         await _db_insert_job(job, "reward")
-        _owner_tag = f" owner={owner_device_id[:8]}" if owner_device_id else ""
+        _owner_tag = f" owner={owner_device_id}" if owner_device_id else ""
         logger.info(
             f"[소싱큐] 적립 추가: {site} action={action} acct={sourcing_account_id} "
             f"(id={request_id}){_owner_tag}"
