@@ -33,16 +33,22 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # CONCURRENTLY 는 트랜잭션 안에서 실패 → autocommit_block 으로 트랜잭션 밖 실행
-    with op.get_context().autocommit_block():
-        op.execute(
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_scp_autotune_cycle "
-            "ON samba_collected_product "
-            "(source_site, last_refreshed_at ASC NULLS FIRST, id) "
-            "WHERE applied_policy_id IS NOT NULL"
-        )
+    # CONCURRENTLY 는 트랜잭션 안에서 실행 불가.
+    # 이 레포 env.py는 async(asyncpg) + connection.run_sync 구조라 alembic
+    # autocommit_block 이 _transaction 을 추적 못 해 AssertionError 발생(검증 완료).
+    # → alembic 트랜잭션을 수동 COMMIT 으로 종료한 뒤 CONCURRENTLY 실행.
+    #   alembic_version UPDATE 는 이후 새 암묵 트랜잭션에서 처리되고 env.py 가 최종 commit.
+    conn = op.get_bind()
+    conn.exec_driver_sql("COMMIT")
+    conn.exec_driver_sql(
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_scp_autotune_cycle "
+        "ON samba_collected_product "
+        "(source_site, last_refreshed_at ASC NULLS FIRST, id) "
+        "WHERE applied_policy_id IS NOT NULL"
+    )
 
 
 def downgrade() -> None:
-    with op.get_context().autocommit_block():
-        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_scp_autotune_cycle")
+    conn = op.get_bind()
+    conn.exec_driver_sql("COMMIT")
+    conn.exec_driver_sql("DROP INDEX CONCURRENTLY IF EXISTS ix_scp_autotune_cycle")
