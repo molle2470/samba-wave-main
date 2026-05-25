@@ -639,11 +639,13 @@ export default function WarroomPage() {
       const dev = getDeviceId()
       if (!dev) return
       const { API_BASE_URL: apiBase } = await import('@/config/api')
-      // (2026-05-25 룰) 체크박스 단일 진실 출처 — split 폐기.
-      // 브라우저 dev + 데몬 dev 둘 다 동일 분담 박음. backend pick_any_owner 가 사이트별로
-      // 데몬/확장앱 자동 선택 (데몬 우선, 데몬 매칭 없으면 확장앱). 사용자가 데몬/확장앱 의식 X.
+      // 사이트별 dev 분리 (2026-05-25 사용자 룰):
+      //  - 데몬 전용(SSG/ABCmart/GrandStage/LOTTEON) → 데몬 dev 에만 분담
+      //  - 브라우저 전용(무신사/GSShop) → 브라우저 dev 에만 분담
+      // 4개 사이트는 확장앱 절대 관여 X — 데몬에만 박는다.
       const daemonDev = (typeof window !== 'undefined' &&
         window.localStorage.getItem('samba.autotune.daemon.deviceId')) || ''
+      const _DAEMON_ONLY = new Set(['SSG', 'ABCmart', 'GrandStage', 'LOTTEON'])
       // ABCmart 체크 = ABCmart + GrandStage 자동 expand (같은 a-rt.com 도메인)
       const _SITE_EXPAND: Record<string, string[]> = {
         ABCmart: ['ABCmart', 'GrandStage'],
@@ -651,25 +653,31 @@ export default function WarroomPage() {
       const expanded = sites === null
         ? null
         : sites.flatMap(s => _SITE_EXPAND[s] || [s])
-      // (split 폐기) 양쪽 dev 동일 분담
+      // 사이트 분리
+      const browserSites = expanded === null
+        ? null
+        : expanded.filter(s => !_DAEMON_ONLY.has(s))
+      const daemonSites = expanded === null
+        ? null
+        : expanded.filter(s => _DAEMON_ONLY.has(s))
       const calls: Promise<unknown>[] = []
-      // 브라우저 dev — 사용자 체크박스 그대로 (null=전체)
+      // 브라우저 dev — 비데몬 사이트만 (또는 null=전체)
       calls.push(fetchWithAuth(
         `${apiBase}/api/v1/samba/collector/autotune/pc-allowed-sites`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ device_id: dev, sites: expanded }),
+          body: JSON.stringify({ device_id: dev, sites: browserSites }),
         },
       ))
-      // 데몬 dev — 사용자 체크박스 그대로
+      // 데몬 dev — 데몬 전용 사이트만
       if (daemonDev) {
         calls.push(fetchWithAuth(
           `${apiBase}/api/v1/samba/collector/autotune/pc-allowed-sites`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ device_id: daemonDev, sites: expanded }),
+            body: JSON.stringify({ device_id: daemonDev, sites: daemonSites }),
           },
         ))
       }
