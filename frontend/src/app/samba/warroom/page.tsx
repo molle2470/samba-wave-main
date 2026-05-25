@@ -547,7 +547,7 @@ export default function WarroomPage() {
 
     // 2) 이 PC의 chrome.storage.allowedSites로 체크박스 초기화
     //    null=미설정(전체처리), []=전체해제, [...]=부분선택
-    let registered = false
+    // (2026-05-25) 자동 register 폐기 — registered 플래그도 제거.
     const onMessage = (e: MessageEvent) => {
       if (e.source !== window) return
       const msg = e.data
@@ -570,26 +570,8 @@ export default function WarroomPage() {
       }
       setFilterSources(next)
       saveFilterSourcesToSession(next)
-      // 첫 수신 시 백엔드 PC분담 등록 (heartbeat 시작) — 폴링으로 last_seen 자동 갱신됨
-      if (!registered) {
-        registered = true
-        // 직접 호출 (registerPcAllowedSites는 useCallback이라 effect 의존성 충돌 회피)
-        ;(async () => {
-          try {
-            const { getDeviceId } = await import('@/lib/samba/deviceId')
-            const dev = getDeviceId()
-            if (!dev) return
-            const { API_BASE_URL: apiBase } = await import('@/config/api')
-            // null(전체선택)이면 availSources로 명시 등록 — 레거시 모드 차단
-            // availSources는 아직 비어있을 수 있으므로 null 그대로 전달 (초기화 후 toggleSource에서 재등록됨)
-            await fetchWithAuth(`${apiBase}/api/v1/samba/collector/autotune/pc-allowed-sites`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ device_id: dev, sites: next }),
-            })
-          } catch { /* ignore */ }
-        })()
-      }
+      // (2026-05-25) 자동 register 폐기 — 페이지 접속만으로 backend 분담 박히는 사고 차단.
+      // 사용자가 "오토튠 활성" 토글 ON 한 경우만 register 호출.
     }
     window.addEventListener('message', onMessage)
     // SPA 라우팅으로 페이지에 재진입한 경우 content_script가 다시 실행되지 않으므로
@@ -600,13 +582,8 @@ export default function WarroomPage() {
     return () => window.removeEventListener('message', onMessage)
   }, [])
 
-  // availSources 로드 완료 후 전체선택(null) 상태면 명시 목록으로 PC분담 재등록
-  // 초기 ALLOWED_SITES 수신 시 availSources가 아직 비어 null로 등록됐을 경우 보정
-  useEffect(() => {
-    if (availSources.length === 0) return
-    if (filterSources !== null) return  // 부분선택 상태는 이미 올바르게 등록됨
-    registerPcAllowedSites([...availSources])
-  }, [availSources]) // eslint-disable-line react-hooks/exhaustive-deps
+  // (2026-05-25) availSources 로드 완료 후 자동 register 폐기.
+  // 페이지 접속 자동 분담 박힘 차단 — 사용자 "오토튠 활성" 토글 ON 시만 register.
 
   // 소싱처 체크 변경 시 익스텐션 chrome.storage 동기화 (PC별 분담 헤더용)
   // null=전체처리(미설정), []=전체해제, [...]=부분선택 — 구분 그대로 전달
@@ -798,33 +775,8 @@ export default function WarroomPage() {
             _lastAutoRejoinAt = Number(window.localStorage.getItem('samba.autotune.autoRejoinAt') || '0')
           } catch { /* ignore */ }
           const cooldownPassed = now - Math.max(autoRejoinAtRef.current, _lastAutoRejoinAt) > 10_000
-          // enabled=false(사용자 정지) 면 자동재합류 금지 — intent 게이트와 이중 방어.
-          if (intent === 'start' && meMissing && cooldownPassed && atStatus.enabled !== false) {
-            autoRejoinAtRef.current = now
-            try { window.localStorage.setItem('samba.autotune.autoRejoinAt', String(now)) } catch { /* ignore */ }
-            // PC분담 재등록 — load() 클로저 stale 방지를 위해 ref에서 최신값 사용
-            const curFilter = filterSourcesOuterRef.current
-            const curAvail = availSourcesOuterRef.current
-            const sites = curFilter === null ? [...curAvail] : curFilter
-            await registerPcAllowedSites(sites)
-            // 오토튠 재시작 (본인 PC 확장앱 + 데몬 둘 다)
-            await collectorApi.autotuneStart('registered', undefined, dev || undefined)
-            try {
-              const daemonDev = (typeof window !== 'undefined' && window.localStorage.getItem('samba.autotune.daemon.deviceId')) || ''
-              if (daemonDev) {
-                await collectorApi.autotuneStart('registered', undefined, daemonDev)
-              }
-            } catch { /* 무시 */ }
-            // 확장앱에도 재합류 신호
-            window.postMessage(
-              { source: 'samba-page', type: 'AUTOTUNE_SET_JOIN', joined: true, sourceSites: curFilter },
-              window.location.origin,
-            )
-            falseCountRef.current = 0
-            setAutotuneRunning(true)
-            // eslint-disable-next-line no-console
-            console.info('[오토튠] 백엔드 재시작 감지 — 자동 재등록 완료')
-          }
+          // (2026-05-25) 자동재합류 폐기 — 사용자가 명시 "오토튠 활성" 토글 ON 한 경우만 시작.
+          // 페이지 접속 + intent==='start' 흔적만으로 자동 register/autotuneStart 호출하던 사고 차단.
         } catch { /* ignore */ }
         // 소싱처 인터벌 동기화 (마운트 시 초기값 포함) — 별도 useEffect 제거하고 여기서 일원화
         if (atStatus.site_intervals) {
@@ -1142,6 +1094,19 @@ export default function WarroomPage() {
                   window.postMessage({ source: 'samba-page', type: 'AUTOTUNE_SET_JOIN', joined: false }, window.location.origin)
                   setAutotuneRunning(false)
                   falseCountRef.current = 0
+                  // (2026-05-25) 정지 시 분담 비우기 — backend pick_any_owner 매칭 차단.
+                  // 본인 PC device + 데몬 device 둘 다 register([]) → 다른 PC 가 잡 발행해도 본인 PC 미매칭.
+                  try {
+                    await registerPcAllowedSites([])
+                    const daemonDev = (typeof window !== 'undefined' && window.localStorage.getItem('samba.autotune.daemon.deviceId')) || ''
+                    if (daemonDev) {
+                      await fetchWithAuth(`${apiBase}/api/v1/samba/collector/autotune/pc-allowed-sites`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ device_id: daemonDev, sites: [] }),
+                      })
+                    }
+                  } catch { /* ignore */ }
                   try {
                     window.localStorage.setItem('samba.autotune.userIntent', 'stop')
                     // 자동 재합류 24시간 잠금 — 다른 PC 실행 중이면 enabled=true 유지되어
