@@ -195,6 +195,16 @@ def musinsa_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
     return {"cookie": ext.get("cookie", "")}
 
 
+def toss_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
+    """토스 — apiKey + apiSecret."""
+    if account is None:
+        return {}
+    return {
+        "apiKey": account.api_key or "",
+        "apiSecret": account.api_secret or "",
+    }
+
+
 # 마켓 → 빌더 매핑 — 동적 디스패치용
 CRED_BUILDERS = {
     "lotteon": lotteon_creds,
@@ -214,6 +224,7 @@ CRED_BUILDERS = {
     "esm": esm_creds,
     "kream": kream_creds,
     "musinsa": musinsa_creds,
+    "toss": toss_creds,
 }
 
 
