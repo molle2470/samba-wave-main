@@ -990,9 +990,10 @@ export default function WarroomPage() {
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
             <span style={{ width: 8, height: 8, borderRadius: '50%', background: autotuneRunning ? '#51CF66' : '#FF6B6B', display: 'inline-block' }} />
             <span style={{ fontWeight: 700, color: '#FF8C00', fontSize: '0.875rem' }}>오토튠 모니터링</span>
-            {autotuneRunning && <span style={{ fontSize: '0.75rem', color: '#51CF66' }}>실행 중</span>}
-            {autotuneRunning && autotuneRestarts > 0 && <span style={{ fontSize: '0.75rem', color: '#FF6B6B' }}>재시작 {fmtNum(autotuneRestarts)}회</span>}
-            {!autotuneRunning && <span style={{ fontSize: '0.75rem', color: '#FF6B6B' }}>정지</span>}
+            {!pcDeviceId && <span style={{ fontSize: '0.75rem', color: '#FFB020' }}>확장앱 미감지 (시크릿창/포크 — 본인 PC만 제어 가능)</span>}
+            {pcDeviceId && autotuneRunning && <span style={{ fontSize: '0.75rem', color: '#51CF66' }}>실행 중</span>}
+            {pcDeviceId && autotuneRunning && autotuneRestarts > 0 && <span style={{ fontSize: '0.75rem', color: '#FF6B6B' }}>재시작 {fmtNum(autotuneRestarts)}회</span>}
+            {pcDeviceId && !autotuneRunning && <span style={{ fontSize: '0.75rem', color: '#FF6B6B' }}>정지</span>}
           </div>
           <div style={{ display: 'flex', gap: '0.5rem', fontSize: '0.8rem', color: '#888', alignItems: 'center' }}>
             <button
@@ -1018,6 +1019,7 @@ export default function WarroomPage() {
             />
             <button
             id="btn-autotune-start"
+            disabled={!pcDeviceId}
             onClick={async () => {
               try {
                 const { API_BASE_URL: apiBase } = await import('@/config/api')
@@ -1061,25 +1063,28 @@ export default function WarroomPage() {
             }}
             style={{
               padding: '0.25rem 0.75rem',
-              background: 'rgba(34,197,94,0.12)',
-              border: '1px solid rgba(34,197,94,0.35)',
+              background: pcDeviceId ? 'rgba(34,197,94,0.12)' : 'rgba(100,100,100,0.12)',
+              border: `1px solid ${pcDeviceId ? 'rgba(34,197,94,0.35)' : 'rgba(100,100,100,0.35)'}`,
               borderRadius: '6px',
-              color: '#22C55E',
+              color: pcDeviceId ? '#22C55E' : '#666',
               fontSize: '0.8125rem',
               fontWeight: 600,
-              cursor: 'pointer',
+              cursor: pcDeviceId ? 'pointer' : 'not-allowed',
             }}
+            title={pcDeviceId ? '' : '확장앱/데몬 미감지 — 시크릿창에서는 제어 불가'}
           >시작</button>
           <button
+            disabled={!pcDeviceId}
             onClick={async () => {
               const { showAlert } = await import('@/components/samba/Modal')
               try {
                 const { API_BASE_URL: apiBase } = await import('@/config/api')
                 const { getDeviceId } = await import('@/lib/samba/deviceId')
                 const dev = getDeviceId()
-                // device_id 누락 가드 — 빈값으로 호출 시 백엔드가 HTTP 200 + {ok:false}로 응답해 silent fail 발생
+                // device_id 누락 가드 — 시크릿창/확장앱 미설치 시 버튼 자체가 disabled.
+                // 여기 도달 시 데몬 device 만 있는 케이스 → 정지 호출 불가 (확장앱 없음).
                 if (!dev) {
-                  showAlert('device_id 누락 — 확장앱 재로드 필요 (정지 안 됨)', 'error')
+                  showAlert('확장앱 device_id 미감지 — 시크릿창/확장앱 미설치에서는 정지 불가', 'error')
                   return
                 }
                 // 본인 PC만 정지 — 다른 PC는 영향 없음
@@ -1129,19 +1134,21 @@ export default function WarroomPage() {
             }}
             style={{
               padding: '0.25rem 0.75rem',
-              background: 'rgba(239,68,68,0.12)',
-              border: '1px solid rgba(239,68,68,0.35)',
+              background: pcDeviceId ? 'rgba(239,68,68,0.12)' : 'rgba(100,100,100,0.12)',
+              border: `1px solid ${pcDeviceId ? 'rgba(239,68,68,0.35)' : 'rgba(100,100,100,0.35)'}`,
               borderRadius: '6px',
-              color: '#EF4444',
+              color: pcDeviceId ? '#EF4444' : '#666',
               fontSize: '0.8125rem',
               fontWeight: 600,
-              cursor: 'pointer',
+              cursor: pcDeviceId ? 'pointer' : 'not-allowed',
             }}
+            title={pcDeviceId ? '' : '확장앱/데몬 미감지 — 시크릿창에서는 제어 불가'}
             >오토튠 정지</button>
           </div>
         </div>
-        {/* 소싱처 체크박스 */}
-        {availSources.length > 0 && (
+        {/* 소싱처 체크박스 — device_id 없으면 (시크릿창) 숨김.
+            null=전체체크 렌더가 다른 PC 분담을 침범하는 사고 차단(2026-05-25). */}
+        {availSources.length > 0 && pcDeviceId && (
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
             <span style={{ fontSize: '0.75rem', color: '#9AA5C0', fontWeight: 600, whiteSpace: 'nowrap' }}>소싱처</span>
             {availSources.map(src => {
@@ -1161,8 +1168,8 @@ export default function WarroomPage() {
             })}
           </div>
         )}
-        {/* 판매처 체크박스 (마켓 단위) */}
-        {availMarkets.length > 0 && (
+        {/* 판매처 체크박스 (마켓 단위) — device_id 없으면 숨김 */}
+        {availMarkets.length > 0 && pcDeviceId && (
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
             <span style={{ fontSize: '0.75rem', color: '#9AA5C0', fontWeight: 600, whiteSpace: 'nowrap' }}>판매처</span>
             {availMarkets.map(mt => {

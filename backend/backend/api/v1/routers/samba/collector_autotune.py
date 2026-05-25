@@ -4002,32 +4002,14 @@ async def autotune_status(device_id: str = ""):
             cycle_count = _pc_cycle_count.get(dev, 0)
             restart_count = _pc_restart_count.get(dev, 0)
     else:
-        # 본인 테넌트의 PC만 합산
+        # device_id 미지정 — 시크릿창/확장앱 미감지 케이스.
+        # (2026-05-25) 타 PC running 합산을 노출하면 시크릿창에서도 "실행 중"으로 보이고
+        # 체크박스가 다 켜진 채 표시돼 다른 PC 분담을 침범하는 사고 발생. strict 빈 응답.
         _active_site_loops = {}
-        for _d, _stasks in _pc_site_tasks.items():
-            if not _is_mine(_d):
-                continue
-            _scc = _pc_site_cycle_counts.get(_d) or {}
-            _shb = _pc_site_heartbeats.get(_d) or {}
-            for s, t in _stasks.items():
-                prev = _active_site_loops.get(s)
-                cycles = _scc.get(s, 0)
-                hb_ago = round(_now_hb - _shb.get(s, _now_hb))
-                if prev is None:
-                    _active_site_loops[s] = {
-                        "running": not t.done(),
-                        "cycles": cycles,
-                        "heartbeat_ago": hb_ago,
-                    }
-                else:
-                    prev["running"] = prev["running"] or not t.done()
-                    prev["cycles"] = prev["cycles"] + cycles
-                    prev["heartbeat_ago"] = min(prev["heartbeat_ago"], hb_ago)
-        running = any(ev.is_set() for d, ev in _pc_running.items() if _is_mine(d))
-        last_tick_vals = [v for d, v in _pc_last_tick.items() if v and _is_mine(d)]
-        last_tick = max(last_tick_vals) if last_tick_vals else None
-        cycle_count = sum(v for d, v in _pc_cycle_count.items() if _is_mine(d))
-        restart_count = sum(v for d, v in _pc_restart_count.items() if _is_mine(d))
+        running = False
+        last_tick = None
+        cycle_count = 0
+        restart_count = 0
 
     return {
         "running": running,
