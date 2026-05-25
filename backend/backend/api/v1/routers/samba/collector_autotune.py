@@ -3749,8 +3749,42 @@ async def autotune_pc_allowed_sites_set(body: PcAllowedSitesRequest):
     union 이 덮어쓰지 않도록 강제. PC 간섭 방지 (2026-05-25 사용자 재요청
     "무조건 서로 간섭없이"). 폴링(X-Allowed-Sites 헤더)은 여전히 union 유지 —
     같은 deviceId 다중 PC flip-flop 가드.
+
+    device_id 가 active key 인지 검증 (2026-05-25) — frontend localStorage 의 옛
+    daemonDev 가 revoked device 분담 박는 사고 차단. dead device 잡 라우팅 → 60s
+    타임아웃 → 재시도 → 매우 느림 사고 원천 차단.
     """
     dev = (body.device_id or "").strip()
+    if not dev:
+        return {"ok": False, "error": "device_id 필수"}
+
+    # device_id active 검증 — samba_extension_key 에 revoke 안 된 키 존재해야 함.
+    # 단 빈 분담 [] 로 등록 해제는 항상 허용 (사용자가 PC 분담 비우기).
+    if body.sites:
+        try:
+            from backend.db.orm import get_read_session
+            from sqlalchemy import text
+
+            async with get_read_session() as _sess:
+                _row = await _sess.execute(
+                    text(
+                        "SELECT 1 FROM samba_extension_key "
+                        "WHERE device_id = :d AND revoked_at IS NULL "
+                        "AND (expires_at IS NULL OR expires_at > now()) LIMIT 1"
+                    ),
+                    {"d": dev},
+                )
+                if _row.first() is None:
+                    return {
+                        "ok": False,
+                        "error": f"device_id 미등록 또는 revoked: {dev[:30]}",
+                        "registered_pcs": 0,
+                    }
+        except Exception as _exc:
+            from backend.utils.logger import logger as _lg
+
+            _lg.warning(f"[pc-allowed-sites] active 검증 실패(무시): {_exc}")
+
     if register_pc_allowed_sites(body.device_id, body.sites, authoritative=True):
         from backend.db.orm import get_write_session
 

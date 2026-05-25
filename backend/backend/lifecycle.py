@@ -413,11 +413,13 @@ async def _pc_cleanup_loop() -> None:
                 await asyncio.sleep(60)
                 continue
 
-            # 3) cleanup — active device + 분담 비어있지 않음만 유지
+            # 3) cleanup — active device 만 유지 (빈 분담 허용)
+            # active key 면 사용자 체크박스 비어있는 상태도 정상 → 보존.
+            # 옛/revoked device 만 제거.
             cleaned = {
                 k: v
                 for k, v in current.items()
-                if v and k in active_set and isinstance(v, list)
+                if k in active_set and isinstance(v, list)
             }
 
             if cleaned != current:
