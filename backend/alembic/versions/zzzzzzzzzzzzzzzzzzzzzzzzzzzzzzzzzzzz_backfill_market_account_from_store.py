@@ -24,7 +24,7 @@ idempotent — 재실행 안전:
 - NOT EXISTS 가드로 같은 (tenant, market_type, is_default=true) 있으면 skip
 - ON CONFLICT 미사용 (PK 가 generated ID 라 충돌 없음)
 
-Revision ID: zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_backfill_market_account_from_store
+Revision ID: zzzz_backfill_market_account
 Revises: zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_market_account_oauth_default
 Create Date: 2026-05-25 13:00:00.000000
 """
@@ -34,9 +34,7 @@ from typing import Sequence, Union
 from alembic import op
 
 
-revision: str = (
-    "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_backfill_market_account_from_store"
-)
+revision: str = "zzzz_backfill_market_account"
 down_revision: Union[str, Sequence[str], None] = (
     "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_market_account_oauth_default"
 )
