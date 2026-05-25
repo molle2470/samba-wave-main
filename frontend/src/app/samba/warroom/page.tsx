@@ -387,16 +387,36 @@ export default function WarroomPage() {
   const [autotuneRestarts, setAutotuneRestarts] = useState(0)
   // 이 PC device_id — 실시간 로그 PC별 분리(2026-05-25)
   // 브라우저 device + 본인 PC 데몬 device 둘 다 합쳐 보냄 → 데몬 잡 로그도 본인 PC 로그로 표시.
+  // 데몬 device_id 는 localhost:51425/device_id (데몬이 띄운 sync 서버)에서 자동 fetch.
+  // 같은 PC 데몬만 응답(loopback) → 사용자 수동 입력 X, 포크 유저 동일 흐름.
   const [pcDeviceId, setPcDeviceId] = useState<string>('')
   useEffect(() => {
     (async () => {
       try {
         const { getDeviceId } = await import('@/lib/samba/deviceId')
         const dev = getDeviceId()
-        const daemonDev = (typeof window !== 'undefined' && (
-          window.localStorage.getItem('samba.autotune.daemon.deviceId') ||
-          window.localStorage.getItem('samba.lotteon.daemon.deviceId')
-        )) || ''
+        let daemonDev = ''
+        // 1) 데몬 sync 서버 우선
+        try {
+          const ctrl = new AbortController()
+          const t = setTimeout(() => ctrl.abort(), 1500)
+          const r = await fetch('http://localhost:51425/device_id', { signal: ctrl.signal })
+          clearTimeout(t)
+          if (r.ok) {
+            const j = await r.json()
+            if (j && typeof j.device_id === 'string' && j.device_id) {
+              daemonDev = j.device_id
+              window.localStorage.setItem('samba.autotune.daemon.deviceId', daemonDev)
+            }
+          }
+        } catch { /* 데몬 안 켜진 PC — 무시 */ }
+        // 2) fallback: localStorage 캐시
+        if (!daemonDev) {
+          daemonDev = (typeof window !== 'undefined' && (
+            window.localStorage.getItem('samba.autotune.daemon.deviceId') ||
+            window.localStorage.getItem('samba.lotteon.daemon.deviceId')
+          )) || ''
+        }
         const ids = [dev, daemonDev].filter(Boolean)
         if (ids.length) setPcDeviceId(ids.join(','))
       } catch { /* ignore */ }

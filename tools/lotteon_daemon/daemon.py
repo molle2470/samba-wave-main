@@ -78,7 +78,7 @@ except ImportError:
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.4.3"
+DAEMON_VERSION = "1.4.4"
 
 
 # ====================================================================
@@ -1938,7 +1938,60 @@ async def _launch_browser(pw, headless: bool):
         )
 
 
+def _start_device_id_sync_server(device_id: str, port: int = 51425) -> None:
+    """페이지가 같은 PC 데몬 device_id 자동 확인용 localhost HTTP 서버.
+
+    사용자 수동 입력 X — 페이지가 mount 시 fetch('http://localhost:51425/device_id')
+    호출 → 같은 PC 데몬 device_id 받아 localStorage 자동 갱신. 포크 유저 동일 흐름.
+    CORS open (localhost loopback).
+    """
+    import http.server
+    import json as _json
+    import threading
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a, **k):
+            return  # 무음 (stdout 로그 X)
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "*")
+            self.end_headers()
+
+        def do_GET(self):
+            if self.path != "/device_id":
+                self.send_response(404)
+                self.end_headers()
+                return
+            body = _json.dumps(
+                {"device_id": device_id, "version": DAEMON_VERSION}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    try:
+        srv = http.server.HTTPServer(("127.0.0.1", port), _H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        logger.info(
+            "device_id sync server: http://127.0.0.1:%d/device_id (페이지 자동 매칭)",
+            port,
+        )
+    except OSError as exc:
+        # 포트 점유(다른 데몬 process 살아있음) — 무시. 페이지는 기존 인스턴스 응답 받음.
+        logger.info("device_id sync server skip (port busy): %s", exc)
+    except Exception as exc:
+        logger.warning("device_id sync server start failed: %s", exc)
+
+
 async def run_daemon(args: argparse.Namespace) -> int:
+    # device_id 페이지 자동 동기화 — 페이지가 localhost:51425/device_id fetch
+    _start_device_id_sync_server(args.device_id)
     state = DaemonState(max_consecutive_fail=args.max_consecutive_fail)
     backend_url = args.backend_url.rstrip("/")
     profile_dir = Path(args.profile_dir).expanduser().resolve()
