@@ -5979,19 +5979,20 @@ async def sync_orders_from_markets(
                 # proc_seq는 주문 상태 변경 시 바뀌므로 중복 체크에서 제외
                 _normalize_synced_order_status(order_data)
                 if order_data.get("source") == "lotteon" and order_data.get("od_no"):
+                    # 중복 차단 — channel_id 제외하고 (tenant_id, od_no, od_seq)로만 매칭.
+                    # 동일 API key를 공유한 2개 마켓계정이 같은 주문을 양쪽 channel에 중복
+                    # 저장하던 사고 방지(2026-05-25).
                     _lo_row = await session.execute(
                         _sa_text(
                             "SELECT id FROM samba_order "
                             "WHERE source = 'lotteon' "
                             "AND tenant_id IS NOT DISTINCT FROM :tid "
-                            "AND channel_id = :cid "
                             "AND od_no = :od_no "
                             "AND od_seq = :od_seq "
                             "LIMIT 1"
                         ),
                         {
                             "tid": order_data.get("tenant_id"),
-                            "cid": order_data.get("channel_id"),
                             "od_no": order_data["od_no"],
                             "od_seq": order_data.get("od_seq", "1"),
                         },

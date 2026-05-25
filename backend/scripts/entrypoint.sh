@@ -177,7 +177,7 @@ asyncio.run(fix())
     echo "Stamping alembic to previous revision (add_install_token = autotune_cycle_idx 이전)..."
     # 신규 autotune_cycle_idx(인덱스) 마이그레이션만 실행 강제. 마이그레이션 자체 idempotent
     # (CREATE INDEX CONCURRENTLY IF NOT EXISTS — hot 테이블 AccessExclusiveLock 회피).
-    uv run alembic stamp --purge zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_add_install_token 2>/dev/null || true
+    uv run alembic stamp --purge zzzzzz_dedupe_market_default 2>/dev/null || true
     _MIGRATION_OK=0
     for i in 1 2 3; do
       if uv run alembic upgrade heads; then
