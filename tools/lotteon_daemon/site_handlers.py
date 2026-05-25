@@ -435,8 +435,14 @@ MUSINSA_LOGIN_URL = "https://www.musinsa.com/auth/login"
 MUSINSA_HOME_URL = "https://www.musinsa.com/mypage"
 MUSINSA_LOGOUT_URL = "https://www.musinsa.com/auth/logout"
 MUSINSA_LOGIN_SELECTORS = {
-    "id": ['input.login-v2-input__input[type="text"]', 'input[type="text"].login-v2-input__input'],
-    "pw": ['input.login-v2-input__input[type="password"]', 'input[type="password"].login-v2-input__input'],
+    "id": [
+        'input.login-v2-input__input[type="text"]',
+        'input[type="text"].login-v2-input__input',
+    ],
+    "pw": [
+        'input.login-v2-input__input[type="password"]',
+        'input[type="password"].login-v2-input__input',
+    ],
     "btn": ['button.login-v2-button__item[type="submit"]', 'button[type="submit"]'],
 }
 MUSINSA_LOGIN_CHECK_JS = r"""
@@ -480,6 +486,289 @@ _MUSINSA_TRACKING_TRACE_JS = r"""
   const te=document.querySelector('button.tracking-number');
   const trackingNumber=(te?.textContent||'').trim();
   if(!trackingNumber) return {success:false, error:'no_tracking: 송장번호 없음', courierName};
+  return {success:true, courierName, trackingNumber};
+})()
+"""
+
+
+# ── GSShop 송장 + 로그인 ──
+# 로그인폼 실측(2026-05-25, /cust/login/login.gs 정적 HTML): #id / #passwd / #btnLogin.
+# reCAPTCHA 존재 — failCnt 누적 시 발동 가능. storage_state 영속화로 재로그인 빈도 최소화.
+# 데몬 송장 전용 — 가격수집(detail) 미지원 (extension 가격수집 흐름 유지).
+GSSHOP_LOGIN_URL = "https://www.gsshop.com/cust/login/login.gs"
+GSSHOP_HOME_URL = "https://www.gsshop.com/ord/dlvcursta/ordList.gs"
+GSSHOP_LOGOUT_URL = "https://www.gsshop.com/cust/login/logout.gs"
+GSSHOP_LOGIN_SELECTORS = {
+    "id": ["#id", 'input[name="id"]'],
+    "pw": ["#passwd", 'input[name="passwd"]'],
+    "btn": ["#btnLogin", 'button[type="button"]#btnLogin'],
+}
+GSSHOP_LOGIN_CHECK_JS = r"""
+(() => {
+  try {
+    const t = (document.body?.innerText || '').slice(0, 1500).replace(/\s+/g, ' ');
+    if (t.includes('로그아웃')) return 'logged_in';
+    if (t.includes('로그인') || t.includes('회원가입')) return 'logged_out';
+    return 'unknown';
+  } catch (e) { return 'unknown'; }
+})()
+"""
+# GSShop 송장 스크랩 — content-tracking-gsshop.js 이식.
+# 팝업 URL(ordDtl.gs)에서 a[data-action="dlvTrace"] data-* 속성 추출.
+# 택배사 코드 매핑은 overlink config.js 기준 (CJ/HJ/KG/LO/LT/EP/POST/RZ/DS/IL/KD/CH/HD/SL/CR/DH/GS).
+_GSSHOP_TRACKING_JS = r"""
+(async () => {
+  const href=location.href||'';
+  if(href.indexOf('/cust/login')!==-1 || href.indexOf('/login.gs')!==-1)
+    return {success:false, needsLogin:true, error:'needs_login redirect'};
+  const t=(document.body?.innerText||'').slice(0,8000);
+  if(/(취소완료|취소처리완료|구매취소완료|주문이\s*취소|취소된\s*주문)/.test(t)) return {success:false,cancelled:true,error:'order_cancelled'};
+  const MAP={CJ:'CJ대한통운',HJ:'한진택배',KG:'로젠택배',LO:'롯데택배',LT:'롯데택배',EP:'우체국택배',POST:'우체국택배',RZ:'로젠택배',DS:'대신택배',IL:'일양로지스',KD:'경동택배',CH:'천일택배',HD:'롯데택배',SL:'SLX택배',CR:'CVSnet편의점택배',DH:'DHL',GS:'GSMNtoN'};
+  const t0=Date.now(); let a=null;
+  while(Date.now()-t0<12000){ a=document.querySelector('a[data-action="dlvTrace"]'); if(a)break; await new Promise(r=>setTimeout(r,300)); }
+  if(!a) return {success:false, error:'no_tracking: dlvTrace 링크 없음 (미발송)'};
+  const code=(a.getAttribute('data-dlvs-co-cd')||'').toUpperCase();
+  const trackingNumber=(a.getAttribute('data-inv-no')||'').trim();
+  const courierName=MAP[code]||code||'';
+  if(!trackingNumber) return {success:false, error:'no_tracking: data-inv-no 비어있음', courierName};
+  return {success:true, courierName, trackingNumber};
+})()
+"""
+
+
+# ── Nike 송장 + 로그인 ──
+# nike-unite SSO (s3.nikecdn.com/unite/scripts/unite.min.js) - iframe 동적 렌더링.
+# 셀렉터는 일반적 nike-unite 폼 추정값 (운영 검증 필요).
+# 송장 URL: /kr/orders/sales/{ord_no}/ — content-tracking-nike.js 가 외부 배송조회 링크 href 파싱.
+NIKE_LOGIN_URL = "https://www.nike.com/kr/login"
+NIKE_HOME_URL = "https://www.nike.com/kr/member/orders"
+NIKE_LOGOUT_URL = "https://www.nike.com/kr/logout"
+# 추정값 — nike-unite 표준 input name. 실측 검증 필요.
+NIKE_LOGIN_SELECTORS = {
+    "id": [
+        'input[name="emailAddress"]',
+        'input[type="email"]',
+        'input[name="email"]',
+        "#email",
+    ],
+    "pw": [
+        'input[name="password"]',
+        'input[type="password"]',
+        "#password",
+    ],
+    "btn": [
+        'input[type="button"].nike-unite-submit-button',
+        'button[type="submit"]',
+        ".nike-unite-submit-button",
+        'input[type="submit"]',
+    ],
+}
+NIKE_LOGIN_CHECK_JS = r"""
+(() => {
+  try {
+    const h = location.href || '';
+    if (h.indexOf('/login') !== -1) return 'logged_out';
+    const t = (document.body?.innerText || '').slice(0, 1500).replace(/\s+/g, ' ');
+    if (/로그아웃|Sign Out|Logout/i.test(t)) return 'logged_in';
+    if (/로그인|Sign In|Log In/i.test(t)) return 'logged_out';
+    return 'unknown';
+  } catch (e) { return 'unknown'; }
+})()
+"""
+# Nike 송장 — content-tracking-nike.js 이식.
+# 주문상세 페이지 외부 배송조회 링크 href 에서 도메인+파라미터 추출.
+_NIKE_TRACKING_JS = r"""
+(async () => {
+  const href=location.href||'';
+  if(href.indexOf('/login')!==-1)
+    return {success:false, needsLogin:true, error:'needs_login redirect'};
+  const t=(document.body?.innerText||'').slice(0,8000);
+  if(/(취소완료|취소처리완료|구매취소완료|주문이\s*취소|취소된\s*주문|Cancell?ed)/i.test(t)) return {success:false,cancelled:true,error:'order_cancelled'};
+  const URL_MAP={'cjlogistics.com':'CJ대한통운','hanjin.co.kr':'한진택배','lotteglogis.com':'롯데택배','epost.go.kr':'우체국택배','ilogen.com':'로젠택배','doortodoor.co.kr':'KGB택배','kdexp.com':'경동택배','cvsnet.co.kr':'CVSnet편의점택배','daesinlogistics.co.kr':'대신택배','ilyanglogis.com':'일양로지스'};
+  const PARAM_MAP={'cjlogistics.com':'gnbInvcNo','hanjin.co.kr':'waybillNo','lotteglogis.com':'InvNo','epost.go.kr':'sid1','ilogen.com':'slipno'};
+  const findLink=()=>{ for(const a of document.querySelectorAll('a[href]')){ const h=a.getAttribute('href')||''; for(const d of Object.keys(URL_MAP)){ if(h.includes(d)) return {a,h,d}; } } return null; };
+  const t0=Date.now(); let info=null;
+  while(Date.now()-t0<12000){ info=findLink(); if(info)break; await new Promise(r=>setTimeout(r,300)); }
+  if(!info) return {success:false, error:'no_tracking: 배송조회 링크 없음 (미발송)'};
+  const courierName=URL_MAP[info.d]||'';
+  let trackingNumber='';
+  try{ const u=new URL(info.h, location.href); const pn=PARAM_MAP[info.d]||''; if(pn) trackingNumber=u.searchParams.get(pn)||''; if(!trackingNumber){ for(const v of u.searchParams.values()){ if(/^\d{8,}$/.test(v)){trackingNumber=v;break;} } } }catch(_){}
+  if(!trackingNumber) return {success:false, error:'no_tracking: 송장 파라미터 추출 실패', courierName};
+  return {success:true, courierName, trackingNumber};
+})()
+"""
+
+
+# ── OliveYoung 송장 + 로그인 ──
+# 로그인 페이지 JS 렌더링 — 정적 HTML 셀렉터 추출 불가. 일반적 올리브영 폼 추정값.
+# 송장 URL: /store/mypage/getOrderDetail.do?ordNo={ord_no} — content-tracking-oliveyoung.js 가 em 라벨 다음 노드 파싱.
+OLIVEYOUNG_LOGIN_URL = "https://www.oliveyoung.co.kr/store/member/getLoginForm.do"
+OLIVEYOUNG_HOME_URL = "https://www.oliveyoung.co.kr/store/mypage/main.do"
+OLIVEYOUNG_LOGOUT_URL = "https://www.oliveyoung.co.kr/store/member/logout.do"
+# 추정값 — 올리브영 일반 input id 패턴. 실측 검증 필요.
+OLIVEYOUNG_LOGIN_SELECTORS = {
+    "id": ["#loginId", "#userId", 'input[name="loginId"]', 'input[name="userId"]'],
+    "pw": ["#passwd", "#password", 'input[name="passwd"]', 'input[type="password"]'],
+    "btn": ["#btnLogin", "button.btn_login", 'button[type="submit"]', "a.btn_login"],
+}
+OLIVEYOUNG_LOGIN_CHECK_JS = r"""
+(() => {
+  try {
+    const h = location.href || '';
+    if (h.indexOf('/member/getLoginForm') !== -1 || h.indexOf('/login') !== -1) return 'logged_out';
+    const t = (document.body?.innerText || '').slice(0, 1500).replace(/\s+/g, ' ');
+    if (t.includes('로그아웃')) return 'logged_in';
+    if (t.includes('로그인')) return 'logged_out';
+    return 'unknown';
+  } catch (e) { return 'unknown'; }
+})()
+"""
+# OliveYoung 송장 — content-tracking-oliveyoung.js 이식.
+# <em>택배사</em>텍스트노드 / <em>운송장번호</em>텍스트노드 패턴.
+_OLIVEYOUNG_TRACKING_JS = r"""
+(async () => {
+  const href=location.href||'';
+  if(href.indexOf('/member/getLoginForm')!==-1 || href.indexOf('/login')!==-1)
+    return {success:false, needsLogin:true, error:'needs_login redirect'};
+  const t=(document.body?.innerText||'').slice(0,8000);
+  if(/(취소완료|취소처리완료|구매취소완료|주문이\s*취소|취소된\s*주문)/.test(t)) return {success:false,cancelled:true,error:'order_cancelled'};
+  const tw=Date.now();
+  while(Date.now()-tw<10000){ if(document.querySelector('.lineBox2, h3')) break; await new Promise(r=>setTimeout(r,300)); }
+  await new Promise(r=>setTimeout(r,800));
+  const byLabel=(label)=>{
+    const ems=document.querySelectorAll('em');
+    for(const em of ems){
+      if((em.textContent||'').trim()===label){
+        let next=em.nextSibling;
+        while(next){
+          if(next.nodeType===3){ const x=next.textContent.trim().replace(/^[:：\s]+/,''); if(x) return x; }
+          else if(next.nodeType===1){ const x=(next.textContent||'').trim(); if(x) return x; }
+          next=next.nextSibling;
+        }
+      }
+    }
+    return '';
+  };
+  const courierName=byLabel('택배사');
+  const raw=byLabel('운송장번호')||byLabel('송장번호');
+  const m=(raw||'').match(/\d{8,}/);
+  const trackingNumber=m?m[0]:'';
+  if(!trackingNumber) return {success:false, error:'no_tracking: 운송장번호 미표시 (미발송)', courierName};
+  return {success:true, courierName, trackingNumber};
+})()
+"""
+
+
+# ── KREAM 송장 + 로그인 ──
+# KREAM 송장수집 신규 구현 — content-tracking-kream.js 부재 상태에서 데몬 전용 작성.
+# 로그인폼 추정값 (실측 검증 필요). 송장 URL: /my/orders/{ord_no} 추정.
+# KREAM 은 자체 검수 후 배송 — 송장 노출 형태/셀렉터 운영 검증 필수.
+KREAM_LOGIN_URL = "https://kream.co.kr/login"
+KREAM_HOME_URL = "https://kream.co.kr/my/orders"
+KREAM_LOGOUT_URL = "https://kream.co.kr/logout"
+# 추정값 — KREAM 일반 input name 패턴. 실측 검증 필요.
+KREAM_LOGIN_SELECTORS = {
+    "id": [
+        'input[name="email"]',
+        'input[type="email"]',
+        "#email",
+        'input[name="login_email"]',
+    ],
+    "pw": [
+        'input[name="password"]',
+        'input[type="password"]',
+        "#password",
+    ],
+    "btn": [
+        "button.btn.full.solid",
+        'button[type="submit"]',
+        ".login_btn",
+        "button.btn_login",
+    ],
+}
+KREAM_LOGIN_CHECK_JS = r"""
+(() => {
+  try {
+    const h = location.href || '';
+    if (h.indexOf('/login') !== -1) return 'logged_out';
+    const t = (document.body?.innerText || '').slice(0, 1500).replace(/\s+/g, ' ');
+    if (t.includes('로그아웃') || /My ?Page|마이/i.test(t)) return 'logged_in';
+    if (t.includes('로그인') || t.includes('회원가입')) return 'logged_out';
+    return 'unknown';
+  } catch (e) { return 'unknown'; }
+})()
+"""
+# KREAM 송장 — 마이페이지 주문 상세에서 택배사/송장 텍스트 추출 (휴리스틱).
+# 실제 DOM 구조 운영 검증 필수 — 추정값.
+_KREAM_TRACKING_JS = r"""
+(async () => {
+  const href=location.href||'';
+  if(href.indexOf('/login')!==-1)
+    return {success:false, needsLogin:true, error:'needs_login redirect'};
+  const t=(document.body?.innerText||'').slice(0,8000);
+  if(/(취소완료|취소처리완료|구매취소완료|주문이\s*취소|취소된\s*주문)/.test(t)) return {success:false,cancelled:true,error:'order_cancelled'};
+  const tw=Date.now();
+  while(Date.now()-tw<10000){ if(document.body && (document.body.innerText||'').length>500) break; await new Promise(r=>setTimeout(r,300)); }
+  await new Promise(r=>setTimeout(r,1500));
+  const txt=document.body?.innerText||'';
+  const cm=txt.match(/택배사\s*[:：]?\s*([가-힣A-Za-z0-9()]+택배|[가-힣A-Za-z0-9()]+로지스|CJ대한통운|한진|롯데|우체국|로젠)/);
+  const tm=txt.match(/(?:운송장|송장)(?:번호)?\s*[:：]?\s*(\d{8,})/);
+  const courierName=cm?.[1]?.trim()||'';
+  const trackingNumber=tm?.[1]?.trim()||'';
+  if(!trackingNumber) return {success:false, error:'no_tracking: KREAM 송장 미표시 (미발송 또는 셀렉터 변경)'};
+  return {success:true, courierName, trackingNumber};
+})()
+"""
+
+
+# ── FashionPlus 송장 + 로그인 ──
+# 로그인폼 실측(2026-05-25, /auth/login 정적 HTML, Vue 컴포넌트):
+#   id=#login_id (v-model="form.id"), pw=input[type="password"] (v-model="form.password"),
+#   btn=button.mm_btn[v-on:click="login"].
+# Vue 리스너는 표준 DOM click 이벤트 받음 — daemon auto_login_site 의 click() 작동.
+# 송장 URL: /mypage/order/detail/{ord_no} (build_tracking_url 참조).
+FASHIONPLUS_LOGIN_URL = "https://www.fashionplus.co.kr/auth/login"
+FASHIONPLUS_HOME_URL = "https://www.fashionplus.co.kr/mypage"
+FASHIONPLUS_LOGOUT_URL = "https://www.fashionplus.co.kr/auth/logout"
+FASHIONPLUS_LOGIN_SELECTORS = {
+    "id": ["#login_id", 'input[v-model="form.id"]'],
+    "pw": [
+        'input[type="password"][v-model="form.password"]',
+        'input[type="password"]',
+    ],
+    "btn": ['button[v-on:click="login"]', "button.mm_btn"],
+}
+FASHIONPLUS_LOGIN_CHECK_JS = r"""
+(() => {
+  try {
+    const h = location.href || '';
+    if (h.indexOf('/auth/login') !== -1) return 'logged_out';
+    const t = (document.body?.innerText || '').slice(0, 1500).replace(/\s+/g, ' ');
+    if (t.includes('로그아웃')) return 'logged_in';
+    if (t.includes('로그인') || t.includes('회원가입')) return 'logged_out';
+    return 'unknown';
+  } catch (e) { return 'unknown'; }
+})()
+"""
+# FashionPlus 송장 — content-tracking-fashionplus.js 이식.
+# 주문상세 페이지 텍스트에서 "택배사 X 송장번호 NNN" 정규식 추출.
+_FASHIONPLUS_TRACKING_JS = r"""
+(async () => {
+  const href=location.href||'';
+  if(href.indexOf('/auth/login')!==-1)
+    return {success:false, needsLogin:true, error:'needs_login redirect'};
+  const t=(document.body?.innerText||'').slice(0,8000);
+  if(/(취소완료|취소처리완료|구매취소완료|주문이\s*취소|취소된\s*주문)/.test(t)) return {success:false,cancelled:true,error:'order_cancelled'};
+  // body 로드 + SPA 렌더 대기
+  const tw=Date.now();
+  while(Date.now()-tw<10000){ if(document.body && (document.body.innerText||'').length>500) break; await new Promise(r=>setTimeout(r,300)); }
+  await new Promise(r=>setTimeout(r,1500));
+  const txt=document.body?.innerText||'';
+  const cm=txt.match(/택배사\s*[:：]?\s*([가-힣A-Za-z0-9()]+택배|[가-힣A-Za-z0-9()]+로지스|CJ대한통운|한진|롯데|우체국|로젠)/);
+  const tm=txt.match(/송장(?:번호)?\s*[:：]?\s*(\d{8,})/);
+  const courierName=cm?.[1]?.trim()||'';
+  const trackingNumber=tm?.[1]?.trim()||'';
+  if(!trackingNumber) return {success:false, error:'no_tracking: 패션플러스 송장 미표시 (미발송 가능)'};
   return {success:true, courierName, trackingNumber};
 })()
 """
@@ -534,6 +823,67 @@ SITE_HANDLERS: dict[str, SiteHandler] = {
         login_check_js=SSG_LOGIN_CHECK_JS,
         tracking_js=_SSG_TRACKING_JS,
         logout_url=SSG_LOGOUT_URL,
+    ),
+    "Nike": SiteHandler(
+        site="Nike",
+        extract_js="(() => ({success:false, error:'Nike detail 데몬 미지원'}))()",
+        requires_login=True,
+        login_url=NIKE_LOGIN_URL,
+        home_url=NIKE_HOME_URL,
+        login_selectors=NIKE_LOGIN_SELECTORS,
+        login_check_js=NIKE_LOGIN_CHECK_JS,
+        tracking_js=_NIKE_TRACKING_JS,
+        logout_url=NIKE_LOGOUT_URL,
+        detail_supported=False,
+    ),
+    "OliveYoung": SiteHandler(
+        site="OliveYoung",
+        extract_js="(() => ({success:false, error:'OliveYoung detail 데몬 미지원'}))()",
+        requires_login=True,
+        login_url=OLIVEYOUNG_LOGIN_URL,
+        home_url=OLIVEYOUNG_HOME_URL,
+        login_selectors=OLIVEYOUNG_LOGIN_SELECTORS,
+        login_check_js=OLIVEYOUNG_LOGIN_CHECK_JS,
+        tracking_js=_OLIVEYOUNG_TRACKING_JS,
+        logout_url=OLIVEYOUNG_LOGOUT_URL,
+        detail_supported=False,
+    ),
+    "KREAM": SiteHandler(
+        site="KREAM",
+        extract_js="(() => ({success:false, error:'KREAM detail 데몬 미지원'}))()",
+        requires_login=True,
+        login_url=KREAM_LOGIN_URL,
+        home_url=KREAM_HOME_URL,
+        login_selectors=KREAM_LOGIN_SELECTORS,
+        login_check_js=KREAM_LOGIN_CHECK_JS,
+        tracking_js=_KREAM_TRACKING_JS,
+        logout_url=KREAM_LOGOUT_URL,
+        detail_supported=False,
+    ),
+    "FashionPlus": SiteHandler(
+        site="FashionPlus",
+        extract_js="(() => ({success:false, error:'FashionPlus detail 데몬 미지원'}))()",
+        requires_login=True,
+        login_url=FASHIONPLUS_LOGIN_URL,
+        home_url=FASHIONPLUS_HOME_URL,
+        login_selectors=FASHIONPLUS_LOGIN_SELECTORS,
+        login_check_js=FASHIONPLUS_LOGIN_CHECK_JS,
+        tracking_js=_FASHIONPLUS_TRACKING_JS,
+        logout_url=FASHIONPLUS_LOGOUT_URL,
+        detail_supported=False,
+    ),
+    "GSShop": SiteHandler(
+        site="GSShop",
+        # GSShop 데몬 가격수집(detail) 미지원 — 송장 전용. extract_js 더미.
+        extract_js="(() => ({success:false, error:'GSShop detail 데몬 미지원'}))()",
+        requires_login=True,
+        login_url=GSSHOP_LOGIN_URL,
+        home_url=GSSHOP_HOME_URL,
+        login_selectors=GSSHOP_LOGIN_SELECTORS,
+        login_check_js=GSSHOP_LOGIN_CHECK_JS,
+        tracking_js=_GSSHOP_TRACKING_JS,
+        logout_url=GSSHOP_LOGOUT_URL,
+        detail_supported=False,
     ),
     "MUSINSA": SiteHandler(
         site="MUSINSA",

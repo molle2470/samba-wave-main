@@ -25,16 +25,56 @@ _JOB_TTL_SEC: dict[str, int] = {
     "cancel_order": 1800,
 }
 
-# 데몬 전용 사이트 강제 정책 폐기 (2026-05-25 사용자 재요청 "강제할당 X").
-# 사용자가 PC 마다 UI 에서 직접 사이트 분담 박음. 데몬 우선 + 확장앱 fallback 만 유지.
-DAEMON_ONLY_SITES: set[str] = set()
+# 데몬 전용 사이트 — 사용자 룰 (3일 강조): SSG/ABC/GrandStage/LOTTEON 은 데몬으로만.
+# 데몬 매칭 없으면 잡 발행 자체 skip. 확장앱 fallback 절대 금지 (60s 미응답 차단 누적).
+# 무신사/GSShop 등은 확장앱 fallback 허용 (DAEMON_ONLY_SITES 외 = detail/reward/cancel 한정).
+# 이건 "라우팅 정책"(어디로 보낼지) — pc_allowed_sites "사용자 분담"(누가 받을지)와 별개.
+DAEMON_ONLY_SITES: set[str] = {"SSG", "ABCmart", "GrandStage", "LOTTEON"}
+
+# 잡 타입별 데몬 강제 사이트 매트릭스 — 사이트 단일 집합으로는 한계.
+# 송장(tracking)은 MUSINSA/GSShop 까지 데몬 핸들러 등록 (site_handlers.py).
+# 그 외 잡 타입(search/detail/reward/cancel)은 SSG/ABC/GrandStage/LOTTEON 만 데몬 지원.
+# 사이트 추가 시 `tools/lotteon_daemon/site_handlers.py` 핸들러 + --sites CLI + 본 dict 동시 갱신 필수.
+DAEMON_ONLY_JOB_SITES: dict[str, set[str]] = {
+    "search": DAEMON_ONLY_SITES,
+    "detail": DAEMON_ONLY_SITES,
+    "reward": DAEMON_ONLY_SITES,
+    "cancel_order": DAEMON_ONLY_SITES,
+    "tracking": DAEMON_ONLY_SITES
+    | {"MUSINSA", "GSShop", "FashionPlus", "Nike", "OliveYoung", "KREAM"},
+}
+
+# 송장 전용 별칭 — 하위호환. 신규 코드는 DAEMON_ONLY_JOB_SITES["tracking"] 사용 권장.
+DAEMON_ONLY_TRACKING_SITES: set[str] = DAEMON_ONLY_JOB_SITES["tracking"]
 
 
-def _resolve_owner_with_daemon_policy(site: str) -> str | None:
-    """데몬 우선 + 확장앱 fallback (강제 정책 없음)."""
+def _daemon_only_for_job(job_type: str) -> set[str]:
+    """잡 타입별 데몬 강제 사이트 집합. 미정의 타입은 기본 DAEMON_ONLY_SITES."""
+    return DAEMON_ONLY_JOB_SITES.get(job_type, DAEMON_ONLY_SITES)
+
+
+def _resolve_job_owner(site: str, job_type: str) -> str | None:
+    """잡 타입별 owner 선택. 데몬 우선 → DAEMON_ONLY_JOB_SITES[job_type] 포함 시 skip → 확장앱."""
     from backend.domain.samba.proxy.daemon_pool import pick_daemon_owner
 
-    return pick_daemon_owner(site) or get_autotune_owner(site)
+    d = pick_daemon_owner(site)
+    if d:
+        return d
+    daemon_only = _daemon_only_for_job(job_type)
+    if (site or "").upper() in {s.upper() for s in daemon_only}:
+        return None  # 데몬 매칭 없음 → 잡 발행 skip
+    return get_autotune_owner(site)
+
+
+# 하위호환 wrapper — 기존 호출처 보존.
+def _resolve_owner_with_daemon_policy(site: str) -> str | None:
+    """기본 정책(DAEMON_ONLY_SITES) wrapper — search/detail/reward/cancel 공용."""
+    return _resolve_job_owner(site, "detail")
+
+
+def _resolve_tracking_owner(site: str) -> str | None:
+    """송장 전용 wrapper — DAEMON_ONLY_JOB_SITES['tracking'] 사용."""
+    return _resolve_job_owner(site, "tracking")
 
 
 # 적립 액션별 진입 URL — 확장앱이 잡 받으면 이 URL의 탭을 열고 content script 주입.
@@ -220,8 +260,15 @@ class SourcingQueue:
         future: asyncio.Future[Any] = loop.create_future()
 
         if owner_device_id is None:
-            # 사이트별 매핑 우선 → 없으면 기본 owner (PC 분산 지원)
-            owner_device_id = get_autotune_owner(site)
+            owner_device_id = _resolve_job_owner(site, "search")
+
+        if owner_device_id is None and (site or "").upper() in {
+            s.upper() for s in _daemon_only_for_job("search")
+        }:
+            logger.warning(
+                f"[소싱큐] {site} 검색 데몬 미등록 — 잡 발행 skip: '{keyword}'"
+            )
+            raise RuntimeError(f"{site} 데몬 미등록 — 검색 잡 발행 불가")
 
         job: dict[str, Any] = {
             "requestId": request_id,
@@ -272,12 +319,10 @@ class SourcingQueue:
         future: asyncio.Future[Any] = loop.create_future()
 
         if owner_device_id is None:
-            # 데몬 전용 사이트 정책 적용 — SSG/ABC/LOTTEON 등은 데몬 없으면 None(skip)
-            owner_device_id = _resolve_owner_with_daemon_policy(site)
+            owner_device_id = _resolve_job_owner(site, "detail")
 
-        # 데몬 전용 사이트에 owner 없음 → 확장앱 fallback 차단, 잡 발행 skip
         if owner_device_id is None and (site or "").upper() in {
-            s.upper() for s in DAEMON_ONLY_SITES
+            s.upper() for s in _daemon_only_for_job("detail")
         }:
             logger.warning(
                 f"[소싱큐] {site} 데몬 미등록 — 잡 발행 skip (확장앱 fallback 차단): {product_id}"
@@ -330,10 +375,9 @@ class SourcingQueue:
         loop = asyncio.get_event_loop()
         future: asyncio.Future[Any] = loop.create_future()
         if owner_device_id is None:
-            # 데몬 전용 사이트 정책 적용
-            owner_device_id = _resolve_owner_with_daemon_policy(site)
+            owner_device_id = _resolve_job_owner(site, "tracking")
         if owner_device_id is None and (site or "").upper() in {
-            s.upper() for s in DAEMON_ONLY_SITES
+            s.upper() for s in _daemon_only_for_job("tracking")
         }:
             logger.warning(
                 f"[소싱큐] {site} 송장 데몬 미등록 — 잡 발행 skip: ord={sourcing_order_number}"
@@ -384,10 +428,15 @@ class SourcingQueue:
         loop = asyncio.get_event_loop()
         future: asyncio.Future[Any] = loop.create_future()
         if owner_device_id is None:
-            owner_device_id = get_autotune_owner(site)
-        # reward 잡은 owner 안 박음 — 대신 get_next_job 에서 X-Ext-Version 헤더로
-        # 옛 확장앱(reward 분기 모름) 필터링. "가장 최근 폴링 PC = 사용자 PC" 가정은
-        # 멀티PC 환경에서 다른 PC가 폴링 더 자주 하면 깨짐 → 검증 실패.
+            owner_device_id = _resolve_job_owner(site, "reward")
+
+        if owner_device_id is None and (site or "").upper() in {
+            s.upper() for s in _daemon_only_for_job("reward")
+        }:
+            logger.warning(
+                f"[소싱큐] {site} 적립 데몬 미등록 — 잡 발행 skip: action={action}"
+            )
+            raise RuntimeError(f"{site} 데몬 미등록 — 적립 잡 발행 불가")
 
         job: dict[str, Any] = {
             "requestId": request_id,
@@ -432,9 +481,16 @@ class SourcingQueue:
         loop = asyncio.get_event_loop()
         future: asyncio.Future[Any] = loop.create_future()
         if owner_device_id is None:
-            from backend.domain.samba.proxy.daemon_pool import pick_daemon_owner
+            owner_device_id = _resolve_job_owner(site, "cancel_order")
 
-            owner_device_id = pick_daemon_owner(site) or get_autotune_owner(site)
+        if owner_device_id is None and (site or "").upper() in {
+            s.upper() for s in _daemon_only_for_job("cancel_order")
+        }:
+            logger.warning(
+                f"[소싱큐] {site} 발주취소 데몬 미등록 — 잡 발행 skip: "
+                f"ord={sourcing_order_number}"
+            )
+            raise RuntimeError(f"{site} 데몬 미등록 — 발주취소 잡 발행 불가")
 
         job: dict[str, Any] = {
             "requestId": request_id,
@@ -515,17 +571,17 @@ class SourcingQueue:
             else:
                 conditions.append("(owner_device_id IS NULL OR owner_device_id = '')")
 
-            # 데몬 전용 사이트 가드 — LOTTEON/SSG/ABCmart/GrandStage 의 detail(상세) 잡만
-            # 헤드리스 데몬이 처리. 확장앱(non-daemon)엔 detail 잡 발행 안 함 → 확장앱 팝업 0.
-            # (이 사이트 상세가는 AJAX 로 늦게 채워져 확장앱은 팝업창을 띄워야만 읽힘. 데몬 headless 만
-            #  팝업 없이 처리 가능.) 단 목록 수집(search)은 데몬 미지원이므로 확장앱이 계속 처리 →
-            #  데몬사이트 'detail' 만 차단하고 search/tracking 등은 확장앱 허용(적체 방지).
-            _DAEMON_ONLY_SITES = ("LOTTEON", "SSG", "ABCmart", "GrandStage")
+            # 데몬 전용 사이트 가드 — DAEMON_ONLY_SITES (LOTTEON/SSG/ABCmart/GrandStage)
+            # 의 모든 job_type (detail/search/tracking/reward/cancel_order) 확장앱 차단.
+            # 사용자 룰 (3일 강조): 4개 사이트는 데몬 전용. 발행 측 가드(add_*_job)와
+            # dequeue 측 가드 2중 장벽 — 옛 잡이 큐에 남아있어도 비데몬 dev 가 못 받음.
+            # 모듈 상수 DAEMON_ONLY_SITES 재사용 (단일 진실 출처).
             if not device_id.startswith("samba-daemon-"):
-                _dph = ", ".join(f":dsite_{i}" for i in range(len(_DAEMON_ONLY_SITES)))
-                conditions.append(f"NOT (site IN ({_dph}) AND job_type = 'detail')")
-                for i, s in enumerate(_DAEMON_ONLY_SITES):
-                    params[f"dsite_{i}"] = s
+                _sites = sorted(DAEMON_ONLY_SITES)
+                _dph = ", ".join(f":dsite_{i}" for i in range(len(_sites)))
+                conditions.append(f"UPPER(site) NOT IN ({_dph})")
+                for i, s in enumerate(_sites):
+                    params[f"dsite_{i}"] = s.upper()
 
             # site 필터 — 케이싱 무관 매칭.
             # detail 잡 site='ABCmart'(혼합)인데 tracking 잡 site='ABCMART'(대문자)라

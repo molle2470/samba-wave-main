@@ -72,6 +72,9 @@ def build_tracking_url(site: str, sourcing_order_number: str) -> str:
         return f"https://www.nike.com/kr/orders/sales/{ord_no}/"
     if s == "OLIVEYOUNG":
         return f"https://www.oliveyoung.co.kr/store/mypage/getOrderDetail.do?ordNo={ord_no}"
+    if s == "KREAM":
+        # KREAM 송장 URL 추정값 — 마이페이지 주문 상세. 실측 검증 필요.
+        return f"https://kream.co.kr/my/orders/{ord_no}"
     raise ValueError(f"지원하지 않는 소싱처 송장조회: {site}")
 
 
@@ -411,20 +414,33 @@ async def enqueue_for_order(order_id: str, *, force: bool = False) -> dict[str, 
                 return backend_result
             # backend fetch 실패 시 기존 SourcingQueue 폴백으로 진행
 
-        # 1) SourcingQueue에 잡 적재 (확장앱 폴링이 받음) — actual_site 사용
+        # 1) SourcingQueue에 잡 적재 — 데몬 등록 사이트면 데몬으로, 아니면 확장앱 폴링
         try:
             url = build_tracking_url(actual_site, order.sourcing_order_number)
         except ValueError as exc:
             return {"success": False, "error": str(exc)}
 
-        request_id, _future = await SourcingQueue.add_tracking_job(
-            site=actual_site,
-            url=url,
-            order_id=order.id,
-            sourcing_order_number=order.sourcing_order_number,
-            owner_device_id=None,
-            sourcing_account_id=order.sourcing_account_id or None,
-        )
+        try:
+            request_id, _future = await SourcingQueue.add_tracking_job(
+                site=actual_site,
+                url=url,
+                order_id=order.id,
+                sourcing_order_number=order.sourcing_order_number,
+                owner_device_id=None,
+                sourcing_account_id=order.sourcing_account_id or None,
+            )
+        except RuntimeError as exc:
+            # DAEMON_ONLY_TRACKING_SITES + 데몬 미등록 → 잡 발행 skip
+            # 배치 도중 한 사이트 데몬 다운으로 전체 중단되지 않게 skipped 반환
+            logger.warning(
+                f"[송장동기화] 데몬 미등록 skip: order={order.id} site={actual_site} "
+                f"err={exc}"
+            )
+            return {
+                "success": True,
+                "skipped": True,
+                "reason": f"{actual_site} 송장 데몬 미등록 — 잡 발행 skip",
+            }
 
         # 2) DB row 생성
         job = SambaTrackingSyncJob(

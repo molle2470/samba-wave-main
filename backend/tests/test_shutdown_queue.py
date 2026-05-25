@@ -45,7 +45,9 @@ def test_sourcing_queue_add_and_resolve_job():
             "backend.domain.samba.proxy.sourcing_queue._db_insert_job",
             new_callable=lambda: lambda *a, **kw: asyncio.sleep(0),
         ):
-            request_id, future = SourcingQueue.add_search_job("ABCmart", "nike")
+            request_id, future = SourcingQueue.add_search_job(
+                "ABCmart", "nike", owner_device_id="test-device"
+            )
 
         payload = {
             "requestId": request_id,

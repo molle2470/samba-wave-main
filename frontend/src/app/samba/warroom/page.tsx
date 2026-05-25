@@ -498,8 +498,9 @@ export default function WarroomPage() {
   // fetch 실패/지연 시에도 체크박스가 항상 보이도록 default 리스트로 즉시 초기화.
   // 백엔드 filters fetch 가 100초 걸리거나 실패할 때 페이지가 빈 상태로 보이던
   // 사고 차단 (2026-05-25 포크 유저도 동일 UX 보장).
+  // GrandStage 는 ABCmart 의 a-rt.com 하부 도메인 — UI 별도 노출 X (ABCmart 에 포함).
   const _DEFAULT_AVAIL_SOURCES = [
-    'ABCmart', 'GSShop', 'GrandStage', 'LOTTEON', 'MUSINSA', 'SSG',
+    'ABCmart', 'GSShop', 'LOTTEON', 'MUSINSA', 'SSG',
   ]
   const _DEFAULT_AVAIL_MARKETS = [
     '11번가', '옥션', '쿠팡', '롯데홈쇼핑', '롯데ON', '플레이오토', '스마트스토어', 'SSG', 'G마켓',
@@ -624,16 +625,49 @@ export default function WarroomPage() {
       const dev = getDeviceId()
       if (!dev) return
       const { API_BASE_URL: apiBase } = await import('@/config/api')
-      // sites=null(전체체크)은 등록 자체를 제거(다른 PC들의 union이 그대로 사용됨)
-      // sites=[](전체해제)는 빈 분담으로 명시 등록
-      // sites=[...]는 명시 사이트만 등록
-      // 백엔드는 모든 등록 PC의 합집합으로 active_sites 결정.
-      // 단일 PC 운영 + 모두 체크 = 등록 0개 → 백엔드 legacy 동작(전체 처리) 유지
-      await fetchWithAuth(`${apiBase}/api/v1/samba/collector/autotune/pc-allowed-sites`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ device_id: dev, sites }),
-      })
+      // 사이트별 dev 분리 (2026-05-25 사용자 룰):
+      //  - 데몬 전용(SSG/ABCmart/GrandStage/LOTTEON) → 데몬 dev 에만 분담
+      //  - 브라우저 전용(무신사/GSShop) → 브라우저 dev 에만 분담
+      // 4개 사이트는 확장앱 절대 관여 X — 데몬에만 박는다.
+      const daemonDev = (typeof window !== 'undefined' &&
+        window.localStorage.getItem('samba.autotune.daemon.deviceId')) || ''
+      const _DAEMON_ONLY = new Set(['SSG', 'ABCmart', 'GrandStage', 'LOTTEON'])
+      // ABCmart 체크 = ABCmart + GrandStage 자동 expand (같은 a-rt.com 도메인)
+      const _SITE_EXPAND: Record<string, string[]> = {
+        ABCmart: ['ABCmart', 'GrandStage'],
+      }
+      const expanded = sites === null
+        ? null
+        : sites.flatMap(s => _SITE_EXPAND[s] || [s])
+      // 사이트 분리
+      const browserSites = expanded === null
+        ? null
+        : expanded.filter(s => !_DAEMON_ONLY.has(s))
+      const daemonSites = expanded === null
+        ? null
+        : expanded.filter(s => _DAEMON_ONLY.has(s))
+      const calls: Promise<unknown>[] = []
+      // 브라우저 dev — 비데몬 사이트만 (또는 null=전체)
+      calls.push(fetchWithAuth(
+        `${apiBase}/api/v1/samba/collector/autotune/pc-allowed-sites`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ device_id: dev, sites: browserSites }),
+        },
+      ))
+      // 데몬 dev — 데몬 전용 사이트만
+      if (daemonDev) {
+        calls.push(fetchWithAuth(
+          `${apiBase}/api/v1/samba/collector/autotune/pc-allowed-sites`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ device_id: daemonDev, sites: daemonSites }),
+          },
+        ))
+      }
+      await Promise.all(calls)
     } catch { /* ignore */ }
   }, [])
 

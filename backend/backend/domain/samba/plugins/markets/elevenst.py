@@ -230,6 +230,17 @@ class ElevenstPlugin(MarketPlugin):
                     f"<rtngExchDetail>{_escape_xml(_rtn_exch)}</rtngExchDetail>"
                 )
 
+                # 안전인증정보 빈값 재검증 가드 — 경량 PUT에 ProductCertGroup 누락 시
+                # 11번가 응답 "안전인증정보 설정 오류 [인증유형 및 인증번호를 입력해주세요] STATUS[103]"
+                # → 전체XML 폴백 → dispCtgrNo 권한 에러 연쇄. transform_product 와 동일 매핑 동봉
+                _cert_xml = (
+                    "<ProductCertGroup><crtfGrpTypCd>01</crtfGrpTypCd><crtfGrpObjClfCd>03</crtfGrpObjClfCd></ProductCertGroup>"
+                    "<ProductCertGroup><crtfGrpTypCd>02</crtfGrpTypCd><crtfGrpObjClfCd>03</crtfGrpObjClfCd></ProductCertGroup>"
+                    "<ProductCertGroup><crtfGrpTypCd>03</crtfGrpTypCd><crtfGrpObjClfCd>03</crtfGrpObjClfCd></ProductCertGroup>"
+                    "<ProductCertGroup><crtfGrpTypCd>04</crtfGrpTypCd><crtfGrpObjClfCd>05</crtfGrpObjClfCd></ProductCertGroup>"
+                    "<ProductCert><certTypeCd>131</certTypeCd><certKey></certKey></ProductCert>"
+                )
+
                 xml_data = (
                     '<?xml version="1.0" encoding="UTF-8"?>'
                     "<Product>"
@@ -239,6 +250,7 @@ class ElevenstPlugin(MarketPlugin):
                     f"{_origin_xml}"
                     f"{_delivery_xml}"
                     f"{_after_xml}"
+                    f"{_cert_xml}"
                     f"{option_xml}"
                     "</Product>"
                 )
@@ -380,7 +392,15 @@ class ElevenstPlugin(MarketPlugin):
 
         try:
             if existing_no:
-                result = await client.update_product(existing_no, xml_data)
+                # 수정 PUT 시 dispCtgrNo 제거 — 카테고리매핑 변경으로 보낸 코드가 등록 카테고리와
+                # 다르면 11번가가 STATUS[103] "상위 카테고리를 수정할 수 있는 권한이 없습니다" 반환
+                # 오토튠 가격/재고 갱신 경로에서 카테고리 변경 의도 없음. 신규등록 path는 영향 없음
+                import re as _re
+
+                xml_data_for_put = _re.sub(
+                    r"<dispCtgrNo>[^<]*</dispCtgrNo>", "", xml_data, count=1
+                )
+                result = await client.update_product(existing_no, xml_data_for_put)
                 logger.info(f"[11번가] 폴백 응답: {result}")
                 return {
                     "success": True,

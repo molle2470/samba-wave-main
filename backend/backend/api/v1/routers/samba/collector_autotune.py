@@ -362,6 +362,14 @@ def register_pc_allowed_sites(
         _pc_last_seen.pop(dev, None)
         _pc_site_history.pop(dev, None)
         return existed
+    # 데몬 전용 사이트 strip — 비데몬 dev 분담에 4개 사이트 절대 박히지 않음.
+    # 옛 확장앱이 X-Allowed-Sites 헤더에 SSG/ABC/GrandStage/LOTTEON 박아 보내도
+    # backend 가 무시. 사용자 룰 (3일 강조) 영구 차단 단일 진실 출처.
+    if not dev.startswith("samba-daemon-"):
+        from backend.domain.samba.proxy.sourcing_queue import DAEMON_ONLY_SITES
+
+        _block = {s.upper() for s in DAEMON_ONLY_SITES}
+        sites = [s for s in sites if (s or "").strip().upper() not in _block]
     new_set = frozenset(s.strip() for s in sites if s and s.strip())
     now = time.time()
     # authoritative: UI 확정 지정 — union 이력 비우고 입력값 그대로 박는다.
@@ -409,27 +417,44 @@ async def restore_pc_allowed_sites_from_db() -> int:
 
     last_seen은 복원하지 않음 — 24h TTL이 의미를 잃음. 첫 폴링 도착 시 갱신.
     그러나 분담 매핑 자체는 `get_pc_allowed_sites()`에서 사용되므로 복원 효과 충분.
+
+    자가치유 (2026-05-25): 옛 DB snapshot 에 비데몬 dev 분담에 4개 사이트
+    (SSG/ABCmart/GrandStage/LOTTEON) 박혀있으면 strip + 1회 재기록. 다음 부팅엔
+    안 떠야 정상. register_pc_allowed_sites 진입 가드와 짝.
     """
     _log = logging.getLogger("autotune")
     try:
         from backend.db.orm import get_read_session
         from backend.api.v1.routers.samba.proxy._helpers import _get_setting
+        from backend.domain.samba.proxy.sourcing_queue import DAEMON_ONLY_SITES
 
         async with get_read_session() as _sess:
             data = await _get_setting(_sess, PC_ALLOWED_SITES_DB_KEY)
         if not isinstance(data, dict):
             return 0
         count = 0
+        dirty = False
         now = time.time()
+        _block = {s.upper() for s in DAEMON_ONLY_SITES}
         for dev, sites in data.items():
             if not isinstance(dev, str) or not isinstance(sites, list):
                 continue
             dev_clean = dev.strip()
             if not dev_clean:
                 continue
-            _pc_allowed_sites[dev_clean] = {
-                s.strip() for s in sites if isinstance(s, str) and s.strip()
-            }
+            raw_set = {s.strip() for s in sites if isinstance(s, str) and s.strip()}
+            if not dev_clean.startswith("samba-daemon-"):
+                stripped = {s for s in raw_set if s.upper() in _block}
+                if stripped:
+                    _log.warning(
+                        "[오토튠] PC 분담 복원 시 데몬전용 사이트 strip: "
+                        "dev=%s removed=%s",
+                        dev_clean,
+                        sorted(stripped),
+                    )
+                    dirty = True
+                    raw_set -= stripped
+            _pc_allowed_sites[dev_clean] = raw_set
             # last_seen은 복원 시점으로 표시 — 첫 폴링까지 stale 정리 방지
             _pc_last_seen[dev_clean] = now
             count += 1
@@ -439,6 +464,19 @@ async def restore_pc_allowed_sites_from_db() -> int:
                 count,
                 sorted(_pc_allowed_sites.keys()),
             )
+        # 자가치유 — DB snapshot 더러우면 1회 재기록
+        if dirty:
+            try:
+                from backend.db.orm import get_write_session
+
+                async with get_write_session() as _ws:
+                    await persist_pc_allowed_sites(_ws)
+                    await _ws.commit()
+                _log.info(
+                    "[오토튠] DB snapshot 자가치유 완료 — 데몬전용 사이트 제거 후 재저장"
+                )
+            except Exception as _e2:
+                _log.warning("[오토튠] 자가치유 재저장 실패(무시): %s", _e2)
         return count
     except Exception as _e:
         _log.warning("[오토튠] PC 분담 복원 실패(무시): %s", _e)
