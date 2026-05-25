@@ -441,6 +441,19 @@ async function _processJobWithCap(job) {
       _siteSemRelease(site)
     }
   }
+  // 발주취소 잡(type=cancel_order) — 가격수집과 격리, 사이트 세마포어 사용.
+  // 사이트별 cancel_js 분석·작성 전이라 현재는 '미지원' 회신만.
+  // 실제 사이트 DOM 자동화는 content-cancel-{site}.js + 본 핸들러에서 라우팅 (분석 후 채움).
+  if (job.type === 'cancel_order') {
+    await _siteSemAcquire(site)
+    _markSourcingSiteActive(site)
+    try {
+      return await handleCancelOrderJob(job)
+    } finally {
+      _markSourcingSiteInactive(site)
+      _siteSemRelease(site)
+    }
+  }
   // 송장 추출 잡(type=tracking) — 가격수집과 격리. 동일 사이트 캡 공유로 무신사 폭주 방지
   if (job.type === 'tracking') {
     if (site === 'MUSINSA') {
@@ -1171,6 +1184,41 @@ async function handleTrackingJob(job) {
       try { await chrome.tabs.remove(tabId) } catch {}
       cleaned = true
     }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 발주취소 잡 핸들러 (소싱처 주문상세 페이지 → DOM 자동화 → cancel-result 전송)
+//
+// 사이트별 cancel_js 분석 전이라 현재는 스텁 — 미지원 회신만 보낸다.
+// 분석 완료 후 사이트별 content-cancel-{site}.js 작성 + 본 함수에서 라우팅 추가 예정.
+//
+// 라우팅 정책:
+//  - SSG/ABCmart/GrandStage/LOTTEON  → 데몬 전용 (확장앱 라우팅 차단됨)
+//  - MUSINSA/GSShop/패션플러스/SNKRDUNK/KREAM/Nike/롯데홈쇼핑 → 확장앱(여기)
+//
+// 결과 스키마: {success, cancelled, alreadyShipped?, reason?, error?}
+// ─────────────────────────────────────────────────────────────────────────────
+const _cancelPending = new Map() // requestId → {resolve, timeoutId, tabId}
+
+async function handleCancelOrderJob(job) {
+  const requestId = job.requestId
+  const site = job.site || ''
+  const ordNo = job.sourcingOrderNumber || ''
+
+  console.log(`[발주취소] 잡 수신 req=${requestId} site=${site} ord=${ordNo}`)
+
+  // 사이트별 cancel_js 미작성 — 분석 후 라우팅 추가 예정.
+  // 지금은 즉시 '미지원' 회신해서 잡 큐가 잠기지 않도록 한다.
+  try {
+    await postResult('sourcing/cancel-result', {
+      requestId,
+      success: false,
+      cancelled: false,
+      reason: `확장앱 cancel_js 미작성(site=${site}) — 분석 후 구현 예정`,
+    })
+  } catch (err) {
+    console.warn(`[발주취소] 결과 전송 실패 req=${requestId}:`, err)
   }
 }
 
