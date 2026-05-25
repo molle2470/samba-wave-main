@@ -220,6 +220,55 @@ async def toggle_account(
     return result
 
 
+class StoreFormUpsertRequest(BaseModel):
+    """설정 페이지 폼 → market_account upsert 요청.
+
+    account_id 있으면 update, 없으면 create.
+    """
+
+    market_type: str
+    form_data: dict
+    account_id: Optional[str] = None
+
+
+@router.post("/from-store-form")
+async def upsert_from_store_form(
+    body: StoreFormUpsertRequest,
+    session: AsyncSession = Depends(get_write_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
+):
+    """설정 페이지 폼 데이터로 market_account create 또는 update.
+
+    credentials.form_to_account_payload 가 마켓별 form 키 → 컬럼 매핑.
+    store_* samba_settings 단일 키 저장을 완전 대체 (2026-05-25).
+    """
+    from backend.domain.samba.account.credentials import form_to_account_payload
+
+    svc = _get_service(session)
+    payload = form_to_account_payload(
+        body.market_type, body.form_data or {}, tenant_id=tenant_id
+    )
+
+    if body.account_id:
+        # update — 소유권 검증
+        existing = await svc.get_account(body.account_id)
+        if not existing:
+            raise HTTPException(404, "계정을 찾을 수 없습니다")
+        if tenant_id is not None and existing.tenant_id != tenant_id:
+            raise HTTPException(403, "해당 계정에 대한 권한이 없습니다")
+        # update 시 tenant_id 변경 금지 + market_type 변경 금지
+        payload.pop("tenant_id", None)
+        payload.pop("market_type", None)
+        result = await svc.update_account(body.account_id, payload)
+        if not result:
+            raise HTTPException(404, "계정을 찾을 수 없습니다")
+        return mask_model_secrets(result.model_dump())
+
+    # create — account_label 자동 생성 (market_info.name + seller_id)
+    result = await svc.create_account(payload)
+    return mask_model_secrets(result.model_dump())
+
+
 @router.put("/{account_id}/set-default")
 async def set_default_account(
     account_id: str,

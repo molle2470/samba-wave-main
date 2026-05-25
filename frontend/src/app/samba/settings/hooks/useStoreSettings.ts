@@ -222,7 +222,8 @@ export function useStoreSettings(): StoreSettingsState & StoreSettingsActions {
         }
       }
       const data = merged
-      await forbiddenApi.saveSetting(`store_${marketKey}`, data)
+      // (2026-05-25) store_* samba_settings 저장 폐기 — samba_market_account 단일 진실 출처.
+      // 아래 accountApi.create/update 가 market_account 저장 담당.
 
       // lottehome: proxy client는 lottehome_credentials 키를 읽으므로 함께 동기화
       if (marketKey === 'lottehome') {
@@ -307,8 +308,8 @@ export function useStoreSettings(): StoreSettingsState & StoreSettingsActions {
           delete safeData[field]
         }
       }
-      // 먼저 설정 저장
-      await forbiddenApi.saveSetting(`store_${marketKey}`, safeData)
+      // (2026-05-25) 인증 테스트 진입점은 저장 안 함 — saveStoreSettings 가 저장 담당.
+      // 폼 데이터는 인증 테스트 endpoint 에 payload 로 직접 전송 (4-1/4-2 적용).
       setSavedStoreData(prev => ({ ...prev, [marketKey]: { ...safeData } }))
       // 마켓별 인증 테스트
       let result: { success: boolean; message: string }

@@ -1017,6 +1017,11 @@ export const accountApi = {
     request<SambaMarketAccount>(`${SAMBA_PREFIX}/accounts/${id}/toggle`, { method: "PUT" }),
   setDefault: (id: string) =>
     request<SambaMarketAccount>(`${SAMBA_PREFIX}/accounts/${id}/set-default`, { method: "PUT" }),
+  upsertFromStoreForm: (body: { market_type: string; form_data: Record<string, unknown>; account_id?: string }) =>
+    request<SambaMarketAccount>(`${SAMBA_PREFIX}/accounts/from-store-form`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   delete: (id: string) =>
     request<{ ok: boolean }>(`${SAMBA_PREFIX}/accounts/${id}`, { method: "DELETE" }),
   getSecrets: (id: string) =>

@@ -236,3 +236,69 @@ def build_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
     if builder is None:
         return {}
     return builder(account)
+
+
+# 마켓별 form 키 → SambaMarketAccount 컬럼 매핑.
+# (api_key_field, api_secret_field, seller_id_field)
+# None = 해당 컬럼 미사용 (additional_fields 에만 저장).
+_FORM_TO_COLUMNS: dict[str, tuple[Optional[str], Optional[str], Optional[str]]] = {
+    "lotteon": ("apiKey", None, None),
+    "11st": ("apiKey", None, None),
+    "elevenst": ("apiKey", None, None),
+    "coupang": ("accessKey", "secretKey", "vendorId"),
+    "ssg": ("apiKey", None, "sellerId"),
+    "smartstore": ("clientId", "clientSecret", None),
+    "gsshop": (None, None, "storeId"),
+    "lottehome": ("userId", "password", "agncNo"),
+    "playauto": ("apiKey", None, "hostingId"),
+    "ebay": ("clientId", "clientSecret", None),
+    "cafe24": ("clientId", "clientSecret", "mallId"),
+    "amazon": ("clientId", "clientSecret", "storeId"),
+    "auction": ("apiKey", None, "sellerId"),
+    "gmarket": ("apiKey", None, "sellerId"),
+    "esm": ("apiKey", None, "sellerId"),
+    "kream": (None, None, None),
+    "musinsa": (None, None, None),
+    "toss": ("apiKey", "apiSecret", None),
+}
+
+
+def form_to_account_payload(
+    market_type: str,
+    form_data: dict[str, Any],
+    tenant_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """설정 페이지 폼 dict → SambaMarketAccount create/update payload 변환.
+
+    api_key/api_secret/seller_id 는 컬럼으로, 그 외는 additional_fields 로.
+    None 컬럼 매핑은 해당 마켓에서 미사용 (form 에 없거나 무관).
+    매핑 누락 마켓은 form_data 전체를 additional_fields 에 저장.
+    """
+    cols = _FORM_TO_COLUMNS.get(market_type.lower(), (None, None, None))
+    api_key_field, api_secret_field, seller_id_field = cols
+
+    payload: dict[str, Any] = {
+        "market_type": market_type,
+        "tenant_id": tenant_id,
+        "is_active": True,
+    }
+    if api_key_field:
+        payload["api_key"] = form_data.get(api_key_field, "") or ""
+    if api_secret_field:
+        payload["api_secret"] = form_data.get(api_secret_field, "") or ""
+    if seller_id_field:
+        payload["seller_id"] = form_data.get(seller_id_field, "") or ""
+
+    # business_name 폼 키 보존
+    if "businessName" in form_data:
+        payload["business_name"] = form_data.get("businessName", "") or ""
+
+    # additional_fields = form 전체 (컬럼 추출분도 남겨둠 — 기존 코드 호환).
+    # 빈 값은 제거해 noise 감소.
+    extras = {
+        k: v
+        for k, v in form_data.items()
+        if v not in (None, "", []) and k != "businessName"
+    }
+    payload["additional_fields"] = extras
+    return payload
