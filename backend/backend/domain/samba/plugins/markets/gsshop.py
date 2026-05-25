@@ -75,16 +75,17 @@ class GsShopPlugin(MarketPlugin):
         from backend.domain.samba.proxy.gsshop import GsShopClient
 
         # creds가 비었으면 settings에서 조회.
-        # (2026-05-25) store_gsshop 직접 호출 → resolver 위임.
+        # (2026-05-25) store_gsshop 직접 호출 → resolver 위임 + account.tenant_id 자동 추출.
         auth_creds = dict(creds) if creds else {}
         if not auth_creds:
             auth_creds = await _get_setting(session, "gsshop_credentials") or {}
         if not auth_creds or not isinstance(auth_creds, dict):
             from backend.domain.samba.account.resolver import resolve_market_creds
 
+            _tid = getattr(account, "tenant_id", None) if account else None
             auth_creds = (
                 await resolve_market_creds(
-                    session, None, market_type="gsshop", store_key="store_gsshop"
+                    session, _tid, market_type="gsshop", store_key="store_gsshop"
                 )
                 or {}
             )

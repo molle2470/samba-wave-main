@@ -43,12 +43,13 @@ class KreamPlugin(MarketPlugin):
         cookie = await _get_setting(session, "kream_cookie") or ""
 
         # token/cookie가 없으면 store_kream 설정에서 폴백.
-        # (2026-05-25) resolver 위임 — find_default('kream') 우선.
+        # (2026-05-25) resolver 위임 + account.tenant_id 자동 추출.
         if not token and not cookie:
             from backend.domain.samba.account.resolver import resolve_market_creds
 
+            _tid = getattr(account, "tenant_id", None) if account else None
             creds = await resolve_market_creds(
-                session, None, market_type="kream", store_key="store_kream"
+                session, _tid, market_type="kream", store_key="store_kream"
             )
             if creds:
                 token = creds.get("token", "")

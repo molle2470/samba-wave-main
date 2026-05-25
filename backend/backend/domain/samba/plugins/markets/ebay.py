@@ -302,13 +302,14 @@ class EbayPlugin(MarketPlugin):
             }
 
         # Business Policy ID — 계정 extras 또는 samba_settings에서 조회.
-        # (2026-05-25) resolver 위임 — find_default('ebay') 우선, 없으면 store_ebay 폴백.
+        # (2026-05-25) resolver 위임 + account.tenant_id 자동 추출.
         settings_creds: dict[str, Any] = {}
         if session:
             from backend.domain.samba.account.resolver import resolve_market_creds
 
+            _tid = getattr(account, "tenant_id", None) if account else None
             raw = await resolve_market_creds(
-                session, None, market_type="ebay", store_key="store_ebay"
+                session, _tid, market_type="ebay", store_key="store_ebay"
             )
             if raw and isinstance(raw, dict):
                 settings_creds = raw

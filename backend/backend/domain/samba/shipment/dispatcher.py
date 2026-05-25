@@ -260,13 +260,16 @@ async def _delete_smartstore(
         )
 
     # 계정이 명시된 삭제에서는 다른 계정의 전역 설정으로 폴백하지 않는다.
-    # (2026-05-25) store_smartstore 직접 호출 → resolver 위임. find_default tenant=None
-    # 미스 시 자동 store_* 레거시 폴백.
+    # (2026-05-25) store_smartstore 직접 호출 → resolver 위임. account.tenant_id 자동 추출.
     if (not client_id or not client_secret) and account is None:
         from backend.domain.samba.account.resolver import resolve_market_creds
 
+        _tid = getattr(account, "tenant_id", None) if account else None
         creds = await resolve_market_creds(
-            session, None, market_type="smartstore", store_key="store_smartstore"
+            session,
+            _tid,
+            market_type="smartstore",
+            store_key="store_smartstore",
         )
         if creds:
             client_id = client_id or creds.get("clientId", "")
@@ -480,8 +483,9 @@ async def _delete_coupang(
     if (not access_key or not secret_key) and account is None:
         from backend.domain.samba.account.resolver import resolve_market_creds
 
+        _tid = getattr(account, "tenant_id", None) if account else None
         creds = await resolve_market_creds(
-            session, None, market_type="coupang", store_key="store_coupang"
+            session, _tid, market_type="coupang", store_key="store_coupang"
         )
         if creds:
             access_key = access_key or creds.get("accessKey", "")
@@ -636,9 +640,10 @@ async def _delete_lottehome(
         else:
             from backend.domain.samba.account.resolver import resolve_market_creds
 
+            _tid = getattr(account, "tenant_id", None) if account else None
             creds = await resolve_market_creds(
                 session,
-                None,
+                _tid,
                 market_type="lottehome",
                 store_key="store_lottehome",
             )
@@ -686,8 +691,9 @@ async def _delete_gsshop(
         if not creds or not isinstance(creds, dict):
             from backend.domain.samba.account.resolver import resolve_market_creds
 
+            _tid = getattr(account, "tenant_id", None) if account else None
             creds = await resolve_market_creds(
-                session, None, market_type="gsshop", store_key="store_gsshop"
+                session, _tid, market_type="gsshop", store_key="store_gsshop"
             )
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "GS샵 설정 없음"}
@@ -733,8 +739,9 @@ async def _delete_11st(
     if not api_key and account is None:
         from backend.domain.samba.account.resolver import resolve_market_creds
 
+        _tid = getattr(account, "tenant_id", None) if account else None
         creds = await resolve_market_creds(
-            session, None, market_type="11st", store_key="store_11st"
+            session, _tid, market_type="11st", store_key="store_11st"
         )
         if creds:
             api_key = creds.get("apiKey", "")
@@ -778,8 +785,9 @@ async def _delete_ssg(
     else:
         from backend.domain.samba.account.resolver import resolve_market_creds
 
+        _tid = getattr(account, "tenant_id", None) if account else None
         creds = await resolve_market_creds(
-            session, None, market_type="ssg", store_key="store_ssg"
+            session, _tid, market_type="ssg", store_key="store_ssg"
         )
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "SSG 설정 없음"}

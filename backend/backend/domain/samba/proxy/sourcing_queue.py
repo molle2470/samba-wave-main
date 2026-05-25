@@ -25,26 +25,16 @@ _JOB_TTL_SEC: dict[str, int] = {
     "cancel_order": 1800,
 }
 
-# 데몬 전용 사이트 — 확장앱(브라우저) 처리 불가. 데몬 없으면 잡 발행 자체 skip.
-# 사용자 룰 (2026-05-25, feedback_daemon_sites_routing): SSG/ABC/LOTTEON 은 데몬으로만.
-# 확장앱 fallback 으로 라우팅 시 60초 미응답 차단 → 무의미한 timeout 누적.
-DAEMON_ONLY_SITES: set[str] = {"SSG", "ABCmart", "GrandStage", "LOTTEON"}
+# 데몬 전용 사이트 강제 정책 폐기 (2026-05-25 사용자 재요청 "강제할당 X").
+# 사용자가 PC 마다 UI 에서 직접 사이트 분담 박음. 데몬 우선 + 확장앱 fallback 만 유지.
+DAEMON_ONLY_SITES: set[str] = set()
 
 
 def _resolve_owner_with_daemon_policy(site: str) -> str | None:
-    """데몬 전용 사이트 라우팅 정책 — 데몬 매칭 우선, 확장앱 fallback 차단.
-
-    SSG/ABC/LOTTEON 은 데몬 풀에 매칭되는 데몬이 없으면 None(잡 발행 skip).
-    기타 사이트는 데몬 → 확장앱 fallback (기존 동작).
-    """
+    """데몬 우선 + 확장앱 fallback (강제 정책 없음)."""
     from backend.domain.samba.proxy.daemon_pool import pick_daemon_owner
 
-    d = pick_daemon_owner(site)
-    if d:
-        return d
-    if (site or "").upper() in {s.upper() for s in DAEMON_ONLY_SITES}:
-        return None  # 데몬 없으면 확장앱 fallback 차단
-    return get_autotune_owner(site)
+    return pick_daemon_owner(site) or get_autotune_owner(site)
 
 
 # 적립 액션별 진입 URL — 확장앱이 잡 받으면 이 URL의 탭을 열고 content script 주입.

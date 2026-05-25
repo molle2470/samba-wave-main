@@ -132,22 +132,9 @@ async def sourcing_collect_queue(request: Request) -> Any:
         update_pc_last_seen(device_id)
         _is_daemon = device_id.startswith("samba-daemon-")
         if _is_daemon:
-            # 데몬 폴링 시 X-Allowed-Sites = 데몬의 active_sites = 사용자 의도
-            # → authoritative 자동 등록 (SaaS 1클릭: 사용자 수동 분담 박기 X).
-            # 2026-05-25 사용자 '포크 유저 1만명 박아줄거냐' 피드백 반영.
-            # 미등록 데몬도 빈 entry 1회 생성(UI 목록 노출).
-            touch_daemon_presence(device_id)
-            raw_sites_for_reg = request.headers.get("X-Allowed-Sites")
-            need_persist = False
-            if raw_sites_for_reg is not None:
-                sites_for_reg = [
-                    s.strip() for s in raw_sites_for_reg.split(",") if s.strip()
-                ]
-                if register_pc_allowed_sites(
-                    device_id, sites_for_reg, authoritative=True
-                ):
-                    need_persist = True
-            if need_persist:
+            # 데몬 = 등록(touch_daemon_presence)만. 사이트 분담은 사용자가 UI 에서
+            # 직접 박는다 (강제 자동 할당 금지, 2026-05-25 사용자 재요청).
+            if touch_daemon_presence(device_id):
                 from backend.db.orm import get_write_session
 
                 async with get_write_session() as _persist_sess:
