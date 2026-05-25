@@ -26,6 +26,7 @@ Create Date: 2026-05-25 12:00:00.000000
 from typing import Sequence, Union
 
 from alembic import op
+import sqlalchemy as sa
 
 
 revision: str = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_market_account_oauth_default"
@@ -36,32 +37,55 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+def _column_exists(conn, table: str, column: str) -> bool:
+    """information_schema 조회 — ALTER TABLE 자체 안 하면 AccessExclusiveLock 안 잡힘.
+    hot 테이블 데드락 방지 (CLAUDE.md '마이그레이션 hot 테이블 데드락 방지' 참조).
+    """
+    return bool(
+        conn.execute(
+            sa.text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name=:t AND column_name=:c"
+            ),
+            {"t": table, "c": column},
+        ).first()
+    )
+
+
+def _index_exists(conn, name: str) -> bool:
+    return bool(
+        conn.execute(
+            sa.text("SELECT 1 FROM pg_indexes WHERE indexname=:n"), {"n": name}
+        ).first()
+    )
+
+
 def upgrade() -> None:
-    # OAuth 토큰 컬럼 (cafe24/ebay/amazon 등) — 만료/갱신 추적
-    op.execute(
-        "ALTER TABLE samba_market_account "
-        "ADD COLUMN IF NOT EXISTS oauth_access_token TEXT"
-    )
-    op.execute(
-        "ALTER TABLE samba_market_account "
-        "ADD COLUMN IF NOT EXISTS oauth_refresh_token TEXT"
-    )
-    op.execute(
-        "ALTER TABLE samba_market_account "
-        "ADD COLUMN IF NOT EXISTS oauth_expires_at TIMESTAMP WITH TIME ZONE"
-    )
-
-    # is_default — market_type+tenant_id 당 1개 (uniqueness 는 service 레벨 강제)
-    op.execute(
-        "ALTER TABLE samba_market_account "
-        "ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT false"
-    )
-
-    # fallback 조회용 인덱스 — (tenant_id, market_type, is_default DESC)
-    op.execute(
-        "CREATE INDEX IF NOT EXISTS ix_smk_default_per_market "
-        "ON samba_market_account (tenant_id, market_type, is_default)"
-    )
+    conn = op.get_bind()
+    # hot 테이블 데드락 방지 — 컬럼 이미 있으면 ALTER 스킵 (AccessExclusiveLock 회피)
+    if not _column_exists(conn, "samba_market_account", "oauth_access_token"):
+        op.execute(
+            "ALTER TABLE samba_market_account ADD COLUMN oauth_access_token TEXT"
+        )
+    if not _column_exists(conn, "samba_market_account", "oauth_refresh_token"):
+        op.execute(
+            "ALTER TABLE samba_market_account ADD COLUMN oauth_refresh_token TEXT"
+        )
+    if not _column_exists(conn, "samba_market_account", "oauth_expires_at"):
+        op.execute(
+            "ALTER TABLE samba_market_account "
+            "ADD COLUMN oauth_expires_at TIMESTAMP WITH TIME ZONE"
+        )
+    if not _column_exists(conn, "samba_market_account", "is_default"):
+        op.execute(
+            "ALTER TABLE samba_market_account "
+            "ADD COLUMN is_default BOOLEAN NOT NULL DEFAULT false"
+        )
+    if not _index_exists(conn, "ix_smk_default_per_market"):
+        op.execute(
+            "CREATE INDEX ix_smk_default_per_market "
+            "ON samba_market_account (tenant_id, market_type, is_default)"
+        )
 
 
 def downgrade() -> None:

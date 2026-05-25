@@ -104,29 +104,27 @@ class SambaMonitorService:
             return None
 
     async def get_dashboard_stats(self) -> Dict[str, Any]:
-        """대시보드 전체 통계.
+        """대시보드 전체 통계 (stale-while-revalidate 패턴).
 
         개선 포인트:
-        1) 15초 TTL 인메모리 캐시 — 30초 폴링 대상이라 중복 연산을 회피.
-        2) 서브쿼리 7개를 독립 세션으로 asyncio.gather 병렬화 (직렬 → 병렬).
+        1) 캐시 있으면 stale 도 즉시 반환 → 페이지 첫 진입 80~120초 블로킹 차단.
+        2) stale 시 백그라운드 재계산 (lock locked 면 skip → 중복 쿼리 0).
+        3) cold start 만 블로킹 (lifecycle warmup 으로 첫 사용자 부담 최소화).
+        4) 서브쿼리 8개 asyncio.gather 병렬 유지.
         """
-        # 1) 캐시 히트 (짧은 lock으로 thundering-herd 방지)
         now_ts = time.monotonic()
         cached = _dashboard_cache.get("data")
-        if (
-            cached is not None
-            and (now_ts - _dashboard_cache["ts"]) < _DASHBOARD_CACHE_TTL
-        ):
+        if cached is not None:
+            stale = (now_ts - _dashboard_cache["ts"]) >= _DASHBOARD_CACHE_TTL
+            if stale and not _dashboard_cache_lock.locked():
+                # 백그라운드 재계산 trigger (caller 는 stale 즉시 반환)
+                asyncio.create_task(self._refresh_dashboard_in_background())
             return cached
 
         async with _dashboard_cache_lock:
-            # lock 획득 사이에 다른 요청이 이미 채웠을 수 있음
             cached = _dashboard_cache.get("data")
-            if (
-                cached is not None
-                and (time.monotonic() - _dashboard_cache["ts"]) < _DASHBOARD_CACHE_TTL
-            ):
-                return cached
+            if cached is not None:
+                return cached  # 다른 요청이 lock 대기 중 채움
 
             now = datetime.now(timezone.utc)
             since_24h = now - timedelta(hours=24)
@@ -168,6 +166,30 @@ class SambaMonitorService:
             _dashboard_cache["data"] = data
             _dashboard_cache["ts"] = time.monotonic()
             return data
+
+    async def _refresh_dashboard_in_background(self) -> None:
+        """stale 캐시 백그라운드 재계산 — 페이지 응답 차단 X. 중복 시 lock 으로 skip."""
+        from backend.db.orm import get_read_session
+
+        if _dashboard_cache_lock.locked():
+            return
+        async with _dashboard_cache_lock:
+            # 진입 후 다른 task 가 채웠으면 skip
+            cached = _dashboard_cache.get("data")
+            if (
+                cached is not None
+                and (time.monotonic() - _dashboard_cache["ts"]) < _DASHBOARD_CACHE_TTL
+            ):
+                return
+            try:
+                async with get_read_session() as fresh_sess:
+                    svc = SambaMonitorService(fresh_sess)
+                    # cache 비우고 get_dashboard_stats 재호출 시 콜드 path 진입
+                    _dashboard_cache["ts"] = 0.0
+                    _dashboard_cache["data"] = None
+                    await svc.get_dashboard_stats()
+            except Exception as exc:
+                logger.warning(f"[monitor] dashboard 백그라운드 재계산 실패: {exc}")
 
     async def _get_product_stats(self) -> Dict[str, Any]:
         """상품 통계: 전체, 소싱처별, 상태별 — 단일 쿼리."""
