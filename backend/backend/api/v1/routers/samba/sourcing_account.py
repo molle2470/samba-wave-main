@@ -178,6 +178,34 @@ async def request_balance_check():
     return {"ok": True}
 
 
+@router.get("/musinsa/autologin-status")
+async def get_musinsa_autologin_status(
+    session: AsyncSession = Depends(get_read_session_dependency),
+):
+    """무신사 자동로그인계정(is_login_default=True) 상태 조회.
+
+    프론트가 폴링해 미설정/쿠키 만료 감지 시 경고 모달 노출.
+    """
+    svc = _read_service(session)
+    acc = await svc.get_login_default("MUSINSA")
+    if not acc:
+        return {"missing": True, "reason": "unset", "account_label": None}
+    af = acc.additional_fields or {}
+    if af.get("cookie_expired"):
+        return {
+            "missing": True,
+            "reason": "cookie_expired",
+            "account_label": acc.account_label,
+        }
+    if not af.get("musinsa_cookie"):
+        return {
+            "missing": True,
+            "reason": "no_cookie",
+            "account_label": acc.account_label,
+        }
+    return {"missing": False, "account_label": acc.account_label}
+
+
 @router.get("/balance-check-requested")
 async def get_balance_check_requested():
     """확장앱이 폴링으로 확인하는 잔액 체크 요청 플래그."""

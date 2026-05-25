@@ -33,6 +33,34 @@ type MarketDeleteModalState = {
 
 export default function ProductsPage() {
   useEffect(() => { document.title = 'SAMBA-상품관리' }, [])
+
+  // 무신사 자동로그인계정 상태 — 60s 폴링. 미설정/만료 시 모달 경고.
+  const [musinsaAuthMissing, setMusinsaAuthMissing] = useState<{
+    reason: 'unset' | 'cookie_expired' | 'no_cookie'
+    account_label: string | null
+  } | null>(null)
+  const [musinsaAuthDismissed, setMusinsaAuthDismissed] = useState<boolean>(false)
+  useEffect(() => {
+    let cancelled = false
+    const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.samba-wave.co.kr'
+    const tick = async () => {
+      try {
+        const r = await fetchWithAuth(`${apiBase}/api/v1/samba/sourcing-accounts/musinsa/autologin-status`)
+        if (!r.ok) return
+        const j = await r.json()
+        if (cancelled) return
+        if (j?.missing) {
+          setMusinsaAuthMissing({ reason: j.reason, account_label: j.account_label })
+        } else {
+          setMusinsaAuthMissing(null)
+          setMusinsaAuthDismissed(false)
+        }
+      } catch { /* ignore */ }
+    }
+    tick()
+    const t = setInterval(tick, 60_000)
+    return () => { cancelled = true; clearInterval(t) }
+  }, [])
   const searchParams = useSearchParams();
   const router = useRouter();
   const [queryReady, setQueryReady] = useState(false)
@@ -1391,6 +1419,49 @@ export default function ProductsPage() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "0" }}>
+      {/* 무신사 자동로그인계정 미설정/만료 경고 모달 */}
+      {musinsaAuthMissing && !musinsaAuthDismissed && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(4px)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ background: '#1A1A1A', border: '2px solid #FF4444', borderRadius: '16px', padding: '2rem', maxWidth: '480px', width: '90%', boxShadow: '0 8px 32px rgba(255,68,68,0.3)', position: 'relative' }}>
+            <button
+              aria-label='알람 닫기'
+              title='닫기'
+              onClick={() => setMusinsaAuthDismissed(true)}
+              style={{ position: 'absolute', top: '0.75rem', right: '0.75rem', width: '28px', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'transparent', border: 'none', borderRadius: '6px', color: '#AAA', fontSize: '1.25rem', fontWeight: 700, cursor: 'pointer', lineHeight: 1 }}
+            >
+              &#10005;
+            </button>
+            <div style={{ textAlign: 'center', marginBottom: '1.5rem' }}>
+              <div style={{ fontSize: '3rem', marginBottom: '0.75rem' }}>&#9888;</div>
+              <h3 style={{ fontSize: '1.25rem', fontWeight: 700, color: '#FF6B6B', marginBottom: '0.5rem' }}>무신사 원가 갱신 중단</h3>
+              <p style={{ fontSize: '0.875rem', color: '#AAA', lineHeight: 1.5 }}>
+                {musinsaAuthMissing.reason === 'cookie_expired'
+                  ? <>자동로그인계정 <b style={{ color: '#FFD' }}>{musinsaAuthMissing.account_label}</b>의 쿠키가 만료됨. 무신사 재로그인 필요.</>
+                  : musinsaAuthMissing.reason === 'no_cookie'
+                  ? <>자동로그인계정 <b style={{ color: '#FFD' }}>{musinsaAuthMissing.account_label}</b>에 쿠키 없음. 무신사 로그인 필요.</>
+                  : <>무신사 자동로그인계정 미설정. <b style={{ color: '#FFD' }}>설정 → 소싱처계정</b>에서 자동로그인 계정을 지정하세요.</>}
+                <br/>
+                <span style={{ color: '#FF8888' }}>cost 계산이 일관되지 않아 자동 갱신을 차단했습니다.</span>
+              </p>
+            </div>
+            <div style={{ display: 'flex', gap: '0.5rem' }}>
+              <button
+                onClick={() => setMusinsaAuthDismissed(true)}
+                style={{ flex: 1, padding: '0.75rem', background: 'transparent', border: '1px solid #444', borderRadius: '8px', color: '#AAA', fontSize: '0.9375rem', fontWeight: 600, cursor: 'pointer' }}
+              >
+                나중에
+              </button>
+              <button
+                onClick={() => { window.location.href = '/samba/settings#sourcing-accounts-MUSINSA' }}
+                style={{ flex: 2, padding: '0.75rem', background: '#FF4444', border: 'none', borderRadius: '8px', color: '#fff', fontSize: '0.9375rem', fontWeight: 700, cursor: 'pointer' }}
+              >
+                지금 설정하기
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {ghostBanner && ghostBanner.total > 0 && (
         <div style={{
           padding: '10px 16px', margin: '8px 12px 0',

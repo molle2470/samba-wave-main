@@ -778,6 +778,34 @@ async def _get_musinsa_cookie() -> str:
     return await get_musinsa_cookie()
 
 
+async def _get_autologin_musinsa_cookie() -> str:
+    """자동로그인계정(is_login_default=True) 쿠키 반환 — cost 계산 단일 진실.
+
+    SambaSourcingAccount 풀에서 site_name=MUSINSA + is_login_default=True 계정 1개 선택.
+    cookie_expired=True이거나 미설정이면 빈 문자열 반환 → 호출부에서 cost 갱신 차단.
+    """
+    try:
+        from backend.db.orm import get_read_session
+        from backend.domain.samba.sourcing_account.service import (
+            SambaSourcingAccountService,
+        )
+        from backend.domain.samba.sourcing_account.repository import (
+            SambaSourcingAccountRepository,
+        )
+
+        async with get_read_session() as session:
+            svc = SambaSourcingAccountService(SambaSourcingAccountRepository(session))
+            acc = await svc.get_login_default("MUSINSA")
+            if not acc:
+                return ""
+            af = acc.additional_fields or {}
+            if af.get("cookie_expired"):
+                return ""
+            return af.get("musinsa_cookie", "") or ""
+    except Exception:
+        return ""
+
+
 async def _get_musinsa_cookies() -> list[str]:
     """DB에서 무신사 쿠키 목록 조회 (musinsa_cookies JSON 배열 또는 musinsa_cookie 단일).
 
@@ -815,11 +843,11 @@ async def _parse_musinsa(product: Any) -> RefreshResult:
     if not site_product_id:
         return RefreshResult(product_id=product.id, error="site_product_id 없음")
 
-    # 벌크 모드면 로테이션 쿠키, 아니면 단일 쿠키
-    if _bulk_musinsa_cache.get("cookies"):
-        cookie = _rotate_musinsa_cookie()
-    else:
-        cookie = _bulk_musinsa_cache.get("cookie") or await _get_musinsa_cookie()
+    # 자동로그인계정(is_login_default=True) 쿠키 단일 사용 — cost 일관성 보장
+    # 미설정/만료 시 cost 갱신 자체 차단 (계정별 등급/적립률 차이로 인한 stale 방지)
+    cookie = await _get_autologin_musinsa_cookie()
+    if not cookie:
+        return RefreshResult(product_id=product.id, error="MUSINSA_AUTH_MISSING")
     # 오토튠이면 메인↔프록시 IP 로테이션
     _is_autotune = _current_refresh_source.get() == "autotune"
     _proxy = _get_rotated_proxy() if _is_autotune else None
