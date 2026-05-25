@@ -22,10 +22,14 @@ def test_delete_11st_uses_account_additional_fields_api_key(monkeypatch):
         async def delete_product(self, product_no: str):
             captured["product_no"] = product_no
 
-    async def fake_get_setting(session, key: str):
+    async def fake_get_setting(session, key: str, tenant_id=None):
         return {"apiKey": "GLOBAL_KEY"}
 
     monkeypatch.setattr(dispatcher, "_get_setting", fake_get_setting)
+    # resolver 도 _get_setting 호출 (4-3b 이후) — 같은 fake 로 패치.
+    import backend.api.v1.routers.samba.proxy._helpers as _helpers_mod
+
+    monkeypatch.setattr(_helpers_mod, "_get_setting", fake_get_setting)
     _install_dummy_elevenst(monkeypatch, DummyClient)
 
     account = SimpleNamespace(
@@ -52,10 +56,14 @@ def test_delete_11st_does_not_fallback_to_global_setting_when_account_is_explici
         async def delete_product(self, product_no: str):
             return None
 
-    async def fake_get_setting(session, key: str):
+    async def fake_get_setting(session, key: str, tenant_id=None):
         return {"apiKey": "GLOBAL_KEY"}
 
     monkeypatch.setattr(dispatcher, "_get_setting", fake_get_setting)
+    # resolver 도 _get_setting 호출 (4-3b 이후) — 같은 fake 로 패치.
+    import backend.api.v1.routers.samba.proxy._helpers as _helpers_mod
+
+    monkeypatch.setattr(_helpers_mod, "_get_setting", fake_get_setting)
     _install_dummy_elevenst(monkeypatch, DummyClient)
 
     account = SimpleNamespace(additional_fields={}, api_key="")
@@ -77,10 +85,14 @@ def test_delete_11st_can_still_fallback_to_global_setting_without_account(monkey
         async def delete_product(self, product_no: str):
             captured["product_no"] = product_no
 
-    async def fake_get_setting(session, key: str):
+    async def fake_get_setting(session, key: str, tenant_id=None):
         return {"apiKey": "GLOBAL_KEY"}
 
     monkeypatch.setattr(dispatcher, "_get_setting", fake_get_setting)
+    # resolver 도 _get_setting 호출 (4-3b 이후) — 같은 fake 로 패치.
+    import backend.api.v1.routers.samba.proxy._helpers as _helpers_mod
+
+    monkeypatch.setattr(_helpers_mod, "_get_setting", fake_get_setting)
     _install_dummy_elevenst(monkeypatch, DummyClient)
 
     product = {"market_product_no": {"11st": "prd-123"}}

@@ -60,13 +60,12 @@ def coupang_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
 
 
 def ssg_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
-    """SSG — clientId + clientSecret + sellerId + 부속 정책."""
+    """SSG — apiKey 단일 (DB api_key 컬럼) + 부속 정책 JSON."""
     if account is None:
         return {}
     ext = _extras(account)
     return {
-        "clientId": account.api_key or "",
-        "clientSecret": account.api_secret or "",
+        "apiKey": account.api_key or "",
         "sellerId": account.seller_id or "",
         "brandList": ext.get("brandList", []),
         "shippingPolicyId": ext.get("shippingPolicyId", ""),

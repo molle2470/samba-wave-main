@@ -301,10 +301,15 @@ class EbayPlugin(MarketPlugin):
                 "message": "eBay 계정 정보가 불완전합니다. appId, certId, authToken(Refresh Token)을 확인해주세요.",
             }
 
-        # Business Policy ID — 계정 extras 또는 samba_settings에서 조회
+        # Business Policy ID — 계정 extras 또는 samba_settings에서 조회.
+        # (2026-05-25) resolver 위임 — find_default('ebay') 우선, 없으면 store_ebay 폴백.
         settings_creds: dict[str, Any] = {}
         if session:
-            raw = await _get_setting(session, "store_ebay")
+            from backend.domain.samba.account.resolver import resolve_market_creds
+
+            raw = await resolve_market_creds(
+                session, None, market_type="ebay", store_key="store_ebay"
+            )
             if raw and isinstance(raw, dict):
                 settings_creds = raw
 

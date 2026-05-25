@@ -1442,16 +1442,18 @@ export const proxyApi = {
     request<MessageLog[]>(`${SAMBA_PREFIX}/proxy/messages/by-order/${encodeURIComponent(orderId)}`),
   fetchSentFlags: (orderIds: string[]) =>
     request<Record<string, { sms: boolean; kakao: boolean }>>(`${SAMBA_PREFIX}/proxy/messages/sent-flags?order_ids=${orderIds.map(encodeURIComponent).join(',')}`),
-  playautoAuthTest: () =>
+  playautoAuthTest: (payload?: { api_key?: string; account_id?: string }) =>
     request<{ success: boolean; message: string }>(
-      `${SAMBA_PREFIX}/proxy/playauto/auth-test`, { method: 'POST' }),
+      `${SAMBA_PREFIX}/proxy/playauto/auth-test`,
+      { method: 'POST', body: JSON.stringify(payload || {}) }),
   smartstoreAuthTest: () =>
     request<{ success: boolean; message: string; token_preview?: string }>(
       `${SAMBA_PREFIX}/proxy/smartstore/auth-test`, { method: 'POST' }),
-  elevenstAuthTest: () =>
+  elevenstAuthTest: (payload?: { api_key?: string; account_id?: string }) =>
     request<{ success: boolean; message: string }>(
-      `${SAMBA_PREFIX}/proxy/11st/auth-test`, { method: 'POST' }),
-  elevenstSellerInfo: () =>
+      `${SAMBA_PREFIX}/proxy/11st/auth-test`,
+      { method: 'POST', body: JSON.stringify(payload || {}) }),
+  elevenstSellerInfo: (payload?: { api_key?: string; account_id?: string }) =>
     request<{
       success: boolean
       message: string
@@ -1467,10 +1469,12 @@ export const proxyApi = {
         inboundList?: unknown
       }
     }>(
-      `${SAMBA_PREFIX}/proxy/11st/seller-info`, { method: 'POST' }),
-  coupangAuthTest: () =>
+      `${SAMBA_PREFIX}/proxy/11st/seller-info`,
+      { method: 'POST', body: JSON.stringify(payload || {}) }),
+  coupangAuthTest: (payload?: { access_key?: string; secret_key?: string; vendor_id?: string; account_id?: string }) =>
     request<{ success: boolean; message: string }>(
-      `${SAMBA_PREFIX}/proxy/coupang/auth-test`, { method: 'POST' }),
+      `${SAMBA_PREFIX}/proxy/coupang/auth-test`,
+      { method: 'POST', body: JSON.stringify(payload || {}) }),
   coupangShippingPlaces: (accountId?: string) =>
     request<{
       success: boolean
@@ -1483,21 +1487,30 @@ export const proxyApi = {
       `${SAMBA_PREFIX}/proxy/coupang/shipping-places`,
       { method: 'POST', body: JSON.stringify({ account_id: accountId || null }) }
     ),
-  lotteonAuthTest: () =>
+  lotteonAuthTest: (payload?: {
+    api_key?: string
+    account_id?: string
+    dv_cst_pol_no?: string
+    owhp_no?: string
+    rtrp_no?: string
+  }) =>
     request<{ success: boolean; message: string; data?: Record<string, string> }>(
-      `${SAMBA_PREFIX}/proxy/lotteon/auth-test`, { method: 'POST' }),
-  lotteonDeliveryPolicies: () =>
+      `${SAMBA_PREFIX}/proxy/lotteon/auth-test`,
+      { method: 'POST', body: JSON.stringify(payload || {}) }
+    ),
+  lotteonDeliveryPolicies: (accountId?: string) =>
     request<{ success: boolean; policies: { value: string; label: string }[] }>(
-      `${SAMBA_PREFIX}/proxy/lotteon/delivery-policies`),
-  lotteonWarehouses: () =>
+      `${SAMBA_PREFIX}/proxy/lotteon/delivery-policies${accountId ? `?account_id=${encodeURIComponent(accountId)}` : ''}`),
+  lotteonWarehouses: (accountId?: string) =>
     request<{
       success: boolean
       departure: { value: string; label: string }[]
       return_: { value: string; label: string }[]
-    }>(`${SAMBA_PREFIX}/proxy/lotteon/warehouses`),
-  ssgAuthTest: () =>
+    }>(`${SAMBA_PREFIX}/proxy/lotteon/warehouses${accountId ? `?account_id=${encodeURIComponent(accountId)}` : ''}`),
+  ssgAuthTest: (payload?: { api_key?: string; account_id?: string }) =>
     request<{ success: boolean; message: string }>(
-      `${SAMBA_PREFIX}/proxy/ssg/auth-test`, { method: 'POST' }),
+      `${SAMBA_PREFIX}/proxy/ssg/auth-test`,
+      { method: 'POST', body: JSON.stringify(payload || {}) }),
   ssgShippingPolicies: (accountId?: string) =>
     request<{ success: boolean; policies: { shppcstId: string; feeAmt: number; prpayCodDivNm: string; shppcstAplUnitNm: string; divCd: number }[] }>(
       `${SAMBA_PREFIX}/proxy/ssg/shipping-policies${accountId ? `?account_id=${encodeURIComponent(accountId)}` : ''}`),
@@ -1510,9 +1523,10 @@ export const proxyApi = {
   esmDeliveryInfo: (market: string, accountId?: string) =>
     request<{ success: boolean; places: { placeNo: number; placeNm: string; placeType: number }[]; dispatchPolicies: { dispatchPolicyNo: number; policyNm: string }[]; message?: string }>(
       `${SAMBA_PREFIX}/proxy/esm/${market}/delivery-info${accountId ? `?account_id=${encodeURIComponent(accountId)}` : ''}`),
-  gsshopAuthTest: () =>
+  gsshopAuthTest: (payload?: { store_id?: string; api_key_dev?: string; api_key_prod?: string; account_id?: string }) =>
     request<{ success: boolean; message: string }>(
-      `${SAMBA_PREFIX}/proxy/gsshop/auth-test`, { method: 'POST' }),
+      `${SAMBA_PREFIX}/proxy/gsshop/auth-test`,
+      { method: 'POST', body: JSON.stringify(payload || {}) }),
   marketAuthTest: (marketKey: string) =>
     request<{ success: boolean; message: string }>(
       `${SAMBA_PREFIX}/proxy/market/auth-test/${marketKey}`, { method: 'POST' }),

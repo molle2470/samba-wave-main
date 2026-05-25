@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from backend.db.orm import get_read_session_dependency
+from backend.domain.samba.account.model import SambaMarketAccount
 from backend.domain.samba.proxy.gsshop import GsShopClient
 from backend.domain.samba.tenant.middleware import get_optional_tenant_id
 from backend.utils.logger import logger
@@ -20,18 +21,86 @@ router = APIRouter(tags=["samba-proxy"])
 
 
 # ═══════════════════════════════════════════════
+# 멀티계정 자격증명 해석 헬퍼 (2026-05-25)
+# 폼 입력 → account_id 조회 → find_default 폴백 → store_* 레거시 폴백 순.
+# ═══════════════════════════════════════════════
+
+
+async def _resolve_creds(
+    session: AsyncSession,
+    tenant_id: Optional[str],
+    market_type: str,
+    store_key: str,
+    form_payload: Optional[dict] = None,
+    account_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """범용 자격증명 해석 — backend.domain.samba.account.resolver 위임 (2026-05-25)."""
+    from backend.domain.samba.account.resolver import resolve_market_creds
+
+    return await resolve_market_creds(
+        session,
+        tenant_id,
+        market_type=market_type,
+        store_key=store_key,
+        form_payload=form_payload,
+        account_id=account_id,
+    )
+
+
+async def _resolve_lotteon_creds(
+    session: AsyncSession,
+    tenant_id: Optional[str],
+    form_api_key: Optional[str] = None,
+    form_extras: Optional[dict] = None,
+    account_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """롯데ON 자격증명 해석 — _resolve_creds 어댑터 (기존 호출자 호환)."""
+    payload: Optional[dict] = None
+    if form_api_key and form_api_key.strip():
+        payload = {"apiKey": form_api_key.strip()}
+        if form_extras:
+            payload.update({k: v for k, v in form_extras.items() if v})
+    creds = await _resolve_creds(
+        session,
+        tenant_id,
+        market_type="lotteon",
+        store_key="store_lotteon",
+        form_payload=payload,
+        account_id=account_id,
+    )
+    # lotteon_creds 빌더가 처리 못 한 store_* 레거시 dict 직접 반환 케이스도 자연 처리됨
+    if not creds and (form_api_key or account_id):
+        return {}
+    # 명시적으로 lotteon_creds 키 보존 위해 type 확인 후 통과
+    return creds or {}
+
+
+# ═══════════════════════════════════════════════
 # 11번가 OpenAPI 인증 테스트
 # ═══════════════════════════════════════════════
 
 
+class ElevenstAuthTestRequest(BaseModel):
+    api_key: Optional[str] = None
+    account_id: Optional[str] = None
+
+
 @router.post("/11st/auth-test")
 async def elevenst_auth_test(
+    body: ElevenstAuthTestRequest = ElevenstAuthTestRequest(),
     session: AsyncSession = Depends(get_read_session_dependency),
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """11번가 OpenAPI 인증 테스트 — 상품검색 API 호출로 Key 유효성 확인."""
-    creds = await _get_setting(session, "store_11st", tenant_id=tenant_id)
-    if not creds or not isinstance(creds, dict):
+    creds = await _resolve_creds(
+        session,
+        tenant_id,
+        market_type="11st",
+        store_key="store_11st",
+        form_payload={"apiKey": body.api_key} if body.api_key else None,
+        account_id=body.account_id,
+    )
+    if not creds:
         return {"success": False, "message": "11번가 설정이 저장되지 않았습니다."}
 
     api_key = creds.get("apiKey", "")
@@ -71,8 +140,14 @@ async def elevenst_auth_test(
         return {"success": False, "message": f"API 호출 실패: {exc}"}
 
 
+class ElevenstSellerInfoRequest(BaseModel):
+    api_key: Optional[str] = None
+    account_id: Optional[str] = None
+
+
 @router.post("/11st/seller-info")
 async def elevenst_seller_info(
+    body: ElevenstSellerInfoRequest = ElevenstSellerInfoRequest(),
     session: AsyncSession = Depends(get_read_session_dependency),
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
@@ -83,8 +158,15 @@ async def elevenst_seller_info(
     """
     from backend.domain.samba.proxy.elevenst import ElevenstClient
 
-    creds = await _get_setting(session, "store_11st", tenant_id=tenant_id)
-    if not creds or not isinstance(creds, dict):
+    creds = await _resolve_creds(
+        session,
+        tenant_id,
+        market_type="11st",
+        store_key="store_11st",
+        form_payload={"apiKey": body.api_key} if body.api_key else None,
+        account_id=body.account_id,
+    )
+    if not creds:
         return {"success": False, "message": "11번가 설정이 저장되지 않았습니다."}
     api_key = creds.get("apiKey", "")
     if not api_key:
@@ -146,14 +228,36 @@ async def elevenst_seller_info(
 # ═══════════════════════════════════════════════
 
 
+class CoupangAuthTestRequest(BaseModel):
+    access_key: Optional[str] = None
+    secret_key: Optional[str] = None
+    vendor_id: Optional[str] = None
+    account_id: Optional[str] = None
+
+
 @router.post("/coupang/auth-test")
 async def coupang_auth_test(
+    body: CoupangAuthTestRequest = CoupangAuthTestRequest(),
     session: AsyncSession = Depends(get_read_session_dependency),
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """쿠팡 Wing API 인증 테스트 — HMAC 서명으로 카테고리 조회."""
-    creds = await _get_setting(session, "store_coupang", tenant_id=tenant_id)
-    if not creds or not isinstance(creds, dict):
+    form_payload = None
+    if body.access_key or body.secret_key or body.vendor_id:
+        form_payload = {
+            "accessKey": body.access_key or "",
+            "secretKey": body.secret_key or "",
+            "vendorId": body.vendor_id or "",
+        }
+    creds = await _resolve_creds(
+        session,
+        tenant_id,
+        market_type="coupang",
+        store_key="store_coupang",
+        form_payload=form_payload,
+        account_id=body.account_id,
+    )
+    if not creds:
         return {"success": False, "message": "쿠팡 설정이 저장되지 않았습니다."}
 
     access_key = creds.get("accessKey", "")
@@ -201,7 +305,6 @@ async def coupang_shipping_places(
 
     우선순위: SambaMarketAccount.additional_fields → account 컬럼 → store_coupang 전역 폴백
     """
-    from backend.domain.samba.account.model import SambaMarketAccount
     from backend.domain.samba.proxy.coupang import CoupangClient
 
     creds: dict[str, Any] = {}
@@ -268,14 +371,41 @@ async def coupang_shipping_places(
 # ═══════════════════════════════════════════════
 
 
+class LotteonAuthTestRequest(BaseModel):
+    """롯데ON 인증 테스트 요청 — 신규 등록 시 폼 입력 우선, 기존 계정 수정 시 account_id 지정."""
+
+    api_key: Optional[str] = None
+    account_id: Optional[str] = None
+    dv_cst_pol_no: Optional[str] = None
+    owhp_no: Optional[str] = None
+    rtrp_no: Optional[str] = None
+
+
 @router.post("/lotteon/auth-test")
 async def lotteon_auth_test(
+    body: LotteonAuthTestRequest = LotteonAuthTestRequest(),
     session: AsyncSession = Depends(get_read_session_dependency),
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
-    """롯데ON Open API 인증 테스트 — 거래처 정보 조회 + 배송인프라 검증."""
-    creds = await _get_setting(session, "store_lotteon", tenant_id=tenant_id)
-    if not creds or not isinstance(creds, dict):
+    """롯데ON Open API 인증 테스트 — 거래처 정보 조회 + 배송인프라 검증.
+
+    멀티계정 환경 지원 (2026-05-25):
+    - body.api_key 우선 (신규 등록 인증 테스트)
+    - body.account_id 지정 시 그 계정
+    - 미지정 시 find_default('lotteon', tenant_id) 폴백
+    """
+    creds = await _resolve_lotteon_creds(
+        session,
+        tenant_id,
+        form_api_key=body.api_key,
+        form_extras={
+            "dvCstPolNo": body.dv_cst_pol_no or "",
+            "owhpNo": body.owhp_no or "",
+            "rtrpNo": body.rtrp_no or "",
+        },
+        account_id=body.account_id,
+    )
+    if not creds:
         return {"success": False, "message": "롯데ON 설정이 저장되지 않았습니다."}
 
     api_key = (creds.get("apiKey", "") or "").strip()
@@ -332,12 +462,13 @@ async def lotteon_auth_test(
 
 @router.get("/lotteon/delivery-policies")
 async def lotteon_delivery_policies(
+    account_id: Optional[str] = None,
     session: AsyncSession = Depends(get_read_session_dependency),
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
-    """롯데ON 배송비정책 목록 조회."""
-    creds = await _get_setting(session, "store_lotteon", tenant_id=tenant_id)
-    api_key = ((creds or {}).get("apiKey", "") or "").strip()
+    """롯데ON 배송비정책 목록 조회. account_id 지정 시 그 계정, 미지정 시 default."""
+    creds = await _resolve_lotteon_creds(session, tenant_id, account_id=account_id)
+    api_key = (creds.get("apiKey", "") or "").strip()
     if not api_key:
         return {"success": False, "policies": []}
     try:
@@ -379,12 +510,13 @@ async def lotteon_delivery_policies(
 
 @router.get("/lotteon/warehouses")
 async def lotteon_warehouses(
+    account_id: Optional[str] = None,
     session: AsyncSession = Depends(get_read_session_dependency),
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
-    """롯데ON 출고지/회수지 목록 조회."""
-    creds = await _get_setting(session, "store_lotteon", tenant_id=tenant_id)
-    api_key = ((creds or {}).get("apiKey", "") or "").strip()
+    """롯데ON 출고지/회수지 목록 조회. account_id 지정 시 그 계정, 미지정 시 default."""
+    creds = await _resolve_lotteon_creds(session, tenant_id, account_id=account_id)
+    api_key = (creds.get("apiKey", "") or "").strip()
     if not api_key:
         return {"success": False, "departure": [], "return_": []}
     try:
@@ -421,14 +553,27 @@ async def lotteon_warehouses(
 # ═══════════════════════════════════════════════
 
 
+class SSGAuthTestRequest(BaseModel):
+    api_key: Optional[str] = None
+    account_id: Optional[str] = None
+
+
 @router.post("/ssg/auth-test")
 async def ssg_auth_test(
+    body: SSGAuthTestRequest = SSGAuthTestRequest(),
     session: AsyncSession = Depends(get_read_session_dependency),
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """SSG Open API 인증 테스트 — 브랜드 목록 조회."""
-    creds = await _get_setting(session, "store_ssg", tenant_id=tenant_id)
-    if not creds or not isinstance(creds, dict):
+    creds = await _resolve_creds(
+        session,
+        tenant_id,
+        market_type="ssg",
+        store_key="store_ssg",
+        form_payload={"apiKey": body.api_key} if body.api_key else None,
+        account_id=body.account_id,
+    )
+    if not creds:
         return {"success": False, "message": "SSG 설정이 저장되지 않았습니다."}
 
     api_key = creds.get("apiKey", "")
@@ -452,28 +597,15 @@ async def ssg_brands(
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
     account_id: str | None = None,
 ) -> dict[str, Any]:
-    """SSG 계약 브랜드 목록 조회 (계정별).
-
-    account_id 지정 시 해당 계정의 API 키 사용, 없으면 store_ssg 전역 폴백.
-    """
-    from backend.domain.samba.account.model import SambaMarketAccount
-
-    api_key = ""
-
-    if account_id:
-        account = await session.get(SambaMarketAccount, account_id)
-        if account:
-            extras = account.additional_fields or {}
-            if isinstance(extras, dict):
-                api_key = extras.get("apiKey", "")
-            if not api_key and account.api_key:
-                api_key = account.api_key
-
-    if not api_key:
-        creds = await _get_setting(session, "store_ssg", tenant_id=tenant_id)
-        if isinstance(creds, dict):
-            api_key = creds.get("apiKey", "")
-
+    """SSG 계약 브랜드 목록 조회 (계정별)."""
+    creds = await _resolve_creds(
+        session,
+        tenant_id,
+        market_type="ssg",
+        store_key="store_ssg",
+        account_id=account_id,
+    )
+    api_key = creds.get("apiKey", "")
     if not api_key:
         return {"success": False, "brands": []}
     try:
@@ -510,9 +642,13 @@ async def ssg_shipping_policies(
     account_id: str | None = None,
 ) -> dict[str, Any]:
     """SSG 배송비정책 목록 조회."""
-    creds = await _get_setting(session, "store_ssg", tenant_id=tenant_id)
-    if not creds or not isinstance(creds, dict):
-        return {"success": False, "policies": []}
+    creds = await _resolve_creds(
+        session,
+        tenant_id,
+        market_type="ssg",
+        store_key="store_ssg",
+        account_id=account_id,
+    )
     api_key = creds.get("apiKey", "")
     if not api_key:
         return {"success": False, "policies": []}
@@ -550,9 +686,13 @@ async def ssg_addresses(
     account_id: str | None = None,
 ) -> dict[str, Any]:
     """SSG 출고/반송 주소 목록 조회."""
-    creds = await _get_setting(session, "store_ssg", tenant_id=tenant_id)
-    if not creds or not isinstance(creds, dict):
-        return {"success": False, "addresses": []}
+    creds = await _resolve_creds(
+        session,
+        tenant_id,
+        market_type="ssg",
+        store_key="store_ssg",
+        account_id=account_id,
+    )
     api_key = creds.get("apiKey", "")
     if not api_key:
         return {"success": False, "addresses": []}
@@ -590,17 +730,40 @@ async def ssg_addresses(
 # ═══════════════════════════════════════════════
 
 
+class GsshopAuthTestRequest(BaseModel):
+    store_id: Optional[str] = None
+    api_key_dev: Optional[str] = None
+    api_key_prod: Optional[str] = None
+    account_id: Optional[str] = None
+
+
 @router.post("/gsshop/auth-test")
 async def gsshop_auth_test(
+    body: GsshopAuthTestRequest = GsshopAuthTestRequest(),
     session: AsyncSession = Depends(get_read_session_dependency),
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """GS샵 AES256 인증 테스트 — 개발/운영 환경 모두 검증."""
-    creds = await _get_setting(session, "store_gsshop", tenant_id=tenant_id)
-    if not creds or not isinstance(creds, dict):
+    form_payload = None
+    if body.store_id or body.api_key_dev or body.api_key_prod:
+        form_payload = {
+            "storeId": body.store_id or "",
+            "apiKeyDev": body.api_key_dev or "",
+            "apiKeyProd": body.api_key_prod or "",
+        }
+    creds = await _resolve_creds(
+        session,
+        tenant_id,
+        market_type="gsshop",
+        store_key="store_gsshop",
+        form_payload=form_payload,
+        account_id=body.account_id,
+    )
+    if not creds:
         return {"success": False, "message": "GS샵 설정이 저장되지 않았습니다."}
 
-    sup_cd = creds.get("storeId", "")
+    # gsshop_creds 빌더는 supCd 키 사용, 레거시 store_gsshop 는 storeId 키.
+    sup_cd = creds.get("supCd", "") or creds.get("storeId", "")
     api_key_dev = creds.get("apiKeyDev", "")
     api_key_prod = creds.get("apiKeyProd", "")
 
@@ -650,16 +813,29 @@ async def gsshop_auth_test(
 # ═══════════════════════════════════════════════
 
 
+class PlayautoAuthTestRequest(BaseModel):
+    api_key: Optional[str] = None
+    account_id: Optional[str] = None
+
+
 @router.post("/playauto/auth-test")
 async def playauto_auth_test(
+    body: PlayautoAuthTestRequest = PlayautoAuthTestRequest(),
     session: AsyncSession = Depends(get_read_session_dependency),
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """플레이오토 API 인증 테스트 — 실제 API 호출로 연결 및 인증 확인."""
     from backend.domain.samba.proxy.playauto import PlayAutoClient, PlayAutoApiError
 
-    creds = await _get_setting(session, "store_playauto", tenant_id=tenant_id)
-    if not creds or not isinstance(creds, dict):
+    creds = await _resolve_creds(
+        session,
+        tenant_id,
+        market_type="playauto",
+        store_key="store_playauto",
+        form_payload={"apiKey": body.api_key} if body.api_key else None,
+        account_id=body.account_id,
+    )
+    if not creds:
         return {"success": False, "message": "플레이오토 설정이 저장되지 않았습니다."}
 
     api_key = creds.get("apiKey", "")

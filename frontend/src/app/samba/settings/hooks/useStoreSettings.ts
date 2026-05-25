@@ -314,11 +314,24 @@ export function useStoreSettings(): StoreSettingsState & StoreSettingsActions {
       if (marketKey === 'smartstore') {
         result = await proxyApi.smartstoreAuthTest()
       } else if (marketKey === '11st') {
-        result = await proxyApi.elevenstAuthTest()
+        result = await proxyApi.elevenstAuthTest({
+          api_key: String(safeData.apiKey || ''),
+        })
       } else if (marketKey === 'coupang') {
-        result = await proxyApi.coupangAuthTest()
+        result = await proxyApi.coupangAuthTest({
+          access_key: String(safeData.accessKey || ''),
+          secret_key: String(safeData.secretKey || ''),
+          vendor_id: String(safeData.vendorId || ''),
+        })
       } else if (marketKey === 'lotteon') {
-        const lotteonResult = await proxyApi.lotteonAuthTest()
+        // 멀티계정 환경 대응(2026-05-25) — 폼 입력값을 직접 전송.
+        // store_lotteon 단일 키 폴백을 거치지 않고 폼값으로 인증 → 신규 등록 정확.
+        const lotteonResult = await proxyApi.lotteonAuthTest({
+          api_key: String(safeData.apiKey || ''),
+          dv_cst_pol_no: String(safeData.dvCstPolNo || ''),
+          owhp_no: String(safeData.owhpNo || ''),
+          rtrp_no: String(safeData.rtrpNo || ''),
+        })
         result = lotteonResult
         // 인증 성공 시 배송비정책/출고지/회수지 목록 자동 로드
         if (lotteonResult.success) {
@@ -330,9 +343,15 @@ export function useStoreSettings(): StoreSettingsState & StoreSettingsActions {
           if (whRes.success) setLotteonWarehouseOptions({ departure: whRes.departure, return_: whRes.return_ })
         }
       } else if (marketKey === 'ssg') {
-        result = await proxyApi.ssgAuthTest()
+        result = await proxyApi.ssgAuthTest({
+          api_key: String(safeData.apiKey || ''),
+        })
       } else if (marketKey === 'gsshop') {
-        result = await proxyApi.gsshopAuthTest()
+        result = await proxyApi.gsshopAuthTest({
+          store_id: String(safeData.storeId || ''),
+          api_key_dev: String(safeData.apiKeyDev || ''),
+          api_key_prod: String(safeData.apiKeyProd || ''),
+        })
       } else if (marketKey === 'lottehome') {
         const userId = safeData.storeId || ''
         const password = safeData.password || ''
@@ -343,7 +362,9 @@ export function useStoreSettings(): StoreSettingsState & StoreSettingsActions {
           result = await proxyApi.lottehomeAuth({ userId, password, agncNo, env: safeData.env || 'prod' })
         }
       } else if (marketKey === 'playauto') {
-        result = await proxyApi.playautoAuthTest()
+        result = await proxyApi.playautoAuthTest({
+          api_key: String(safeData.apiKey || ''),
+        })
       } else {
         result = await proxyApi.marketAuthTest(marketKey)
       }

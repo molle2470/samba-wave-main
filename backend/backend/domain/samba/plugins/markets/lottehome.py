@@ -438,7 +438,12 @@ class LotteHomePlugin(MarketPlugin):
 
         # store_lottehome(설정 페이지) → lottehome_policy(정책 페이지) 순으로 로드,
         # 뒤에 로드한 값이 우선(정책 페이지가 최종 override). 빈 값은 무시.
-        store_lh = await _get_setting(session, "store_lottehome")
+        # (2026-05-25) resolver 위임 — find_default('lottehome') 우선, 없으면 store_* 폴백.
+        from backend.domain.samba.account.resolver import resolve_market_creds
+
+        store_lh = await resolve_market_creds(
+            session, None, market_type="lottehome", store_key="store_lottehome"
+        )
         store_lh = store_lh if isinstance(store_lh, dict) else {}
         policy = await _get_setting(session, "lottehome_policy")
         policy = policy if isinstance(policy, dict) else {}

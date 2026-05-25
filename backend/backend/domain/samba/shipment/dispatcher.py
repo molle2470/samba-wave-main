@@ -260,9 +260,15 @@ async def _delete_smartstore(
         )
 
     # 계정이 명시된 삭제에서는 다른 계정의 전역 설정으로 폴백하지 않는다.
+    # (2026-05-25) store_smartstore 직접 호출 → resolver 위임. find_default tenant=None
+    # 미스 시 자동 store_* 레거시 폴백.
     if (not client_id or not client_secret) and account is None:
-        creds = await _get_setting(session, "store_smartstore")
-        if creds and isinstance(creds, dict):
+        from backend.domain.samba.account.resolver import resolve_market_creds
+
+        creds = await resolve_market_creds(
+            session, None, market_type="smartstore", store_key="store_smartstore"
+        )
+        if creds:
             client_id = client_id or creds.get("clientId", "")
             client_secret = client_secret or creds.get("clientSecret", "")
 
@@ -472,8 +478,12 @@ async def _delete_coupang(
         )
 
     if (not access_key or not secret_key) and account is None:
-        creds = await _get_setting(session, "store_coupang")
-        if creds and isinstance(creds, dict):
+        from backend.domain.samba.account.resolver import resolve_market_creds
+
+        creds = await resolve_market_creds(
+            session, None, market_type="coupang", store_key="store_coupang"
+        )
+        if creds:
             access_key = access_key or creds.get("accessKey", "")
             secret_key = secret_key or creds.get("secretKey", "")
             vendor_id = vendor_id or creds.get("vendorId", "")
@@ -621,7 +631,17 @@ async def _delete_lottehome(
             # account 제공됐지만 lottehome 자격증명 없음 → 전역 설정 폴백 금지
             return {"success": False, "message": "롯데홈쇼핑 계정 자격증명 없음"}
     if not creds:
-        creds = db_creds or await _get_setting(session, "store_lottehome")
+        if db_creds:
+            creds = db_creds
+        else:
+            from backend.domain.samba.account.resolver import resolve_market_creds
+
+            creds = await resolve_market_creds(
+                session,
+                None,
+                market_type="lottehome",
+                store_key="store_lottehome",
+            )
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "롯데홈쇼핑 설정 없음"}
 
@@ -664,7 +684,11 @@ async def _delete_gsshop(
     else:
         creds = await _get_setting(session, "gsshop_credentials")
         if not creds or not isinstance(creds, dict):
-            creds = await _get_setting(session, "store_gsshop")
+            from backend.domain.samba.account.resolver import resolve_market_creds
+
+            creds = await resolve_market_creds(
+                session, None, market_type="gsshop", store_key="store_gsshop"
+            )
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "GS샵 설정 없음"}
 
@@ -707,8 +731,12 @@ async def _delete_11st(
     # 11번가 계정 API Key는 additional_fields.apiKey에 저장되는 경로가 기본이므로,
     # 여기서 전역 store_11st를 섞으면 다계정 환경에서 오삭제가 날 수 있다.
     if not api_key and account is None:
-        creds = await _get_setting(session, "store_11st")
-        if creds and isinstance(creds, dict):
+        from backend.domain.samba.account.resolver import resolve_market_creds
+
+        creds = await resolve_market_creds(
+            session, None, market_type="11st", store_key="store_11st"
+        )
+        if creds:
             api_key = creds.get("apiKey", "")
     if not api_key:
         return {"success": False, "message": "11번가 인증 정보 없음"}
@@ -748,7 +776,11 @@ async def _delete_ssg(
         ):
             creds = extra
     else:
-        creds = await _get_setting(session, "store_ssg")
+        from backend.domain.samba.account.resolver import resolve_market_creds
+
+        creds = await resolve_market_creds(
+            session, None, market_type="ssg", store_key="store_ssg"
+        )
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "SSG 설정 없음"}
 
