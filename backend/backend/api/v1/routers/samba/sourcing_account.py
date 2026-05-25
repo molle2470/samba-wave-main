@@ -1004,33 +1004,61 @@ async def receive_reward_result(
 
 
 def _check_owner_device(request: Request) -> None:
-    """소유자 deviceId 화이트리스트 가드.
+    """키-디바이스 바인딩 가드 (근본 해결, 2026-05-25).
 
     민감 엔드포인트(/login-credential, /extension-key) 전용 — 포크된 확장앱이
     원본 백엔드를 그대로 가리키는 케이스에서 평문 자격증명/API 키 유출 차단.
 
-    settings.owner_device_ids 가 비어있으면 가드 무효(레거시 호환).
-    설정되어 있고 X-Device-Id 헤더가 화이트리스트에 없으면 403.
-    """
-    from backend.core.config import settings
+    동작:
+    - middleware 가 X-Api-Key 검증 시 키 row 의 device_id 를 request.state.key_bound_device_id 에 주입.
+    - bound_device_id IS NULL 이면 TOFU 첫 사용 — middleware 가 이번 호출 device 로 백필했으므로 통과.
+    - bound_device_id 와 요청 X-Device-Id 일치 → 통과.
+    - 불일치 → 403 (다른 PC 가 키 탈취해서 사용 시도).
+    - 글로벌 키(tenant_id=None) 는 차단 (라우터 본문 1148-1153 에서 처리되지만 여기서 선차단).
+    - `samba-daemon-` prefix 는 자동 허용 — 데몬은 install-token 교환 후 별도 키 발급 흐름.
 
-    raw = (getattr(settings, "owner_device_ids", "") or "").strip()
-    if not raw:
-        return  # 가드 미설정 — 레거시 호환
-    allowed = {d.strip() for d in raw.split(",") if d.strip()}
+    env 화이트리스트(owner_device_ids) 의존 폐지 — 새 PC/재설치마다 .env 갱신 불필요.
+    """
+    bound_dev = getattr(request.state, "key_bound_device_id", None)
+    tenant_id = getattr(request.state, "tenant_id", None)
     device_id = (request.headers.get("X-Device-Id") or "").strip()
-    # LOTTEON 헤드리스 데몬 prefix 자동 허용 — 신규 PC 마다 owner_device_ids 갱신 부담 제거.
-    # `samba-daemon-<hostname>` 패턴은 본 저장소 scripts/lotteon_daemon 가 생성하는 device_id.
-    _is_daemon = device_id.startswith("samba-daemon-")
-    if not device_id or (device_id not in allowed and not _is_daemon):
+
+    # 글로벌 키 (tenant 미바인딩) — 자격증명 조회 불가
+    if tenant_id is None:
+        logger.warning(
+            f"[owner-guard] 글로벌 키 차단 path={request.url.path} "
+            f"device_id={device_id[:12]}"
+        )
+        raise HTTPException(
+            403,
+            "글로벌 키로는 민감 엔드포인트 접근 불가. "
+            "/samba/extension-link 에서 테넌트 키 발급 필요.",
+        )
+
+    # 데몬 자동 허용 — 데몬 device_id 는 키 발급 흐름이 별개
+    if device_id.startswith("samba-daemon-"):
+        return
+
+    if not device_id:
+        raise HTTPException(403, "X-Device-Id 헤더 필수")
+
+    # bound_dev IS NULL → middleware TOFU 백필 직후, 같은 device 로 통과
+    if bound_dev is None:
+        return
+
+    if bound_dev != device_id:
         client_ip = request.headers.get("X-Forwarded-For", "") or (
             request.client.host if request.client else ""
         )
         logger.warning(
-            f"[owner-guard] 차단 path={request.url.path} "
-            f"device_id={device_id[:12]}... ip={client_ip[:60]}"
+            f"[owner-guard] 키-디바이스 불일치 path={request.url.path} "
+            f"bound={bound_dev[:12]} req={device_id[:12]} ip={client_ip[:60]}"
         )
-        raise HTTPException(403, "허용되지 않은 디바이스입니다.")
+        raise HTTPException(
+            403,
+            "키가 다른 디바이스에 바인딩되어 있습니다. "
+            "/samba/extension-link 에서 새 키를 발급받으세요.",
+        )
 
 
 class SyncChromeProfileRequest(BaseModel):

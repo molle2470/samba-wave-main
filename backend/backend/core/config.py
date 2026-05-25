@@ -77,10 +77,9 @@ class BackendSettings(BaseSettings):
     """True 시 글로벌 키 폴백 비활성화 — 테넌트 키만 허용. 모든 유저가 웹 로그인 후 전환."""
 
     owner_device_ids: str = ""
-    """소유자 확장앱 deviceId 화이트리스트 (콤마 구분).
-    민감 엔드포인트(/login-credential, /extension-key) 가드용 — 포크 확장앱이
-    원본 백엔드를 가리키는 케이스에서 평문 자격증명/API 키 누출 차단.
-    비어있으면 가드 무효(레거시 호환). 운영 환경에서는 반드시 설정."""
+    """[deprecated 2026-05-25] 키-디바이스 TOFU 바인딩으로 대체됨.
+    samba_extension_key.device_id 컬럼이 첫 사용 시 자동 백필되어 동일 보안 효과 제공.
+    필드는 pydantic env 호환을 위해 유지하되 더 이상 참조되지 않음."""
 
     autotune_daemon_device_id: str = ""
     """[deprecated] 단일 데몬 deviceId — 하위호환용. 신규는 autotune_daemon_device_ids 사용.

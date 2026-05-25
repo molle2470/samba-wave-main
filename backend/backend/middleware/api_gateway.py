@@ -43,9 +43,10 @@ _EXEMPT_PREFIXES = (
     "/api/v1/samba/proxy/autotune-daemon/",  # 데몬 health/version — 인증無 (오토튠 페이지 + 데몬 부트스트랩)
 )
 
-# 테넌트 키 캐시: key_hash → (tenant_id, is_install_token, cached_until_monotonic)
+# 테넌트 키 캐시: key_hash → (tenant_id, is_install_token, bound_device_id, cached_until_monotonic)
 # tenant_id = None 은 테넌트 미설정 키 (사용자 발급 후 JWT 에 tid 없는 경우)
-_KEY_CACHE: dict[str, tuple[Optional[str], bool, float]] = {}
+# bound_device_id = None 은 첫 사용 전(TOFU 미수행) 상태
+_KEY_CACHE: dict[str, tuple[Optional[str], bool, Optional[str], float]] = {}
 _KEY_CACHE_TTL = 60.0  # 1분
 
 # device_id 백필 완료된 key_hash (프로세스 메모리) — 키당 1회만 기록 시도해 핫패스 부담 최소화
@@ -89,18 +90,22 @@ async def _backfill_device_id(key_hash: str, device_id: str) -> None:
         logger.warning("[api-gateway] device_id 백필 실패: %s", exc)
 
 
-async def _lookup_tenant_key(key_hash: str) -> tuple[bool, Optional[str], bool]:
-    """DB 에서 테넌트 키 조회. (found, tenant_id, is_install_token) 반환. 1분 캐시.
+async def _lookup_tenant_key(
+    key_hash: str,
+) -> tuple[bool, Optional[str], bool, Optional[str]]:
+    """DB 에서 테넌트 키 조회. (found, tenant_id, is_install_token, bound_device_id) 반환. 1분 캐시.
 
     install-token(데몬 다운로드용 1시간 단기 토큰)은 만료 전이어도 exchange
     엔드포인트에서만 통과시킨다(dispatch 에서 경로 확인). 만료/revoke 된 키는 미발견 처리.
+
+    bound_device_id: 키 행에 저장된 device_id (TOFU 로 첫 사용 시 백필). NULL 이면 아직 바인딩 안 됨.
     """
     now = time.monotonic()
     cached = _KEY_CACHE.get(key_hash)
     if cached is not None:
-        tenant_id, is_install, expires = cached
+        tenant_id, is_install, bound_dev, expires = cached
         if now < expires:
-            return True, tenant_id, is_install
+            return True, tenant_id, is_install, bound_dev
 
     try:
         from backend.db.orm import get_read_session
@@ -108,7 +113,7 @@ async def _lookup_tenant_key(key_hash: str) -> tuple[bool, Optional[str], bool]:
         async with get_read_session() as session:
             result = await session.execute(
                 text(
-                    "SELECT tenant_id, is_install_token FROM samba_extension_key "
+                    "SELECT tenant_id, is_install_token, device_id FROM samba_extension_key "
                     "WHERE key_hash = :kh AND revoked_at IS NULL "
                     "AND (expires_at IS NULL OR expires_at > now()) "
                     "LIMIT 1"
@@ -120,13 +125,24 @@ async def _lookup_tenant_key(key_hash: str) -> tuple[bool, Optional[str], bool]:
         if row is not None:
             tenant_id = row[0]
             is_install = bool(row[1])
-            _KEY_CACHE[key_hash] = (tenant_id, is_install, now + _KEY_CACHE_TTL)
-            return True, tenant_id, is_install
+            bound_dev = row[2]
+            _KEY_CACHE[key_hash] = (
+                tenant_id,
+                is_install,
+                bound_dev,
+                now + _KEY_CACHE_TTL,
+            )
+            return True, tenant_id, is_install, bound_dev
 
-        return False, None, False
+        return False, None, False, None
     except Exception as exc:
         logger.warning("[api-gateway] 테넌트 키 조회 실패: %s", exc)
-        return False, None, False
+        return False, None, False, None
+
+
+def _invalidate_key_cache(key_hash: str) -> None:
+    """캐시 무효화 — device_id 백필 직후 다음 요청이 최신 값을 읽도록."""
+    _KEY_CACHE.pop(key_hash, None)
 
 
 class ApiGatewayMiddleware(BaseHTTPMiddleware):
@@ -162,7 +178,7 @@ class ApiGatewayMiddleware(BaseHTTPMiddleware):
         # 1단계: 테넌트 키 체크 (DB 조회, 1분 캐시)
         if request_key:
             key_hash = _hash_key(request_key)
-            found, tenant_id, is_install = await _lookup_tenant_key(key_hash)
+            found, tenant_id, is_install, bound_dev = await _lookup_tenant_key(key_hash)
             if found:
                 # install-token 은 exchange 엔드포인트에서만 통과 — 일반 API 거부.
                 if is_install and not request.url.path.endswith("/exchange"):
@@ -178,11 +194,16 @@ class ApiGatewayMiddleware(BaseHTTPMiddleware):
                     )
                 request.state.tenant_id = tenant_id
                 # 확장앱 device_id 백필 — install-token 제외, X-Device-Id 헤더 있을 때만.
-                # _is_mine 판정용 device_id 가 비어 있던 기존 키 행을 채운다.
+                # TOFU(Trust On First Use): bound_dev IS NULL 인 키의 첫 호출 device 로 바인딩.
+                # 이후 호출은 bound_dev 와 X-Device-Id 일치 여부를 라우터 의존성에서 검증.
                 if not is_install:
                     _dev = (request.headers.get("X-Device-Id") or "").strip()
-                    if _dev:
+                    if _dev and bound_dev is None:
                         await _backfill_device_id(key_hash, _dev)
+                        _invalidate_key_cache(key_hash)
+                        bound_dev = _dev
+                request.state.key_bound_device_id = bound_dev
+                request.state.key_hash = key_hash
                 return await call_next(request)
 
         # 2단계: 글로벌 키 폴백 (DEPRECATE_GLOBAL_KEY=true 시 건너뜀)

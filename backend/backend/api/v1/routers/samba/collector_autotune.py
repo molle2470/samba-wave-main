@@ -3738,18 +3738,8 @@ async def autotune_status(device_id: str = ""):
                 _my_devices = {d for (d,) in _dev_result.all() if d}
         except Exception:
             _my_devices = set()
-        # Fallback (2026-05-20): samba_extension_key 테이블에 device_id 컬럼
-        # 마이그레이션 누락으로 _my_devices 빈 집합이 되면 "오토튠 정지"로 잘못
-        # 표시되던 사고. OWNER_DEVICE_IDS env 화이트리스트를 본인 device로 인정.
-        if not _my_devices:
-            try:
-                from backend.core.config import settings as _st
-
-                _own_raw = (getattr(_st, "owner_device_ids", "") or "").strip()
-                if _own_raw:
-                    _my_devices = {d.strip() for d in _own_raw.split(",") if d.strip()}
-            except Exception:
-                pass
+        # (2026-05-25) owner_device_ids env fallback 제거 — 키-디바이스 TOFU 바인딩으로
+        # samba_extension_key.device_id 가 첫 사용 시 자동 백필되어 _my_devices 자연 충원.
 
     tripped = {
         site: count
