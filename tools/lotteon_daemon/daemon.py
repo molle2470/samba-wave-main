@@ -78,7 +78,7 @@ except ImportError:
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.4.4"
+DAEMON_VERSION = "1.4.5"
 
 
 # ====================================================================
@@ -613,62 +613,40 @@ def _extract_backend_from_argv_or_exename() -> str | None:
 
 
 def _default_device_id() -> str:
-    """PC 마다 고유한 device_id 생성 + 캐시 재사용.
+    """PC 마다 고유한 device_id 생성 + v2 마커 캐시.
 
-    1순위: %APPDATA%\\samba-autotune-daemon\\device_id.txt 캐시 (재사용 = 안정 ID)
-    2순위: Windows MachineGuid (HKLM\\SOFTWARE\\Microsoft\\Cryptography) — PC 고유
-    3순위: MAC 주소 hash
-    4순위: 새 UUID 생성 + 캐시 저장
+    (2026-05-26 v2 전환) MachineGuid / MAC hash 분기 폐기 — 클론 PC 끼리 같은
+    레지스트리 값을 공유해 device_id 충돌하던 사고 차단 (어제 SSG 전담 PC 문제).
+    v2 부터는 **순수 random UUID** 만 사용. PC 마다 무조건 unique.
 
-    hostname 의존 제거 (2026-05-25): 같은 hostname (예: DESKTOP-KDESNDM) 두 PC가
-    같은 device_id 박혀 잡 충돌하던 SaaS 사고 차단.
+    캐시 형식:
+      v1 (옛): `samba-daemon-<sanitized>` 평문
+      v2 (현): `v2:samba-daemon-<random16>` prefix
+
+    부팅 시 캐시가 v2 prefix 면 그대로 재사용. v1 또는 부재면 새 random UUID 발급 후
+    v2 형식으로 저장. 기존 클론 PC 는 1회 데몬 부팅으로 자동 마이그레이션됨.
     """
-    # 1. 캐시 재사용
+    import uuid as _uuid
+
+    cache_path: Path | None = None
     try:
         cache_path = _install_dir() / "device_id.txt"
         if cache_path.exists():
             cached = cache_path.read_text(encoding="utf-8").strip()
-            if cached.startswith("samba-daemon-") and len(cached) > 20:
-                return cached
+            if cached.startswith("v2:samba-daemon-") and len(cached) > 19:
+                return cached[3:]  # "v2:" prefix 제거 후 device_id 반환
+            # v1 캐시 — 폐기하고 새 random 발급 (클론 충돌 차단)
     except Exception:
         cache_path = None
 
-    # 2. Windows MachineGuid (PC 고유, 재설치해도 동일)
-    sanitized = ""
-    try:
-        if os.name == "nt":
-            import winreg
-
-            with winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography"
-            ) as k:
-                guid, _ = winreg.QueryValueEx(k, "MachineGuid")
-                sanitized = guid.replace("-", "").lower()[:16]
-    except Exception:
-        sanitized = ""
-
-    # 3. MAC 주소 hash
-    if not sanitized:
-        try:
-            import uuid as _uuid
-
-            sanitized = format(_uuid.getnode(), "012x")
-        except Exception:
-            sanitized = ""
-
-    # 4. 새 UUID
-    if not sanitized:
-        import uuid as _uuid
-
-        sanitized = _uuid.uuid4().hex[:16]
-
+    sanitized = _uuid.uuid4().hex[:16]
     did = f"samba-daemon-{sanitized}"
 
-    # 캐시 저장 (다음 실행에 재사용)
+    # v2 마커 + device_id 캐시 저장
     try:
         if cache_path:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_text(did, encoding="utf-8")
+            cache_path.write_text(f"v2:{did}", encoding="utf-8")
     except Exception:
         pass
     return did
