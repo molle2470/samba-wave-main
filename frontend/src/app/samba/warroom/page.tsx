@@ -973,7 +973,12 @@ export default function WarroomPage() {
                 setAutotuneCycles(0)
                 if (pno) setSingleProductNo('')
                 // 사용자 의도 저장 — 백엔드 재시작 시 자동 재등록 트리거용
-                try { window.localStorage.setItem('samba.autotune.userIntent', 'start') } catch { /* ignore */ }
+                try {
+                  window.localStorage.setItem('samba.autotune.userIntent', 'start')
+                  // 정지 때 박아둔 24h autoRejoin 잠금 해제 — 사용자 명시 start 의도
+                  window.localStorage.removeItem('samba.autotune.autoRejoinAt')
+                } catch { /* ignore */ }
+                autoRejoinAtRef.current = 0
               } catch { /* ignore */ }
             }}
             style={{
@@ -1011,7 +1016,13 @@ export default function WarroomPage() {
                   window.postMessage({ source: 'samba-page', type: 'AUTOTUNE_SET_JOIN', joined: false }, window.location.origin)
                   setAutotuneRunning(false)
                   falseCountRef.current = 0
-                  try { window.localStorage.setItem('samba.autotune.userIntent', 'stop') } catch { /* ignore */ }
+                  try {
+                    window.localStorage.setItem('samba.autotune.userIntent', 'stop')
+                    // 자동 재합류 24시간 잠금 — 다른 PC 실행 중이면 enabled=true 유지되어
+                    // cooldown 만료 후 autoRejoin 발동하던 사고 차단(2026-05-25 사용자 재요청).
+                    window.localStorage.setItem('samba.autotune.autoRejoinAt', String(Date.now() + 86400_000))
+                  } catch { /* ignore */ }
+                  autoRejoinAtRef.current = Date.now() + 86400_000
                   showAlert('이 PC 오토튠 정지 완료', 'success')
                 } else if (r.ok && data.ok === false) {
                   showAlert(`정지 실패 — ${data.error || '백엔드 거절'}`, 'error')
