@@ -1026,6 +1026,22 @@ async def _site_autotune_loop(device_id: str, site: str):
                             _kst_now = (
                                 datetime.now(timezone.utc) + timedelta(hours=9)
                             ).strftime("%H:%M:%S")
+                            # MUSINSA 인터벌 표시 — 차단 시 인터벌 증가 추적 (2026-05-26 사용자 요청).
+                            # msg 가 호출자에서 이미 [MUSINSA] site tag 포함 → 그 직후에 [int=X.Xs] 삽입.
+                            if site == "MUSINSA":
+                                try:
+                                    _cur_int = _ref_mod._site_intervals.get(
+                                        "MUSINSA", 1.0
+                                    )
+                                    _tag = f" [int={_cur_int:.1f}s]"
+                                    if "[MUSINSA]" in msg:
+                                        msg = msg.replace(
+                                            "[MUSINSA]", f"[MUSINSA]{_tag}", 1
+                                        )
+                                    else:
+                                        msg = f"{_tag} {msg}"
+                                except Exception:
+                                    pass
                             _ref_mod._refresh_log_buffer.append(
                                 {
                                     "ts": datetime.now(timezone.utc).isoformat(),
