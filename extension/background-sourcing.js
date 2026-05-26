@@ -1303,13 +1303,25 @@ async function _cancelMusinsa(ordNo) {
   const results = []
   let allCancelled = true
   let anyAlreadyShipped = false
+  let alreadyCancelledCount = 0
+  let newlyCancelledCount = 0
+  let skippedCount = 0
   for (const it of items) {
     const optNo = String(it.orderOptionNo || '')
     if (!optNo) continue
 
-    // claimState !== 0 = 이미 취소/반품 진행 중
+    // claimState !== 0 = 이미 취소/반품 처리됨 (또는 우리 직전 호출이 이미 성공함)
+    // raw 검증(2026-05-26 ord=202605260959460003): claimState=61 + orderStateText="취소 완료"
+    // + buttonStatus 전부 disabled = 취소 처리 확정.
+    // → "실패"가 아니라 "이미 취소됨" 으로 success 처리. cancel-result router 가 status='cancelling' 으로 advance.
     if (it.claimState && it.claimState !== 0) {
-      results.push({ optNo, skipped: true, reason: `claimState=${it.claimState}` })
+      results.push({
+        optNo,
+        ok: true,
+        already: true,
+        reason: `claimState=${it.claimState} (이미 취소 처리됨)`,
+      })
+      alreadyCancelledCount++
       continue
     }
 
@@ -1329,11 +1341,13 @@ async function _cancelMusinsa(ordNo) {
       results.push({ optNo, skipped: true, reason: `code=${code} 배송/완료 단계` })
       anyAlreadyShipped = true
       allCancelled = false
+      skippedCount++
       continue
     }
     if (code !== 10 && code !== 20) {
       results.push({ optNo, skipped: true, reason: `code=${code} 미지원 단계` })
       allCancelled = false
+      skippedCount++
       continue
     }
 
@@ -1360,6 +1374,7 @@ async function _cancelMusinsa(ordNo) {
         ok = j && (j.code === 1 || j.cd === 1 || (j.meta && j.meta.result === 'SUCCESS') || j.message === 'SUCCESS' || j.msg === 'SUCCESS')
       } catch (_) { ok = r.status === 200 && /SUCCESS/i.test(txt) }
       results.push({ optNo, status: r.status, ok, body: txt.slice(0, 300) })
+      if (ok) newlyCancelledCount++
       if (!ok) allCancelled = false
     } catch (e) {
       results.push({ optNo, error: e.message || String(e) })
@@ -1367,11 +1382,25 @@ async function _cancelMusinsa(ordNo) {
     }
   }
 
+  // 최종 판정 — already + newly + skipped 조합
+  // 모든 라인이 already 거나 newly 면 = 전체 취소됨 (success)
+  // 일부 배송단계면 alreadyShipped flag
+  // 그 외 = 일부 실패
+  const totalItems = items.length
+  const allDone = (alreadyCancelledCount + newlyCancelledCount) === totalItems
   return {
-    success: allCancelled,
-    cancelled: allCancelled,
+    success: allDone,
+    cancelled: allDone,
     alreadyShipped: anyAlreadyShipped,
-    reason: allCancelled ? '무신사 발주취소 완료' : (anyAlreadyShipped ? '일부/전부 배송단계 — 자동취소 불가' : '일부 실패'),
+    reason: allDone
+      ? (alreadyCancelledCount === totalItems
+          ? '무신사에 이미 취소 처리됨 (claimState!=0)'
+          : (newlyCancelledCount === totalItems
+              ? '무신사 발주취소 완료'
+              : `완료 (신규=${newlyCancelledCount}, 이미취소=${alreadyCancelledCount})`))
+      : (anyAlreadyShipped
+          ? '일부/전부 배송단계 — 자동취소 불가'
+          : `일부 실패 (신규=${newlyCancelledCount}, 이미취소=${alreadyCancelledCount}, skipped=${skippedCount})`),
     details: results,
   }
 }
