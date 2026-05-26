@@ -78,7 +78,7 @@ except ImportError:
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.4.6"
+DAEMON_VERSION = "1.4.7"
 
 
 # ====================================================================
@@ -625,12 +625,35 @@ def _default_device_id() -> str:
 
     부팅 시 캐시가 v2 prefix 면 그대로 재사용. v1 또는 부재면 새 random UUID 발급 후
     v2 형식으로 저장. 기존 클론 PC 는 1회 데몬 부팅으로 자동 마이그레이션됨.
+
+    v1.4.7+ api_key.txt 마이그레이션: 클론 PC 가 같은 api_key.txt 도 공유해 backend
+    TOFU 1번째 PC device_id 만 키에 백필되던 사고 (SSG/LOTTEON 분담 박힘 실패) 차단.
+    `.api_key_v2_migrated` 마커 없으면 api_key.txt 폐기 + 마커 생성 → 다음 부팅에서
+    install-token / Tk 다이얼로그로 새 키 받기 → PC 마다 unique 키 보장.
     """
     import uuid as _uuid
 
     cache_path: Path | None = None
+    install_dir = None
     try:
-        cache_path = _install_dir() / "device_id.txt"
+        install_dir = _install_dir()
+        cache_path = install_dir / "device_id.txt"
+
+        # api_key.txt 1회 마이그레이션 — 클론 PC 공유 키 차단
+        try:
+            marker = install_dir / ".api_key_v2_migrated"
+            if not marker.exists():
+                api_key_path = install_dir / "api_key.txt"
+                if api_key_path.exists():
+                    api_key_path.unlink()
+                    logger.info(
+                        "v1.4.7 마이그레이션: api_key.txt 폐기 (클론 PC 공유 키 차단)"
+                    )
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.touch()
+        except Exception:
+            pass
+
         if cache_path.exists():
             cached = cache_path.read_text(encoding="utf-8").strip()
             if cached.startswith("v2:samba-daemon-") and len(cached) > 19:
