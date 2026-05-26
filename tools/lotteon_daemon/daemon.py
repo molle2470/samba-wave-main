@@ -78,7 +78,7 @@ except ImportError:
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.4.5"
+DAEMON_VERSION = "1.4.6"
 
 
 # ====================================================================
@@ -2306,8 +2306,24 @@ async def run_daemon(args: argparse.Namespace) -> int:
                 "사이트별 병렬 워커 스폰: %s (총 %d 페이지)", _cur_conc, len(_workers)
             )
             try:
+                _last_version_check_at = time.time()
                 while not state.should_die():
                     await asyncio.sleep(60)
+                    # v1.4.6+ 주기적 버전 체크 — 매 5분, 신버전 감지 시 즉시 종료
+                    # → supervisor 가 self-update 다운로드 + 재시작. 사용자 수동 작업 0.
+                    # v1.4.5 까지는 시작 시 1회 체크만 → 무한 polling 중 업데이트 안 됨 사고.
+                    if time.time() - _last_version_check_at > 300:
+                        _last_version_check_at = time.time()
+                        try:
+                            if await _check_and_self_update(
+                                http_client, backend_url
+                            ):
+                                logger.info(
+                                    "주기 버전 체크: 신버전 감지 — 종료(supervisor 자동 업데이트 트리거)"
+                                )
+                                return 10
+                        except Exception as _vexc:
+                            logger.debug("주기 버전 체크 실패(무시): %s", _vexc)
                     _new_conc = await _sync_assignment()
                     if _new_conc != _cur_conc:
                         logger.info(
