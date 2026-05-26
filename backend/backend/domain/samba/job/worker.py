@@ -852,12 +852,26 @@ class JobWorker:
                     else:
                         await repo.fail_job(_job_id, f"알 수 없는 잡 타입: {_job_type}")
 
-                    await session.commit()
+                    # main session.commit() — 장수명 세션이 pool_recycle(60s)에 닫혀
+                    # greenlet_spawn 예외가 발생하면 잡 전체가 실패 처리되어 running 고착됨.
+                    # 내부 fresh 세션에서 이미 잡 상태/완료를 commit했으므로 여기 commit 실패는 무시.
+                    try:
+                        await session.commit()
+                    except Exception as _commit_err:
+                        logger.warning(
+                            f"[잡워커] main session.commit() 무시 — fresh 세션에서 이미 처리됨: "
+                            f"{_job_id} — {_commit_err}"
+                        )
                 except Exception as e:
                     logger.error(f"[잡워커] 잡 실행 실패: {_job_id} — {e}")
+                    # fail_job 은 main session(닫혔을 수 있음)이 아닌 fresh 세션으로 격리.
+                    # 격리 안 하면 greenlet_spawn으로 fail 처리 자체가 실패해 running 고착 →
+                    # startup _recover_running_jobs 가 attempt+1 누적 → OOM 마킹 사이클.
                     try:
-                        await repo.fail_job(_job_id, str(e))
-                        await session.commit()
+                        async with get_write_session() as _fail_sess:
+                            _fail_repo = SambaJobRepository(_fail_sess)
+                            await _fail_repo.fail_job(_job_id, str(e))
+                            await _fail_sess.commit()
                     except Exception as fail_exc:
                         logger.error(
                             f"[잡워커] 잡 상태 갱신 실패 (running 고착 가능): {_job_id} — {fail_exc}"
@@ -1069,6 +1083,79 @@ class JobWorker:
         except Exception as _te:
             logger.warning(f"[잡워커] tetris 매칭 로드 실패(무시): {_te}")
 
+        # 정책 미적용 상품 사전 필터링 — 모든 건이 "정책 미적용 상품은 전송할 수 없습니다"로
+        # fail되면 잡이 0 success 상태로 끝나고 컨테이너 재시작 누적으로 attempt>=3 도달 →
+        # "OOM repeated restart" 오해 마킹됨. 정책 없는 상품은 잡 시작 시점에 skip 처리.
+        try:
+            from backend.domain.samba.collector.model import (
+                SambaCollectedProduct as _CPFilter,
+            )
+            from sqlmodel import select as _filter_select
+
+            _pre_filter_total = len(product_ids)
+            _eligible_pids: list[str] = []
+            # 1,000건씩 chunked IN — IN 한도 회피
+            _chunk = 1000
+            async with get_write_session() as _filter_sess:
+                for _i0 in range(0, len(product_ids), _chunk):
+                    _chunk_ids = product_ids[_i0 : _i0 + _chunk]
+                    _rows = (
+                        (
+                            await _filter_sess.execute(
+                                _filter_select(_CPFilter.id).where(
+                                    _CPFilter.id.in_(_chunk_ids),
+                                    _CPFilter.applied_policy_id.is_not(None),
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    _eligible_pids.extend(_rows)
+            # 잡 시작 시 product_ids 순서 유지하면서 정책 없는 건 제외
+            _eligible_set = set(_eligible_pids)
+            _excluded_count = _pre_filter_total - len(_eligible_set)
+            if _excluded_count > 0:
+                product_ids = [p for p in product_ids if p in _eligible_set]
+                logger.info(
+                    f"[잡워커] 정책 미적용 사전 제외: {job.id} — "
+                    f"{_excluded_count}건 skip, 처리 대상 {len(product_ids)}건"
+                )
+                _add_job_log(
+                    job.id,
+                    f"정책 미적용 {_excluded_count:,}건 사전 제외 (정책 적용 후 재전송 필요), "
+                    f"전송 대상 {len(product_ids):,}건",
+                )
+                # 모든 상품이 정책 미적용 → 잡 즉시 완료 (skipped 카운트)
+                if not product_ids:
+                    _add_job_log(
+                        job.id,
+                        f"전송 가능 상품 없음 — 정책 적용 후 재시도 필요. "
+                        f"건너뜀 {_excluded_count:,}건",
+                    )
+                    async with get_write_session() as _done_filter_sess:
+                        _done_filter_repo = SambaJobRepository(_done_filter_sess)
+                        await _done_filter_repo.complete_job(
+                            job.id,
+                            {
+                                "success": 0,
+                                "skipped": _excluded_count,
+                                "failed": 0,
+                                "policy_missing": _excluded_count,
+                            },
+                        )
+                        await _done_filter_sess.commit()
+                    logger.info(
+                        f"[잡워커] 정책 미적용으로 잡 즉시 완료: {job.id} "
+                        f"(skipped {_excluded_count:,}건)"
+                    )
+                    return
+        except Exception as _pf_err:
+            logger.warning(
+                f"[잡워커] 정책 미적용 사전 필터 실패(무시, 일반 경로 진행): "
+                f"{job.id} — {_pf_err}"
+            )
+
         total = len(product_ids)
 
         # 이어하기: 이전 진행 위치를 먼저 읽은 후 진행률 갱신
@@ -1110,6 +1197,8 @@ class JobWorker:
             if not err:
                 return False
             # 11번가: "판매 중인 상품은 최대 5,000개까지 등록할 수 있습니다"
+            # 쿠팡: "오늘 등록할 수 있는 구매옵션 개수(5000)를 초과하였습니다"
+            #        — 일일 한도 초과, 다음날 reset (false-positive 방지 위해 "오늘 등록할 수 있는" + "초과" AND)
             # 기타 마켓에서도 등록 한도/판매자 상태 차단 메시지 추가 시 여기에 보강
             patterns = (
                 "판매 중인 상품은 최대",
@@ -1117,7 +1206,12 @@ class JobWorker:
                 "최대 5000개",
                 "상품을 판매중지",
             )
-            return any(p in err for p in patterns)
+            if any(p in err for p in patterns):
+                return True
+            # 쿠팡 일일 한도 — 단어 AND 매칭으로 false-positive 차단
+            if ("오늘 등록할 수 있는" in err) and ("초과" in err):
+                return True
+            return False
 
         async def _process_one(i: int, pid: str) -> tuple[int, int, int, str | None]:
             """상품 1건 처리 → (success_delta, skip_delta, fail_delta, failed_pid)"""
@@ -1346,16 +1440,19 @@ class JobWorker:
                     from sqlalchemy import text
 
                     await repo.update_progress(job.id, i_first, total)
-                    # 정상 배포 중단 → 즉시 pending + attempt 리셋 (OOM 아님)
-                    await session.execute(
-                        text(
-                            "UPDATE samba_jobs SET status = 'pending', "
-                            "started_at = NULL, attempt = 0 "
-                            "WHERE id = :jid AND status = 'running'"
-                        ),
-                        {"jid": job.id},
-                    )
-                    await session.commit()
+                    # 정상 배포 중단 → 즉시 pending + attempt 리셋 (OOM 아님).
+                    # main session 은 pool_recycle(60s)로 이미 닫혔을 수 있어
+                    # fresh 단명 세션으로 격리해야 status update 가 확실히 commit됨.
+                    async with get_write_session() as _shutdown_sess:
+                        await _shutdown_sess.execute(
+                            text(
+                                "UPDATE samba_jobs SET status = 'pending', "
+                                "started_at = NULL, attempt = 0 "
+                                "WHERE id = :jid AND status = 'running'"
+                            ),
+                            {"jid": job.id},
+                        )
+                        await _shutdown_sess.commit()
                 except Exception as exc:
                     logger.warning(
                         f"[잡워커] 배포 종료 진행 저장 실패: {job.id} — {exc}"
