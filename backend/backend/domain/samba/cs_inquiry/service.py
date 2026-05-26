@@ -373,7 +373,7 @@ class SambaCSInquiryService:
             ext_id = f"{ccn_no}:{mvot_req_sn}"
             active_ids.add(ext_id)
 
-            existing = await self.repo.find_by_external_id("LOTTEHOME", ext_id)
+            existing = await self.repo.find_by_external_id("롯데홈쇼핑", ext_id)
             if existing:
                 # 마켓 측 처리상태가 '완료'면 replied 마킹
                 if (
@@ -393,7 +393,7 @@ class SambaCSInquiryService:
             inquiry_type = "note" if str(it.get("CcnMvotTpNm", "")) == "알림" else "qna"
 
             await self.repo.create_async(
-                market="LOTTEHOME",
+                market="롯데홈쇼핑",
                 inquiry_type=inquiry_type,
                 external_id=ext_id,
                 external_sent=False,
@@ -415,7 +415,7 @@ class SambaCSInquiryService:
 
         # API 결과에 없는 기존 pending → 외부에서 처리됨으로 간주, replied 마킹
         existing_pending = await self.repo.find_pending_since(
-            "LOTTEHOME", "qna", start_dt, account_id=account_id
+            "롯데홈쇼핑", "qna", start_dt, account_id=account_id
         )
         for ep in existing_pending:
             if ep.external_id not in active_ids:

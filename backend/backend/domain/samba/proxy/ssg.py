@@ -284,11 +284,12 @@ class SSGClient:
         uitem_id_map: dict[str, str] = {}
         try:
             status_resp = await self.get_item_sales_status(item_id)
-            option_invs = (
-                status_resp.get("result", {})
-                .get("salesStatus", {})
-                .get("optionInventories", [])
-            )
+            _sales_status = status_resp.get("result", {}).get("salesStatus", {})
+            # 반려(05) 상품은 updateItem 불가 — 호출자에서 신규 insertItem으로 전환
+            if str(_sales_status.get("sellStatCd", "")) == "05":
+                logger.info(f"[SSG] 반려 상품 감지(sellStatCd=05) → _is_rejected 반환: itemId={item_id}")
+                return {"success": True, "data": {}, "_is_rejected": True}
+            option_invs = _sales_status.get("optionInventories", [])
             if isinstance(option_invs, dict):
                 option_invs = [option_invs]
             for idx, inv in enumerate(option_invs, start=1):
@@ -2267,13 +2268,16 @@ class SSGClient:
         ):
             logger.warning(f"[SSG] 쪽지 목록 조회 실패 (전체응답): {res}")
             return []
-        data = result.get("resultData", {})
+        data = result.get("resultData") or {}
+        if not isinstance(data, dict):
+            return []
         note_list = data.get("noteList", {})
-        # noteList 자체가 list로 내려오는 경우 처리
         if isinstance(note_list, list):
             notes = note_list
-        else:
+        elif isinstance(note_list, dict):
             notes = note_list.get("note", [])
+        else:
+            notes = []
         if isinstance(notes, dict):
             notes = [notes]
         return notes
@@ -2384,10 +2388,14 @@ class SSGClient:
         ):
             logger.warning(f"[SSG] Q&A 목록 조회 실패 (전체응답): {res}")
             return []
-        data = result.get("resultData", {})
-        qna_list = data.get("qnaList") or {}
-        # 실제 응답 구조: {"qnaList": [{"qna": [{...}, {...}]}]}
-        # qnaList가 list → 첫 번째 원소의 "qna" 키에서 실제 목록 추출
+        # qnaList 위치: result.qnaList (직접) 또는 result.resultData.qnaList (레거시)
+        data = result.get("resultData") or {}
+        qna_list = (
+            result.get("qnaList")
+            or (data.get("qnaList") if isinstance(data, dict) else None)
+            or {}
+        )
+        # 실제 응답 구조: {"qnaList": [{"qna": {...}}]} — qna가 dict(단건) 또는 list
         if isinstance(qna_list, list):
             items: list = []
             for entry in qna_list:

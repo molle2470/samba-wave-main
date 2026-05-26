@@ -1138,7 +1138,7 @@ class LotteHomeClient:
         cert_key = await self._ensure_auth()
         result = await self._call_api_auto_retry(
             "updateCounselMemoOpenApi.lotte",
-            "GET",
+            "POST",
             {
                 "subscriptionId": cert_key,
                 "ccn_no": ccn_no,
