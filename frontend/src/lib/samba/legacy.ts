@@ -394,7 +394,18 @@ export const orderApi = {
       method: "POST", body: JSON.stringify({ order_number: orderNumber, reason: reason || '단순변심' }),
     }),
   getCancelAlertCount: () =>
-    request<{ count: number }>(`${SAMBA_PREFIX}/orders/cancel-alert-count`),
+    request<{
+      count: number
+      by_fault?: { customer: number; non_customer: number; unknown: number }
+    }>(`${SAMBA_PREFIX}/orders/cancel-alert-count`),
+  // 쿠팡 자동 발주확인 토글 (#246 PR-6)
+  getCoupangAutoConfirm: () =>
+    request<{ enabled: boolean }>(`${SAMBA_PREFIX}/orders/coupang-auto-confirm`),
+  setCoupangAutoConfirm: (enabled: boolean) =>
+    request<{ ok: boolean; enabled: boolean }>(`${SAMBA_PREFIX}/orders/coupang-auto-confirm`, {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    }),
   syncTracking: (orderId: string, force = false) =>
     request<{ success: boolean; jobId?: string; requestId?: string; skipped?: boolean; reason?: string; error?: string }>(
       `${SAMBA_PREFIX}/orders/${orderId}/sync-tracking?force=${force}`,

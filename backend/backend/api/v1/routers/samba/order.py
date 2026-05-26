@@ -2007,18 +2007,62 @@ async def get_cancel_alert_count(
     """아직 처리 안 한 취소요청 건수 반환.
 
     인지 누락 사고 방지가 목적. 조건은 _build_cancel_alert_clause() 와 동일.
+    응답에 귀책별 분리 카운트 포함 (#246 PR-6) — 운영자 우선순위 판단용.
     """
-    from sqlalchemy import select, func
+    from sqlalchemy import case, select, func
     from backend.domain.samba.order.model import SambaOrder as OrderModel
 
-    stmt = select(func.count()).where(_build_cancel_alert_clause())
+    base_where = _build_cancel_alert_clause()
     if tenant_id is not None:
-        stmt = stmt.where(OrderModel.tenant_id == tenant_id)
-    # session.exec(select(func.count()))는 SQLModel에서 Row 객체를 반환해
-    # FastAPI 직렬화가 실패한다(500). session.execute().scalar_one() 으로 정수만 추출.
-    result = await session.execute(stmt)
-    count = int(result.scalar_one())
-    return {"count": count}
+        base_where = base_where & (OrderModel.tenant_id == tenant_id)
+
+    customer_expr = func.sum(
+        case(
+            (
+                func.upper(func.coalesce(OrderModel.cancel_fault_by, "")) == "CUSTOMER",
+                1,
+            ),
+            else_=0,
+        )
+    )
+    non_customer_expr = func.sum(
+        case(
+            (
+                func.upper(func.coalesce(OrderModel.cancel_fault_by, "")).in_(
+                    ("VENDOR", "COUPANG", "WMS")
+                ),
+                1,
+            ),
+            else_=0,
+        )
+    )
+    unknown_expr = func.sum(
+        case(
+            (
+                func.upper(func.coalesce(OrderModel.cancel_fault_by, "")).in_(
+                    ("CUSTOMER", "VENDOR", "COUPANG", "WMS")
+                ),
+                0,
+            ),
+            else_=1,
+        )
+    )
+    stmt = select(
+        func.count(),
+        customer_expr,
+        non_customer_expr,
+        unknown_expr,
+    ).where(base_where)
+    row = (await session.execute(stmt)).one()
+    total, customer, non_customer, unknown = row
+    return {
+        "count": int(total or 0),
+        "by_fault": {
+            "customer": int(customer or 0),
+            "non_customer": int(non_customer or 0),
+            "unknown": int(unknown or 0),
+        },
+    }
 
 
 @router.get("/alarm-settings")
@@ -2056,6 +2100,40 @@ async def save_alarm_settings(
         },
     )
     return {"ok": True}
+
+
+@router.get("/coupang-auto-confirm")
+async def get_coupang_auto_confirm(
+    session: AsyncSession = Depends(get_read_session_dependency),
+) -> dict:
+    """쿠팡 자동 발주확인(ACCEPT→INSTRUCT) 토글 조회 (#246 PR-6).
+
+    기본값 True (현재 동작 유지). 운영자가 OFF 시 sync 시 confirm_orders 호출 스킵.
+    """
+    from backend.api.v1.routers.samba.proxy import _get_setting
+
+    raw = await _get_setting(session, "coupang_auto_confirm_orders")
+    enabled = True
+    if isinstance(raw, dict):
+        v = raw.get("enabled")
+        if isinstance(v, bool):
+            enabled = v
+    elif isinstance(raw, bool):
+        enabled = raw
+    return {"enabled": enabled}
+
+
+@router.post("/coupang-auto-confirm")
+async def set_coupang_auto_confirm(
+    body: dict,
+    session: AsyncSession = Depends(get_write_session_dependency),
+) -> dict:
+    """쿠팡 자동 발주확인 토글 저장 (#246 PR-6)."""
+    from backend.api.v1.routers.samba.proxy import _set_setting
+
+    enabled = bool(body.get("enabled", True))
+    await _set_setting(session, "coupang_auto_confirm_orders", {"enabled": enabled})
+    return {"ok": True, "enabled": enabled}
 
 
 @router.get("/auto-sync-interval")
@@ -5252,7 +5330,26 @@ async def sync_orders_from_markets(
                                 pass
 
                     # 발주확인 호출 (ACCEPT → INSTRUCT, 상품준비중)
-                    if unconfirmed_box_ids:
+                    # 자동 발주확인 토글 (#246 PR-6) — samba_settings.coupang_auto_confirm_orders
+                    # 기본값 True (현재 동작 유지). 운영자가 OFF 시 box_id만 모으고 호출 스킵 → 운영자가 /confirm 수동 실행.
+                    from backend.api.v1.routers.samba.proxy import _get_setting
+
+                    _auto_setting = await _get_setting(
+                        session, "coupang_auto_confirm_orders"
+                    )
+                    auto_confirm = True
+                    if isinstance(_auto_setting, dict):
+                        v = _auto_setting.get("enabled")
+                        if isinstance(v, bool):
+                            auto_confirm = v
+                    elif isinstance(_auto_setting, bool):
+                        auto_confirm = _auto_setting
+                    if unconfirmed_box_ids and not auto_confirm:
+                        logger.info(
+                            f"[주문동기화] 쿠팡({label}): "
+                            f"자동 발주확인 OFF — {len(unconfirmed_box_ids)}건 스킵"
+                        )
+                    elif unconfirmed_box_ids:
                         try:
                             ack_results = await client.confirm_orders(
                                 unconfirmed_box_ids
@@ -5271,6 +5368,47 @@ async def sync_orders_from_markets(
                                         and od.get("shipping_status") == "결제완료"
                                     ):
                                         od["shipping_status"] = "상품준비중"
+
+                                # 공식 가이드: 발주확인 후 단건 조회로 배송지 변경 여부 재확인 (#246).
+                                # 옵션 동작이라 실패해도 동기화 자체는 진행. 변경 감지 시 로그만.
+                                for box_str in success_box_strs:
+                                    try:
+                                        box_id_int = int(box_str)
+                                        ord_sheet = (
+                                            await client.get_ordersheet_by_box_id(
+                                                box_id_int
+                                            )
+                                        )
+                                        if isinstance(ord_sheet, dict):
+                                            new_addr = (
+                                                (ord_sheet.get("receiver") or {}).get(
+                                                    "addr1"
+                                                )
+                                                or ord_sheet.get("receiverAddr1")
+                                                or ""
+                                            )
+                                            if new_addr:
+                                                for od in orders_data:
+                                                    if (
+                                                        od.get("source") == "coupang"
+                                                        and od.get("order_number")
+                                                        == box_str
+                                                        and od.get("customer_address")
+                                                        and od.get("customer_address")
+                                                        != new_addr.strip()
+                                                    ):
+                                                        logger.warning(
+                                                            f"[주문동기화] 쿠팡({label}): "
+                                                            f"발주확인 후 배송지 변경 감지 boxId={box_str} "
+                                                            f"old='{od.get('customer_address')}' new='{new_addr.strip()}'"
+                                                        )
+                                                        od["customer_address"] = (
+                                                            new_addr.strip()
+                                                        )
+                                    except Exception as _re:
+                                        logger.warning(
+                                            f"[주문동기화] 쿠팡 단건 재조회 실패 boxId={box_str}: {_re}"
+                                        )
                             logger.info(
                                 f"[주문동기화] 쿠팡({label}): "
                                 f"{len(success_box_strs)}/{len(unconfirmed_box_ids)}건 발주확인 완료"

@@ -87,9 +87,15 @@ export function useOrderSync({ accounts, period, setLogMessages, showNotificatio
       } finally {
         await loadOrders()
         try {
-          const { count } = await orderApi.getCancelAlertCount()
+          const { count, by_fault } = await orderApi.getCancelAlertCount()
           if (count > 0) {
-            showNotification(`처리 중인 주문 중 취소요청이 ${fmtNum(count)}건 있습니다. 확인해 주세요.`)
+            // 귀책별 분리 표시 (#246 PR-6) — 운영자 우선순위 판단 도움
+            const cust = by_fault?.customer ?? 0
+            const nonCust = by_fault?.non_customer ?? 0
+            const detail = (cust > 0 || nonCust > 0)
+              ? ` (구매자 사유 ${fmtNum(cust)}건 / 판매자·쿠팡 사유 ${fmtNum(nonCust)}건)`
+              : ''
+            showNotification(`처리 중인 주문 중 취소요청이 ${fmtNum(count)}건 있습니다.${detail} 확인해 주세요.`)
           }
         } catch { /* 알람 조회 실패는 무시 */ }
         setSyncing(false)

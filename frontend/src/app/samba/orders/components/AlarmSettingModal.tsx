@@ -1,6 +1,6 @@
 'use client'
 
-import React, { Dispatch, SetStateAction } from 'react'
+import React, { Dispatch, SetStateAction, useEffect, useState } from 'react'
 import { orderApi } from '@/lib/samba/api/commerce'
 import { showAlert } from '@/components/samba/Modal'
 
@@ -20,6 +20,15 @@ interface Props {
 export default function AlarmSettingModal(props: Props) {
   const { open, onClose, alarmHour, setAlarmHour, alarmMin, setAlarmMin, sleepStart, setSleepStart, sleepEnd, setSleepEnd } = props
 
+  // 쿠팡 자동 발주확인 토글 (#246 PR-6)
+  const [coupangAutoConfirm, setCoupangAutoConfirm] = useState(true)
+  useEffect(() => {
+    if (!open) return
+    orderApi.getCoupangAutoConfirm()
+      .then(r => setCoupangAutoConfirm(r.enabled))
+      .catch(() => { /* 실패 시 기본값 true 유지 */ })
+  }, [open])
+
   if (!open) return null
 
   const handleSave = async () => {
@@ -30,9 +39,11 @@ export default function AlarmSettingModal(props: Props) {
         sleep_start: sleepStart,
         sleep_end: sleepEnd,
       })
+      await orderApi.setCoupangAutoConfirm(coupangAutoConfirm)
       // 레이아웃 글로벌 폴러가 새 주기·영업시간으로 즉시 리셋되도록 이벤트 발송
       window.dispatchEvent(new CustomEvent('alarm-settings-updated'))
-      showAlert(`수집 주기: ${alarmHour}시간 ${alarmMin}분 / 영업시간: ${sleepEnd} ~ ${sleepStart} 저장완료`, 'success')
+      const autoLabel = coupangAutoConfirm ? '쿠팡 자동발주확인 ON' : '쿠팡 자동발주확인 OFF'
+      showAlert(`수집 주기: ${alarmHour}시간 ${alarmMin}분 / 영업시간: ${sleepEnd} ~ ${sleepStart} / ${autoLabel} 저장완료`, 'success')
       onClose()
     } catch {
       showAlert('저장 실패', 'error')
@@ -89,6 +100,35 @@ export default function AlarmSettingModal(props: Props) {
             />
           </div>
           <p style={{ fontSize: '0.72rem', color: '#555', marginTop: '0.375rem' }}>영업시간 외에는 취소주문 수집을 하지 않습니다</p>
+        </div>
+
+        {/* 쿠팡 자동 발주확인 토글 (#246 PR-6) */}
+        <div style={{ marginBottom: '1.5rem', padding: '0.75rem', background: '#0F0F0F', border: '1px solid #2D2D2D', borderRadius: '8px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div>
+              <label style={{ fontSize: '0.8125rem', color: '#E5E5E5', fontWeight: 600 }}>쿠팡 자동 발주확인</label>
+              <p style={{ fontSize: '0.7rem', color: '#666', marginTop: '0.25rem' }}>주문동기화 시 ACCEPT→INSTRUCT 자동 전이</p>
+            </div>
+            <button
+              onClick={() => setCoupangAutoConfirm(!coupangAutoConfirm)}
+              style={{
+                position: 'relative', width: '44px', height: '24px',
+                background: coupangAutoConfirm ? '#10B981' : '#444',
+                border: 'none', borderRadius: '12px', cursor: 'pointer', transition: 'background 0.2s',
+              }}
+            >
+              <span style={{
+                position: 'absolute', top: '2px', left: coupangAutoConfirm ? '22px' : '2px',
+                width: '20px', height: '20px', background: '#fff', borderRadius: '50%',
+                transition: 'left 0.2s',
+              }} />
+            </button>
+          </div>
+          <p style={{ fontSize: '0.68rem', color: coupangAutoConfirm ? '#10B981' : '#F59E0B', marginTop: '0.4rem' }}>
+            {coupangAutoConfirm
+              ? '✓ ON — 자동 처리 + 발주확인 후 단건 재조회로 배송지 변경 감지'
+              : '⚠ OFF — 주문이 결제완료 상태로 머무릅니다. 운영자 수동 /confirm 필요'}
+          </p>
         </div>
 
         <div style={{ display: 'flex', gap: '0.75rem', justifyContent: 'flex-end' }}>
