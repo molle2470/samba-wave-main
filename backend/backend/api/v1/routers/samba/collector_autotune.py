@@ -2249,6 +2249,21 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                 _combined_action_txt,
                                             )
                                         )
+                                        # preemptive failed_at — fire-and-forget transmit task 가
+                                        # is_bulk_cancelled / task cancel / SIGTERM / 예외 등으로
+                                        # _dispatch_one 도달 못한 채 사라지면 last_sent_data 갱신 누락 →
+                                        # 다음 사이클이 같은 변동 또 인식 → 무한 반복 (LOTTEON 27h 지연,
+                                        # MUSINSA 45일 미전송 1,000+ 건 사고, 2026-05-27).
+                                        # 전송 성공 시 sent_snapshot 으로 덮어써져 자동 제거됨
+                                        # (shipment/service.py:1989). 누락 시 failed_at 살아남아
+                                        # 다음 사이클 _has_failed_mark=True 로 재시도 명확.
+                                        _pre_acc_last = dict(
+                                            last_sent.get(acc_id) or {}
+                                        )
+                                        _pre_acc_last["failed_at"] = datetime.now(
+                                            timezone.utc
+                                        ).isoformat()
+                                        last_sent[acc_id] = _pre_acc_last
 
                                 # 통합 한 줄 로그 (전송 전에 즉시 출력)
                                 # 원가 변동: 마지막 전송 시 원가 vs 현재 원가 비교
@@ -2285,6 +2300,23 @@ async def _site_autotune_loop(device_id: str, site: str):
                             # lock 밖: 즉시 전송 (사이클 내 완료 보장 → last_sent_data.cost 정확성)
                             # 같은 items 조합의 계정들을 묶어 한 번의 start_update로 호출
                             # → service.start_update 내부 asyncio.gather가 계정별 동시 전송 (account 단위 세마포어로 안전)
+
+                            # preemptive failed_at DB 박기 — transmit task cancel/누락 대비.
+                            # 메모리 last_sent[acc_id]["failed_at"] 를 _transmit_queue.append 직후
+                            # 마킹했으므로 여기서 DB 반영. transmit 성공 시 sent_snapshot 덮어쓰기로 자동 제거.
+                            if _transmit_queue:
+                                try:
+                                    await _partial_update(
+                                        r.product_id,
+                                        {"last_sent_data": dict(last_sent)},
+                                    )
+                                except Exception as _pe:
+                                    log.warning(
+                                        "[오토튠][preemptive] %s last_sent_data 갱신 실패: %s",
+                                        r.product_id,
+                                        str(_pe)[:120],
+                                    )
+
                             _tx_groups: dict[tuple, list[tuple]] = {}
                             for (
                                 _tx_pid,
