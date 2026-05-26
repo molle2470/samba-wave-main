@@ -297,12 +297,20 @@ class SambaAnalyticsService:
     async def get_best_sellers(
         self, limit: int = 10, days: int = 30, tenant_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """매출 상위 상품 (베스트셀러)."""
+        """매출 상위 상품 (베스트셀러).
+
+        소싱주문번호(sourcing_order_number)가 존재하는 = 실제로 소싱처에
+        주문이행이 완료된 상품만 집계. 결제만 되고 미발주/취소 상태는 제외.
+        """
         all_orders = self._filter_by_tenant(
             await self.order_repo.list_async(), tenant_id
         )
         cutoff = datetime.now(UTC) - timedelta(days=days)
-        filtered = [o for o in all_orders if o.created_at >= cutoff]
+        filtered = [
+            o
+            for o in all_orders
+            if o.created_at >= cutoff and (o.sourcing_order_number or "").strip()
+        ]
 
         agg: Dict[str, Dict[str, Any]] = defaultdict(
             lambda: {"sales": 0.0, "profit": 0.0, "orders": 0, "units": 0}

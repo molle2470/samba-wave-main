@@ -494,7 +494,10 @@ export default function AnalyticsPage() {
                     <span style={{ color: '#FF8C00', fontWeight: 700, width: '1.5rem' }}>{i + 1}</span>
                     <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.product_name}</span>
                   </div>
-                  <span style={{ color: '#FF8C00', fontWeight: 600, whiteSpace: 'nowrap', marginLeft: '0.5rem' }}>₩{fmt(p.sales)}</span>
+                  <span style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', whiteSpace: 'nowrap', marginLeft: '0.5rem' }}>
+                    <span style={{ color: '#888', fontSize: '0.75rem' }}>{fmt(p.orders)}건</span>
+                    <span style={{ color: '#FF8C00', fontWeight: 600 }}>₩{fmt(p.sales)}</span>
+                  </span>
                 </div>
               ))}
             </div>
