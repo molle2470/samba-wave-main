@@ -123,7 +123,14 @@ def _build_display_product_name(product: dict[str, Any]) -> str:
 
 
 def _build_search_tags(product: dict[str, Any]) -> str:
-    """쿠팡 검색어 태그 생성 (최대 20개, 콤마 구분, 각 20자 이내)."""
+    """쿠팡 검색어 태그 생성 (최대 20개, 콤마 구분, 각 20자 이내).
+
+    우선순위:
+      1. brand (1개)
+      2. SS 태그사전 검증 태그 — `product["tags"]` 중 `__` 접두 시스템 태그 제외 (최대 10개)
+      3. `coupang_search_tags` — 쿠팡 전용 연관·자동완성·롱테일 (최대 10개)
+      4. 폴백 — seo_keywords / 카테고리 / 상품명 토큰 / 품번 / 소재 / 색상
+    """
     seen: set[str] = set()
     tags: list[str] = []
 
@@ -140,27 +147,60 @@ def _build_search_tags(product: dict[str, Any]) -> str:
     brand = (product.get("brand") or "").strip()
     if brand:
         _add(brand)
-    seo_keywords = product.get("seo_keywords") or []
-    if isinstance(seo_keywords, list):
-        for kw in seo_keywords:
-            _add(str(kw))
-    for key in ("category4", "category3", "category2", "category1"):
-        cat_val = (product.get(key) or "").strip()
-        if cat_val:
-            _add(cat_val)
-    original_name = product.get("name") or ""
-    name_tokens = re.split(r"[\s/\-_,()]+", original_name)
-    for token in name_tokens:
-        _add(token)
-    style_code = (product.get("style_code") or "").strip()
-    if style_code:
-        _add(style_code)
-    material = (product.get("material") or "").strip()
-    if material:
-        _add(material)
-    color = (product.get("color") or "").strip()
-    if color:
-        _add(color)
+
+    # 1) SS 태그사전 검증 통과 태그 (시스템 태그 제외, 최대 10개)
+    ss_tags = product.get("tags") or []
+    ss_added = 0
+    if isinstance(ss_tags, list):
+        for t in ss_tags:
+            if not isinstance(t, str):
+                continue
+            if t.startswith("__"):
+                continue
+            before = len(tags)
+            _add(t)
+            if len(tags) > before:
+                ss_added += 1
+                if ss_added >= 10:
+                    break
+
+    # 2) 쿠팡 전용 롱테일·자동완성·연관 검색어 (최대 10개)
+    coupang_tags = product.get("coupang_search_tags") or []
+    coupang_added = 0
+    if isinstance(coupang_tags, list):
+        for t in coupang_tags:
+            if not isinstance(t, str):
+                continue
+            before = len(tags)
+            _add(t)
+            if len(tags) > before:
+                coupang_added += 1
+                if coupang_added >= 10:
+                    break
+
+    # 3) 폴백 — 20개 미달 시 기존 보조 소스
+    if len(tags) < 20:
+        seo_keywords = product.get("seo_keywords") or []
+        if isinstance(seo_keywords, list):
+            for kw in seo_keywords:
+                _add(str(kw))
+        for key in ("category4", "category3", "category2", "category1"):
+            cat_val = (product.get(key) or "").strip()
+            if cat_val:
+                _add(cat_val)
+        original_name = product.get("name") or ""
+        name_tokens = re.split(r"[\s/\-_,()]+", original_name)
+        for token in name_tokens:
+            _add(token)
+        style_code = (product.get("style_code") or "").strip()
+        if style_code:
+            _add(style_code)
+        material = (product.get("material") or "").strip()
+        if material:
+            _add(material)
+        color = (product.get("color") or "").strip()
+        if color:
+            _add(color)
     return ",".join(tags[:20])
 
 
@@ -1387,6 +1427,175 @@ class CoupangClient:
         }
         result = await self._call_api("PUT", path, body=body)
         logger.info(f"[쿠팡] 출고중지완료: receiptId={receipt_id} count={cancel_count}")
+        return result
+
+    async def get_cancel_and_return_requests(
+        self,
+        days: int = 30,
+        status: str = "",
+        max_per_page: int = 50,
+    ) -> list[dict[str, Any]]:
+        """취소·반품 요청 통합 조회 (#246).
+
+        get_return_requests 와 동일 엔드포인트(returnRequests)이나 receiptType 필드를
+        호출자가 사용할 수 있도록 원본 응답을 그대로 반환. CANCEL 과 RETURN 모두 포함.
+
+        쿠팡 Wing API: GET /v2/.../vendors/{vendorId}/returnRequests
+        status 미지정 시 4개 상태(RU/CC/PR/UC) 합산 조회.
+        """
+        now = datetime.now(timezone.utc)
+        since = now - timedelta(days=days)
+
+        statuses = [status] if status else ["RU", "CC", "PR", "UC"]
+        all_items: list[dict[str, Any]] = []
+
+        for st in statuses:
+            next_token = ""
+            for _ in range(100):
+                params: dict[str, str] = {
+                    "createdAtFrom": since.strftime("%Y-%m-%d"),
+                    "createdAtTo": now.strftime("%Y-%m-%d"),
+                    "maxPerPage": str(max_per_page),
+                    "status": st,
+                }
+                if next_token:
+                    params["nextToken"] = next_token
+
+                path = (
+                    f"/v2/providers/openapi/apis/api/v4/vendors/{self.vendor_id}/"
+                    f"returnRequests"
+                )
+                result = await self._call_api("GET", path, params=params)
+
+                data = result.get("data", []) if isinstance(result, dict) else []
+                if isinstance(data, list):
+                    all_items.extend(data)
+                elif isinstance(data, dict):
+                    items = data.get("returnRequests", data.get("content", []))
+                    if isinstance(items, list):
+                        all_items.extend(items)
+
+                next_token = (
+                    result.get("nextToken", "") if isinstance(result, dict) else ""
+                )
+                if not next_token:
+                    break
+
+        cancel_cnt = sum(
+            1 for r in all_items if (r.get("receiptType") or "").upper() == "CANCEL"
+        )
+        return_cnt = sum(
+            1 for r in all_items if (r.get("receiptType") or "").upper() == "RETURN"
+        )
+        logger.info(
+            f"[쿠팡] 취소·반품 통합 조회 완료: {len(all_items)}건 "
+            f"(CANCEL={cancel_cnt}, RETURN={return_cnt}, 최근 {days}일)"
+        )
+        return all_items
+
+    async def confirm_completed_shipment(
+        self,
+        receipt_id: int,
+        delivery_company_code: str,
+        invoice_number: str,
+    ) -> dict[str, Any]:
+        """이미출고 처리 (#246) — 출고된 상태에서 반품 처리.
+
+        쿠팡 Wing API:
+          PATCH /v2/.../vendors/{vendorId}/returnRequests/{receiptId}/completedShipment
+
+        조건: cancel_release_status == 'A' (이미출고).
+        주의: 왕복 배송비 판매자 부담.
+        """
+        path = (
+            f"/v2/providers/openapi/apis/api/v4/vendors/{self.vendor_id}/"
+            f"returnRequests/{receipt_id}/completedShipment"
+        )
+        body = {
+            "vendorId": self.vendor_id,
+            "receiptId": receipt_id,
+            "deliveryCompanyCode": delivery_company_code,
+            "invoiceNumber": invoice_number,
+        }
+        result = await self._call_api("PATCH", path, body=body)
+        logger.info(
+            f"[쿠팡] 이미출고 처리 완료: receiptId={receipt_id} "
+            f"company={delivery_company_code} invoice={invoice_number}"
+        )
+        return result
+
+    async def seller_cancel_order(
+        self,
+        order_id: int,
+        vendor_item_ids: list[int],
+        receipt_counts: list[int],
+        middle_cancel_code: str,
+        user_id: str,
+    ) -> dict[str, Any]:
+        """판매자 능동 취소 — 출고중지 요청 (#246).
+
+        쿠팡 Wing API:
+          POST /v2/.../vendors/{vendorId}/orders/{orderId}/cancel
+
+        middle_cancel_code:
+          CCTTER — 재고 연동 오류 (재고 부족)
+          CCPNER — 제휴사이트 오류 (배송지 문제)
+          CCPRER — 가격등재오류
+        모두 판매자 귀책 → 판매자 점수 하락 주의.
+        """
+        if len(vendor_item_ids) != len(receipt_counts):
+            raise ValueError(
+                f"vendor_item_ids({len(vendor_item_ids)}) != receipt_counts({len(receipt_counts)})"
+            )
+        path = (
+            f"/v2/providers/openapi/apis/api/v5/vendors/{self.vendor_id}/"
+            f"orders/{order_id}/cancel"
+        )
+        body = {
+            "vendorId": self.vendor_id,
+            "orderId": order_id,
+            "vendorItemIdList": vendor_item_ids,
+            "receiptCountList": receipt_counts,
+            "middleCancelCode": middle_cancel_code,
+            "userId": user_id,
+        }
+        result = await self._call_api("POST", path, body=body)
+        logger.info(
+            f"[쿠팡] 판매자 능동 취소: orderId={order_id} "
+            f"items={vendor_item_ids} reason={middle_cancel_code}"
+        )
+        return result
+
+    async def confirm_return_receipt(self, receipt_id: int) -> dict[str, Any]:
+        """반품상품 입고 확인 — 회수 완료 (#246).
+
+        쿠팡 Wing API:
+          PATCH /v2/.../vendors/{vendorId}/returnRequests/{receiptId}/receiveConfirmation
+        """
+        path = (
+            f"/v2/providers/openapi/apis/api/v4/vendors/{self.vendor_id}/"
+            f"returnRequests/{receipt_id}/receiveConfirmation"
+        )
+        result = await self._call_api("PATCH", path)
+        logger.info(f"[쿠팡] 반품 입고 확인: receiptId={receipt_id}")
+        return result
+
+    async def get_ordersheet_by_box_id(
+        self,
+        shipment_box_id: int,
+    ) -> dict[str, Any]:
+        """발주서 단건 조회 — 발주확인 후 배송지 재확인용 (#246).
+
+        쿠팡 Wing API:
+          GET /v2/.../vendors/{vendorId}/ordersheets/{shipmentBoxId}
+
+        공식 가이드: confirm_orders 호출 후 단건 조회로 배송지 변경 여부 반드시 재확인.
+        """
+        path = (
+            f"/v2/providers/openapi/apis/api/v5/vendors/{self.vendor_id}/"
+            f"ordersheets/{shipment_box_id}"
+        )
+        result = await self._call_api("GET", path)
         return result
 
     async def get_exchange_requests(

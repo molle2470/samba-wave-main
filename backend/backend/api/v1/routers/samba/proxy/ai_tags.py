@@ -545,6 +545,135 @@ def _extract_seo_keywords(
     return seo
 
 
+async def _generate_coupang_longtail(
+    http_client: httpx.AsyncClient,
+    method: str,
+    model: str,
+    api_key: str,
+    brand: str,
+    category: str,
+    sample_names: list[str],
+    existing_tags: list[str],
+    banned: set[str],
+    name_words: set[str],
+    ss_banned: set[str],
+    brand_words: set[str],
+) -> tuple[list[str], int, int]:
+    """쿠팡 자동완성·연관·롱테일 검색어 10개 생성.
+
+    SS 태그사전 검증을 거치지 않으므로 롱테일(2~4어절 복합어) 허용.
+    원칙: 대표/연관/롱테일 + 색상·사이즈·용도 반영.
+    기존 SS 검증 태그 10개와 의미 중복 금지(프롬프트로 회피 + 사후 dedup).
+
+    반환: (선정된 키워드 list[<=10], input_tokens, output_tokens)
+    """
+    sample_str = "\n".join(f"  · {n}" for n in sample_names)
+    existing_str = ", ".join(existing_tags) if existing_tags else "(없음)"
+    prompt = (
+        f"쇼핑몰(쿠팡) 검색 노출 최적화용 '연관·자동완성·롱테일 검색어'를 15개 생성해주세요.\n\n"
+        f"상품 정보:\n"
+        f"- 브랜드: {brand}\n"
+        f"- 카테고리: {category}\n"
+        f"- 대표 상품명 샘플:\n{sample_str}\n\n"
+        f"이미 등록된 일반 태그(중복 금지): {existing_str}\n\n"
+        f"규칙:\n"
+        f"1. 소비자가 쿠팡 검색창에 '입력 중 자동완성으로 뜨는' 스타일의 키워드\n"
+        f"2. 단일어가 아닌 '대표어+수식어' 결합한 2~4어절 롱테일 허용·권장\n"
+        f"   - 용도형: '데일리운동화', '출근용스니커즈', '등산용경량신발', '러닝화여성용'\n"
+        f"   - 색상+카테고리: '블랙스니커즈', '화이트운동화', '네이비러닝화'\n"
+        f"   - 사이즈/핏형: '발편한운동화', '발넓은신발', '오버사이즈티셔츠'\n"
+        f"   - 대상형: '20대남자신발', '키높이운동화', '여성러닝화'\n"
+        f"   - 시즌형: '여름샌들', '겨울부츠'\n"
+        f"3. 색상·사이즈·용도·소재·대상·시즌을 골고루 섞어 다양성 확보\n"
+        f"4. 브랜드명('{brand}'), 경쟁브랜드명(나이키·아디다스·뉴발란스 등 모든 브랜드), "
+        f"수집사이트명(무신사·MUSINSA·KREAM 등)은 절대 포함 금지\n"
+        f"5. 한글, 각 키워드 2~20자 이내\n"
+        f"6. 쉼표로만 구분하여 출력 (번호·설명·따옴표 없이)\n"
+        f"7. 위 '이미 등록된 일반 태그'와 의미·표현이 겹치면 안 됨 (예: 등록된게 '운동화'면 '운동화' 단독 금지, '데일리운동화'는 OK)\n"
+    )
+    in_tok = 0
+    out_tok = 0
+    resp = None
+    text = ""
+    for _attempt in range(3):
+        if method in ("gemma", "gemini"):
+            resp = await http_client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+                headers={"content-type": "application/json"},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "maxOutputTokens": 600,
+                        **(
+                            {"thinkingConfig": {"thinkingBudget": 0}}
+                            if not model.endswith("-image")
+                            else {}
+                        ),
+                    },
+                },
+            )
+        else:
+            resp = await http_client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "max_tokens": 600,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+            )
+        if resp.status_code == 429 and _attempt < 2:
+            import asyncio as _aio
+
+            logger.warning(f"[쿠팡롱테일] {method} 429 — {30 * (_attempt + 1)}초 대기")
+            await _aio.sleep(30 * (_attempt + 1))
+            continue
+        break
+
+    if not resp or resp.status_code != 200:
+        logger.warning(
+            f"[쿠팡롱테일] {method} 호출 실패: {resp.status_code if resp else 'no response'}"
+        )
+        return [], 0, 0
+
+    data = resp.json()
+    if method in ("gemma", "gemini"):
+        usage = data.get("usageMetadata", {})
+        in_tok = usage.get("promptTokenCount", 0)
+        out_tok = usage.get("candidatesTokenCount", 0)
+        candidates = data.get("candidates", [])
+        if candidates:
+            parts = candidates[0].get("content", {}).get("parts", [])
+            text = parts[0].get("text", "") if parts else ""
+    else:
+        usage = data.get("usage", {})
+        in_tok = usage.get("input_tokens", 0)
+        out_tok = usage.get("output_tokens", 0)
+        text = data.get("content", [{}])[0].get("text", "")
+
+    existing_lower = {t.lower().replace(" ", "") for t in existing_tags}
+    seen: set[str] = set()
+    result: list[str] = []
+    for raw in text.split(","):
+        t = raw.strip()
+        if not t or len(t) > 20:
+            continue
+        if not _is_valid_tag(t, banned, name_words, ss_banned, brand_words):
+            continue
+        tl = t.lower().replace(" ", "")
+        if tl in seen or tl in existing_lower:
+            continue
+        seen.add(tl)
+        result.append(t)
+        if len(result) >= 10:
+            break
+    return result, in_tok, out_tok
+
+
 # 모듈 레벨 SmartStore 클라이언트 캐시 — 같은 계정 키면 인스턴스를 재사용해 토큰 재발급 최소화
 _ss_client_cache: dict[tuple[str, str], object] = {}
 
@@ -880,6 +1009,41 @@ async def generate_ai_tags(
                         ),
                         {"kws": _json.dumps(seo_kws), "ids": product_ids},
                     )
+
+                # 쿠팡 전용 롱테일·자동완성·연관 검색어 10개 생성 (SS 태그사전 검증 우회)
+                coupang_tags, c_in, c_out = await _generate_coupang_longtail(
+                    http_client,
+                    method,
+                    model,
+                    api_key,
+                    brand,
+                    category,
+                    sample_names,
+                    list(tags),
+                    banned,
+                    name_words,
+                    ss_banned,
+                    brand_words,
+                )
+                total_input_tokens += c_in
+                total_output_tokens += c_out
+                if coupang_tags:
+                    import json as _json_c
+
+                    from sqlalchemy import text as _text_c
+
+                    await session.execute(
+                        _text_c(
+                            "UPDATE samba_collected_product "
+                            "SET coupang_search_tags = CAST(:cks AS JSONB), updated_at = NOW() "
+                            "WHERE id = ANY(CAST(:ids AS TEXT[]))"
+                        ),
+                        {
+                            "cks": _json_c.dumps(coupang_tags),
+                            "ids": product_ids,
+                        },
+                    )
+
                 total_tagged += len(products)
 
             except Exception as e:
@@ -1183,6 +1347,28 @@ async def preview_ai_tags(
                 validated_tags = top12_preview[2:12]
                 tag_shortage = len(validated_tags) < 10
 
+                # 쿠팡 전용 롱테일 10개 별도 생성 (SS 검증 우회)
+                (
+                    coupang_tags_preview,
+                    c_in_p,
+                    c_out_p,
+                ) = await _generate_coupang_longtail(
+                    http_client,
+                    method,
+                    model,
+                    api_key,
+                    brand,
+                    category,
+                    sample_names,
+                    list(validated_tags),
+                    banned,
+                    name_words,
+                    ss_banned,
+                    brand_words,
+                )
+                total_input_tokens += c_in_p
+                total_output_tokens += c_out_p
+
                 preview_results.append(
                     {
                         "group_id": gid,
@@ -1194,6 +1380,7 @@ async def preview_ai_tags(
                         "tags": validated_tags,
                         "rejected_tags": rejected_tags,
                         "seo_keywords": seo_preview,
+                        "coupang_search_tags": coupang_tags_preview,
                         "candidate_count": len(candidate_tags),
                         "candidates": candidate_tags[:15],
                         "validation_error": tag_validation_error,
@@ -1380,6 +1567,39 @@ async def apply_ai_tags(
                 ),
                 {"kws": _json.dumps(seo_kws), "ids": product_ids},
             )
+
+        # 쿠팡 전용 검색어 — preview 단계에서 생성된 값을 그대로 저장 (사용자 편집 가능)
+        coupang_tags_payload = group.get("coupang_search_tags", []) or []
+        if isinstance(coupang_tags_payload, list):
+            # 길이 컷 + 중복 제거
+            seen_ct: set[str] = set()
+            ct_clean: list[str] = []
+            for t in coupang_tags_payload:
+                if not isinstance(t, str):
+                    continue
+                tt = t.strip()
+                if len(tt) < 2 or len(tt) > 20:
+                    continue
+                tl = tt.lower().replace(" ", "")
+                if tl in seen_ct:
+                    continue
+                seen_ct.add(tl)
+                ct_clean.append(tt)
+                if len(ct_clean) >= 10:
+                    break
+            import json as _json_c
+
+            from sqlalchemy import text as _text_c
+
+            await session.execute(
+                _text_c(
+                    "UPDATE samba_collected_product "
+                    "SET coupang_search_tags = CAST(:cks AS JSONB), updated_at = NOW() "
+                    "WHERE id = ANY(CAST(:ids AS TEXT[]))"
+                ),
+                {"cks": _json_c.dumps(ct_clean), "ids": product_ids},
+            )
+
         total_tagged += len(products)
 
     await session.commit()
@@ -1423,6 +1643,9 @@ async def clear_ai_tags(
             # issue #239 — `p.tags = None` 전부 wipe 금지. __접두 시스템 태그 보존.
             p.tags = _apply_preserved_system_tags(p.tags, None)
             p.seo_keywords = None
+            if hasattr(p, "coupang_search_tags"):
+                p.coupang_search_tags = None
+                _fm(p, "coupang_search_tags")
             _fm(p, "tags")
             _fm(p, "seo_keywords")
             if hasattr(p, "updated_at"):

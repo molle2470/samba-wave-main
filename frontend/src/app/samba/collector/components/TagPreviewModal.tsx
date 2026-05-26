@@ -11,6 +11,7 @@ export interface TagPreview {
   rep_name: string
   tags: string[]
   seo_keywords: string[]
+  coupang_search_tags?: string[]
 }
 
 export interface TagPreviewCost {
@@ -141,6 +142,56 @@ export default function TagPreviewModal({
                 color: '#E5E5E5', outline: 'none',
               }}
             />
+            {/* 쿠팡 전용 검색어 (연관/자동완성/롱테일) — 최대 10개 */}
+            <div style={{ marginTop: '10px', paddingTop: '10px', borderTop: '1px dashed #2D2D2D' }}>
+              <div style={{ fontSize: '0.72rem', color: '#FFB84D', fontWeight: 600, marginBottom: '6px' }}>
+                쿠팡 전용 검색어 (연관·자동완성·롱테일) — {fmtNum((preview.coupang_search_tags || []).length)}개
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: '6px' }}>
+                {(preview.coupang_search_tags || []).map((tag, ti) => (
+                  <span key={`c-${ti}`} style={{
+                    fontSize: '0.78rem', padding: '4px 10px', borderRadius: '14px',
+                    background: 'rgba(255,140,0,0.1)', border: '1px solid rgba(255,140,0,0.25)', color: '#FFB84D',
+                    display: 'inline-flex', alignItems: 'center', gap: '6px',
+                  }}>
+                    {tag}
+                    <span
+                      style={{ cursor: 'pointer', color: '#666', fontSize: '0.85rem', lineHeight: 1 }}
+                      onClick={() => {
+                        setTagPreviews(prev => prev.map(p =>
+                          p.group_id === preview.group_id
+                            ? { ...p, coupang_search_tags: (p.coupang_search_tags || []).filter(t => t !== tag) }
+                            : p
+                        ))
+                      }}
+                    >&times;</span>
+                  </span>
+                ))}
+              </div>
+              <input
+                type='text'
+                placeholder='쿠팡 검색어 추가 후 Enter (콤마 구분 가능, 최대 10개)'
+                onKeyDown={e => {
+                  if (e.key === 'Enter') {
+                    const input = (e.target as HTMLInputElement)
+                    const adds = input.value.split(',').map(t => t.trim()).filter(Boolean)
+                    if (adds.length === 0) return
+                    setTagPreviews(prev => prev.map(p => {
+                      if (p.group_id !== preview.group_id) return p
+                      const cur = p.coupang_search_tags || []
+                      const merged = [...cur, ...adds.filter(t => !cur.includes(t))].slice(0, 10)
+                      return { ...p, coupang_search_tags: merged }
+                    }))
+                    input.value = ''
+                  }
+                }}
+                style={{
+                  width: '100%', padding: '5px 10px', fontSize: '0.75rem',
+                  background: '#111', border: '1px solid #2D2D2D', borderRadius: '6px',
+                  color: '#E5E5E5', outline: 'none',
+                }}
+              />
+            </div>
           </div>
         ))}
         {removedTags.length > 0 && (
@@ -161,7 +212,7 @@ export default function TagPreviewModal({
           >취소</button>
           <button
             onClick={async () => {
-              const groups = tagPreviews.filter(p => p.tags.length > 0).map(p => ({ group_id: p.group_id, tags: p.tags, seo_keywords: p.seo_keywords }))
+              const groups = tagPreviews.filter(p => p.tags.length > 0).map(p => ({ group_id: p.group_id, tags: p.tags, seo_keywords: p.seo_keywords, coupang_search_tags: p.coupang_search_tags || [] }))
               if (groups.length === 0) { showAlert('적용할 태그가 없습니다'); return }
               try {
                 const res = await proxyApi.applyAiTags(groups, removedTags)

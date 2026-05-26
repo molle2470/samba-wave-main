@@ -1684,7 +1684,7 @@ export const proxyApi = {
       body: JSON.stringify({ product_ids: productIds, group_ids: groupIds || [] }),
     }),
   // AI 태그 확정 적용 (삭제된 태그는 금지태그에 추가)
-  applyAiTags: (groups: { group_id: string; tags: string[]; seo_keywords?: string[] }[], removedTags?: string[]) =>
+  applyAiTags: (groups: { group_id: string; tags: string[]; seo_keywords?: string[]; coupang_search_tags?: string[] }[], removedTags?: string[]) =>
     request<{ success: boolean; message: string; total_tagged: number }>(
       `${SAMBA_PREFIX}/proxy/ai-tags/apply`, {
         method: 'POST',

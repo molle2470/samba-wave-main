@@ -296,6 +296,10 @@ class SambaCollectedProduct(SQLModel, table=True):
     seo_keywords: Optional[List[str]] = Field(
         default=None, sa_column=Column(JSON, nullable=True)
     )
+    # 쿠팡 전용 연관·자동완성·롱테일 검색어 (최대 10개) — SS 태그사전 검증 우회, 롱테일 허용
+    coupang_search_tags: Optional[List[str]] = Field(
+        default=None, sa_column=Column(JSONB, nullable=True)
+    )
 
     # 모니터링 우선순위: hot / warm / cold
     monitor_priority: str = Field(

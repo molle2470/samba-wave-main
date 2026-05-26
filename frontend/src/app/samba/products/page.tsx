@@ -288,7 +288,7 @@ export default function ProductsPage() {
 
   // AI 태그 미리보기 모달
   const [showTagPreview, setShowTagPreview] = useState(false)
-  const [tagPreviews, setTagPreviews] = useState<{ group_id: string; group_name: string; product_count: number; product_ids?: string[]; rep_name: string; tags: string[]; seo_keywords: string[] }[]>([])
+  const [tagPreviews, setTagPreviews] = useState<{ group_id: string; group_name: string; product_count: number; product_ids?: string[]; rep_name: string; tags: string[]; seo_keywords: string[]; coupang_search_tags?: string[] }[]>([])
   const [tagPreviewCost, setTagPreviewCost] = useState<{ api_calls: number; input_tokens: number; output_tokens: number; cost_krw: number } | null>(null)
   const [tagPreviewLoading, setTagPreviewLoading] = useState(false)
   const [removedTags, setRemovedTags] = useState<string[]>([])
@@ -1979,7 +1979,7 @@ export default function ProductsPage() {
               <button onClick={() => { setShowTagPreview(false); setRemovedTags([]) }}
                 style={{ padding: '7px 20px', fontSize: '0.85rem', borderRadius: '6px', cursor: 'pointer', border: '1px solid #3D3D3D', background: 'transparent', color: '#888' }}>취소</button>
               <button onClick={async () => {
-                const groups = tagPreviews.filter(p => p.tags.length > 0).map(p => ({ group_id: p.group_id, tags: p.tags, seo_keywords: p.seo_keywords }))
+                const groups = tagPreviews.filter(p => p.tags.length > 0).map(p => ({ group_id: p.group_id, tags: p.tags, seo_keywords: p.seo_keywords, coupang_search_tags: (p as { coupang_search_tags?: string[] }).coupang_search_tags || [] }))
                 if (groups.length === 0) { showAlert('적용할 태그가 없습니다'); return }
                 try {
                   const res = await proxyApi.applyAiTags(groups, removedTags)

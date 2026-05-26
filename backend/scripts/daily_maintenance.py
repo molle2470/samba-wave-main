@@ -347,7 +347,7 @@ async def task_ai_tags(conn: asyncpg.Connection) -> dict:
     existing = await conn.fetch("""
         SELECT DISTINCT ON (cp.brand, cp.category1, cp.category2, cp.category3)
             cp.brand, cp.category1, cp.category2, cp.category3,
-            cp.tags, cp.seo_keywords
+            cp.tags, cp.seo_keywords, cp.coupang_search_tags
         FROM samba_collected_product cp
         WHERE cp.tags::text LIKE '%__ai_tagged__%'
         ORDER BY cp.brand, cp.category1, cp.category2, cp.category3, cp.updated_at DESC
@@ -355,7 +355,7 @@ async def task_ai_tags(conn: asyncpg.Connection) -> dict:
     tag_db: dict[tuple, dict] = {}
     brand_fallback: dict[str, dict] = {}
 
-    def _register(brand, cat, tags, seo):
+    def _register(brand, cat, tags, seo, coupang):
         parts = [cat] + (cat.split("/") if "/" in cat else [])
         for part in parts:
             part = part.strip()
@@ -364,19 +364,24 @@ async def task_ai_tags(conn: asyncpg.Connection) -> dict:
             for b in [brand, ""]:
                 key = (b, part)
                 if key not in tag_db:
-                    tag_db[key] = {"tags": tags, "seo": seo}
+                    tag_db[key] = {"tags": tags, "seo": seo, "coupang": coupang}
 
     for r in existing:
         brand = r["brand"] or ""
         cats = [r["category1"] or "", r["category2"] or "", r["category3"] or ""]
         tags = [t for t in parse_json(r["tags"]) if not t.startswith("__")]
         seo = parse_json(r["seo_keywords"])
+        coupang = parse_json(r["coupang_search_tags"]) or []
         if tags:
             for c in cats:
                 if c:
-                    _register(brand, c, tags, seo)
+                    _register(brand, c, tags, seo, coupang)
             if brand and brand not in brand_fallback:
-                brand_fallback[brand] = {"tags": tags, "seo": seo}
+                brand_fallback[brand] = {
+                    "tags": tags,
+                    "seo": seo,
+                    "coupang": coupang,
+                }
 
     print(f"  기존 패턴: {len(tag_db):,}개, 브랜드 폴백: {len(brand_fallback):,}개")
 
@@ -430,13 +435,14 @@ async def task_ai_tags(conn: asyncpg.Connection) -> dict:
         ]
 
         # 후보 태그 조회
-        candidate_tags, cand_seo = [], []
+        candidate_tags, cand_seo, cand_coupang = [], [], []
         for cat in reversed(cats):
             for b in [brand, ""]:
                 key = (b, cat)
                 if key in tag_db:
                     candidate_tags = tag_db[key]["tags"]
                     cand_seo = tag_db[key]["seo"]
+                    cand_coupang = tag_db[key].get("coupang") or []
                     break
             if candidate_tags:
                 break
@@ -450,6 +456,7 @@ async def task_ai_tags(conn: asyncpg.Connection) -> dict:
                         if key in tag_db:
                             candidate_tags = tag_db[key]["tags"]
                             cand_seo = tag_db[key]["seo"]
+                            cand_coupang = tag_db[key].get("coupang") or []
                             break
                     if candidate_tags:
                         break
@@ -459,6 +466,7 @@ async def task_ai_tags(conn: asyncpg.Connection) -> dict:
         if not candidate_tags and brand in brand_fallback:
             candidate_tags = brand_fallback[brand]["tags"]
             cand_seo = brand_fallback[brand]["seo"]
+            cand_coupang = brand_fallback[brand].get("coupang") or []
 
         if not candidate_tags:
             no_match += 1
@@ -507,9 +515,12 @@ async def task_ai_tags(conn: asyncpg.Connection) -> dict:
                 dict.fromkeys([*preserved, "__ai_tagged__", *tags_to_apply])
             )
             await conn.execute(
-                "UPDATE samba_collected_product SET tags=$1::jsonb, seo_keywords=$2::jsonb, updated_at=NOW() WHERE id=$3",
+                "UPDATE samba_collected_product "
+                "SET tags=$1::jsonb, seo_keywords=$2::jsonb, "
+                "coupang_search_tags=$3::jsonb, updated_at=NOW() WHERE id=$4",
                 json.dumps(new_tags, ensure_ascii=False),
                 json.dumps(seo_to_apply, ensure_ascii=False),
+                json.dumps(cand_coupang or [], ensure_ascii=False),
                 p["id"],
             )
 
