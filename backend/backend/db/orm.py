@@ -106,16 +106,17 @@ def _build_write_engine() -> AsyncEngine:
         future=True,
         echo=False,  # Disable SQL echo to reduce noise
         pool_pre_ping=False,  # asyncpg 버그: SELECT 1이 idle in transaction 좀비 누적 → pool_recycle로 대체
-        pool_size=25,  # write 풀 확장 (20 → 25)
-        max_overflow=25,  # 추가 허용 (write 최대 50개, Cloud SQL max=100 내)
-        pool_recycle=60,  # idle 커넥션 1분 후 재활용 — 좀비 회수 가속
+        pool_size=30,  # write 풀 확장 (25 → 30) — transmit sem 사이트별 확대 대응
+        max_overflow=30,  # 추가 허용 (write 최대 60개, Cloud SQL max=100 내)
+        pool_recycle=45,  # idle 커넥션 45초 후 재활용 — 좀비 회수 가속 (60→45)
         pool_timeout=10,  # 빠른 실패 — 30s 대기 중 ASGI 워커 타임아웃 방지
         connect_args={
             "timeout": 10,  # asyncpg 연결 타임아웃 10초
             "server_settings": {
-                # 트랜잭션 안에서 마켓 HTTP 호출까지 처리하는 transmit/오토튠 경로가 90s를 종종 넘김
-                # → 180s로 완화 (좀비 회수는 pool_recycle=60 + 명시적 rollback 경로가 담당)
-                "idle_in_transaction_session_timeout": "180000",
+                # 좀비 차단 단축 — idle in transaction 60s 초과 시 PostgreSQL 자동 종료.
+                # 풀 점유 좀비 (image 23건 발견 2026-05-26) 회수 가속.
+                # transmit task 가 60s 넘는 마켓 HTTP 호출 가지면 실패 — 대부분 30~45s 라 안전.
+                "idle_in_transaction_session_timeout": "60000",
             },
         },
     )
@@ -144,14 +145,15 @@ def _build_read_engine() -> AsyncEngine:
         future=True,
         echo=False,
         pool_pre_ping=False,  # asyncpg 버그: SELECT 1이 idle in transaction 좀비 누적 → pool_recycle로 대체
-        pool_size=8,  # idle 연결 수 (scroll_products 병렬화로 진입당 ~3 세션 사용 가능)
-        max_overflow=10,  # 추가 허용 (read 최대 18개)
-        pool_recycle=60,  # idle 커넥션 1분 후 재활용 — 좀비 회수 가속
+        pool_size=15,  # read 풀 확장 (8 → 15) — 좀비 누적 사고 대응
+        max_overflow=15,  # 추가 허용 (read 최대 30개)
+        pool_recycle=45,  # idle 커넥션 45초 후 재활용 — 좀비 회수 가속 (60→45)
         pool_timeout=10,  # 빠른 실패 — 30s 대기 중 ASGI 워커 타임아웃 방지
         connect_args={
             "timeout": 10,  # asyncpg 연결 타임아웃 10초
             "server_settings": {
-                "idle_in_transaction_session_timeout": "90000",  # 90초 초과 idle in transaction 자동 종료
+                # 좀비 차단 단축 — read 트랜잭션은 짧으므로 30s 초과 = 좀비 확정.
+                "idle_in_transaction_session_timeout": "30000",
             },
         },
     )
