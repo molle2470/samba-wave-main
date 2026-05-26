@@ -4935,21 +4935,67 @@ async def sync_orders_from_markets(
                     if raw_orders is None:
                         raw_orders = await client.get_orders(days=body.days)
                     logger.info(f"[주문동기화] 쿠팡({label}): {len(raw_orders)}건 조회")
-                    # ACCEPT(결제완료) + 취소/반품요청 없는 건만 자동 발주확인 대상
+
+                    # 취소·반품 요청 통합 조회 (#246) — ordersheets v5에 cancelRequests/
+                    # returnRequests 필드가 없으므로 returnRequests v6 API를 별도 호출해 머지.
+                    # orderId 기준으로 매핑 (1 orderId : 0..N receipt).
+                    cancel_map: dict[int, dict] = {}
+                    try:
+                        cr_list = await client.get_cancel_and_return_requests(
+                            days=max(body.days, 30)
+                        )
+                        # receiptType=CANCEL 우선 (배송 전), 같은 orderId면 createdAt 최신 우선
+                        # returnRequests 응답의 orderId 키는 카멜케이스 그대로
+                        for cr in cr_list or []:
+                            if not isinstance(cr, dict):
+                                continue
+                            oid_raw = cr.get("orderId")
+                            try:
+                                oid = int(oid_raw) if oid_raw is not None else None
+                            except (TypeError, ValueError):
+                                oid = None
+                            if oid is None:
+                                continue
+                            prev = cancel_map.get(oid)
+                            if prev is None:
+                                cancel_map[oid] = cr
+                            else:
+                                # CANCEL 우선
+                                if (
+                                    cr.get("receiptType") or ""
+                                ).upper() == "CANCEL" and (
+                                    prev.get("receiptType") or ""
+                                ).upper() != "CANCEL":
+                                    cancel_map[oid] = cr
+                        logger.info(
+                            f"[주문동기화] 쿠팡({label}): "
+                            f"취소·반품 요청 {len(cr_list or [])}건 머지 "
+                            f"({len(cancel_map)} orderId)"
+                        )
+                    except Exception as cre:
+                        logger.warning(
+                            f"[주문동기화] {label}: 쿠팡 취소·반품 조회 실패 — {cre}"
+                        )
+
+                    # ACCEPT(결제완료) + 취소·반품 머지 없음 → 자동 발주확인 대상
                     unconfirmed_box_ids: list[int] = []
                     for ro in raw_orders:
+                        oid_raw = ro.get("orderId")
+                        try:
+                            oid = int(oid_raw) if oid_raw is not None else None
+                        except (TypeError, ValueError):
+                            oid = None
+                        ci = cancel_map.get(oid) if oid is not None else None
                         try:
                             orders_data.append(
-                                _parse_coupang_order(ro, account["id"], label)
+                                _parse_coupang_order(
+                                    ro, account["id"], label, cancel_info=ci
+                                )
                             )
                         except Exception as parse_err:
                             logger.warning(f"[주문동기화] 쿠팡 파싱 실패: {parse_err}")
                             continue
-                        if (
-                            (ro.get("status") or "").upper() == "ACCEPT"
-                            and not ro.get("cancelRequests")
-                            and not ro.get("returnRequests")
-                        ):
+                        if (ro.get("status") or "").upper() == "ACCEPT" and ci is None:
                             box_id_raw = ro.get("shipmentBoxId")
                             try:
                                 if box_id_raw is not None:
@@ -7349,8 +7395,15 @@ def _parse_coupang_order(
     order: dict,
     account_id: str,
     account_label: str,
+    cancel_info: Optional[dict] = None,
 ) -> dict[str, Any]:
-    """쿠팡 ordersheet 1건 → SambaOrder 데이터 변환."""
+    """쿠팡 ordersheet 1건 → SambaOrder 데이터 변환 (#246).
+
+    cancel_info: returnRequests v6 API 응답에서 매칭된 1건. 없으면 None.
+      필드: receiptId, receiptType(CANCEL/RETURN), faultByType,
+            reasonCode, reasonCodeText, cancelReasonCategory1/2,
+            releaseStatus(Y/N/S/A), releaseStopStatus, createdAt
+    """
     status_map = {
         "ACCEPT": "pending",
         "INSTRUCT": "pending",
@@ -7372,13 +7425,15 @@ def _parse_coupang_order(
     shipment_box_id = order.get("shipmentBoxId") or 0
     order_id = order.get("orderId") or 0
 
-    # 클레임 (취소/반품 요청) 우선
-    cancel_requests = order.get("cancelRequests") or []
-    return_requests = order.get("returnRequests") or []
-    if cancel_requests:
+    # 클레임 (취소/반품 요청) — returnRequests v6 API 응답으로 판단 (#246)
+    # 과거: order["cancelRequests"]/["returnRequests"] 의존했으나 ordersheets v5에 존재 X
+    receipt_type = (
+        ((cancel_info or {}).get("receiptType") or "").upper() if cancel_info else ""
+    )
+    if receipt_type == "CANCEL":
         market_order_status = "취소요청"
         internal_status = "cancel_requested"
-    elif return_requests:
+    elif receipt_type == "RETURN":
         market_order_status = "반품요청"
         internal_status = "return_requested"
     else:
@@ -7468,6 +7523,36 @@ def _parse_coupang_order(
     # 쿠팡 옵션 ID — 송장업로드 API(/orders/invoices) body 필수 파라미터
     vendor_item_id = str(first_item.get("vendorItemId") or "") or None
 
+    # 취소·반품 사유 필드 (#246) — cancel_info 매칭된 returnRequests v6 응답에서 추출
+    cancel_receipt_id: Optional[int] = None
+    cancel_reason_code: Optional[str] = None
+    cancel_reason_text: Optional[str] = None
+    cancel_reason_category1: Optional[str] = None
+    cancel_reason_category2: Optional[str] = None
+    cancel_fault_by: Optional[str] = None
+    cancel_release_status: Optional[str] = None
+    cancel_release_stop_status: Optional[str] = None
+    cancel_requested_at = None
+    if cancel_info:
+        _rid = cancel_info.get("receiptId")
+        if _rid is not None:
+            try:
+                cancel_receipt_id = int(_rid)
+            except (TypeError, ValueError):
+                cancel_receipt_id = None
+        cancel_reason_code = cancel_info.get("reasonCode") or None
+        cancel_reason_text = cancel_info.get("reasonCodeText") or None
+        cancel_reason_category1 = cancel_info.get("cancelReasonCategory1") or None
+        cancel_reason_category2 = cancel_info.get("cancelReasonCategory2") or None
+        cancel_fault_by = cancel_info.get("faultByType") or None
+        cancel_release_stop_status = cancel_info.get("releaseStopStatus") or None
+        # returnItems[].releaseStatus — 첫 항목 기준 (Y/N/S/A 단일값 가정)
+        return_items = cancel_info.get("returnItems") or []
+        if isinstance(return_items, list) and return_items:
+            first_ri = return_items[0] if isinstance(return_items[0], dict) else {}
+            cancel_release_status = first_ri.get("releaseStatus") or None
+        cancel_requested_at = _coupang_paid_to_utc(cancel_info.get("createdAt"))
+
     return {
         "order_number": order_number,
         "shipment_id": str(order_id) if order_id else "",
@@ -7504,6 +7589,16 @@ def _parse_coupang_order(
         "tracking_number": order.get("invoiceNumber", "") or "",
         "paid_at": _coupang_paid_to_utc(order.get("paidAt") or order.get("orderedAt")),
         "source": "coupang",
+        # 쿠팡 취소/반품 사유 (#246)
+        "cancel_receipt_id": cancel_receipt_id,
+        "cancel_reason_code": cancel_reason_code,
+        "cancel_reason_text": cancel_reason_text,
+        "cancel_reason_category1": cancel_reason_category1,
+        "cancel_reason_category2": cancel_reason_category2,
+        "cancel_fault_by": cancel_fault_by,
+        "cancel_release_status": cancel_release_status,
+        "cancel_release_stop_status": cancel_release_stop_status,
+        "cancel_requested_at": cancel_requested_at,
     }
 
 
