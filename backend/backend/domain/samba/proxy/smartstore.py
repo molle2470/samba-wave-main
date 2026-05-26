@@ -2199,26 +2199,25 @@ class SmartStoreClient:
                     sanitized_style
                 )
 
-        # 브랜드명 정제 — brandId가 이미 있으면(카탈로그 매칭 완료) 정제 스킵
-        # brandId 없을 때만 접미사 제거하여 검색 성공률 높임
-        if not product.get("_brand_id"):
-            import re as _re_brand
+        # 브랜드명 접미사 정제 — brandId 유무와 무관하게 항상 실행 (issue #211)
+        # 카탈로그가 brandName 미반환 + 파생표기(키즈/골프 등) 남으면 brandId 불일치로 400 발생
+        import re as _re_brand
 
-            _brand_suffixes = r"\s*(키즈|kids|kid|주니어|junior|jr|아동|유아|베이비|baby|우먼|women|맨즈|men|골프|golf|스포츠|sports|아웃도어|outdoor)\s*$"
-            if brand:
-                brand = (
-                    _re_brand.sub(
-                        _brand_suffixes, "", brand, flags=_re_brand.IGNORECASE
-                    ).strip()
-                    or brand
-                )
-            if mfr:
-                mfr = (
-                    _re_brand.sub(
-                        _brand_suffixes, "", mfr, flags=_re_brand.IGNORECASE
-                    ).strip()
-                    or mfr
-                )
+        _brand_suffixes = r"\s*(키즈|kids|kid|주니어|junior|jr|아동|유아|베이비|baby|우먼|women|맨즈|men|골프|golf|스포츠|sports|아웃도어|outdoor)\s*$"
+        if brand:
+            brand = (
+                _re_brand.sub(
+                    _brand_suffixes, "", brand, flags=_re_brand.IGNORECASE
+                ).strip()
+                or brand
+            )
+        if mfr:
+            mfr = (
+                _re_brand.sub(
+                    _brand_suffixes, "", mfr, flags=_re_brand.IGNORECASE
+                ).strip()
+                or mfr
+            )
 
         # 브랜드/제조사 — naverShoppingSearchInfo에 설정 (스마트스토어 상품주요정보)
         # brandName은 네이버에 등록된 브랜드만 허용 — brandId 있을 때만 전송

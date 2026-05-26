@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useCallback } from 'react'
-import { type SambaOrder } from '@/lib/samba/api/commerce'
+import { type AnalyticsAggregateRow } from '@/lib/samba/api/commerce'
 import { useLocalStorageState } from '@/hooks/useLocalStorageState'
 import { STORAGE_KEYS } from '@/lib/samba/constants'
 import { card, fmtNum } from '@/lib/samba/styles'
@@ -45,24 +45,44 @@ export default function AnalyticsPage() {
   }
 
   const {
-    loading, marketAccounts, orders,
+    loading, error, marketAccounts, aggregate,
     dailyData, sourcingRoi, bestSellers, brandData, load,
-  } = useAnalyticsData({ searchYear, searchMonth, setSelectedSites, setSelectedMarkets })
+  } = useAnalyticsData({
+    searchYear, searchMonth, setSelectedSites, setSelectedMarkets,
+    hasStoredMarkets: selectedMarkets.length > 0,
+    hasStoredSites: selectedSites.length > 0,
+  })
 
-  // 기간 + 주문상태 필터링 (고객결제일 기준)
-  const filteredOrders = orders.filter(o => {
-    const d = new Date(o.paid_at || o.created_at)
-    if (d.getFullYear() !== searchYear) return false
-    if (searchMonth > 0 && d.getMonth() + 1 !== searchMonth) return false
+  const channelToMarket = (name: string | undefined): string => {
+    if (!name) return '기타'
+    const idx = name.indexOf('(')
+    return idx > 0 ? name.substring(0, idx) : name
+  }
+
+  // 기간 + 마켓 + 소싱처 + 주문상태 필터링 (paid_at KST 기준)
+  // aggregate row.date 형식: 'YYYY-MM-DD' (백엔드에서 KST 변환 완료)
+  const filteredRows: AnalyticsAggregateRow[] = aggregate.filter(r => {
+    if (!r.date) return false
+    const [yStr, mStr] = r.date.split('-')
+    const y = Number(yStr), m = Number(mStr)
+    if (y !== searchYear) return false
+    if (searchMonth > 0 && m !== searchMonth) return false
     if (selectedStatuses.length < ORDER_STATUSES.length) {
-      if (!selectedStatuses.includes(o.status)) return false
+      if (!selectedStatuses.includes(r.status)) return false
+    }
+    if (selectedMarkets.length > 0) {
+      if (!selectedMarkets.includes(channelToMarket(r.channel_name))) return false
+    }
+    if (selectedSites.length > 0 && selectedSites.length < SOURCE_SITES.length) {
+      const siteKey = r.source_site && SOURCE_SITES.includes(r.source_site) ? r.source_site : '미등록상품'
+      if (siteKey !== '미등록상품' && !selectedSites.includes(siteKey)) return false
     }
     return true
   })
 
   // 전체 합계
-  const totalSales = filteredOrders.reduce((s, o) => s + (o.sale_price || 0), 0)
-  const totalOrders = filteredOrders.length
+  const totalSales = filteredRows.reduce((s, r) => s + (r.sales || 0), 0)
+  const totalOrders = filteredRows.reduce((s, r) => s + (r.orders || 0), 0)
 
   // ──────────────────────────────────────────────
   // 집계 함수: 월 선택 시 일별, 전체 시 월별
@@ -71,20 +91,21 @@ export default function AnalyticsPage() {
   const rowCount = isDaily ? new Date(searchYear, searchMonth, 0).getDate() : 12
 
   const buildTable = (
-    getKey: (o: SambaOrder) => string,
+    getKey: (r: AnalyticsAggregateRow) => string,
   ): { columns: string[], data: Record<number, Record<string, MonthlyCell>> } => {
     const colSet = new Set<string>()
     const data: Record<number, Record<string, MonthlyCell>> = {}
     for (let r = 1; r <= rowCount; r++) data[r] = {}
 
-    for (const o of filteredOrders) {
-      const d = new Date(o.paid_at || o.created_at)
-      const row = isDaily ? d.getDate() : d.getMonth() + 1
-      const key = getKey(o)
+    for (const ar of filteredRows) {
+      const [, mStr, dStr] = ar.date.split('-')
+      const row = isDaily ? Number(dStr) : Number(mStr)
+      if (!row || row < 1 || row > rowCount) continue
+      const key = getKey(ar)
       colSet.add(key)
       if (!data[row][key]) data[row][key] = { sales: 0, orders: 0 }
-      data[row][key].sales += o.sale_price || 0
-      data[row][key].orders += 1
+      data[row][key].sales += ar.sales || 0
+      data[row][key].orders += ar.orders || 0
     }
 
     const columns = [...colSet].sort()
@@ -92,21 +113,17 @@ export default function AnalyticsPage() {
   }
 
   // 마켓별 통계
-  const marketTable = buildTable(o => {
-    const name = o.channel_name || '기타'
-    const idx = name.indexOf('(')
-    return idx > 0 ? name.substring(0, idx) : name
-  })
+  const marketTable = buildTable(r => channelToMarket(r.channel_name))
   // 소싱처별 통계
-  const siteTable = buildTable(o => {
-    const site = o.source_site
+  const siteTable = buildTable(r => {
+    const site = r.source_site
     if (!site || !SOURCE_SITES.includes(site)) return '미등록상품'
     return site
   })
   // 주문상태별 통계
   const statusLabelMap: Record<string, string> = {}
   for (const s of ORDER_STATUSES) statusLabelMap[s.key] = s.label
-  const statusTable = buildTable(o => statusLabelMap[o.status] || o.status)
+  const statusTable = buildTable(r => statusLabelMap[r.status] || r.status || '미지정')
   // 주문상태별 컬럼을 ORDER_STATUSES 정의 순서로 정렬
   const statusColumnOrder = ORDER_STATUSES.map(s => s.label)
   const orderedStatusColumns = statusColumnOrder.filter(label => statusTable.columns.includes(label))
@@ -266,6 +283,17 @@ export default function AnalyticsPage() {
       <div style={{ marginBottom: '1.5rem' }}>
         <h2 style={{ fontSize: '1.5rem', fontWeight: 700, marginBottom: '0.25rem' }}>매출통계</h2>
       </div>
+
+      {/* 에러 배너 — 무음 0건 회귀 차단 */}
+      {error && (
+        <div style={{
+          padding: '0.75rem 1rem', marginBottom: '1rem',
+          background: 'rgba(220,38,38,0.12)', border: '1px solid #DC2626',
+          borderRadius: '4px', color: '#FCA5A5', fontSize: '0.8125rem',
+        }}>
+          매출 데이터 조회 실패: {error} — 잠시 후 [매출검색] 다시 눌러주세요.
+        </div>
+      )}
 
       {/* 검색 조건 */}
       <div style={{ ...card, padding: '1.25rem', marginBottom: '1.5rem' }}>

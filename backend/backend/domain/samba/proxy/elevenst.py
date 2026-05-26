@@ -356,7 +356,32 @@ class ElevenstClient:
             raise ElevenstApiError(f"API 에러 ({result_code}): {msg}")
 
         result = data
-        prd_no = result.get("productNo", "") if isinstance(result, dict) else ""
+        # 11번가 등록 응답은 환경에 따라 키가 prdNo / productNo / ProductNo 로 들쭉날쭉
+        # → 어떤 키로 와도 잡도록 다중 fallback
+        prd_no = ""
+        if isinstance(result, dict):
+            for _k in ("prdNo", "productNo", "ProductNo"):
+                _v = result.get(_k, "")
+                if _v:
+                    prd_no = _v
+                    break
+        # 응답 파싱 실패 시 sellerPrdCd로 11번가 강제 재조회하여 실제 prdNo 확보
+        # (등록 자체는 성공해도 응답 키 매칭 실패로 DB 매핑 누락되는 사고 방지)
+        if not prd_no:
+            try:
+                import re as _re
+
+                m = _re.search(r"<sellerPrdCd>([^<]+)</sellerPrdCd>", xml_data)
+                seller_prd_cd = (m.group(1) if m else "").strip()
+                if seller_prd_cd:
+                    lookup = await self.find_by_seller_code(seller_prd_cd)
+                    if lookup.get("found") and lookup.get("prd_no"):
+                        prd_no = lookup["prd_no"]
+                        logger.warning(
+                            f"[11번가] 등록응답 prdNo 파싱 실패 → sellerprodcode 재조회로 확보: {prd_no}"
+                        )
+            except Exception as _e:
+                logger.warning(f"[11번가] 등록응답 prdNo fallback 조회 실패: {_e}")
         logger.info(
             f"[11번가] 상품 등록 완료 — prdNo={prd_no}, keys={list(result.keys()) if isinstance(result, dict) else type(result)}"
         )

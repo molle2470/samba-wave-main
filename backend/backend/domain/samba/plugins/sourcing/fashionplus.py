@@ -79,9 +79,18 @@ class FashionPlusPlugin(SourcingPlugin):
 
         new_sale_price = fresh.get("sale_price")
         new_original_price = fresh.get("original_price")
-        # 배송비 포함 원가
+        # 배송비 포함 원가 — sale_price 추출 실패 시 cost=None (배송비만 박는 폴백 금지)
         shipping_fee = fresh.get("shipping_fee", 3000)
-        new_cost = (new_sale_price or 0) + shipping_fee
+        if new_sale_price is None or new_sale_price <= 0:
+            new_cost = None
+            _price_uncertain = True
+            logger.warning(
+                f"[FashionPlus][가격불확실] sale_price 추출 실패: {site_product_id} "
+                f"→ cost 갱신 및 전송 보류"
+            )
+        else:
+            new_cost = new_sale_price + shipping_fee
+            _price_uncertain = False
 
         old_sale_price = getattr(product, "sale_price", None)
         old_cost = getattr(product, "cost", None)
@@ -113,4 +122,5 @@ class FashionPlusPlugin(SourcingPlugin):
             new_options=new_options,
             changed=price_changed,
             stock_changed=stock_changed,
+            price_uncertain=_price_uncertain,
         )

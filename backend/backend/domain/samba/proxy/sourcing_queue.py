@@ -22,7 +22,66 @@ _JOB_TTL_SEC: dict[str, int] = {
     "detail": 180,
     "tracking": 3600,
     "reward": 3600,
+    "cancel_order": 1800,
 }
+
+# 데몬 전용 사이트 — 사용자 룰 (3일 강조): SSG/ABC/GrandStage/LOTTEON 은 데몬으로만.
+# 데몬 매칭 없으면 잡 발행 자체 skip. 확장앱 fallback 절대 금지 (60s 미응답 차단 누적).
+# 무신사/GSShop 등은 확장앱 fallback 허용 (DAEMON_ONLY_SITES 외 = detail/reward/cancel 한정).
+# 이건 "라우팅 정책"(어디로 보낼지) — pc_allowed_sites "사용자 분담"(누가 받을지)와 별개.
+DAEMON_ONLY_SITES: set[str] = {"SSG", "ABCmart", "GrandStage", "LOTTEON"}
+
+# 잡 타입별 데몬 강제 사이트 매트릭스 — 사이트 단일 집합으로는 한계.
+# 송장(tracking)은 MUSINSA/GSShop 까지 데몬 핸들러 등록 (site_handlers.py).
+# 그 외 잡 타입(search/detail/reward/cancel)은 SSG/ABC/GrandStage/LOTTEON 만 데몬 지원.
+# 사이트 추가 시 `tools/lotteon_daemon/site_handlers.py` 핸들러 + --sites CLI + 본 dict 동시 갱신 필수.
+DAEMON_ONLY_JOB_SITES: dict[str, set[str]] = {
+    "search": DAEMON_ONLY_SITES,
+    "detail": DAEMON_ONLY_SITES,
+    "reward": DAEMON_ONLY_SITES,
+    "cancel_order": DAEMON_ONLY_SITES,
+    "tracking": DAEMON_ONLY_SITES
+    | {"MUSINSA", "GSShop", "FashionPlus", "Nike", "OliveYoung", "KREAM"},
+}
+
+# 송장 전용 별칭 — 하위호환. 신규 코드는 DAEMON_ONLY_JOB_SITES["tracking"] 사용 권장.
+DAEMON_ONLY_TRACKING_SITES: set[str] = DAEMON_ONLY_JOB_SITES["tracking"]
+
+
+def _daemon_only_for_job(job_type: str) -> set[str]:
+    """잡 타입별 데몬 강제 사이트 집합. 미정의 타입은 기본 DAEMON_ONLY_SITES."""
+    return DAEMON_ONLY_JOB_SITES.get(job_type, DAEMON_ONLY_SITES)
+
+
+def _resolve_job_owner(site: str, job_type: str) -> str | None:
+    """잡 owner = PC 체크박스 단일 룰 (2026-05-26 재정리).
+
+    site 가 DAEMON_ONLY_JOB_SITES[job_type] 에 속하면 **데몬만** 매칭, 확장앱 폴백 차단.
+    그 외 사이트는 데몬 우선 → 확장앱 폴백. 둘 다 매칭 없으면 None → 잡 발행 skip.
+
+    배경: 송장수집을 데몬 헤드리스로 전환했음에도 데몬 미응답 시 확장앱 폴백으로
+    탭 팝업 회귀하던 버그. job_type 인자가 받기만 하고 무시되던 결함 제거.
+    """
+    from backend.domain.samba.proxy.daemon_pool import (
+        pick_any_owner,
+        pick_daemon_owner,
+    )
+
+    if (site or "").upper() in {s.upper() for s in _daemon_only_for_job(job_type)}:
+        return pick_daemon_owner(site)
+    return pick_any_owner(site)
+
+
+# 하위호환 wrapper — 기존 호출처 보존.
+def _resolve_owner_with_daemon_policy(site: str) -> str | None:
+    """기본 정책(DAEMON_ONLY_SITES) wrapper — search/detail/reward/cancel 공용."""
+    return _resolve_job_owner(site, "detail")
+
+
+def _resolve_tracking_owner(site: str) -> str | None:
+    """송장 전용 wrapper — DAEMON_ONLY_JOB_SITES['tracking'] 사용."""
+    return _resolve_job_owner(site, "tracking")
+
 
 # 적립 액션별 진입 URL — 확장앱이 잡 받으면 이 URL의 탭을 열고 content script 주입.
 REWARD_ACTION_URLS: dict[str, str] = {
@@ -207,8 +266,15 @@ class SourcingQueue:
         future: asyncio.Future[Any] = loop.create_future()
 
         if owner_device_id is None:
-            # 사이트별 매핑 우선 → 없으면 기본 owner (PC 분산 지원)
-            owner_device_id = get_autotune_owner(site)
+            owner_device_id = _resolve_job_owner(site, "search")
+
+        if owner_device_id is None and (site or "").upper() in {
+            s.upper() for s in _daemon_only_for_job("search")
+        }:
+            logger.warning(
+                f"[소싱큐] {site} 검색 데몬 미등록 — 잡 발행 skip: '{keyword}'"
+            )
+            raise RuntimeError(f"{site} 데몬 미등록 — 검색 잡 발행 불가")
 
         job: dict[str, Any] = {
             "requestId": request_id,
@@ -222,7 +288,7 @@ class SourcingQueue:
             job["maxCount"] = max_count
         cls.resolvers[request_id] = future
         asyncio.create_task(_db_insert_job(job, "search"))
-        _owner_tag = f" owner={owner_device_id[:8]}" if owner_device_id else ""
+        _owner_tag = f" owner={owner_device_id}" if owner_device_id else ""
         logger.info(
             f"[소싱큐] 검색 추가: {site} '{keyword}' (id={request_id}){_owner_tag}"
         )
@@ -259,8 +325,15 @@ class SourcingQueue:
         future: asyncio.Future[Any] = loop.create_future()
 
         if owner_device_id is None:
-            # 사이트별 매핑 우선 → 없으면 기본 owner (PC 분산 지원)
-            owner_device_id = get_autotune_owner(site)
+            owner_device_id = _resolve_job_owner(site, "detail")
+
+        if owner_device_id is None and (site or "").upper() in {
+            s.upper() for s in _daemon_only_for_job("detail")
+        }:
+            logger.warning(
+                f"[소싱큐] {site} 데몬 미등록 — 잡 발행 skip (확장앱 fallback 차단): {product_id}"
+            )
+            raise RuntimeError(f"{site} 데몬 미등록 — 잡 발행 불가")
 
         job: dict[str, Any] = {
             "requestId": request_id,
@@ -276,7 +349,7 @@ class SourcingQueue:
             job.update(extra)
         cls.resolvers[request_id] = future
         asyncio.create_task(_db_insert_job(job, "detail", priority=priority))
-        _owner_tag = f" owner={owner_device_id[:8]}" if owner_device_id else ""
+        _owner_tag = f" owner={owner_device_id}" if owner_device_id else ""
         _prio_tag = " [우선]" if priority else ""
         logger.info(
             f"[소싱큐] 상세 추가: {site} #{product_id} (id={request_id}){_owner_tag}{_prio_tag}"
@@ -308,7 +381,14 @@ class SourcingQueue:
         loop = asyncio.get_event_loop()
         future: asyncio.Future[Any] = loop.create_future()
         if owner_device_id is None:
-            owner_device_id = get_autotune_owner(site)
+            owner_device_id = _resolve_job_owner(site, "tracking")
+        if owner_device_id is None and (site or "").upper() in {
+            s.upper() for s in _daemon_only_for_job("tracking")
+        }:
+            logger.warning(
+                f"[소싱큐] {site} 송장 데몬 미등록 — 잡 발행 skip: ord={sourcing_order_number}"
+            )
+            raise RuntimeError(f"{site} 데몬 미등록 — 송장 잡 발행 불가")
 
         job: dict[str, Any] = {
             "requestId": request_id,
@@ -322,7 +402,7 @@ class SourcingQueue:
         }
         cls.resolvers[request_id] = future
         await _db_insert_job(job, "tracking")
-        _owner_tag = f" owner={owner_device_id[:8]}" if owner_device_id else ""
+        _owner_tag = f" owner={owner_device_id}" if owner_device_id else ""
         logger.info(
             f"[소싱큐] 송장조회 추가: {site} ord={sourcing_order_number} "
             f"(id={request_id}){_owner_tag}"
@@ -354,10 +434,15 @@ class SourcingQueue:
         loop = asyncio.get_event_loop()
         future: asyncio.Future[Any] = loop.create_future()
         if owner_device_id is None:
-            owner_device_id = get_autotune_owner(site)
-        # reward 잡은 owner 안 박음 — 대신 get_next_job 에서 X-Ext-Version 헤더로
-        # 옛 확장앱(reward 분기 모름) 필터링. "가장 최근 폴링 PC = 사용자 PC" 가정은
-        # 멀티PC 환경에서 다른 PC가 폴링 더 자주 하면 깨짐 → 검증 실패.
+            owner_device_id = _resolve_job_owner(site, "reward")
+
+        if owner_device_id is None and (site or "").upper() in {
+            s.upper() for s in _daemon_only_for_job("reward")
+        }:
+            logger.warning(
+                f"[소싱큐] {site} 적립 데몬 미등록 — 잡 발행 skip: action={action}"
+            )
+            raise RuntimeError(f"{site} 데몬 미등록 — 적립 잡 발행 불가")
 
         job: dict[str, Any] = {
             "requestId": request_id,
@@ -370,12 +455,164 @@ class SourcingQueue:
         }
         cls.resolvers[request_id] = future
         await _db_insert_job(job, "reward")
-        _owner_tag = f" owner={owner_device_id[:8]}" if owner_device_id else ""
+        _owner_tag = f" owner={owner_device_id}" if owner_device_id else ""
         logger.info(
             f"[소싱큐] 적립 추가: {site} action={action} acct={sourcing_account_id} "
             f"(id={request_id}){_owner_tag}"
         )
         return request_id, future
+
+    @classmethod
+    async def add_cancel_order_job(
+        cls,
+        site: str,
+        sourcing_order_number: str,
+        order_id: str,
+        *,
+        sourcing_account_id: str = "",
+        url: str = "",
+        owner_device_id: str | None = None,
+    ) -> tuple[str, asyncio.Future[Any]]:
+        """소싱처 발주 취소 작업 큐에 추가 (헤드리스 데몬 처리).
+
+        - tracking 잡과 동일 패턴 — 데몬 우선 라우팅, 없으면 확장앱 폴백.
+        - 결과 라우터: POST /api/v1/samba/proxy/sourcing/cancel-result
+        - 결과 스키마: {success, cancelled, alreadyShipped?, reason?, error?}
+        - 사이트별 cancel_js 미정의면 데몬이 "미지원" 실패 회신 — 부작용 없음.
+        """
+        cls._ensure_accepting_jobs()
+        if not sourcing_order_number:
+            raise ValueError("sourcing_order_number 필수")
+        request_id = str(uuid.uuid4())[:8]
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+        if owner_device_id is None:
+            owner_device_id = _resolve_job_owner(site, "cancel_order")
+
+        if owner_device_id is None and (site or "").upper() in {
+            s.upper() for s in _daemon_only_for_job("cancel_order")
+        }:
+            logger.warning(
+                f"[소싱큐] {site} 발주취소 데몬 미등록 — 잡 발행 skip: "
+                f"ord={sourcing_order_number}"
+            )
+            raise RuntimeError(f"{site} 데몬 미등록 — 발주취소 잡 발행 불가")
+
+        job: dict[str, Any] = {
+            "requestId": request_id,
+            "site": site,
+            "type": "cancel_order",
+            "url": url or "",
+            "orderId": order_id,
+            "sourcingOrderNumber": sourcing_order_number,
+            "sourcingAccountId": sourcing_account_id or "",
+            "ownerDeviceId": owner_device_id or "",
+        }
+        cls.resolvers[request_id] = future
+        await _db_insert_job(job, "cancel_order")
+        _owner_tag = f" owner={owner_device_id}" if owner_device_id else ""
+        logger.info(
+            f"[소싱큐] 발주취소 추가: {site} ord={sourcing_order_number} "
+            f"(id={request_id}){_owner_tag}"
+        )
+        return request_id, future
+
+    @classmethod
+    async def maybe_trigger_auto_cancel(
+        cls,
+        *,
+        order_id: str,
+        source_site: str | None,
+        sourcing_order_number: str | None,
+        sourcing_account_id: str | None,
+        new_status: str | None,
+        shipping_status: str | None,
+        prev_status: str | None = None,
+    ) -> bool:
+        """마켓 상태가 cancel_requested 로 진입하면 소싱처 자동 취소 잡 발행.
+
+        호출 지점: 마켓 폴러/동기화 코드에서 order.status 가 cancel_requested 로
+        갱신된 직후. 다음 가드를 모두 통과해야 잡 발행:
+
+        - new_status 가 cancel_requested 또는 cancelling
+        - prev_status 가 new_status 와 동일하면 skip (중복 트리거 방지)
+        - source_site / sourcing_order_number 미존재 시 skip (아직 발주 안 된 주문)
+        - shipping_status 가 배송 진행 키워드 포함 시 skip (이미 발송됨 → 자동 취소 불가)
+        - 같은 (source_site, sourcing_order_number) 의 pending/dispatched cancel_order
+          잡이 이미 존재하면 skip (멱등성)
+
+        반환: True = 잡 발행됨, False = skip.
+        """
+        from backend.domain.samba.order.model import (
+            SHIPPED_SHIPPING_STATUS_KEYWORDS,
+        )
+
+        normalized = (new_status or "").strip().lower()
+        if normalized not in {"cancel_requested", "cancelling"}:
+            return False
+        if prev_status and prev_status.strip().lower() == normalized:
+            return False
+        site = (source_site or "").strip()
+        ord_no = (sourcing_order_number or "").strip()
+        if not site or not ord_no:
+            return False
+
+        ship = shipping_status or ""
+        for kw in SHIPPED_SHIPPING_STATUS_KEYWORDS:
+            if kw in ship:
+                logger.info(
+                    f"[자동취소] order={order_id} 배송단계({ship!r}) — 자동 취소 skip"
+                )
+                return False
+
+        # 중복 가드: 동일 (site, ord_no) cancel_order 잡 in-flight 검사
+        from sqlalchemy import and_, or_, select
+
+        try:
+            async with get_write_session() as session:
+                stmt = (
+                    select(SambaSourcingJob.request_id)
+                    .where(
+                        and_(
+                            SambaSourcingJob.job_type == "cancel_order",
+                            SambaSourcingJob.site == site,
+                            or_(
+                                SambaSourcingJob.status == "pending",
+                                SambaSourcingJob.status == "dispatched",
+                            ),
+                            SambaSourcingJob.payload["sourcingOrderNumber"].astext
+                            == ord_no,
+                        )
+                    )
+                    .limit(1)
+                )
+                existing = (await session.execute(stmt)).scalar_one_or_none()
+                if existing is not None:
+                    logger.info(
+                        f"[자동취소] order={order_id} 잡 이미 존재({existing}) — skip"
+                    )
+                    return False
+        except Exception as exc:
+            logger.warning(f"[자동취소] 중복 가드 조회 실패 (계속): {exc}")
+
+        try:
+            await cls.add_cancel_order_job(
+                site=site,
+                sourcing_order_number=ord_no,
+                order_id=order_id,
+                sourcing_account_id=sourcing_account_id or "",
+            )
+            logger.info(
+                f"[자동취소] order={order_id} site={site} ord={ord_no} 잡 발행 완료"
+            )
+            return True
+        except RuntimeError as exc:
+            # 데몬 미등록 / 확장앱 미연결 — 운영자 수동 처리 필요
+            logger.warning(f"[자동취소] order={order_id} 발행 실패: {exc}")
+            return False
+        except Exception as exc:
+            logger.exception(f"[자동취소] order={order_id} 예외: {exc}")
+            return False
 
     @classmethod
     async def get_next_job(
@@ -437,13 +674,28 @@ class SourcingQueue:
             else:
                 conditions.append("(owner_device_id IS NULL OR owner_device_id = '')")
 
-            # site 필터
+            # 데몬 전용 사이트 가드 — DAEMON_ONLY_SITES (LOTTEON/SSG/ABCmart/GrandStage)
+            # 의 모든 job_type (detail/search/tracking/reward/cancel_order) 확장앱 차단.
+            # 사용자 룰 (3일 강조): 4개 사이트는 데몬 전용. 발행 측 가드(add_*_job)와
+            # dequeue 측 가드 2중 장벽 — 옛 잡이 큐에 남아있어도 비데몬 dev 가 못 받음.
+            # 모듈 상수 DAEMON_ONLY_SITES 재사용 (단일 진실 출처).
+            if not device_id.startswith("samba-daemon-"):
+                _sites = sorted(DAEMON_ONLY_SITES)
+                _dph = ", ".join(f":dsite_{i}" for i in range(len(_sites)))
+                conditions.append(f"UPPER(site) NOT IN ({_dph})")
+                for i, s in enumerate(_sites):
+                    params[f"dsite_{i}"] = s.upper()
+
+            # site 필터 — 케이싱 무관 매칭.
+            # detail 잡 site='ABCmart'(혼합)인데 tracking 잡 site='ABCMART'(대문자)라
+            # 데몬 폴링(X-Poll-Site='ABCmart')이 ABCMART tracking 잡을 dequeue 하려면
+            # UPPER 양쪽 비교 필요. 사이트명 충돌 없어 안전.
             if allowed_sites is not None:
                 site_list = [s.strip() for s in allowed_sites if s.strip()]
                 placeholders = ", ".join(f":site_{i}" for i in range(len(site_list)))
-                conditions.append(f"site IN ({placeholders})")
+                conditions.append(f"UPPER(site) IN ({placeholders})")
                 for i, s in enumerate(site_list):
-                    params[f"site_{i}"] = s
+                    params[f"site_{i}"] = s.upper()
 
             where = " AND ".join(conditions)
             # [중요] 모달 리스트 정렬과 동일 순서 — site → sourcing_account_id → created_at.

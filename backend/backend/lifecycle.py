@@ -354,6 +354,89 @@ _order_auto_sync_task: asyncio.Task | None = None
 _order_auto_sync_last_run: float = 0.0
 _reward_auto_task: asyncio.Task | None = None
 _reward_auto_last_run: float = 0.0
+_pc_sync_task: asyncio.Task | None = None
+_pc_cleanup_task: asyncio.Task | None = None
+
+
+async def _pc_sync_loop() -> None:
+    """매 10초 PC 분담 매핑 DB → in-memory 동기화 (worker 간 sync).
+
+    Gunicorn 다중 worker 환경에서 UI POST 가 1개 worker 만 갱신해 다른 worker 의
+    잡 발행 시 stale 매핑 사용 → 잡 발행 skip 사고 차단. lifecycle background task.
+    """
+    from backend.api.v1.routers.samba.collector_autotune import (
+        sync_pc_allowed_sites_from_db,
+    )
+
+    _lg = logging.getLogger("backend.pc-sync")
+    while True:
+        try:
+            await sync_pc_allowed_sites_from_db()
+        except Exception as exc:
+            _lg.warning(f"[lifecycle][pc-sync] 동기화 실패(무시): {exc}")
+        await asyncio.sleep(10)
+
+
+async def _pc_cleanup_loop() -> None:
+    """매 60초 PC 분담 매핑 자동 cleanup — dead device + 빈 분담 제거.
+
+    1) samba_extension_key 에서 active device_id 목록 조회 (revoked/expired 제외)
+    2) autotune_pc_allowed_sites 에서 active_set 외 device 또는 빈 분담 dev 제거
+    3) 변경 발생 시 DB UPDATE → 다음 sync_loop 가 in-memory 정리
+
+    사용자가 데몬 삭제/PC 교체 시 옛 흔적 자동 정리 — 수동 SQL 부담 제거.
+    """
+    import json
+
+    from backend.api.v1.routers.samba.proxy._helpers import _get_setting, _set_setting
+    from backend.db.orm import get_read_session, get_write_session
+
+    _lg = logging.getLogger("backend.pc-cleanup")
+    while True:
+        try:
+            # 1) active device 목록
+            async with get_read_session() as session:
+                from sqlalchemy import text
+
+                rows = await session.execute(
+                    text(
+                        "SELECT DISTINCT device_id FROM samba_extension_key "
+                        "WHERE device_id IS NOT NULL AND revoked_at IS NULL "
+                        "AND (expires_at IS NULL OR expires_at > now())"
+                    )
+                )
+                active_set = {r[0] for r in rows.all() if r[0]}
+
+                # 2) DB 분담 매핑 조회
+                current = await _get_setting(session, "autotune_pc_allowed_sites")
+            if not isinstance(current, dict):
+                await asyncio.sleep(60)
+                continue
+
+            # 3) cleanup — active device 만 유지 (빈 분담 허용)
+            # active key 면 사용자 체크박스 비어있는 상태도 정상 → 보존.
+            # 옛/revoked device 만 제거.
+            cleaned = {
+                k: v
+                for k, v in current.items()
+                if k in active_set and isinstance(v, list)
+            }
+
+            if cleaned != current:
+                removed = sorted(set(current.keys()) - set(cleaned.keys()))
+                async with get_write_session() as wsess:
+                    await _set_setting(wsess, "autotune_pc_allowed_sites", cleaned)
+                    await wsess.commit()
+                _lg.info(
+                    "[pc-cleanup] dead device 매핑 %d개 제거: %s",
+                    len(removed),
+                    removed[:5],
+                )
+        except Exception as exc:
+            _lg.warning(f"[lifecycle][pc-cleanup] 실패(무시): {exc}")
+            # unused 방지
+            _ = json  # noqa: F841
+        await asyncio.sleep(60)
 
 
 async def _tetris_sync_loop() -> None:
@@ -577,11 +660,13 @@ async def _warmup_tetris_board_cache(logger: logging.Logger) -> None:
 
 
 async def _start_tetris_sync_scheduler() -> None:
-    global _tetris_sync_task
+    global _tetris_sync_task, _pc_sync_task, _pc_cleanup_task
 
     _tetris_sync_task = asyncio.create_task(_tetris_sync_loop())
+    _pc_sync_task = asyncio.create_task(_pc_sync_loop())
+    _pc_cleanup_task = asyncio.create_task(_pc_cleanup_loop())
     logging.getLogger("backend.lifecycle").info(
-        "[lifecycle] 테트리스 sync 스케줄러 시작"
+        "[lifecycle] 테트리스 sync + PC 분담 sync + cleanup 스케줄러 시작"
     )
 
 
@@ -927,6 +1012,44 @@ async def _start_elevenst_ghost_reconciler() -> None:
     )
 
 
+# 컨테이너 재시작 후 filters 캐시 cold → 첫 호출 100초 → 프론트 fetch 타임아웃 →
+# 체크박스 빈 채로 뜨던 문제. startup 시 백그라운드로 미리 워밍업.
+async def _warmup_filters_cache() -> None:
+    """autotune_get_filters 캐시 백그라운드 워밍업 (2026-05-25, 사용자 요청).
+
+    + warroom dashboard 캐시도 같이 워밍업 — 페이지 첫 진입 cold start 83초 블로킹 차단.
+    """
+    _log = logging.getLogger("backend.lifecycle")
+    try:
+        from backend.api.v1.routers.samba.collector_autotune import autotune_get_filters
+
+        await autotune_get_filters()
+        _log.info("[lifecycle] filters 캐시 워밍업 완료")
+    except Exception as exc:
+        _log.warning("[lifecycle] filters 캐시 워밍업 실패(무시): %s", exc)
+
+    # warroom dashboard 캐시 — 사용자 첫 진입 시 빈 구조 대신 실제 데이터 즉시 노출
+    try:
+        from backend.domain.samba.warroom.service import SambaMonitorService
+        from backend.db.orm import get_read_session
+
+        async with get_read_session() as sess:
+            svc = SambaMonitorService(sess)
+            await svc._compute_dashboard_now()
+        _log.info("[lifecycle] warroom dashboard 캐시 워밍업 완료")
+    except Exception as exc:
+        _log.warning("[lifecycle] warroom dashboard 캐시 워밍업 실패(무시): %s", exc)
+
+
+_filters_warmup_task: asyncio.Task | None = None
+
+
+async def _start_filters_warmup() -> None:
+    """startup 직후 filters 캐시 채움 — 첫 사용자 fetch 타임아웃 방지."""
+    global _filters_warmup_task
+    _filters_warmup_task = asyncio.create_task(_warmup_filters_cache())
+
+
 async def _start_lotteon_ghost_reconciler() -> None:
     """롯데ON 유령상품 일일 자동 감지 잡 — 24시간 주기."""
     global _lotteon_ghost_reconciler_task
@@ -1108,6 +1231,7 @@ async def lifespan(app: FastAPI):
         await _start_sourcing_job_cleanup()
         await _start_lotteon_ghost_reconciler()
         await _start_elevenst_ghost_reconciler()
+        await _start_filters_warmup()
         await _start_coupang_pid_reconciler()
     _validate_startup_settings()
 

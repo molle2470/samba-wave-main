@@ -73,17 +73,26 @@ async def send_invoice_to_market(
 
 
 async def _send_lotteon(order, account, courier, tracking, session):
-    from backend.domain.samba.forbidden.repository import SambaSettingsRepository
+    from backend.domain.samba.account.resolver import resolve_market_creds
     from backend.domain.samba.proxy.lotteon import LotteonClient
 
     lo_api_key = (
         (account.additional_fields or {}).get("apiKey", "") or account.api_key or ""
     )
     if not lo_api_key:
-        _repo = SambaSettingsRepository(session)
-        _row = await _repo.find_by_async(key="store_lotteon")
-        if _row and isinstance(_row.value, dict):
-            lo_api_key = _row.value.get("apiKey", "")
+        # (2026-05-25) resolver 위임 — account_id 명시로 그 계정 자격증명만 해석.
+        # default 계정 폴백 금지: 테트리스/정책으로 정해진 계정 결정을 덮어선 안 됨.
+        _tid = getattr(account, "tenant_id", None) if account else None
+        _aid = getattr(account, "id", None) if account else None
+        _creds = await resolve_market_creds(
+            session,
+            _tid,
+            market_type="lotteon",
+            store_key="store_lotteon",
+            account_id=_aid,
+        )
+        if _creds:
+            lo_api_key = _creds.get("apiKey", "")
     if not lo_api_key:
         return False, "롯데ON API Key 누락"
 
@@ -103,18 +112,27 @@ async def _send_lotteon(order, account, courier, tracking, session):
 
 
 async def _send_smartstore(order, account, courier, tracking, session):
-    from backend.domain.samba.forbidden.repository import SambaSettingsRepository
+    from backend.domain.samba.account.resolver import resolve_market_creds
     from backend.domain.samba.proxy.smartstore import SmartStoreClient
 
     _extras = account.additional_fields or {}
     cid = _extras.get("clientId", "") or account.api_key or ""
     csecret = _extras.get("clientSecret", "") or account.api_secret or ""
     if not cid or not csecret:
-        _repo = SambaSettingsRepository(session)
-        _row = await _repo.find_by_async(key="store_smartstore")
-        if _row and isinstance(_row.value, dict):
-            cid = cid or _row.value.get("clientId", "")
-            csecret = csecret or _row.value.get("clientSecret", "")
+        # (2026-05-25) resolver 위임 — account_id 명시로 그 계정 자격증명만 해석.
+        # default 계정 폴백 금지: 테트리스/정책으로 정해진 계정 결정을 덮어선 안 됨.
+        _tid = getattr(account, "tenant_id", None) if account else None
+        _aid = getattr(account, "id", None) if account else None
+        _creds = await resolve_market_creds(
+            session,
+            _tid,
+            market_type="smartstore",
+            store_key="store_smartstore",
+            account_id=_aid,
+        )
+        if _creds:
+            cid = cid or _creds.get("clientId", "")
+            csecret = csecret or _creds.get("clientSecret", "")
     if not cid or not csecret:
         return False, "스마트스토어 자격증명(clientId/Secret) 누락"
 
@@ -316,14 +334,50 @@ async def _send_lottehome(order, account, courier, tracking, session):
 
     courier_code = lottehome_courier_code(courier)
     extras = account.additional_fields or {}
-    if not extras.get("userId") or not extras.get("password"):
+
+    # issue #216 — plugins/markets/lottehome.py 와 동일한 자격증명 우선순위 적용:
+    # additional_fields → lottehome_credentials → store_lottehome → seller_id
+    from backend.domain.samba.forbidden.model import SambaSettings
+    from sqlmodel import select as _select
+
+    async def _load_setting(key: str):
+        try:
+            _r = await session.execute(
+                _select(SambaSettings).where(SambaSettings.key == key)
+            )
+            _row = _r.scalars().first()
+            return _row.value if _row else None
+        except Exception:
+            return None
+
+    _lh_creds = await _load_setting("lottehome_credentials")
+    _lh_store = await _load_setting("store_lottehome")
+
+    def _pick(*keys: str) -> str:
+        for src in (
+            extras,
+            _lh_creds if isinstance(_lh_creds, dict) else {},
+            _lh_store if isinstance(_lh_store, dict) else {},
+        ):
+            for k in keys:
+                v = src.get(k) if isinstance(src, dict) else None
+                if v:
+                    return str(v)
+        return ""
+
+    user_id = _pick("userId") or (getattr(account, "seller_id", "") or "")
+    password = _pick("password")
+    agnc_no = _pick("agncNo") or user_id
+    env = _pick("env") or "test"
+
+    if not user_id or not password:
         return False, "롯데홈쇼핑 자격증명(userId/password) 누락"
 
     client = LotteHomeClient(
-        user_id=extras.get("userId", ""),
-        password=extras.get("password", ""),
-        agnc_no=extras.get("agncNo", ""),
-        env=extras.get("env", "test"),
+        user_id=user_id,
+        password=password,
+        agnc_no=agnc_no,
+        env=env,
     )
     api_resp = await client.send_invoice(
         ord_no=ord_no,

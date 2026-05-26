@@ -1849,9 +1849,15 @@ async def _do_sync_cs_from_markets(
                 )
 
         except Exception as e:
-            logger.error(f"[CS동기화] 롯데ON({lo_setting.key}) 동기화 실패: {e}")
+            # issue #214 — SambaMarketAccount/SambaSettings 양쪽 안전 폴백
+            _label = (
+                getattr(lo_setting, "account_label", None)
+                or getattr(lo_setting, "key", None)
+                or ""
+            )
+            logger.error(f"[CS동기화] 롯데ON({_label}) 동기화 실패: {e}")
             errors.append(
-                f"롯데ON({lo_setting.key}): {str(e)}"
+                f"롯데ON({_label}): {str(e)}"
             )  # 독립 에러 격리 — 다른 마켓에 영향 없음
 
     # 미연결 CS 문의 일괄 매칭 (market_product_no → market_product_nos)
@@ -2526,6 +2532,176 @@ async def _do_sync_cs_from_markets(
                 await ssg_client.close()
     except Exception as e:
         logger.warning(f"[CS동기화] SSG 계정 조회 실패: {e}")
+
+    # ── ESM Plus (G마켓 / 옥션) 판매자 문의 수집 ──
+    # qnaType 사이트별: G마켓=[3] 전체, 옥션=[1 일반, 2 비밀글]
+    # status=1 전체, type=1 (서버 필수 — 누락 시 500 "Error getting value from 'Type'")
+    # 클라이언트가 type 누락 시 자동 1로 채워주지만 명시도 OK
+    try:
+        from backend.domain.samba.account.model import SambaMarketAccount
+        from backend.domain.samba.proxy.esmplus import (
+            ESMPlusClient,
+            resolve_esm_credentials,
+        )
+        from sqlalchemy import func as sa_func
+
+        esm_stmt = select(SambaMarketAccount).where(
+            sa_func.lower(SambaMarketAccount.market_type).in_(("gmarket", "auction")),
+            SambaMarketAccount.is_active == True,  # noqa: E712
+        )
+        esm_result = await session.execute(esm_stmt)
+        esm_accounts = esm_result.scalars().all()
+        if account_id:
+            esm_accounts = (
+                [acc for acc in esm_accounts if acc.id == account_id]
+                if target_market_type in ("gmarket", "auction")
+                else []
+            )
+
+        for esm_acc in esm_accounts:
+            esm_mt = (esm_acc.market_type or "").lower()
+            esm_label = (
+                esm_acc.account_label
+                or esm_acc.business_name
+                or esm_acc.market_name
+                or esm_mt
+            )
+            esm_seller_id = esm_acc.seller_id or ""
+            if not esm_seller_id:
+                continue
+            esm_hosting_id, esm_secret_key = await resolve_esm_credentials(
+                session, esm_acc
+            )
+            if not esm_hosting_id or not esm_secret_key:
+                continue
+            esm_market_label = "G마켓" if esm_mt == "gmarket" else "옥션"
+            esm_qna_types = [3] if esm_mt == "gmarket" else [1, 2]
+
+            # 7일 단위 (claim/CS API 한도)
+            esm_end = datetime.now(timezone.utc)
+            esm_start = esm_end - timedelta(days=7)
+            esm_from = esm_start.strftime("%Y-%m-%d")
+            esm_to = esm_end.strftime("%Y-%m-%d")
+
+            esm_client = ESMPlusClient(
+                esm_hosting_id, esm_secret_key, esm_seller_id, site=esm_mt
+            )
+            try:
+                esm_synced = 0
+                for qna_type in esm_qna_types:
+                    try:
+                        resp = await esm_client.search_customer_inquiries(
+                            {
+                                "qnaType": qna_type,
+                                "status": 1,
+                                "type": 1,
+                                "startDate": esm_from,
+                                "endDate": esm_to,
+                            }
+                        )
+                    except Exception as qe:
+                        logger.warning(
+                            f"[CS동기화][ESM] {esm_label}: qnaType={qna_type} 조회 실패 — {qe}"
+                        )
+                        continue
+                    data = resp.get("Data") if isinstance(resp, dict) else None
+                    items = data or []
+                    if isinstance(data, dict):
+                        items = data.get("Items") or data.get("BulletinBoard") or []
+                    if not isinstance(items, list):
+                        continue
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        msg_no = str(item.get("messageNo") or "")
+                        if not msg_no:
+                            continue
+                        existing_result = await session.execute(
+                            select(SambaCSInquiry).where(
+                                SambaCSInquiry.market == esm_market_label,
+                                SambaCSInquiry.market_inquiry_no == msg_no,
+                                SambaCSInquiry.is_hidden == False,  # noqa: E712
+                            )
+                        )
+                        if existing_result.scalar_one_or_none():
+                            continue
+                        product_no = str(item.get("siteGoodsNo") or "")
+                        content = str(item.get("question") or item.get("content") or "")
+                        questioner = str(item.get("inquirerName") or "")
+                        token = str(item.get("token") or "") or None
+                        answer = str(item.get("answer") or "")
+                        inform_status = str(item.get("informStatus") or "")
+                        is_answered = inform_status == "처리완료" or bool(answer)
+
+                        raw_dt = str(
+                            item.get("registDate")
+                            or item.get("regDate")
+                            or item.get("inquiryDate")
+                            or ""
+                        )
+                        parsed_date = None
+                        for fmt in (
+                            "%Y-%m-%dT%H:%M:%S",
+                            "%Y-%m-%d %H:%M:%S",
+                            "%Y-%m-%d",
+                        ):
+                            try:
+                                parsed_date = datetime.strptime(raw_dt[:19], fmt)
+                                break
+                            except Exception:
+                                continue
+                        if parsed_date is None:
+                            parsed_date = datetime.now(timezone.utc)
+
+                        matched = await _find_collected_product_by_market_product_no(
+                            session, product_no
+                        )
+                        product_link = (
+                            _build_market_product_url(esm_market_label, product_no)
+                            if product_no
+                            else ""
+                        )
+
+                        inquiry_data = {
+                            "market": esm_market_label,
+                            "market_inquiry_no": msg_no,
+                            "market_answer_no": token,
+                            "market_order_id": None,
+                            "market_product_no": product_no or None,
+                            "account_id": esm_acc.id,
+                            "account_name": esm_label,
+                            "inquiry_type": "product_question",
+                            "questioner": questioner,
+                            "product_name": str(item.get("goodsName") or ""),
+                            "product_image": matched["product_image"]
+                            if matched
+                            else "",
+                            "product_link": product_link,
+                            "original_link": matched["original_link"]
+                            if matched
+                            else "",
+                            "collected_product_id": matched["id"] if matched else None,
+                            "content": content,
+                            "reply": answer if is_answered else None,
+                            "reply_status": "replied" if is_answered else "pending",
+                            "inquiry_date": parsed_date,
+                            "replied_at": None,
+                        }
+                        try:
+                            await svc.create_inquiry(inquiry_data)
+                            esm_synced += 1
+                        except Exception as ce:
+                            logger.warning(
+                                f"[CS동기화][ESM] {esm_label} 문의 {msg_no} 저장 실패: {ce}"
+                            )
+                if esm_synced > 0:
+                    logger.info(f"[CS동기화][ESM] {esm_label}: {esm_synced}건 동기화")
+                synced += esm_synced
+            except Exception as e:
+                logger.error(f"[CS동기화][ESM] {esm_label} 실패: {e}", exc_info=True)
+                errors.append(f"{esm_market_label}({esm_label}): {e}")
+    except Exception as e:
+        logger.warning(f"[CS동기화][ESM] 계정 조회 실패: {e}")
 
     results: list[dict[str, Any]] = []
     try:

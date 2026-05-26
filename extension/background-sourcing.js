@@ -441,6 +441,19 @@ async function _processJobWithCap(job) {
       _siteSemRelease(site)
     }
   }
+  // 발주취소 잡(type=cancel_order) — 가격수집과 격리, 사이트 세마포어 사용.
+  // 사이트별 cancel_js 분석·작성 전이라 현재는 '미지원' 회신만.
+  // 실제 사이트 DOM 자동화는 content-cancel-{site}.js + 본 핸들러에서 라우팅 (분석 후 채움).
+  if (job.type === 'cancel_order') {
+    await _siteSemAcquire(site)
+    _markSourcingSiteActive(site)
+    try {
+      return await handleCancelOrderJob(job)
+    } finally {
+      _markSourcingSiteInactive(site)
+      _siteSemRelease(site)
+    }
+  }
   // 송장 추출 잡(type=tracking) — 가격수집과 격리. 동일 사이트 캡 공유로 무신사 폭주 방지
   if (job.type === 'tracking') {
     if (site === 'MUSINSA') {
@@ -1174,6 +1187,41 @@ async function handleTrackingJob(job) {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 발주취소 잡 핸들러 (소싱처 주문상세 페이지 → DOM 자동화 → cancel-result 전송)
+//
+// 사이트별 cancel_js 분석 전이라 현재는 스텁 — 미지원 회신만 보낸다.
+// 분석 완료 후 사이트별 content-cancel-{site}.js 작성 + 본 함수에서 라우팅 추가 예정.
+//
+// 라우팅 정책:
+//  - SSG/ABCmart/GrandStage/LOTTEON  → 데몬 전용 (확장앱 라우팅 차단됨)
+//  - MUSINSA/GSShop/패션플러스/SNKRDUNK/KREAM/Nike/롯데홈쇼핑 → 확장앱(여기)
+//
+// 결과 스키마: {success, cancelled, alreadyShipped?, reason?, error?}
+// ─────────────────────────────────────────────────────────────────────────────
+const _cancelPending = new Map() // requestId → {resolve, timeoutId, tabId}
+
+async function handleCancelOrderJob(job) {
+  const requestId = job.requestId
+  const site = job.site || ''
+  const ordNo = job.sourcingOrderNumber || ''
+
+  console.log(`[발주취소] 잡 수신 req=${requestId} site=${site} ord=${ordNo}`)
+
+  // 사이트별 cancel_js 미작성 — 분석 후 라우팅 추가 예정.
+  // 지금은 즉시 '미지원' 회신해서 잡 큐가 잠기지 않도록 한다.
+  try {
+    await postResult('sourcing/cancel-result', {
+      requestId,
+      success: false,
+      cancelled: false,
+      reason: `확장앱 cancel_js 미작성(site=${site}) — 분석 후 구현 예정`,
+    })
+  } catch (err) {
+    console.warn(`[발주취소] 결과 전송 실패 req=${requestId}:`, err)
+  }
+}
+
 // content script 가 페이지에서 추출 결과를 background로 보낼 때 매칭
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg && msg.type === 'TRACKING_RESULT' && msg.requestId) {
@@ -1286,6 +1334,16 @@ async function _runLotteonPreLogin() {
 globalThis._setLocalAutotuneJoined = (joined, sourceSites = null) => {
   _localAutotuneJoined = !!joined
   _allowedSourceSites = joined ? sourceSites : null
+  // 폴링 헤더(X-Allowed-Sites)는 chrome.storage.allowedSites를 읽는다(background-core.js).
+  // JOIN 시 오토튠 선택 소싱처를 storage에도 반영 — 페이지→확장앱 SET_ALLOWED_SITES가
+  // content script 타이밍으로 누락돼도, 폴링이 stale 사이트 목록으로 백엔드 PC분담 등록을
+  // 덮어쓰지 않게 한다. (SSG 선택인데 확장앱 stale [MUSINSA]가 등록을 덮어 SSG가
+  // active_sites에서 탈락하던 flip-flop의 근본 원인 차단.)
+  if (joined && Array.isArray(sourceSites)) {
+    try {
+      chrome.storage.local.set({ allowedSites: sourceSites })
+    } catch (_) {}
+  }
   if (joined) {
     _sourcingForceStop = false
     _siteLoginConfirmed.clear()
@@ -3457,3 +3515,66 @@ async function extractDetailData(tabId, site, productId) {
 
   return result?.result || { success: false, message: 'DOM 파싱 실패' }
 }
+
+// ============================================================
+// 자가 업데이트 — 백엔드 latest 버전과 비교해 구버전이면 chrome.runtime.reload().
+// 공유폴더 동기화로 디스크 파일이 최신이면 reload 시 최신본을 다시 읽는다.
+// (롯데ON 데몬의 self-update 와 동일 패턴 — sourcing.py)
+// ============================================================
+const _SELF_UPDATE_ALARM = 'sambaSelfUpdate'
+const _SELF_UPDATE_INTERVAL_MIN = 360 // 6시간
+
+function _cmpSemver(a, b) {
+  const pa = String(a).split('.').map((n) => parseInt(n, 10) || 0)
+  const pb = String(b).split('.').map((n) => parseInt(n, 10) || 0)
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i] || 0
+    const y = pb[i] || 0
+    if (x !== y) return x - y
+  }
+  return 0
+}
+
+async function _checkSelfUpdate() {
+  try {
+    // 오토튠/잡 실행 중인 PC는 reload 보류 — 작업 끊김 방지. 다음 주기에 재시도.
+    if (_localAutotuneJoined) return
+
+    const { proxyUrl } = await chrome.storage.local.get('proxyUrl')
+    if (!proxyUrl) return
+
+    const res = await fetch(
+      `${proxyUrl}/api/v1/samba/proxy/autotune-daemon/extension-version`,
+      { method: 'GET' },
+    )
+    if (!res.ok) return
+    const data = await res.json().catch(() => ({}))
+    const latest = data && data.version
+    const current = chrome.runtime.getManifest().version
+    if (!latest || _cmpSemver(current, latest) >= 0) return // 이미 최신
+
+    // 무한루프 가드: 디스크 파일이 아직 구버전(공유폴더 미동기화)이면 reload 해도
+    // 같은 버전 → 반복. 같은 latest 로 6시간 내 시도했으면 skip.
+    const stored = await chrome.storage.local.get('_selfUpdateTried')
+    const tried = stored._selfUpdateTried || {}
+    const now = Date.now()
+    if (tried.version === latest && now - (tried.at || 0) < _SELF_UPDATE_INTERVAL_MIN * 60 * 1000) {
+      return
+    }
+    // reload 가 worker 를 죽이므로 가드 기록 flush 를 await 로 보장한 뒤 reload.
+    await chrome.storage.local.set({ _selfUpdateTried: { version: latest, at: now } })
+    console.log(`[SAMBA] 자가 업데이트 ${current} → ${latest} — reload`)
+    chrome.runtime.reload()
+  } catch (e) {
+    console.warn('[SAMBA] 자가 업데이트 체크 실패:', e && e.message)
+  }
+}
+
+// 부팅 1분 후 첫 체크 + 6시간 주기 (동일 이름이면 덮어써져 중복 안 됨)
+chrome.alarms.create(_SELF_UPDATE_ALARM, {
+  delayInMinutes: 1,
+  periodInMinutes: _SELF_UPDATE_INTERVAL_MIN,
+})
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm && alarm.name === _SELF_UPDATE_ALARM) _checkSelfUpdate()
+})

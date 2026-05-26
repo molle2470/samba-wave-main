@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 from fastapi import APIRouter, Depends
@@ -11,6 +11,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from backend.db.orm import get_write_session_dependency
 from backend.domain.samba.cache import cache
+from backend.domain.samba.tenant.middleware import get_optional_tenant_id
 from backend.utils.logger import logger
 
 from ._helpers import _get_setting
@@ -167,6 +168,73 @@ _BRAND_PARTIAL_MATCH: frozenset[str] = frozenset(
 
 
 # ── 헬퍼 함수 ──
+
+
+def _apply_preserved_system_tags(
+    existing_tags: list | None, new_tags: list[str] | None
+) -> list[str] | None:
+    """기존 시스템 태그(__접두)를 보존하고 일반 태그만 new_tags 로 교체.
+
+    issue #239 — `p.tags = None` / `p.tags = body.tags` 같은 통째 덮어쓰기가
+    `__ai_image__`, `__ai_tagged__` 같은 시스템 태그를 wipe 시켜 마켓 전송 차단
+    유령 상태 유발 (SSG/LOTTEON 나이키 ~8천 건 사고). 본 헬퍼로 시스템 태그
+    보존 후 일반 태그만 교체.
+
+    new_tags=None 이면 일반 태그 전부 제거(시스템 태그만 남김).
+    """
+    preserved = [
+        t for t in (existing_tags or []) if isinstance(t, str) and t.startswith("__")
+    ]
+    if new_tags is None:
+        return preserved if preserved else None
+    return list(dict.fromkeys([*preserved, *new_tags]))
+
+
+async def _atomic_merge_tags(
+    session: AsyncSession,
+    product_ids: list[str],
+    new_tags: list[str],
+    add_ai_tagged_marker: bool = True,
+) -> None:
+    """tags 컬럼을 atomic UPDATE — fetch-then-write race 차단.
+
+    issue #239 원인 2 — SELECT tags → in-memory preserve → UPDATE 패턴은
+    SELECT~UPDATE 사이에 다른 트랜잭션이 commit 시 덮어쓰기 가능
+    (samba-task2-aitag routine + 복원 작업 동시 실행 시 재현).
+
+    본 함수는 outer UPDATE 의 row lock 안에서 SELECT 하여 race 차단:
+      DB 현재 시점의 __접두 시스템 태그 + ('__ai_tagged__' 마커) + new_tags
+      를 jsonb_agg(DISTINCT) 로 merge 후 단일 UPDATE.
+    """
+    if not product_ids:
+        return
+
+    import json
+
+    from sqlalchemy import text
+
+    marker_sql = "UNION SELECT '__ai_tagged__'" if add_ai_tagged_marker else ""
+    await session.execute(
+        text(
+            f"""
+            UPDATE samba_collected_product
+            SET tags = (
+                SELECT COALESCE(jsonb_agg(DISTINCT elem), '[]'::jsonb)
+                FROM (
+                    SELECT t AS elem
+                    FROM jsonb_array_elements_text(COALESCE(tags, '[]'::jsonb)) AS t
+                    WHERE strpos(t, '__') = 1
+                    {marker_sql}
+                    UNION SELECT t
+                    FROM jsonb_array_elements_text(CAST(:new_tags AS JSONB)) AS t
+                ) merged
+            ),
+            updated_at = NOW()
+            WHERE id = ANY(CAST(:ids AS TEXT[]))
+            """
+        ),
+        {"new_tags": json.dumps(new_tags), "ids": product_ids},
+    )
 
 
 def _make_ai_tag_group_key_id(search_filter_id: str, group_key: str) -> str:
@@ -522,6 +590,7 @@ async def _get_smartstore_tag_client(session: AsyncSession):
 async def generate_ai_tags(
     request: dict[str, Any],
     session: AsyncSession = Depends(get_write_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """선택 상품을 그룹별로 묶어 대표 1개로 AI 태그 생성 후 태그사전 검증 → 그룹 전체에 적용."""
     from backend.domain.samba.collector.repository import (
@@ -540,7 +609,7 @@ async def generate_ai_tags(
 
     # API 키 조회 (method에 따라 분기)
     if method in ("gemma", "gemini"):
-        creds = await _get_setting(session, "gemini")
+        creds = await _get_setting(session, "gemini", tenant_id=tenant_id)
         if not creds or not isinstance(creds, dict) or not creds.get("apiKey"):
             return {"success": False, "message": "Gemini API 설정이 없습니다"}
         api_key = str(creds["apiKey"]).strip()
@@ -549,7 +618,7 @@ async def generate_ai_tags(
         else:
             model = str(creds.get("model", "gemini-2.5-flash"))
     else:
-        creds = await _get_setting(session, "claude")
+        creds = await _get_setting(session, "claude", tenant_id=tenant_id)
         if not creds or not isinstance(creds, dict) or not creds.get("apiKey"):
             return {"success": False, "message": "Claude API 설정이 없습니다"}
         api_key = str(creds["apiKey"]).strip()
@@ -791,20 +860,27 @@ async def generate_ai_tags(
                         f"[AI태그] 그룹 {gid}: 등재 태그 부족 — 태그 {len(tags)}개/10개"
                     )
 
-                # 태그 생성 후 그룹 전체 상품 조회 → 벌크 적용
-                # 기존 태그는 __센티넬만 보존하고 새 태그로 교체 (누적 방지)
-                for p in products:
-                    preserved = [
-                        t
-                        for t in (p.tags or [])
-                        if isinstance(t, str) and t.startswith("__")
-                    ]
-                    merged = list(dict.fromkeys([*preserved, "__ai_tagged__", *tags]))
-                    update_data: dict = {"tags": merged}
-                    if seo_kws:
-                        update_data["seo_keywords"] = seo_kws
-                    await repo.update_async(p.id, **update_data)
-                    total_tagged += 1
+                # 태그 생성 후 그룹 전체 상품에 atomic merge — issue #239 race 차단.
+                # repo.update_async 의 SELECT-then-UPDATE 패턴 대신 DB 시점 시스템 태그
+                # 보존하는 단일 UPDATE 로 전환.
+                product_ids = [p.id for p in products]
+                await _atomic_merge_tags(
+                    session, product_ids, list(tags), add_ai_tagged_marker=True
+                )
+                if seo_kws:
+                    import json as _json
+
+                    from sqlalchemy import text as _text
+
+                    await session.execute(
+                        _text(
+                            "UPDATE samba_collected_product "
+                            "SET seo_keywords = CAST(:kws AS JSONB), updated_at = NOW() "
+                            "WHERE id = ANY(CAST(:ids AS TEXT[]))"
+                        ),
+                        {"kws": _json.dumps(seo_kws), "ids": product_ids},
+                    )
+                total_tagged += len(products)
 
             except Exception as e:
                 logger.error(f"[AI태그] 그룹 {gid} 실패: {e}")
@@ -848,6 +924,7 @@ async def generate_ai_tags(
 async def preview_ai_tags(
     request: dict[str, Any],
     session: AsyncSession = Depends(get_write_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """선택 상품의 그룹별 대표 1개로 AI 태그 25개 생성 → 적용하지 않고 미리보기 반환."""
     from backend.domain.samba.collector.repository import (
@@ -866,7 +943,7 @@ async def preview_ai_tags(
 
     # API 키 조회 (method에 따라 분기)
     if method in ("gemma", "gemini"):
-        creds = await _get_setting(session, "gemini")
+        creds = await _get_setting(session, "gemini", tenant_id=tenant_id)
         if not creds or not isinstance(creds, dict) or not creds.get("apiKey"):
             return {"success": False, "message": "Gemini API 설정이 없습니다"}
         api_key = str(creds["apiKey"]).strip()
@@ -875,7 +952,7 @@ async def preview_ai_tags(
         else:
             model = str(creds.get("model", "gemini-2.5-flash"))
     else:
-        creds = await _get_setting(session, "claude")
+        creds = await _get_setting(session, "claude", tenant_id=tenant_id)
         if not creds or not isinstance(creds, dict) or not creds.get("apiKey"):
             return {"success": False, "message": "Claude API 설정이 없습니다"}
         api_key = str(creds["apiKey"]).strip()
@@ -1214,7 +1291,56 @@ async def apply_ai_tags(
             # 개별 상품 (그룹 없는 경우)
 
         # SEO 키워드: 프론트에서 수정한 값 우선, 없으면 자동 추출 (태그와 중복 방지)
-        seo_kws: list[str] = group.get("seo_keywords", [])
+        seo_kws: list[str] = list(group.get("seo_keywords", []) or [])
+
+        # 브랜드/소싱처 금지어 필터 — 프론트 우회·구버전 preview 값으로
+        # 경쟁 브랜드명("나이키","뉴발란스" 등)이 SEO에 섞이는 사고 방지.
+        # 사용자 정의 스마트스토어 금지태그(ss_banned)+DB 등록 브랜드도 함께 차단.
+        try:
+            _ss_banned_set, _db_brands = await _load_tag_filter_data(session)
+        except Exception:
+            _ss_banned_set, _db_brands = set(), set()
+        _self_brand_lower = ""
+        try:
+            for _p in products:
+                _b = getattr(_p, "brand", None)
+                if _b:
+                    _self_brand_lower = str(_b).lower().replace(" ", "")
+                    break
+        except Exception:
+            pass
+        _brand_block_lower = {b.lower().replace(" ", "") for b in _BRAND_BANNED}
+        _site_block_lower = {s.lower().replace(" ", "") for s in _SOURCING_SITE_BANNED}
+        _db_brand_block_lower = {b.lower().replace(" ", "") for b in _db_brands if b}
+        _blocked_lower = (
+            _brand_block_lower
+            | _site_block_lower
+            | _ss_banned_set
+            | _db_brand_block_lower
+        )
+        # 자기 브랜드는 차단 대상에서 제외 (자기 브랜드 SEO는 정상 허용)
+        if _self_brand_lower:
+            _blocked_lower.discard(_self_brand_lower)
+
+        def _seo_allowed(word: str) -> bool:
+            wl = (word or "").lower().replace(" ", "")
+            if not wl:
+                return False
+            if wl in _blocked_lower:
+                return False
+            # 부분일치 차단 (예: "나이키신발" 같은 결합어) — 자기 브랜드 토큰은 허용
+            for token in _BRAND_PARTIAL_MATCH:
+                tl = token.lower().replace(" ", "")
+                if not tl:
+                    continue
+                if _self_brand_lower and tl == _self_brand_lower:
+                    continue
+                if tl in wl:
+                    return False
+            return True
+
+        seo_kws = [w for w in seo_kws if _seo_allowed(w)]
+
         if not seo_kws:
             tag_lower_set = {t.lower().replace(" ", "") for t in tags}
             ordered = list(tags[10:]) + list(tags[:10])
@@ -1222,32 +1348,39 @@ async def apply_ai_tags(
                 for word in kw.split():
                     w = word.strip()
                     wl = w.lower().replace(" ", "")
-                    if len(w) >= 2 and wl not in tag_lower_set and w not in seo_kws:
+                    if (
+                        len(w) >= 2
+                        and wl not in tag_lower_set
+                        and w not in seo_kws
+                        and _seo_allowed(w)
+                    ):
                         seo_kws.append(w)
                         if len(seo_kws) >= 2:
                             break
                 if len(seo_kws) >= 2:
                     break
 
-        # 그룹 내 모든 상품에 적용 (개별 커밋 없이 일괄 처리)
-        from sqlalchemy.orm.attributes import flag_modified as _fm
-        from datetime import datetime as _dt, UTC as _utc
+        # 그룹 내 모든 상품에 atomic merge — issue #239 race 차단.
+        # DB 시점 시스템 태그 + '__ai_tagged__' + tags 를 jsonb_agg(DISTINCT) UPDATE.
+        # seo_keywords 는 race 무관 → 별도 raw UPDATE.
+        product_ids = [p.id for p in products]
+        await _atomic_merge_tags(
+            session, product_ids, list(tags), add_ai_tagged_marker=True
+        )
+        if seo_kws:
+            import json as _json
 
-        for p in products:
-            # 기존 태그는 __센티넬만 보존하고 새 태그로 교체 (누적 방지)
-            preserved = [
-                t for t in (p.tags or []) if isinstance(t, str) and t.startswith("__")
-            ]
-            merged = list(dict.fromkeys([*preserved, "__ai_tagged__", *tags]))
-            p.tags = merged
-            _fm(p, "tags")
-            if seo_kws:
-                p.seo_keywords = seo_kws
-                _fm(p, "seo_keywords")
-            if hasattr(p, "updated_at"):
-                p.updated_at = _dt.now(_utc)
-            session.add(p)
-            total_tagged += 1
+            from sqlalchemy import text as _text
+
+            await session.execute(
+                _text(
+                    "UPDATE samba_collected_product "
+                    "SET seo_keywords = CAST(:kws AS JSONB), updated_at = NOW() "
+                    "WHERE id = ANY(CAST(:ids AS TEXT[]))"
+                ),
+                {"kws": _json.dumps(seo_kws), "ids": product_ids},
+            )
+        total_tagged += len(products)
 
     await session.commit()
     await cache.clear_pattern("filters:tree:counts:*")
@@ -1287,7 +1420,8 @@ async def clear_ai_tags(
     for gid in group_ids:
         _, products = await _resolve_ai_tag_apply_products(repo, {"group_id": gid})
         for p in products:
-            p.tags = None
+            # issue #239 — `p.tags = None` 전부 wipe 금지. __접두 시스템 태그 보존.
+            p.tags = _apply_preserved_system_tags(p.tags, None)
             p.seo_keywords = None
             _fm(p, "tags")
             _fm(p, "seo_keywords")

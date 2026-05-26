@@ -215,9 +215,18 @@ async def get_site_health(
 @router.get("/refresh-logs")
 async def get_refresh_log_entries(
     since_idx: int = Query(0, ge=0),
+    device_id: str = Query(
+        "", description="자기 PC device_id — PC별 로그 분리(2026-05-25)"
+    ),
 ):
-    """오토튠 실시간 로그 (인메모리 링 버퍼). since_idx 이후 증분 반환. 오토튠 로그만 필터."""
-    logs, current_idx = get_refresh_logs(since_idx, source_filter="autotune")
+    """오토튠 실시간 로그 (인메모리 링 버퍼). since_idx 이후 증분 반환. 오토튠 로그만 필터.
+
+    device_id 지정 시 그 PC 잡 로그 + 글로벌 메시지만 표시 — 다른 PC 잡 차단(사용자 분리 요청).
+    빈 문자열이면 전체(레거시 호환).
+    """
+    logs, current_idx = get_refresh_logs(
+        since_idx, source_filter="autotune", device_id_filter=device_id.strip()
+    )
     intervals_info = get_site_intervals_info()
     return {
         "logs": logs,
@@ -391,9 +400,7 @@ async def refresh_store_scores(
                 vendor_id = extras.get("vendorId", "")
                 if not access_key or not secret_key:
                     continue
-                from backend.domain.samba.proxy.coupang import CoupangClient
 
-                client_cp = CoupangClient(access_key, secret_key)
                 results[acc.id] = {
                     **old,
                     "account_id": acc.id,

@@ -15,6 +15,7 @@ export default function useProxyAuth() {
   const [proxyText, setProxyText] = useState('프록시 서버 확인 중...')
   const [musinsaAuth, setMusinsaAuth] = useState<ProxyAuthStatus>('checking')
   const [musinsaAuthText, setMusinsaAuthText] = useState('인증 상태 확인 중...')
+  const [musinsaCookieUpdatedAt, setMusinsaCookieUpdatedAt] = useState<string | null>(null)
   const [poolInfo, setPoolInfo] = useState<PoolInfo>(null)
 
   // 프록시 서버 상태 확인 — 502/네트워크 오류 시 1회 재시도(1.5초 지연)
@@ -55,9 +56,11 @@ export default function useProxyAuth() {
         if (data.status === 'ok') {
           setMusinsaAuth('ok')
           setMusinsaAuthText(data.message || '무신사 인증 완료')
+          setMusinsaCookieUpdatedAt(data.updated_at ?? null)
         } else {
           setMusinsaAuth('error')
           setMusinsaAuthText(data.message || '무신사 인증 필요')
+          setMusinsaCookieUpdatedAt(null)
         }
       })
       .catch(() => {
@@ -67,6 +70,7 @@ export default function useProxyAuth() {
         }
         setMusinsaAuth('error')
         setMusinsaAuthText('백엔드 서버 연결 실패')
+        setMusinsaCookieUpdatedAt(null)
       })
   }, [])
 
@@ -111,6 +115,7 @@ export default function useProxyAuth() {
     proxyText,
     musinsaAuth,
     musinsaAuthText,
+    musinsaCookieUpdatedAt,
     poolInfo,
     checkProxyStatus,
     checkMusinsaAuth,

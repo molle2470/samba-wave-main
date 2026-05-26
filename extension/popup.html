@@ -143,16 +143,10 @@
 
     <div class="divider"></div>
 
-    <div class="sync-badge">
-      <span class="sync-dot"></span>
-      자동 동기화 활성
+    <div class="sync-badge" id="connBadge">
+      <span class="sync-dot" id="connDot"></span>
+      <span id="connText">연결 확인 중...</span>
     </div>
-
-    <button class="btn btn-primary" id="btnLogin">🔑 웹사이트로 로그인</button>
-    <div class="status" id="loginStatus"></div>
-
-    <button class="btn btn-score" id="btnStoreScore">스토어 점수 가져오기</button>
-    <div class="status" id="scoreResult"></div>
   </div>
 
   <script src="popup.js"></script>

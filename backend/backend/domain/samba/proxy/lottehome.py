@@ -248,7 +248,25 @@ class LotteHomeClient:
     @staticmethod
     def _parse_lotte_response(xml_str: str) -> dict[str, Any]:
         """롯데홈쇼핑 XML 응답 파싱 (성공/에러 분기)."""
-        root_el = ET.fromstring(xml_str)
+        # 비정상 응답 방어 — 인증만료/장애 시 거대 HTML(수십MB)이 와서
+        # ET.fromstring이 "not well-formed (invalid token): column 24861604" 같은
+        # cryptic 에러를 내고 정체를 못 드러내던 사고 방지. 응답 정체를 로그에 노출.
+        _stripped = (xml_str or "").lstrip()
+        if not _stripped.startswith("<"):
+            raise LotteApiError(
+                code="NOT_XML",
+                message=f"비XML 응답({len(xml_str):,}자) 앞부분: {_stripped[:500]!r}",
+            )
+        try:
+            root_el = ET.fromstring(xml_str)
+        except ET.ParseError as _e:
+            raise LotteApiError(
+                code="XML_PARSE",
+                message=(
+                    f"XML 파싱 실패({len(xml_str):,}자): {str(_e)[:200]} / "
+                    f"앞부분: {_stripped[:300]!r}"
+                ),
+            )
         parsed = LotteHomeClient._parse_xml_to_dict(root_el)
 
         # 실제 루트는 대문자 Response

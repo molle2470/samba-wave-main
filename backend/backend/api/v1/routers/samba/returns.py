@@ -259,9 +259,6 @@ async def list_returns(
 
     # 주문의 ext_order_number(타마켓주문링크) 또는 소싱처 주문상세 URL을 return_link로 매칭
     # 주문탭 원주문링크와 100% 동일한 로직
-    from backend.domain.samba.order.repository import SambaOrderRepository
-
-    order_repo = SambaOrderRepository(session)
     order_ids = list({r.order_id for r in returns if r.order_id})
     link_map: dict[str, str] = {}
     channel_id_map: dict[str, str] = {}  # order_id → channel_id
@@ -736,7 +733,6 @@ async def sync_returns_from_markets(
                 claims_data: list[dict[str, Any]] = []
                 for ro in raw_orders:
                     po = ro.get("productOrder", ro)
-                    order_info = ro.get("order", {})
                     claim_info = (
                         ro.get("claim")
                         if isinstance(ro.get("claim"), dict)
@@ -1723,9 +1719,6 @@ async def sync_returns_from_markets(
                         order_id=order_id, type="exchange"
                     )
 
-                    status_raw = item.get("ordPrdStatCd", "") or item.get(
-                        "clmStatCd", ""
-                    )
                     mapped_status = "requested"
 
                     timeline_msg = "11번가 교환 요청이 접수되었습니다."
@@ -2163,6 +2156,252 @@ async def sync_returns_from_markets(
                 total_synced += synced_ebay
                 logger.info(
                     f"[반품동기화][eBay] {label}: 반품 {len(raw_returns)}건 조회, {synced_ebay}건 신규"
+                )
+
+            elif market_type in ("gmarket", "auction"):
+                from backend.domain.samba.proxy.esmplus import (
+                    ESMPlusClient,
+                    resolve_esm_credentials,
+                )
+                from datetime import (
+                    UTC as _esm_UTC,
+                    datetime as _esm_dt,
+                    timedelta as _esm_td,
+                )
+
+                esm_hosting_id, esm_secret_key = await resolve_esm_credentials(
+                    session, account
+                )
+                if not esm_hosting_id or not esm_secret_key:
+                    results.append(
+                        {
+                            "account": label,
+                            "status": "skip",
+                            "message": "ESM 인증정보 없음",
+                        }
+                    )
+                    continue
+                if not seller_id:
+                    results.append(
+                        {
+                            "account": label,
+                            "status": "skip",
+                            "message": "ESM seller_id 없음",
+                        }
+                    )
+                    continue
+
+                # claim API SiteType: 1=옥션, **3=G마켓** (주문 API의 2=G마켓과 다름!)
+                _esm_claim_site_type = 3 if market_type == "gmarket" else 1
+                # 7일 max — claim API 한도
+                _esm_days_claim = min(int(body.days or 1), 7)
+                _esm_end_claim = _esm_dt.now(_esm_UTC)
+                _esm_start_claim = _esm_end_claim - _esm_td(days=_esm_days_claim)
+                _esm_from_claim = _esm_start_claim.strftime("%Y-%m-%d")
+                _esm_to_claim = _esm_end_claim.strftime("%Y-%m-%d")
+
+                _esm_client = ESMPlusClient(
+                    esm_hosting_id, esm_secret_key, seller_id, site=market_type
+                )
+
+                # CancelStatus 1~4 → status
+                _cancel_status_map = {
+                    1: ("requested", "취소요청"),
+                    2: ("cancelled", "취소완료"),
+                    3: ("completed", "취소완료"),
+                    4: ("rejected", "취소거부"),
+                }
+                # ExchangeStatus 1~5 → status
+                _exchange_status_map = {
+                    1: ("requested", "교환요청"),
+                    2: ("approved", "교환진행"),
+                    3: ("approved", "교환진행"),
+                    4: ("completed", "교환완료"),
+                    5: ("rejected", "교환거부"),
+                }
+
+                _market_label = "G마켓" if market_type == "gmarket" else "옥션"
+
+                try:
+                    _cancel_resp = await _esm_client.search_cancels(
+                        {
+                            "SiteType": _esm_claim_site_type,
+                            "CancelStatus": 0,
+                            "Type": 2,
+                            "StartDate": _esm_from_claim,
+                            "EndDate": _esm_to_claim,
+                        }
+                    )
+                except Exception as _ce:
+                    logger.warning(
+                        f"[반품동기화][ESM] {label}: cancels 조회 실패 — {_ce}"
+                    )
+                    _cancel_resp = {}
+
+                try:
+                    _exchange_resp = await _esm_client.search_exchanges(
+                        {
+                            "SiteType": _esm_claim_site_type,
+                            "ExchangeStatus": 0,
+                            "Type": 2,
+                            "StartDate": _esm_from_claim,
+                            "EndDate": _esm_to_claim,
+                        }
+                    )
+                except Exception as _xe:
+                    logger.warning(
+                        f"[반품동기화][ESM] {label}: exchanges 조회 실패 — {_xe}"
+                    )
+                    _exchange_resp = {}
+
+                _cancel_items = (
+                    _cancel_resp.get("Data") if isinstance(_cancel_resp, dict) else []
+                ) or []
+                _exchange_items = (
+                    _exchange_resp.get("Data")
+                    if isinstance(_exchange_resp, dict)
+                    else []
+                ) or []
+
+                _esm_synced = 0
+                _esm_total = len(_cancel_items) + len(_exchange_items)
+
+                async def _esm_upsert_claim(
+                    order_number: str,
+                    return_type: str,
+                    market_order_status: str,
+                    status: str,
+                    reason: str,
+                    quantity: int,
+                    product_name: str,
+                ) -> int:
+                    if not order_number:
+                        return 0
+                    existing_order = await order_repo.find_by_async(
+                        order_number=order_number
+                    )
+                    if not existing_order:
+                        logger.warning(
+                            f"[반품동기화][ESM] {label}: 주문 미매칭 OrderNo={order_number}"
+                        )
+                        return 0
+                    order_id = existing_order.id
+                    existing_returns = await svc.repo.filter_by_async(
+                        order_id=order_id, type=return_type
+                    )
+                    if existing_returns:
+                        er = existing_returns[0]
+                        patch: dict[str, Any] = {
+                            "order_date": existing_order.paid_at
+                            or existing_order.created_at,
+                        }
+                        if not er.product_image and existing_order.product_image:
+                            patch["product_image"] = existing_order.product_image
+                        if not er.market_order_status:
+                            patch["market_order_status"] = market_order_status
+                        status_priority = {
+                            "requested": 0,
+                            "approved": 1,
+                            "completed": 2,
+                            "rejected": 2,
+                            "cancelled": 2,
+                        }
+                        if status_priority.get(status, 0) > status_priority.get(
+                            er.status, 0
+                        ):
+                            patch["status"] = status
+                            if status in ("completed", "rejected", "cancelled"):
+                                patch["completion_date"] = _esm_dt.now(_esm_UTC)
+                        if patch:
+                            await svc.repo.update_async(er.id, **patch)
+                    else:
+                        await svc.repo.create_async(
+                            order_id=order_id,
+                            order_number=order_number,
+                            type=return_type,
+                            reason=reason or None,
+                            quantity=quantity,
+                            product_name=product_name or existing_order.product_name,
+                            product_image=existing_order.product_image,
+                            customer_name=existing_order.customer_name,
+                            customer_phone=existing_order.customer_phone,
+                            product_location=_extract_city_district(
+                                existing_order.customer_address
+                            ),
+                            customer_address=existing_order.customer_address,
+                            business_name=account.business_name
+                            or account.market_name
+                            or label,
+                            market=_market_label,
+                            market_order_status=market_order_status,
+                            status=status,
+                            timeline=[
+                                {
+                                    "date": _esm_dt.now(_esm_UTC).isoformat(),
+                                    "status": status,
+                                    "message": f"{return_type} 요청 접수",
+                                }
+                            ],
+                            notes=[],
+                        )
+                    # 원주문 shipping_status 동기화
+                    new_ss = market_order_status
+                    if return_type == "exchange" and "교환" not in new_ss:
+                        new_ss = "교환요청"
+                    if return_type == "cancel" and "취소" not in new_ss:
+                        new_ss = "취소요청"
+                    if existing_order.shipping_status != new_ss:
+                        await order_repo.update_async(
+                            existing_order.id, shipping_status=new_ss
+                        )
+                    return 1
+
+                for _ci in _cancel_items:
+                    if not isinstance(_ci, dict):
+                        continue
+                    _cs = int(_ci.get("CancelStatus") or 1)
+                    _st, _mos = _cancel_status_map.get(_cs, ("requested", "취소요청"))
+                    _esm_synced += await _esm_upsert_claim(
+                        order_number=str(_ci.get("OrderNo") or ""),
+                        return_type="cancel",
+                        market_order_status=_mos,
+                        status=_st,
+                        reason=str(_ci.get("CancelReason") or _ci.get("Reason") or ""),
+                        quantity=int(_ci.get("CancelQty") or _ci.get("OrderQty") or 1),
+                        product_name=str(_ci.get("GoodsName") or ""),
+                    )
+
+                for _xi in _exchange_items:
+                    if not isinstance(_xi, dict):
+                        continue
+                    _xs = int(_xi.get("ExchangeStatus") or 1)
+                    _st, _mos = _exchange_status_map.get(_xs, ("requested", "교환요청"))
+                    _esm_synced += await _esm_upsert_claim(
+                        order_number=str(_xi.get("OrderNo") or ""),
+                        return_type="exchange",
+                        market_order_status=_mos,
+                        status=_st,
+                        reason=str(
+                            _xi.get("ExchangeReason") or _xi.get("Reason") or ""
+                        ),
+                        quantity=int(
+                            _xi.get("ExchangeQty") or _xi.get("OrderQty") or 1
+                        ),
+                        product_name=str(_xi.get("GoodsName") or ""),
+                    )
+
+                total_synced += _esm_synced
+                results.append(
+                    {
+                        "account": label,
+                        "status": "success",
+                        "fetched": _esm_total,
+                        "synced": _esm_synced,
+                    }
+                )
+                logger.info(
+                    f"[반품동기화][ESM] {label}: cancels={len(_cancel_items)}, "
+                    f"exchanges={len(_exchange_items)}, synced={_esm_synced}"
                 )
 
             else:

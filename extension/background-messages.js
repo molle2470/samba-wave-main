@@ -1,6 +1,16 @@
 // ==================== 메시지 리스너 ====================
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // 키 발급 완료 → popup이 연 연결 페이지(extension-link) 탭 자동 닫기.
+  // content-samba-deviceid.js 가 키 저장 직후 이 메시지를 보냄.
+  if (msg.type === 'SAMBA_CLOSE_LINK_TAB') {
+    const tabId = sender?.tab?.id
+    if (tabId) {
+      try { chrome.tabs.remove(tabId) } catch {}
+    }
+    return
+  }
+
   // content_script(삼바 프론트엔드 페이지)가 deviceId를 요청할 때 응답
   if (msg.type === 'GET_DEVICE_ID') {
     ;(async () => {

@@ -92,6 +92,25 @@ def _looks_like_country(value: str) -> bool:
     return value.strip() in _COUNTRY_NAMES
 
 
+def _apply_preserved_system_tags(
+    existing_tags: list | None, new_tags: list | None
+) -> list:
+    """기존 tags의 시스템 태그(__로 시작)를 new_tags에 머지하여 반환.
+
+    재수집 IntegrityError fallback에서 새 태그로 통째 덮어쓸 때
+    __ai_image__/__img_edited__/__ai_tagged__ 같은 시스템 마커가 유실되는
+    것을 방지한다 (#233). 사용자 태그는 보존 대상 아님(덮어쓰기 정책 유지).
+    """
+    preserved = [
+        t for t in (existing_tags or []) if isinstance(t, str) and t.startswith("__")
+    ]
+    merged = list(new_tags or [])
+    for t in preserved:
+        if t not in merged:
+            merged.append(t)
+    return merged
+
+
 def _derive_sale_status(data: Dict[str, Any]) -> None:
     """전옵션 품절이면 sale_status를 sold_out으로 자동 설정."""
     if data.get("sale_status") and data["sale_status"] != "in_stock":
@@ -295,9 +314,12 @@ class SambaCollectorService:
                 .first()
             )
             if existing:
+                # 시스템 태그(__로 시작) 보존 — AI 이미지 변환/편집 흔적 유실 방지 (#227, #233)
+                prev_tags = list(existing.tags or [])
                 for k, v in data.items():
                     if k not in ("id", "source_site", "site_product_id", "created_at"):
                         setattr(existing, k, v)
+                existing.tags = _apply_preserved_system_tags(prev_tags, existing.tags)
                 await self.product_repo.session.flush()
                 return existing
             raise
@@ -514,6 +536,8 @@ class SambaCollectorService:
                     .first()
                 )
                 if existing:
+                    # 시스템 태그(__로 시작) 보존 — 배치 재수집 시 __ai_image__ 등 유실 방지 (#233)
+                    prev_tags = list(existing.tags or [])
                     update_fields = {
                         k: v
                         for k, v in d.items()
@@ -524,6 +548,9 @@ class SambaCollectorService:
                         async with self.product_repo.session.begin_nested():
                             for k, v in update_fields.items():
                                 setattr(existing, k, v)
+                            existing.tags = _apply_preserved_system_tags(
+                                prev_tags, existing.tags
+                            )
                             await self.product_repo.session.flush()
                         created += 1
                     except IntegrityError:

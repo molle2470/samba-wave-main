@@ -3,7 +3,7 @@
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +123,7 @@ def _build_product_data(
     goods_no: str,
     filter_id: str,
     site: str,
-    cost: float,
+    cost: Optional[float],
     sale_price: float,
     original_price: float,
     raw_cat: str,

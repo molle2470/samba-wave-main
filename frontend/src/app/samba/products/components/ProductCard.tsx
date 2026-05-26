@@ -129,7 +129,7 @@ function buildMarketProductUrl(
 
 // 가격범위별 마진 매칭 (백엔드 policy/service.py:_calculate_range_margin과 동일 로직)
 // cost >= min && cost < max 인 첫 번째 범위의 rate를 반환, 매칭 실패 시 fallback
-export function pickRangeMargin(
+function pickRangeMargin(
   cost: number,
   ranges: Array<{ min?: number; max?: number; rate?: number }>,
   fallback: number,
@@ -143,9 +143,9 @@ export function pickRangeMargin(
 }
 
 // 가격 계산 공통 함수 (ProductCard 내 2곳 중복 제거)
-export function calcPrice(
+function calcPrice(
   cost: number, mRate: number, ship: number, fee: number, extra: number, minMargin: number,
-  ssMRate = 0, ssMAmount = 0,
+  ssMRate = 0, ssMAmount = 0, curSym = '₩',
 ): { price: number; marginAmt: number; usedMin: boolean; feeAmt: number; calcStr: string } {
   let marginAmt = Math.round(cost * mRate / 100)
   const usedMin = minMargin > 0 && marginAmt < minMargin
@@ -175,7 +175,7 @@ export function calcPrice(
     `추가요금 ${fmt(extra)}`,
     `수수료 ${fmt(feeAmt)}(${fee}%)`,
   ]
-  return { price, marginAmt, usedMin, feeAmt, calcStr: `₩${fmt(price)} = ${parts.join(' + ')}${ssExtra}` }
+  return { price, marginAmt, usedMin, feeAmt, calcStr: `${curSym}${fmt(price)} = ${parts.join(' + ')}${ssExtra}` }
 }
 
 // 소싱처별 원문링크 URL 템플릿 (통합 관리)
@@ -294,7 +294,7 @@ function simultaneousReplace(
 }
 
 // 상품명 조합 적용 (name_composition 태그 기반)
-export function composeProductName(
+function composeProductName(
   product: SambaCollectedProduct,
   nameRule: SambaNameRule | undefined,
   deletionWords?: string[],
@@ -450,6 +450,8 @@ const ProductCard = React.memo(function ProductCard({
   }
   // 원가: best_benefit_price(최대혜택가) > sale_price > original_price 순 우선
   const cost = p.cost || p.sale_price || p.original_price || 0
+  // 통화 기호: SNKRDUNK 등 USD 소싱처는 달러($)로 표기 (원화 환산 안 함, 달러 값 그대로)
+  const curSym = ((p.extra_data as Record<string, unknown> | undefined)?.currency === 'USD') ? '$' : '₩'
   const policy = policies.find((pol) => pol.id === p.applied_policy_id)
   const pricing = (policy?.pricing || {}) as Record<string, unknown>
   const baseMarginRate = (pricing.marginRate as number) || 15
@@ -471,8 +473,8 @@ const ProductCard = React.memo(function ProductCard({
 
   // 공통 가격 계산 (useMemo 캐싱)
   const { price: marketPrice, calcStr } = useMemo(
-    () => calcPrice(cost, marginRate, shippingCost, feeRate, extraCharge, minMarginAmount, ssMRate, ssMAmount),
-    [cost, marginRate, shippingCost, feeRate, extraCharge, minMarginAmount, ssMRate, ssMAmount],
+    () => calcPrice(cost, marginRate, shippingCost, feeRate, extraCharge, minMarginAmount, ssMRate, ssMAmount, curSym),
+    [cost, marginRate, shippingCost, feeRate, extraCharge, minMarginAmount, ssMRate, ssMAmount, curSym],
   )
 
   const isActive = p.status === 'registered' || p.status === 'saved'
@@ -492,7 +494,7 @@ const ProductCard = React.memo(function ProductCard({
       const acct = v.accountId ? accMap.get(v.accountId) : undefined
       const acctFeeRate = Number((acct?.additional_fields as Record<string, unknown> | undefined)?.feeRate || 0)
       const acctExtraFeeRate = Number((acct?.additional_fields as Record<string, unknown> | undefined)?.extraFeeRate || 0)
-      const r = calcPrice(cost, marginRate, (v.shippingCost ?? shippingCost) || shippingCost, acctFeeRate || v.feeRate || feeRate, extraCharge, minMarginAmount, ssMRate, ssMAmount)
+      const r = calcPrice(cost, marginRate, (v.shippingCost ?? shippingCost) || shippingCost, acctFeeRate || v.feeRate || feeRate, extraCharge, minMarginAmount, ssMRate, ssMAmount, curSym)
       let displayPrice = r.price
       let displayCalcStr = r.calcStr
       // 스마트스토어: 300원 올림 반영 (백엔드 25% 역산과 동일)
@@ -500,7 +502,7 @@ const ProductCard = React.memo(function ProductCard({
         displayPrice = Math.ceil(r.price / 300) * 300
         const diff = displayPrice - r.price
         if (diff > 0) {
-          displayCalcStr = `₩${fmt(displayPrice)} = ${r.calcStr.split(' = ')[1]} + 300원올림 +${fmt(diff)}`
+          displayCalcStr = `${curSym}${fmt(displayPrice)} = ${r.calcStr.split(' = ')[1]} + 300원올림 +${fmt(diff)}`
         }
       }
       // SSG: 추가수수료율 역산 + 100원 단위 올림
@@ -510,16 +512,16 @@ const ProductCard = React.memo(function ProductCard({
           displayPrice = Math.ceil(before / (1 - acctExtraFeeRate / 100))
           const extraAmt = displayPrice - before
           const baseCalc = displayCalcStr.split(' = ').slice(1).join(' = ')
-          displayCalcStr = `₩${fmt(displayPrice)} = ${baseCalc} + 추가수수료 ${fmt(extraAmt)}(${acctExtraFeeRate}%)`
+          displayCalcStr = `${curSym}${fmt(displayPrice)} = ${baseCalc} + 추가수수료 ${fmt(extraAmt)}(${acctExtraFeeRate}%)`
         }
         const rounded = Math.ceil(displayPrice / 100) * 100
         if (rounded !== displayPrice) {
-          displayCalcStr = displayCalcStr.replace(/^₩[\d,]+/, `₩${fmt(rounded)}`)
+          displayCalcStr = displayCalcStr.replace(/^[₩$][\d,]+/, `${curSym}${fmt(rounded)}`)
           displayPrice = rounded
         }
       }
       return { marketName, price: displayPrice, calcStr: displayCalcStr }
-    }), [mp, cost, marginRate, shippingCost, extraCharge, minMarginAmount, ssMRate, ssMAmount])
+    }), [mp, cost, marginRate, shippingCost, extraCharge, minMarginAmount, ssMRate, ssMAmount, curSym])
 
   const marketEnabled = (p.market_enabled || {}) as Record<string, boolean>
 
@@ -1356,7 +1358,7 @@ const ProductCard = React.memo(function ProductCard({
                 style={{ fontSize: '0.6rem', padding: '2px 5px', borderRadius: '3px', cursor: 'pointer', border: '1px solid #2D2D2D', background: 'transparent', color: '#888', whiteSpace: 'nowrap' }}>업데이트</button>
               <button onClick={(e) => { e.stopPropagation(); window.open(`/samba/orders?cpId=${encodeURIComponent(p.id)}&cpName=${encodeURIComponent(p.name)}`, '_blank') }}
                 style={{ fontSize: '0.6rem', padding: '2px 5px', borderRadius: '3px', cursor: 'pointer', border: '1px solid rgba(255,140,0,0.3)', background: 'transparent', color: '#FF8C00', whiteSpace: 'nowrap' }}>판매</button>
-              <span style={{ color: '#FFB84D', fontWeight: 600, flexShrink: 0 }}>₩{fmt(cost)}</span>
+              <span style={{ color: '#FFB84D', fontWeight: 600, flexShrink: 0 }}>{curSym}{fmt(cost)}</span>
             </div>
             <div style={{ color: '#888', fontSize: '0.72rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {composeProductName(p, nameRules.find(r => r.id === (policy?.extras as Record<string, string> | undefined)?.name_rule_id), deletionWords)}
@@ -1532,7 +1534,7 @@ const ProductCard = React.memo(function ProductCard({
                 <td style={tdLabel}>정상가</td>
                 <td style={tdVal}>
                   <span style={{ color: '#C5C5C5', fontWeight: 600 }}>
-                    {p.original_price > 0 ? `₩${fmt(p.original_price)}` : '-'}
+                    {p.original_price > 0 ? `${curSym}${fmt(p.original_price)}` : '-'}
                   </span>
                 </td>
               </tr>
@@ -1541,7 +1543,7 @@ const ProductCard = React.memo(function ProductCard({
                 <tr style={{ borderBottom: '1px solid #1E1E1E' }}>
                   <td style={tdLabel}>할인가</td>
                   <td style={tdVal}>
-                    <span style={{ color: '#51CF66', fontWeight: 600 }}>₩{fmt(p.sale_price)}</span>
+                    <span style={{ color: '#51CF66', fontWeight: 600 }}>{curSym}{fmt(p.sale_price)}</span>
                     <span style={{ color: '#FF6B6B', fontSize: '0.72rem', marginLeft: '6px' }}>
                       {Math.round((1 - p.sale_price / p.original_price) * 100)}% 할인
                     </span>
@@ -1552,7 +1554,7 @@ const ProductCard = React.memo(function ProductCard({
               <tr style={{ borderBottom: '1px solid #1E1E1E' }}>
                 <td style={tdLabel}>원가</td>
                 <td style={tdVal}>
-                  <span style={{ color: '#FFB84D', fontWeight: 600 }}>₩{fmt(cost)}</span>
+                  <span style={{ color: '#FFB84D', fontWeight: 600 }}>{curSym}{fmt(cost)}</span>
                   {(p.sourcing_shipping_fee ?? 0) > 0 && (
                     <span style={{ color: '#888', fontSize: '0.7rem', marginLeft: '0.25rem' }}>
                       (상품가 {fmt(cost - (p.sourcing_shipping_fee ?? 0))}+배송비 {fmt(p.sourcing_shipping_fee ?? 0)})
@@ -1594,7 +1596,7 @@ const ProductCard = React.memo(function ProductCard({
                   <td style={tdVal}>
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                        <span style={{ color: '#FFB84D', fontWeight: 600 }}>₩{fmt(m.price)}</span>
+                        <span style={{ color: '#FFB84D', fontWeight: 600 }}>{curSym}{fmt(m.price)}</span>
                         {(() => {
                           const marketKey = MARKETS.find(mk => m.marketName.includes(mk.name))?.id
                             || m.marketName.toLowerCase().replace(/\s/g, '')
@@ -1682,7 +1684,7 @@ const ProductCard = React.memo(function ProductCard({
                   <td style={tdLabel}>마켓가격</td>
                   <td style={tdVal}>
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
-                      <span style={{ color: '#FFB84D', fontWeight: 600 }}>₩{fmt(marketPrice)}</span>
+                      <span style={{ color: '#FFB84D', fontWeight: 600 }}>{curSym}{fmt(marketPrice)}</span>
                       <span style={{ fontSize: '0.72rem', color: '#666' }}>{calcStr}</span>
                     </div>
                   </td>
@@ -1974,6 +1976,7 @@ const ProductCard = React.memo(function ProductCard({
                       productCost={cost}
                       productId={p.id}
                       sourceSite={p.source_site}
+                      curSym={curSym}
                       nameRule={nameRules.find(r => r.id === (policy?.extras as Record<string, string> | undefined)?.name_rule_id)}
                     />
                   ) : (

@@ -77,10 +77,26 @@ class BackendSettings(BaseSettings):
     """True 시 글로벌 키 폴백 비활성화 — 테넌트 키만 허용. 모든 유저가 웹 로그인 후 전환."""
 
     owner_device_ids: str = ""
-    """소유자 확장앱 deviceId 화이트리스트 (콤마 구분).
-    민감 엔드포인트(/login-credential, /extension-key) 가드용 — 포크 확장앱이
-    원본 백엔드를 가리키는 케이스에서 평문 자격증명/API 키 누출 차단.
-    비어있으면 가드 무효(레거시 호환). 운영 환경에서는 반드시 설정."""
+    """[deprecated 2026-05-25] 키-디바이스 TOFU 바인딩으로 대체됨.
+    samba_extension_key.device_id 컬럼이 첫 사용 시 자동 백필되어 동일 보안 효과 제공.
+    필드는 pydantic env 호환을 위해 유지하되 더 이상 참조되지 않음."""
+
+    autotune_daemon_device_id: str = ""
+    """[deprecated] 단일 데몬 deviceId — 하위호환용. 신규는 autotune_daemon_device_ids 사용.
+    값 있으면 autotune_daemon_device_ids 의 1번째 원소로 자동 승격된다."""
+
+    autotune_daemon_device_ids: str = ""
+    """LOTTEON 헤드리스 데몬 deviceId 풀 (콤마 구분).
+    예) "samba-daemon-pc1,samba-daemon-pc2,samba-daemon-pc3"
+    설정 시 LOTTEON DOM 위임 잡을 풀에서 round-robin 으로 1개 데몬에 라우팅.
+    비어있으면 기존 흐름(오토튠 시작 PC 확장앱) 유지 — 즉시 롤백 가능.
+    각 데몬은 본인 deviceId 만 picking — 백엔드 get_next_job 가 owner 매칭."""
+
+    daemon_public_backend_url: str = ""
+    """데몬 설치본이 가리킬 백엔드 공개 URL (포크 운영자용).
+    설정 시 /daemon-installer 가 파일명에 `_be-<hex>` 로 박아 데몬이 본인 백엔드를 향하게 한다.
+    비어있으면 미박음 → 데몬 기본값(https://api.samba-wave.co.kr) 사용. 메인 운영은 비워둬도 동일.
+    예) "https://api.myfork.com" """
 
     # ===========================================
     # AI / Anthropic Configuration

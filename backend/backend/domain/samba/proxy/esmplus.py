@@ -56,6 +56,27 @@ class _AsyncTokenBucket:
 _ESM_RATE_LIMITER = _AsyncTokenBucket(rate_per_min=30)
 
 
+# 주문조회 전용 5초 인터벌 락 — ESM resultCode=3000 "주문 조회는 5초당 1회 호출 가능합니다"
+# 토큰버킷 30/min(2초)으로는 4계정×5상태=20회 폭주 시 3000 응답.
+# search_orders 호출 직전 마지막 호출 후 5.2초 경과 보장.
+_ESM_ORDER_LOCK = asyncio.Lock()
+_ESM_ORDER_LAST_CALL: float = 0.0
+_ESM_ORDER_MIN_INTERVAL = 5.2
+
+
+async def _esm_order_throttle() -> None:
+    """search_orders 호출 직전 5.2초 글로벌 인터벌 보장."""
+    global _ESM_ORDER_LAST_CALL
+    async with _ESM_ORDER_LOCK:
+        now = time.monotonic()
+        elapsed = now - _ESM_ORDER_LAST_CALL
+        if elapsed < _ESM_ORDER_MIN_INTERVAL:
+            wait = _ESM_ORDER_MIN_INTERVAL - elapsed
+            logger.debug(f"[ESM order throttle] waiting {wait:.2f}s")
+            await asyncio.sleep(wait)
+        _ESM_ORDER_LAST_CALL = time.monotonic()
+
+
 # 옵션 그룹/값 TTL 캐시 — 옵션값 list 가 크고(색상 1.3K건) 자주 변하지 않음.
 # 카테고리당 그룹은 거의 영구. 옵션값은 신규 색상/사이즈 등 가끔 추가.
 _OPT_CACHE_TTL_SEC = 3600  # 1시간
@@ -765,7 +786,9 @@ class ESMPlusClient:
           - orderNo (long): orderStatus=0 시 필수
         Optional: pageIndex, pageSize.
         조회 기간: G마켓 31일, 옥션 180일.
+        rate limit: 5초당 1회 (orderStatus=0 직접 조회 제외) — `_esm_order_throttle()`로 보장.
         """
+        await _esm_order_throttle()
         return await self._call_api(
             "POST", "/shipping/v1/Order/RequestOrders", data=params
         )
@@ -1082,11 +1105,14 @@ class ESMPlusClient:
         """판매자 문의 조회 — POST /item/v1/communications/customer/bulletin-board.
 
         Required params:
-          - qnaType (int): 문의 종류 (3 등)
-          - status (int): 답변상태
-          - type (int): 마켓 구분
+          - qnaType (int): 1=옥션 일반, 2=옥션 비밀글, 3=G마켓 전체
+          - status (int): 1=전체, 2=미처리, 3=처리완료, 4=처리중(G마켓), 5=중복
+          - type (int): **서버 필수** — 누락 시 500 "Error getting value from 'Type'".
+                         공식 문서에는 누락되어 있으나 raw probe로 확인. 1 사용 검증됨.
           - startDate / endDate (YYYY-MM-DD): 7일 단위
         """
+        if "type" not in params:
+            params = {**params, "type": 1}
         return await self._call_api(
             "POST",
             "/item/v1/communications/customer/bulletin-board",
@@ -1121,10 +1147,15 @@ class ESMPlusClient:
         )
 
     async def search_urgent_alerts(self, params: dict[str, Any]) -> dict[str, Any]:
-        """긴급알리미 조회 — ESM 측 CS 긴급 요청 사항."""
+        """긴급알리미 조회 — ESM 측 CS 긴급 요청 사항.
+
+        정확한 경로는 etapi.gmarket.com 문서 기준
+        `/assist/v1/Selling/GetEmergencyInformList`. 기존 `/item/v1/...` 경로는
+        401 응답이며 권한 이슈로 오인되기 쉬워서 정정.
+        """
         return await self._call_api(
             "POST",
-            "/item/v1/communications/urgent-alert/bulletin-board",
+            "/assist/v1/Selling/GetEmergencyInformList",
             data=params,
         )
 
@@ -1329,6 +1360,8 @@ class ESMPlusClient:
                 "price": {site_key: sale_price},
                 "stock": {site_key: stock},
                 "sellingPeriod": {site_key: selling_period},
+                # 판매여부 — ESM 서버 필수. 누락 시 G마켓 등록 reject "판매 여부(isSell)를 입력해주세요"
+                "isSell": {site_key: 1},
                 "shipping": shipping,
                 "images": {
                     "basicImgURL": basic_img,
@@ -1461,8 +1494,16 @@ _ESM_NOTICE_ITEMS: dict[int, list[tuple[str, str]]] = {
         ("4-8", "_as_phone"),  # A/S
         ("4-9", ""),  # 배송기간
     ],
-    35: [  # 기타 재화 — 필수 fields 가이드: '직접입력' 또는 상세설명참조 통일.
-        ("999-5", ""),
+    35: [  # 기타 재화 — ESM 필수(isExtraMark=true) 항목 35-1~35-6 (항목명은 API 미제공).
+        # 검증: GET /item/v1/official-notice/groups/35/codes (2026-05-24, 가디 응답)
+        # 999-5 는 isExtraMark=false(비필수)라 단독 전송 시 "35-1 미입력" 오류 발생.
+        # source_key 미지정 → 전부 fallback("[상세설명참조]")로 검증 통과.
+        ("35-1", ""),
+        ("35-2", ""),
+        ("35-3", ""),
+        ("35-4", ""),
+        ("35-5", ""),
+        ("35-6", ""),
     ],
 }
 

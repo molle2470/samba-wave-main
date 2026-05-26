@@ -185,6 +185,9 @@ class SambaCollectedProduct(SQLModel, table=True):
     original_price: float = Field(default=0)
     sale_price: float = Field(default=0)
     cost: Optional[float] = Field(default=None)
+    # 무신사 보유 적립금 사용 제외 cost (정책 토글 excludeHeldPoint=True에서 사용)
+    # 무신사 외 소싱처: cost와 동일값 (refresh 시 자동 저장)
+    cost_excl_held_point: Optional[float] = Field(default=None)
 
     # 적립금 사용 제한 여부 (무신사 isRestictedUsePoint 등)
     # True = 적립금 사용 불가 상품, False = 사용 가능, None = 미수집/지원 안 됨

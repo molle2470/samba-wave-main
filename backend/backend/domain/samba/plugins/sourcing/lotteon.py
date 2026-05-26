@@ -24,6 +24,13 @@ _lotteon_safe_interval: float = 999.0  # 차단 없는 최소 인터벌 기록
 _sitm_no_cache: dict[str, str] = {}
 
 
+def _pick_autotune_daemon_owner(settings_obj: object) -> str | None:
+    """LOTTEON 데몬 owner 선택 — `daemon_pool.pick_daemon_owner` 위임 thin wrapper."""
+    from backend.domain.samba.proxy.daemon_pool import pick_daemon_owner
+
+    return pick_daemon_owner("LOTTEON", settings_obj)
+
+
 def _select_lotteon_proxy() -> str | None:
     """현재 실행 컨텍스트에 따라 롯데ON 호출용 프록시 URL을 선택.
 
@@ -222,6 +229,9 @@ class LotteonSourcingPlugin(SourcingPlugin):
             for _opt in detail["options"]:
                 _opt["price"] = _eff_price
 
+        # pbf-only 빠른경로는 best_benefit_price 미수집 → 항상 price_uncertain
+        # 오토튠이 cost 갱신 및 전송 보류 (정가 폴백 차단)
+        detail["price_uncertain"] = True
         return detail
 
     def _parse_pbf_to_detail(self, pbf: dict) -> dict:
@@ -546,11 +556,17 @@ class LotteonSourcingPlugin(SourcingPlugin):
         # pbf 옵션 리스트의 stock을 덮어쓴다. 미연결/타임아웃/파싱 실패 시 pbf 값 유지.
         # ── DOM 위임 필수 — 최대혜택가/실재고는 DOM에서만 수집 가능 ──
         dom_ext: dict | None = None
+        from backend.core.config import settings
         from backend.domain.samba.proxy.sourcing_queue import SourcingQueue
+
+        # 헤드리스 데몬 라우팅 — 환경변수의 데몬 풀에서 round-robin 으로 1개 선택.
+        # autotune_daemon_device_ids (콤마 구분) 가 우선, 비어있으면 하위호환으로
+        # autotune_daemon_device_id (단수) 사용. 둘 다 비어있으면 기존 확장앱 흐름.
+        _route_owner: str | None = _pick_autotune_daemon_owner(settings)
 
         try:
             _dom_req, _dom_fut = SourcingQueue.add_detail_job(
-                "LOTTEON", site_product_id
+                "LOTTEON", site_product_id, owner_device_id=_route_owner
             )
             dom_ext = await asyncio.wait_for(_dom_fut, timeout=60)
             if isinstance(dom_ext, dict) and dom_ext.get("login_required"):
@@ -601,6 +617,7 @@ class LotteonSourcingPlugin(SourcingPlugin):
                 detail["_option_stock_live"] = True
 
         # DOM에서 직접 파싱한 "나의 혜택가" — 유일한 혜택가 출처
+        # 추출 실패(DOM 미연결/혜택가 0) 시 price_uncertain=True 마킹 → 오토튠이 cost 갱신 및 전송 보류
         if dom_ext:
             _dom_benefit = dom_ext.get("best_benefit_price") or 0
             if _dom_benefit > 0:
@@ -608,6 +625,17 @@ class LotteonSourcingPlugin(SourcingPlugin):
                 logger.info(
                     f"[LOTTEON] DOM 혜택가 적용: {site_product_id} → {_dom_benefit:,}원"
                 )
+            else:
+                detail["price_uncertain"] = True
+                logger.warning(
+                    f"[LOTTEON][가격불확실] DOM 혜택가 추출 실패: {site_product_id} "
+                    f"→ cost 갱신 및 전송 보류"
+                )
+        else:
+            detail["price_uncertain"] = True
+            logger.warning(
+                f"[LOTTEON][가격불확실] DOM 미응답: {site_product_id} → cost 갱신 및 전송 보류"
+            )
 
         if dom_ext:
             # §12 방어 로깅 — DOM이 다른 상품 긁었을 가능성 조기 감지

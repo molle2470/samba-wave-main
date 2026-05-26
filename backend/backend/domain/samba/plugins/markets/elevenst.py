@@ -182,6 +182,65 @@ class ElevenstPlugin(MarketPlugin):
                     _origin_parts.append(f"<orgnNmVal>{_escape_xml(_onv)}</orgnNmVal>")
                 _origin_xml = "".join(_origin_parts)
 
+                # 배송 — 11번가는 PUT 시 dlvCstInstBasiCd(배송비 설정 코드)도 조건부 재검증
+                # 저장된 값이 빈 경우 가격만 보내도 STATUS[103] 검증 실패 → 전체XML 폴백 → dispCtgrNo 권한 에러 연쇄
+                # → 경량 XML에서도 배송 블록 동봉 (transform_product 와 동일 매핑)
+                _dlv_code_map = {"DV_FREE": "01", "DV_FIXED": "02", "DV_COND": "03"}
+                _raw_dlv = _acct_extras.get("deliveryType", "01")
+                _delivery_type = _dlv_code_map.get(_raw_dlv, _raw_dlv) or "01"
+                _delivery_fee = int(_acct_extras.get("deliveryFee", 0) or 0)
+                _return_fee = int(_acct_extras.get("returnFee", 4000) or 4000)
+                _exchange_fee = int(_acct_extras.get("exchangeFee", 8000) or 8000)
+                _jeju_fee = int(_acct_extras.get("jejuFee", 0) or 0)
+                _island_fee = int(_acct_extras.get("islandFee", 0) or 0)
+                _ship_from = _acct_extras.get("shipFromAddress", "") or ""
+                _return_addr = _acct_extras.get("returnAddress", "") or ""
+                _dispatch_tmpl = str(
+                    _acct_extras.get("dispatchTemplateNo", "") or ""
+                ).strip()
+                _dispatch_tmpl_xml = (
+                    f"<dlvSendCloseTmpltNo>{_escape_xml(_dispatch_tmpl)}</dlvSendCloseTmpltNo>"
+                    if _dispatch_tmpl
+                    else ""
+                )
+                _delivery_xml = (
+                    f"<dlvCnFee>{_delivery_fee}</dlvCnFee>"
+                    f"<dlvGrntYn>Y</dlvGrntYn>"
+                    f"{_dispatch_tmpl_xml}"
+                    f"<dlvCstInstBasiCd>{_delivery_type}</dlvCstInstBasiCd>"
+                    f"<jejuDlvCst>{_jeju_fee}</jejuDlvCst>"
+                    f"<islandDlvCst>{_island_fee}</islandDlvCst>"
+                    f"<rtngdDlvCst>{_return_fee}</rtngdDlvCst>"
+                    f"<exchDlvCst>{_exchange_fee}</exchDlvCst>"
+                    f"<dlvBsPlc>{_escape_xml(_ship_from)}</dlvBsPlc>"
+                    f"<rtngBsPlc>{_escape_xml(_return_addr)}</rtngBsPlc>"
+                )
+
+                # A/S·교환반품 안내 — 11번가 PUT 시 빈값 재검증 가드
+                # 저장된 값이 빈 경우 경량 PUT 응답 "교환반품 안내는 반드시 입력하셔야 합니다 STATUS[103]"
+                # → 전체 XML 폴백 시 다시 카테고리 권한 에러로 종료되어 자동복구가 못 잡음
+                _as_msg = (
+                    _acct_extras.get("asMessage") or ""
+                ).strip() or "상세페이지 참조"
+                _rtn_exch = (
+                    _acct_extras.get("returnExchangeGuide") or ""
+                ).strip() or "상세페이지 참조"
+                _after_xml = (
+                    f"<asDetail>{_escape_xml(_as_msg)}</asDetail>"
+                    f"<rtngExchDetail>{_escape_xml(_rtn_exch)}</rtngExchDetail>"
+                )
+
+                # 안전인증정보 빈값 재검증 가드 — 경량 PUT에 ProductCertGroup 누락 시
+                # 11번가 응답 "안전인증정보 설정 오류 [인증유형 및 인증번호를 입력해주세요] STATUS[103]"
+                # → 전체XML 폴백 → dispCtgrNo 권한 에러 연쇄. transform_product 와 동일 매핑 동봉
+                _cert_xml = (
+                    "<ProductCertGroup><crtfGrpTypCd>01</crtfGrpTypCd><crtfGrpObjClfCd>03</crtfGrpObjClfCd></ProductCertGroup>"
+                    "<ProductCertGroup><crtfGrpTypCd>02</crtfGrpTypCd><crtfGrpObjClfCd>03</crtfGrpObjClfCd></ProductCertGroup>"
+                    "<ProductCertGroup><crtfGrpTypCd>03</crtfGrpTypCd><crtfGrpObjClfCd>03</crtfGrpObjClfCd></ProductCertGroup>"
+                    "<ProductCertGroup><crtfGrpTypCd>04</crtfGrpTypCd><crtfGrpObjClfCd>05</crtfGrpObjClfCd></ProductCertGroup>"
+                    "<ProductCert><certTypeCd>131</certTypeCd><certKey></certKey></ProductCert>"
+                )
+
                 xml_data = (
                     '<?xml version="1.0" encoding="UTF-8"?>'
                     "<Product>"
@@ -189,6 +248,9 @@ class ElevenstPlugin(MarketPlugin):
                     f"<selPrc>{new_price}</selPrc>"
                     f"{_brand_xml}"
                     f"{_origin_xml}"
+                    f"{_delivery_xml}"
+                    f"{_after_xml}"
+                    f"{_cert_xml}"
                     f"{option_xml}"
                     "</Product>"
                 )
@@ -261,8 +323,46 @@ class ElevenstPlugin(MarketPlugin):
                         "success": False,
                         "message": "11번가 등록 실패: 이미지 미러링 후 사용 가능한 이미지가 없습니다.",
                     }
+                # issue #218 — 미러링 후에도 핫링크 차단 도메인(msscdn 등) URL이 남아있으면 등록 차단
+                # 그대로 등록되면 무신사 광고 배너가 11번가 상품 페이지에 노출됨
+                _still_blocked = [
+                    u
+                    for u in (product.get("images") or [])
+                    if ImageTransformService.is_hotlink_blocked_url(u)
+                ]
+                if _still_blocked:
+                    return {
+                        "success": False,
+                        "message": (
+                            f"11번가 등록 취소: R2 미러링 실패로 핫링크 차단 URL {len(_still_blocked)}개 잔존. "
+                            "R2 설정을 확인하고 재시도하세요."
+                        ),
+                    }
         except Exception as e:
-            logger.warning(f"[11번가] 이미지 미러링 단계 오류 — 원본 URL 유지: {e}")
+            # R2 설정 자체가 없는 경우(개발환경) 대비 — 차단 도메인 잔존 시에만 등록 차단
+            try:
+                from backend.domain.samba.image.service import (
+                    ImageTransformService as _ITS,
+                )
+
+                _blocked = [
+                    u
+                    for u in (product.get("images") or [])
+                    if _ITS.is_hotlink_blocked_url(u)
+                ]
+            except Exception:
+                _blocked = []
+            if _blocked:
+                logger.error(
+                    f"[11번가] R2 미러링 오류 + 차단 URL 존재 — 등록 차단: {e}"
+                )
+                return {
+                    "success": False,
+                    "message": f"11번가 등록 취소: R2 미러링 오류. {e}",
+                }
+            logger.warning(
+                f"[11번가] 이미지 미러링 단계 오류 — 차단 URL 없어 원본 유지: {e}"
+            )
 
         # 카테고리 키속성 메타 조회 (TTL 캐시 — 재호출 시 즉시 반환)
         # 선글라스/시계 등은 치수 키속성이 필수이며, 누락 시 11번가가 500 반환
@@ -292,7 +392,15 @@ class ElevenstPlugin(MarketPlugin):
 
         try:
             if existing_no:
-                result = await client.update_product(existing_no, xml_data)
+                # 수정 PUT 시 dispCtgrNo 제거 — 카테고리매핑 변경으로 보낸 코드가 등록 카테고리와
+                # 다르면 11번가가 STATUS[103] "상위 카테고리를 수정할 수 있는 권한이 없습니다" 반환
+                # 오토튠 가격/재고 갱신 경로에서 카테고리 변경 의도 없음. 신규등록 path는 영향 없음
+                import re as _re
+
+                xml_data_for_put = _re.sub(
+                    r"<dispCtgrNo>[^<]*</dispCtgrNo>", "", xml_data, count=1
+                )
+                result = await client.update_product(existing_no, xml_data_for_put)
                 logger.info(f"[11번가] 폴백 응답: {result}")
                 return {
                     "success": True,
@@ -338,6 +446,67 @@ class ElevenstPlugin(MarketPlugin):
                     "message": f"11번가 유령 매핑 자동정리 (사유: {err})",
                     "ghost_cleanup": True,
                 }
+            # 상위 카테고리 권한 에러(STATUS[103]) → DB prdNo가 11번가 실제 prdNo와 불일치할 때 발생
+            # sellerprodcode로 진짜 prdNo 재조회 후 DB 동기화 + 1회 재시도
+            if existing_no and (
+                "상위 카테고리를 수정할 수 있는 권한" in err or "STATUS : [103]" in err
+            ):
+                pid = str(product.get("id") or "")
+                aid = getattr(account, "id", "") if account else ""
+                try:
+                    lookup = await client.find_by_seller_code(pid)
+                    real_prd_no = (lookup.get("prd_no") or "").strip()
+                except Exception as _e:
+                    real_prd_no = ""
+                    logger.warning(
+                        f"[11번가] STATUS[103] 자동복구 — sellerprodcode 조회 실패 product={pid}: {_e}"
+                    )
+                if real_prd_no and real_prd_no != existing_no:
+                    # DB market_product_nos[aid] 갱신
+                    try:
+                        from sqlalchemy.orm.attributes import flag_modified
+                        from sqlmodel import select
+
+                        from backend.domain.samba.collector.model import (
+                            SambaCollectedProduct,
+                        )
+
+                        stmt = select(SambaCollectedProduct).where(
+                            SambaCollectedProduct.id == pid
+                        )
+                        prod = (await session.execute(stmt)).scalars().first()
+                        if prod and aid:
+                            nos = dict(prod.market_product_nos or {})
+                            nos[aid] = real_prd_no
+                            prod.market_product_nos = nos
+                            flag_modified(prod, "market_product_nos")
+                            session.add(prod)
+                            await session.commit()
+                            logger.warning(
+                                f"[11번가] STATUS[103] 자동복구 — DB prdNo 갱신 product={pid} account={aid} {existing_no}→{real_prd_no}"
+                            )
+                    except Exception as _e:
+                        logger.warning(f"[11번가] STATUS[103] DB 갱신 실패: {_e}")
+                    # 진짜 prdNo로 PUT 1회 재시도
+                    try:
+                        retry_result = await client.update_product(
+                            real_prd_no, xml_data
+                        )
+                        logger.info(
+                            f"[11번가] STATUS[103] 재시도 성공 prdNo={real_prd_no}"
+                        )
+                        return {
+                            "success": True,
+                            "product_no": real_prd_no,
+                            "message": f"11번가 수정 성공 (prdNo 재동기화: {existing_no}→{real_prd_no})",
+                            "data": retry_result,
+                            "prd_no_resync": True,
+                        }
+                    except Exception as _e:
+                        return {
+                            "success": False,
+                            "message": f"11번가 수정 실패 (prdNo 재동기화 후 재시도 실패): {_e}",
+                        }
             if "해외 쇼핑 카테고리" in err:
                 return {
                     "success": False,

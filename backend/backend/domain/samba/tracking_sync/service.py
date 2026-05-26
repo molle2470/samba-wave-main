@@ -72,6 +72,9 @@ def build_tracking_url(site: str, sourcing_order_number: str) -> str:
         return f"https://www.nike.com/kr/orders/sales/{ord_no}/"
     if s == "OLIVEYOUNG":
         return f"https://www.oliveyoung.co.kr/store/mypage/getOrderDetail.do?ordNo={ord_no}"
+    if s == "KREAM":
+        # KREAM 송장 URL 추정값 — 마이페이지 주문 상세. 실측 검증 필요.
+        return f"https://kream.co.kr/my/orders/{ord_no}"
     raise ValueError(f"지원하지 않는 소싱처 송장조회: {site}")
 
 
@@ -166,90 +169,6 @@ def _detect_site_from_url(url: str) -> str:
     if "oliveyoung.co.kr" in host:
         return "OLIVEYOUNG"
     return ""
-
-
-async def _try_backend_fetch_musinsa(order, session) -> Optional[dict[str, Any]]:
-    """MUSINSA 송장 정보 백엔드 직접 fetch — 성공 시 SCRAPED 잡 row 생성 후 결과 반환.
-
-    쿠키 풀(musinsa_cookies) 전체를 순회하며 한 쿠키라도 성공하면 OK.
-    무신사 마이페이지 deliveryInfo는 그 주문이 자기 계정 주문일 때만 200 SUCCESS,
-    아니면 FAIL 반환. 즉 풀 순회로 "이 주문이 누구 계정 거냐"를 자동 매칭함.
-
-    실패/누락 시 None 반환 → enqueue_for_order 호출자가 SourcingQueue 폴백.
-    """
-    from backend.domain.samba.collector.refresher import _get_musinsa_cookies
-    from backend.domain.samba.proxy.musinsa import MusinsaClient
-
-    ord_no = (order.sourcing_order_number or "").strip()
-    ord_opt_no = (order.musinsa_ord_opt_no or "").strip()
-    if not ord_no or not ord_opt_no:
-        return None
-
-    cookies = await _get_musinsa_cookies()
-    if not cookies:
-        logger.info("[송장동기화] MUSINSA backend fetch 스킵 — 쿠키 풀 비어있음")
-        return None
-
-    result = None
-    last_error = ""
-    for idx, cookie in enumerate(cookies):
-        client = MusinsaClient(cookie=cookie)
-        result = await client.fetch_tracking(ord_no, ord_opt_no)
-        if result.get("ok"):
-            logger.info(
-                f"[송장동기화] MUSINSA backend fetch 성공 (cookie #{idx + 1}/{len(cookies)}): "
-                f"order={order.id} ord_no={ord_no}"
-            )
-            break
-        last_error = result.get("error") or ""
-    else:
-        logger.info(
-            f"[송장동기화] MUSINSA backend fetch 모든 쿠키 실패 ({len(cookies)}개 시도, 폴백): "
-            f"order={order.id} ord_no={ord_no} last_err={last_error}"
-        )
-        return None
-    if not result or not result.get("ok"):
-        return None
-
-    courier = normalize_courier_name(result.get("courier") or "")
-    tracking = (result.get("trackingNumber") or "").strip()
-    if not tracking:
-        return None
-
-    # SambaTrackingSyncJob을 SCRAPED 상태로 즉시 생성
-    job = SambaTrackingSyncJob(
-        tenant_id=order.tenant_id,
-        order_id=order.id,
-        sourcing_site="MUSINSA",
-        sourcing_order_number=ord_no,
-        sourcing_account_id=order.sourcing_account_id,
-        owner_device_id=None,
-        request_id=None,
-        status=STATUS_SCRAPED,
-        scraped_courier=courier,
-        scraped_tracking=tracking,
-        scraped_at=datetime.now(_UTC),
-    )
-    session.add(job)
-
-    # SambaOrder.tracking_number / shipping_company도 함께 갱신
-    order.tracking_number = tracking
-    order.shipping_company = courier or order.shipping_company
-    order.updated_at = datetime.now(_UTC)
-    session.add(order)
-
-    await session.commit()
-    logger.info(
-        f"[송장동기화] MUSINSA backend fetch 성공: order={order.id} "
-        f"courier={courier} tracking={tracking}"
-    )
-    return {
-        "success": True,
-        "jobId": job.id,
-        "backendFetch": True,
-        "courier": courier,
-        "tracking": tracking,
-    }
 
 
 _KNOWN_SOURCE_SITES = {
@@ -403,28 +322,33 @@ async def enqueue_for_order(order_id: str, *, force: bool = False) -> dict[str, 
         # 확장앱이 받아 현재 로그인 계정으로 시도 → 다른 계정 주문이면 패스(NO_TRACKING).
         # 계정 분리 운영은 사용자가 PC별 로그인으로 관리.
 
-        # MUSINSA 백엔드 직접 fetch 분기 — ord_opt_no가 DB에 저장돼 있으면
-        # 확장앱 탭 폴링 없이 cookie 기반 deliveryInfo API 직접 호출.
-        if actual_site == "MUSINSA" and (order.musinsa_ord_opt_no or "").strip():
-            backend_result = await _try_backend_fetch_musinsa(order, session)
-            if backend_result:
-                return backend_result
-            # backend fetch 실패 시 기존 SourcingQueue 폴백으로 진행
-
-        # 1) SourcingQueue에 잡 적재 (확장앱 폴링이 받음) — actual_site 사용
+        # 1) SourcingQueue에 잡 적재 — 데몬 전용 사이트는 데몬, 그 외는 확장앱 폴링
         try:
             url = build_tracking_url(actual_site, order.sourcing_order_number)
         except ValueError as exc:
             return {"success": False, "error": str(exc)}
 
-        request_id, _future = await SourcingQueue.add_tracking_job(
-            site=actual_site,
-            url=url,
-            order_id=order.id,
-            sourcing_order_number=order.sourcing_order_number,
-            owner_device_id=None,
-            sourcing_account_id=order.sourcing_account_id or None,
-        )
+        try:
+            request_id, _future = await SourcingQueue.add_tracking_job(
+                site=actual_site,
+                url=url,
+                order_id=order.id,
+                sourcing_order_number=order.sourcing_order_number,
+                owner_device_id=None,
+                sourcing_account_id=order.sourcing_account_id or None,
+            )
+        except RuntimeError as exc:
+            # DAEMON_ONLY_TRACKING_SITES + 데몬 미등록 → 잡 발행 skip
+            # 배치 도중 한 사이트 데몬 다운으로 전체 중단되지 않게 skipped 반환
+            logger.warning(
+                f"[송장동기화] 데몬 미등록 skip: order={order.id} site={actual_site} "
+                f"err={exc}"
+            )
+            return {
+                "success": True,
+                "skipped": True,
+                "reason": f"{actual_site} 송장 데몬 미등록 — 잡 발행 skip",
+            }
 
         # 2) DB row 생성
         job = SambaTrackingSyncJob(

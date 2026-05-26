@@ -34,34 +34,143 @@ from backend.utils.logger import logger
 router = APIRouter(prefix="/orders", tags=["samba-orders"])
 
 
-# ── 매칭 캐시(_mpn_cache) 모듈 전역 TTL 캐시 ──
-# 매 sync마다 collected_product 12.6만건 SELECT + 인덱싱(약 7초) 부담을
-# 60초 TTL로 한 번만 빌드해 재사용. 신규 cp 등록은 60초 안에 매칭됨.
-_MPN_CACHE_TTL_SEC = 60.0
+# ── 매칭 캐시(_mpn_cache) 모듈 전역 — 증분 갱신 ──
+# 과거: 호출마다 등록상품 전체(~10만건, 1GB) 풀스캔 빌드 → 빌드(150초)>TTL 이라
+# 캐시가 안 채워지고 무한 재스캔 → read 풀 고갈 사고.
+# 현재: updated_at(ix_scp_updated_at_desc) 변경분만 증분 머지 + 주기적 전체 재빌드.
+_MPN_CACHE_TTL_SEC = 180.0  # 증분 적용 최소 간격(초)
+_MPN_FULL_REBUILD_SEC = 21600.0  # 전체 재빌드 주기(초, 6h) — 삭제·등록해제 staleness 정리. 증분이 신선도 담당하므로 드물게
 # (by_global, by_account) 튜플 — by_account는 정확 매칭(account_id, product_no) 인덱스
 _mpn_cache_data: tuple[dict[str, dict], dict[str, dict]] | None = None
-_mpn_cache_built_at: float = 0.0
+_mpn_cache_built_at: float = 0.0  # 마지막 빌드/증분 monotonic
+_mpn_cache_full_built_at: float = 0.0  # 마지막 전체빌드 monotonic
+_mpn_cache_delta_since = None  # 증분 쿼리 기준 wall-clock(datetime, UTC)
 _mpn_cache_lock = asyncio.Lock()
+
+
+def _index_mpn_row(_row, by_global: dict, by_account: dict, sourcing_urls: dict) -> int:
+    """수집상품 1행을 by_global / by_account 인덱스에 반영. ambiguous 신규 발생 수 반환.
+
+    전체 빌드와 증분 머지 둘 다 이 함수를 재사용 — 인덱싱 규칙을 1곳에 모은다.
+    """
+    _cpid, _site, _spid, _thumb_raw, _mpnos, _src_url, _cat = _row
+    if not (_mpnos and isinstance(_mpnos, dict)):
+        return 0
+    # 썸네일은 (images->>0)로 첫 URL만 추출 — TOAST 전체 fetch 회피하면서 표시용 확보.
+    _thumb = _thumb_raw or ""
+    _olink = _src_url or (
+        sourcing_urls.get(_site, "").format(_spid)
+        if _site in sourcing_urls and _spid
+        else ""
+    )
+    # account_id별 등록된 site_ids 모음 — `{account_id}_sites` 키 패턴.
+    _sites_by_account: dict[str, list[str]] = {}
+    for _k, _v in _mpnos.items():
+        if _k.endswith("_sites") and isinstance(_v, list):
+            _account_id = _k[: -len("_sites")]
+            _sites_by_account[_account_id] = [str(s) for s in _v if s]
+
+    _ambiguous_new = 0
+    for _k, _v in _mpnos.items():
+        if not _v or _k.endswith("_qa") or _k.endswith("_sites"):
+            continue
+        # _origin 키도 인덱싱한다 — 스마트스토어 주문 product_id 에는
+        # channelProductNo 대신 originProductNo 가 들어오는 케이스가 있어
+        # 매칭 실패 → source_site/source_url 공란 저장 사고가 반복되어 추가.
+        if _k.endswith("_origin"):
+            _account_key = _k[: -len("_origin")]
+        else:
+            _account_key = str(_k)
+        if isinstance(_v, dict):
+            _values = [
+                _v.get("smartstoreChannelProductNo"),
+                _v.get("originProductNo"),
+                _v.get("channelProductNo"),
+            ]
+        else:
+            _values = [_v]
+        for _sub_v in _values:
+            if not _sub_v:
+                continue
+            _key = str(_sub_v)
+            # 글로벌 인덱스 — 충돌 감지 (다른 cp가 같은 키 차지 시 ambiguous)
+            _existing_global = by_global.get(_key)
+            if not _existing_global:
+                by_global[_key] = {
+                    "collected_product_id": _cpid,
+                    "source_site": _site,
+                    "product_image": _thumb,
+                    "original_link": _olink,
+                    "category": _cat or "",
+                    "site_ids_by_account": dict(_sites_by_account),
+                }
+            elif _existing_global.get("collected_product_id") != _cpid:
+                if not _existing_global.get("ambiguous"):
+                    _ambiguous_new += 1
+                _existing_global["ambiguous"] = True
+            else:
+                # 같은 cp 재반영(증분 포함) — site_ids만 보강
+                for acc, sites in _sites_by_account.items():
+                    _existing_global["site_ids_by_account"].setdefault(acc, []).extend(
+                        s
+                        for s in sites
+                        if s not in _existing_global["site_ids_by_account"].get(acc, [])
+                    )
+            # 정확 매칭 인덱스 — (account_id, product_no). 증분 시 동일 cp는 갱신,
+            # 다른 cp가 이미 점유 중이면 가장 오래된 것 우선(덮어쓰기 안 함).
+            _acc_key = f"{_account_key}:{_key}"
+            _existing_acc = by_account.get(_acc_key)
+            if (
+                _existing_acc is None
+                or _existing_acc.get("collected_product_id") == _cpid
+            ):
+                by_account[_acc_key] = {
+                    "collected_product_id": _cpid,
+                    "source_site": _site,
+                    "product_image": _thumb,
+                    "original_link": _olink,
+                    "category": _cat or "",
+                    "site_ids_by_account": dict(_sites_by_account),
+                }
+    return _ambiguous_new
+
+
+# images(JSON 배열, TOAST)는 SELECT에서 제외 — 포함 시 전체 스캔이 61초→337초로 폭증해
+# 빌드가 per-account 타임아웃(180~300초)에 매번 killed → 캐시 영영 미생성 사고.
+# product_image는 표시용일 뿐(마켓 자동채움 + /fetch-product-image 지연조회 존재)이라 빈값으로 둔다.
+_MPN_SELECT_COLS = (
+    "SELECT id, source_site, site_product_id, (images->>0) AS thumb, "
+    "market_product_nos, source_url, category FROM samba_collected_product "
+    "WHERE market_product_nos IS NOT NULL"
+)
 
 
 async def _get_mpn_cache(
     session, sourcing_urls: dict
 ) -> tuple[dict[str, dict], dict[str, dict]]:
-    """market_product_no → collected_product 인덱스 (TTL 60초).
+    """market_product_no → collected_product 인덱스 (증분 갱신).
 
     리턴: (by_global, by_account)
       - by_global[product_no]            = entry  (기존 호환 키, 충돌 시 entry["ambiguous"]=True)
-      - by_account[f"{account_id}:{no}"] = entry  (정확 매칭용, 충돌 없음)
+      - by_account[f"{account_id}:{no}"] = entry  (정확 매칭용)
 
-    SELECT 전용이므로 write session(외부 마켓 API 동안 idle in transaction
-    timeout으로 죽을 수 있음)에 의존하지 않고 내부에서 별도 read session을
-    연다. 인자 ``session``은 호환을 위해 유지되며 사용되지 않는다.
+    [성능] 과거엔 호출마다 등록상품 전체(~10만건, 1GB 테이블)를 풀스캔해 빌드 →
+    빌드(150초)가 TTL보다 길어 캐시가 안 채워지고 무한 재스캔 → read 풀 고갈 사고.
+    이제 증분 방식:
+      - 콜드스타트 / 전체 재빌드 주기(_MPN_FULL_REBUILD_SEC) 경과 시: 전체 빌드
+      - 그 외: updated_at >= 직전빌드 변경분만(ix_scp_updated_at_desc) 가져와 기존 캐시에 머지
+    삭제·등록해제로 사라진 키는 증분에서 안 지워지나, 전체 재빌드 주기마다 정리됨.
+    매칭 키는 정확 키만 쓰므로 staleness가 오매칭을 만들지 않음.
+
+    SELECT 전용이라 별도 read session을 연다. 인자 ``session``은 호환용(미사용).
     """
     import time as _t
+    from datetime import datetime, timezone
 
     from sqlalchemy import text as _sa_text
 
-    global _mpn_cache_data, _mpn_cache_built_at
+    global _mpn_cache_data, _mpn_cache_built_at, _mpn_cache_full_built_at
+    global _mpn_cache_delta_since
     async with _mpn_cache_lock:
         now = _t.monotonic()
         if (
@@ -69,110 +178,53 @@ async def _get_mpn_cache(
             and (now - _mpn_cache_built_at) < _MPN_CACHE_TTL_SEC
         ):
             return _mpn_cache_data
-        async with get_read_session() as _read_sess:
-            _cp_result = await _read_sess.execute(
-                _sa_text(
-                    "SELECT id, source_site, site_product_id, images, market_product_nos, source_url, category "
-                    "FROM samba_collected_product WHERE market_product_nos IS NOT NULL"
-                )
-            )
-            _cp_rows = _cp_result.fetchall()
-        new_cache: dict[str, dict] = {}
-        new_by_account: dict[str, dict] = {}
-        _ambiguous_count = 0
-        for _row in _cp_rows:
-            _cpid, _site, _spid, _imgs, _mpnos, _src_url, _cat = _row
-            if not (_mpnos and isinstance(_mpnos, dict)):
-                continue
-            _thumb = _imgs[0] if _imgs and isinstance(_imgs, list) and _imgs else ""
-            _olink = _src_url or (
-                sourcing_urls.get(_site, "").format(_spid)
-                if _site in sourcing_urls and _spid
-                else ""
-            )
-            # account_id별 등록된 site_ids 모음 — `{account_id}_sites` 키 패턴.
-            # 신규 등록 액션에서 이 키에 [site_id, ...] 저장 (Phase 3에서 구현).
-            # 기존 cp는 _sites 키 없음 → cache value의 site_ids_by_account = {} 유지 →
-            # 매칭 시 호환 모드(site_id 검증 안 함).
-            _sites_by_account: dict[str, list[str]] = {}
-            for _k, _v in _mpnos.items():
-                if _k.endswith("_sites") and isinstance(_v, list):
-                    _account_id = _k[: -len("_sites")]
-                    _sites_by_account[_account_id] = [str(s) for s in _v if s]
 
-            for _k, _v in _mpnos.items():
-                if not _v or _k.endswith("_qa") or _k.endswith("_sites"):
-                    continue
-                # _origin 키도 인덱싱한다 — 스마트스토어 주문 product_id 에는
-                # channelProductNo 대신 originProductNo 가 들어오는 케이스가 있어
-                # 매칭 실패 → source_site/source_url 공란 저장 사고가 반복되어 추가.
-                # 정확 매칭 인덱스 키는 account_id 로 정규화하여 동일 account 의
-                # 두 키(channel/origin) 가 동일 entry 를 가리키도록 통일.
-                if _k.endswith("_origin"):
-                    _account_key = _k[: -len("_origin")]
-                else:
-                    _account_key = str(_k)
-                if isinstance(_v, dict):
-                    _values = [
-                        _v.get("smartstoreChannelProductNo"),
-                        _v.get("originProductNo"),
-                        _v.get("channelProductNo"),
-                    ]
-                else:
-                    _values = [_v]
-                for _sub_v in _values:
-                    if not _sub_v:
-                        continue
-                    _key = str(_sub_v)
-                    # 글로벌 인덱스 — 충돌 감지 (다른 cp가 같은 키 차지 시 ambiguous)
-                    _existing_global = new_cache.get(_key)
-                    if not _existing_global:
-                        _entry = {
-                            "collected_product_id": _cpid,
-                            "source_site": _site,
-                            "product_image": _thumb,
-                            "original_link": _olink,
-                            "category": _cat or "",
-                            "site_ids_by_account": dict(_sites_by_account),
-                        }
-                        new_cache[_key] = _entry
-                    elif _existing_global.get("collected_product_id") != _cpid:
-                        # 다른 cp가 같은 글로벌 키를 차지 → 글로벌 매칭 거부 표시
-                        if not _existing_global.get("ambiguous"):
-                            _ambiguous_count += 1
-                        _existing_global["ambiguous"] = True
-                    else:
-                        # 같은 cp 내 여러 키 — site_ids만 보강
-                        for acc, sites in _sites_by_account.items():
-                            _existing_global["site_ids_by_account"].setdefault(
-                                acc, []
-                            ).extend(
-                                s
-                                for s in sites
-                                if s
-                                not in _existing_global["site_ids_by_account"].get(
-                                    acc, []
-                                )
-                            )
-                    # 정확 매칭 인덱스 — (account_id, product_no) 쌍은 충돌 거의 없음.
-                    # 첫 번째 entry 유지(같은 키에 여러 cp 등록 시 가장 오래된 것 우선).
-                    _acc_key = f"{_account_key}:{_key}"
-                    if _acc_key not in new_by_account:
-                        new_by_account[_acc_key] = {
-                            "collected_product_id": _cpid,
-                            "source_site": _site,
-                            "product_image": _thumb,
-                            "original_link": _olink,
-                            "category": _cat or "",
-                            "site_ids_by_account": dict(_sites_by_account),
-                        }
-        _mpn_cache_data = (new_cache, new_by_account)
-        _mpn_cache_built_at = now
-        logger.info(
-            f"[주문동기화] _mpn_cache 재빌드 완료 — global={len(new_cache):,} "
-            f"by_account={len(new_by_account):,} ambiguous={_ambiguous_count:,} "
-            f"TTL={_MPN_CACHE_TTL_SEC}s"
+        now_wall = datetime.now(timezone.utc)
+        _full_rebuild = (
+            _mpn_cache_data is None
+            or (now - _mpn_cache_full_built_at) >= _MPN_FULL_REBUILD_SEC
         )
+
+        if _full_rebuild:
+            by_global: dict[str, dict] = {}
+            by_account: dict[str, dict] = {}
+            _ambiguous = 0
+            async with get_read_session() as _read_sess:
+                _cp_result = await _read_sess.execute(_sa_text(_MPN_SELECT_COLS))
+                _cp_rows = _cp_result.fetchall()
+            for _row in _cp_rows:
+                _ambiguous += _index_mpn_row(_row, by_global, by_account, sourcing_urls)
+            _mpn_cache_data = (by_global, by_account)
+            _mpn_cache_full_built_at = now
+            _mpn_cache_delta_since = now_wall
+            _mpn_cache_built_at = now
+            logger.info(
+                f"[주문동기화] _mpn_cache 전체빌드 — global={len(by_global):,} "
+                f"by_account={len(by_account):,} ambiguous={_ambiguous:,} "
+                f"행={len(_cp_rows):,}"
+            )
+        else:
+            # 증분 머지 — 변경분만. 시계 오차/경계 누락 방지 위해 10초 여유
+            by_global, by_account = _mpn_cache_data
+            _since = _mpn_cache_delta_since or now_wall
+            from datetime import timedelta
+
+            _since_q = _since - timedelta(seconds=10)
+            async with get_read_session() as _read_sess:
+                _cp_result = await _read_sess.execute(
+                    _sa_text(_MPN_SELECT_COLS + " AND updated_at >= :since"),
+                    {"since": _since_q},
+                )
+                _cp_rows = _cp_result.fetchall()
+            _ambiguous = 0
+            for _row in _cp_rows:
+                _ambiguous += _index_mpn_row(_row, by_global, by_account, sourcing_urls)
+            _mpn_cache_delta_since = now_wall
+            _mpn_cache_built_at = now
+            logger.info(
+                f"[주문동기화] _mpn_cache 증분머지 — 변경 {len(_cp_rows):,}건 "
+                f"global={len(by_global):,} ambiguous신규={_ambiguous:,}"
+            )
         return _mpn_cache_data
 
 
@@ -344,7 +396,7 @@ async def _build_order_filters(
     search_text: str = "",
     search_category: str = "customer",
 ) -> list[Any]:
-    from sqlalchemy import and_, func, or_
+    from sqlalchemy import and_, func, or_, select
 
     filters: list[Any] = []
 
@@ -411,8 +463,6 @@ async def _build_order_filters(
         elif status_filter == "cancel_return_excluded":
             # status 컬럼만 기준 — shipping_status 는 일절 관여 금지
             filters.append(~SambaOrder.status.in_(EXCLUDED_ORDER_STATUSES))
-        elif status_filter == "pending":
-            filters.append(SambaOrder.status.in_(PENDING_ORDER_STATUSES))
         elif status_filter == "cancel_alert":
             # 알람 카운트와 동일한 조건 — 발주·송장 사고 위험 케이스
             filters.append(_build_cancel_alert_clause())
@@ -476,40 +526,55 @@ async def _build_order_filters(
             )
         )
 
-    # 등록필터 — SSG는 product_image가 항상 채워지므로 collected_product_id 단독 판단.
-    # 타 마켓은 "미등록 입력" UX로 source_url/product_image를 채운 주문도 등록으로 간주.
-    if registration_filter == "registered":
-        if market_filter == "type:ssg":
-            filters.append(SambaOrder.collected_product_id != None)  # noqa: E711
+    # 등록필터
+    # - product_image: SSG/스마트스토어/플레이오토가 매칭 없이도 자동으로 채워주므로 판정 기준에서 제외
+    # - source_url: SSG는 itemId 기반으로 주문 수집 시 자동 채워주므로 SSG 계정 주문에서는 판정 기준에서 제외
+    # - 타 마켓은 "미등록 입력" UX(사용자가 직접 source_url 채움)로 source_url 채우면 등록으로 간주 (기존 동작 유지)
+    if registration_filter in ("registered", "unregistered"):
+        from backend.domain.samba.account.model import SambaMarketAccount
+
+        _ssg_stmt = select(SambaMarketAccount.id).where(
+            SambaMarketAccount.market_type == "ssg"
+        )
+        if tenant_id is not None:
+            _ssg_stmt = _ssg_stmt.where(
+                or_(
+                    SambaMarketAccount.tenant_id == tenant_id,
+                    SambaMarketAccount.tenant_id == None,  # noqa: E711
+                )
+            )
+        _ssg_rows = (await session.execute(_ssg_stmt)).all()
+        ssg_channel_ids = [r[0] for r in _ssg_rows if r[0]]
+
+        has_source_url = and_(
+            SambaOrder.source_url != None,  # noqa: E711
+            SambaOrder.source_url != "",
+        )
+        no_source_url = or_(
+            SambaOrder.source_url == None,  # noqa: E711
+            SambaOrder.source_url == "",
+        )
+        if ssg_channel_ids:
+            is_ssg = SambaOrder.channel_id.in_(ssg_channel_ids)
+            not_ssg = SambaOrder.channel_id.notin_(ssg_channel_ids)
         else:
+            from sqlalchemy import false, true
+
+            is_ssg = false()
+            not_ssg = true()
+
+        if registration_filter == "registered":
             filters.append(
                 or_(
                     SambaOrder.collected_product_id != None,  # noqa: E711
-                    and_(
-                        SambaOrder.source_url != None,  # noqa: E711
-                        SambaOrder.source_url != "",
-                    ),
-                    and_(
-                        SambaOrder.product_image != None,  # noqa: E711
-                        SambaOrder.product_image != "",
-                    ),
+                    and_(not_ssg, has_source_url),
                 )
             )
-    elif registration_filter == "unregistered":
-        if market_filter == "type:ssg":
-            filters.append(SambaOrder.collected_product_id == None)  # noqa: E711
         else:
             filters.append(
                 and_(
                     SambaOrder.collected_product_id == None,  # noqa: E711
-                    or_(
-                        SambaOrder.source_url == None,  # noqa: E711
-                        SambaOrder.source_url == "",
-                    ),
-                    or_(
-                        SambaOrder.product_image == None,  # noqa: E711
-                        SambaOrder.product_image == "",
-                    ),
+                    or_(is_ssg, no_source_url),
                 )
             )
 
@@ -913,13 +978,13 @@ async def dashboard_stats(
     # 일별 누적 등록상품수: "지금 마켓에 1개 이상 등록된 상품수" 정의로 통일
     #   - 오늘(today_str): 실시간 build_market_registered_conditions 계산값
     #   - 과거 6일: samba_daily_registered_snapshot 테이블의 그날 0시 스냅샷
-    #   - 스냅샷이 없는 과거일은 오늘값으로 평탄 채움
+    #   - 스냅샷이 없는 과거일은 None(프론트에서 "-" 표시) — 거짓 평탄 채움 금지
     #     (역산은 first_market_registered_at의 0→≥1 사이클 재진입 때문에
     #      오토튠 재등록 시 신규등록이 과대 집계돼 과거값이 비정상적으로 작아짐 — 사용 금지)
     from backend.domain.samba.collector.model import SambaDailyRegisteredSnapshot
 
     today_str = (week_ago + timedelta(days=6)).strftime("%Y-%m-%d")
-    reg_count_map: dict[str, int] = {}
+    reg_count_map: dict[str, Optional[int]] = {}
 
     # 마켓 1개 이상 등록된 상품수 (현재 시점) — KPI + 오늘 행에 사용
     market_registered_q = select(func.count(SambaCollectedProduct.id)).where(
@@ -944,11 +1009,10 @@ async def dashboard_stats(
     snap_rows = (await session.execute(snap_q)).all()
     snap_map = {r.snapshot_date: int(r.registered_count) for r in snap_rows}
 
-    # 스냅샷이 있으면 사용, 없으면 오늘값으로 평탄 채움
+    # 스냅샷이 있으면 사용, 없으면 None(프론트 "-" 표시)
     # — 매일 0시 TASK 6 누적되면 자연스럽게 진짜 스냅샷으로 대체됨
-    today_count = int(market_registered_count)
     for d_str in past_dates:
-        reg_count_map[d_str] = snap_map.get(d_str, today_count)
+        reg_count_map[d_str] = snap_map.get(d_str)
 
     # 일별 누적 수집상품수 = "그 날(말) 시점 삼바에 저장되어있는 전체 상품수"
     # 구현: 현재 total 에서 그 다음날 이후 created 된 행수를 빼서 역산 (1풀스캔 + 1범위스캔)
@@ -993,11 +1057,37 @@ async def dashboard_stats(
         running_total -= daily_new_map.get(next_d_str, 0)
         collected_count_map[d_str] = max(running_total, 0)
 
-    for w in weekly:
-        w["newRegistered"] = int(new_reg_map.get(w["date"], 0))
-        w["marketDeleted"] = int(del_map.get(w["date"], 0))
-        w["registeredCount"] = int(reg_count_map.get(w["date"], 0))
-        w["collectedCount"] = int(collected_count_map.get(w["date"], 0))
+    # 7일 이전(week_ago - 1d) 스냅샷 추가 조회 — 첫 행 신규등록 역산용
+    prev_day_str = (week_ago - timedelta(days=1)).strftime("%Y-%m-%d")
+    prev_snap_row = (
+        await session.execute(
+            select(SambaDailyRegisteredSnapshot.registered_count).where(
+                SambaDailyRegisteredSnapshot.snapshot_date == prev_day_str
+            )
+        )
+    ).scalar()
+    reg_count_map[prev_day_str] = (
+        int(prev_snap_row) if prev_snap_row is not None else None
+    )
+
+    # 신규등록 = (등록상품수[d] - 등록상품수[d-1]) + 마켓삭제[d] 로 역산
+    #   - first_market_registered_at 기반 카운트는 오토튠 재등록 시 중복 → 사용 금지
+    #   - 등록상품수[d] 또는 [d-1] 스냅샷 없으면 None
+    all_dates = [(week_ago + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+    for idx, w in enumerate(weekly):
+        d_str = w["date"]
+        prev_str = prev_day_str if idx == 0 else all_dates[idx - 1]
+        reg_today = reg_count_map.get(d_str)
+        reg_prev = reg_count_map.get(prev_str)
+        deleted = int(del_map.get(d_str, 0))
+        if reg_today is not None and reg_prev is not None:
+            new_reg = (reg_today - reg_prev) + deleted
+            w["newRegistered"] = max(new_reg, 0)
+        else:
+            w["newRegistered"] = None
+        w["marketDeleted"] = deleted
+        w["registeredCount"] = reg_today
+        w["collectedCount"] = int(collected_count_map.get(d_str, 0))
 
     tm_fulfillment_rate = (
         round(int(tm.fulfillment_count or 0) / int(tm.count) * 100) if tm.count else 0
@@ -1138,6 +1228,81 @@ async def list_orders_by_collected_product_paged(
         sort_by=sort_by,
         extra_filters=[SambaOrder.collected_product_id == collected_product_id],
     )
+
+
+@router.get("/analytics-aggregate")
+async def analytics_aggregate(
+    start: str = Query(..., description="시작일 YYYY-MM-DD"),
+    end: str = Query(..., description="종료일 YYYY-MM-DD"),
+    session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
+):
+    """매출통계 페이지 전용 사전집계 엔드포인트.
+
+    paid_at(KST) 일자 × channel_name × source_site × status 단위로
+    sum(sale_price), count(*)를 미리 집계해서 반환한다.
+    매출통계 페이지가 raw 주문 4천+건(6MB)을 통째 받아 클라이언트에서
+    필터링하던 구조를 대체 — 페이로드 99% 축소, 무음 실패 회귀 방지.
+    """
+    from sqlalchemy import select as sa_select, func as sa_func, or_
+    from backend.domain.samba.account.model import SambaMarketAccount
+    from backend.utils import kst_date_range_to_utc
+
+    start_dt, end_dt = kst_date_range_to_utc(start, end)
+
+    # paid_at(timestamptz) → KST 변환 후 일자만 추출
+    kst_date = sa_func.date(sa_func.timezone("Asia/Seoul", SambaOrder.paid_at))
+
+    # 마켓 그룹키 — samba_market_account.market_name(G마켓/옥션/11번가/...) 우선,
+    # 매칭 안 되면 channel_name 사용. channel_name(=계정 닉네임 "가디(...)")으로
+    # 그룹화하면 마켓별 통계에 계정 닉네임이 노출되는 문제 발생(2026-05-26).
+    market_key = sa_func.coalesce(
+        SambaMarketAccount.market_name, SambaOrder.channel_name
+    )
+
+    stmt = (
+        sa_select(
+            kst_date.label("date"),
+            market_key.label("channel_name"),
+            SambaOrder.source_site,
+            SambaOrder.status,
+            sa_func.coalesce(sa_func.sum(SambaOrder.sale_price), 0).label("sales"),
+            sa_func.count().label("orders"),
+        )
+        .select_from(SambaOrder)
+        .outerjoin(SambaMarketAccount, SambaMarketAccount.id == SambaOrder.channel_id)
+        .where(
+            SambaOrder.paid_at != None,  # noqa: E711
+            SambaOrder.paid_at >= start_dt,
+            SambaOrder.paid_at <= end_dt,
+        )
+        .group_by(
+            kst_date,
+            market_key,
+            SambaOrder.source_site,
+            SambaOrder.status,
+        )
+    )
+    if tenant_id is not None:
+        stmt = stmt.where(
+            or_(
+                SambaOrder.tenant_id == tenant_id,
+                SambaOrder.tenant_id == None,  # noqa: E711
+            )
+        )
+    result = await session.execute(stmt)
+    rows = [
+        {
+            "date": str(r.date),
+            "channel_name": r.channel_name or "",
+            "source_site": r.source_site or "",
+            "status": r.status or "",
+            "sales": float(r.sales or 0),
+            "orders": int(r.orders or 0),
+        }
+        for r in result.all()
+    ]
+    return {"rows": rows}
 
 
 @router.get("/by-date-range", response_model=list[SambaOrder])
@@ -2151,6 +2316,60 @@ async def approve_cancel(
         raise HTTPException(
             status_code=400, detail=f"{account.market_type} 취소승인 미지원"
         )
+
+
+# ══════════════════════════════════════════════
+# 소싱처 발주 자동취소 (헤드리스 데몬)
+# ══════════════════════════════════════════════
+
+
+@router.post("/{order_id}/sourcing-cancel")
+async def sourcing_cancel_order(
+    order_id: str,
+    session: AsyncSession = Depends(get_write_session_dependency),
+):
+    """소싱처 발주 헤드리스 자동취소 — 운영자 수동 트리거.
+
+    가드:
+      - sourcing_order_number 있어야 함 (실제 발주 완료된 주문)
+      - shipping_status가 '배송중'/'배송완료' 면 차단 (이미 발송)
+    동작:
+      - SourcingQueue 에 cancel_order 잡 enqueue → 데몬 처리 → cancel-result 콜백
+      - 결과는 비동기. 즉시 {jobId, accepted: True} 반환.
+    """
+    from backend.domain.samba.order.service import SambaOrderService
+    from backend.domain.samba.proxy.sourcing_queue import SourcingQueue
+
+    svc = SambaOrderService(session)
+    order = await svc.get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="주문 없음")
+    if not (order.sourcing_order_number or "").strip():
+        raise HTTPException(
+            status_code=400, detail="소싱처 발주번호 없음 — 발주 안 된 주문"
+        )
+    blocked_shipping = ("배송중", "배송완료", "출고완료", "구매확정")
+    if (order.shipping_status or "").strip() in blocked_shipping:
+        raise HTTPException(
+            status_code=400,
+            detail=f"이미 발송 단계({order.shipping_status}) — 소싱처 자동취소 불가",
+        )
+
+    site = (order.source_site or "").strip()
+    if not site:
+        raise HTTPException(status_code=400, detail="source_site 미상")
+
+    request_id, _future = await SourcingQueue.add_cancel_order_job(
+        site=site,
+        sourcing_order_number=order.sourcing_order_number,
+        order_id=order_id,
+        sourcing_account_id=order.sourcing_account_id or "",
+    )
+    logger.info(
+        f"[소싱취소] 잡 enqueue order={order_id} site={site} "
+        f"ord={order.sourcing_order_number} req={request_id}"
+    )
+    return {"accepted": True, "jobId": request_id, "site": site}
 
 
 # ══════════════════════════════════════════════
@@ -4408,17 +4627,16 @@ async def sync_orders_from_markets(
                         {"account": label, "status": "skip", "message": "API Key 없음"}
                     )
                     continue
-                # 별칭 매핑 로드 (store_playauto 설정에서)
+                # 별칭 매핑 로드 — 2026-05-25 store_* samba_settings 폐기 후
+                # samba_market_account.additional_fields 가 단일 진실 출처.
+                # 현재 처리 중인 playauto 계정의 extras(=additional_fields)에서 alias1~5 추출.
                 alias_map: dict[str, str] = {}
                 try:
-                    settings_repo = SambaSettingsRepository(session)
-                    pa_setting = await settings_repo.find_by_async(key="store_playauto")
-                    if pa_setting and isinstance(pa_setting.value, dict):
-                        for ak in ("alias1", "alias2", "alias3", "alias4", "alias5"):
-                            av = pa_setting.value.get(ak, "")
-                            code, nick = parse_playauto_alias_entry(av)
-                            if code and nick:
-                                alias_map[code] = nick
+                    for ak in ("alias1", "alias2", "alias3", "alias4", "alias5"):
+                        av = str(extras.get(ak, "") or "")
+                        code, nick = parse_playauto_alias_entry(av)
+                        if code and nick:
+                            alias_map[code] = nick
                 except Exception:
                     pass
                 # 롯데홈쇼핑 직접 연동 계정이 있으면 플레이오토 중복 주문 차단
@@ -5055,7 +5273,9 @@ async def sync_orders_from_markets(
                         _ssg_raw_orders = await _ssg_client.get_orders(days=body.days)
                     # 출고대기(피킹완료) 주문 추가 조회 — listShppDirection은 배송지시(11)만 반환
                     # 캐시 여부와 무관하게 항상 호출
-                    _ssg_wo_orders = await _ssg_client.get_warehouse_out_orders(days=body.days)
+                    _ssg_wo_orders = await _ssg_client.get_warehouse_out_orders(
+                        days=body.days
+                    )
                     if _ssg_wo_orders:
                         _ssg_raw_orders = list(_ssg_raw_orders) + _ssg_wo_orders
                     logger.info(
@@ -5480,6 +5700,116 @@ async def sync_orders_from_markets(
                     f"[주문동기화] {label}: 롯데홈쇼핑 주문 {len(orders_data)}건 조회"
                 )
 
+            elif market_type in ("gmarket", "auction"):
+                from backend.domain.samba.proxy.esmplus import (
+                    ESMPlusClient,
+                    resolve_esm_credentials,
+                )
+
+                # 인증 정보 — account 모델 직접 조회 (sync는 dict 스냅샷이라 model 어댑터 작성)
+                class _AccountAdapter:
+                    def __init__(self, fields: dict[str, Any]) -> None:
+                        self.additional_fields = fields
+
+                _esm_account = _AccountAdapter(extras)
+                esm_hosting_id, esm_secret_key = await resolve_esm_credentials(
+                    session, _esm_account
+                )
+                if not esm_hosting_id or not esm_secret_key:
+                    results.append(
+                        {
+                            "account": label,
+                            "status": "skip",
+                            "message": "ESM 인증정보 없음",
+                        }
+                    )
+                    continue
+                if not seller_id:
+                    results.append(
+                        {
+                            "account": label,
+                            "status": "skip",
+                            "message": "ESM seller_id 없음",
+                        }
+                    )
+                    continue
+
+                _esm_site = market_type  # "gmarket" or "auction"
+                _esm_site_type = 2 if market_type == "gmarket" else 1
+                # 기간 클램프: G마켓 31일 / 옥션 180일
+                _esm_max_days = 31 if market_type == "gmarket" else 180
+                _esm_days = min(int(body.days or 1), _esm_max_days)
+
+                from datetime import (
+                    datetime as _esm_dt,
+                    timedelta as _esm_td,
+                    UTC as _esm_UTC,
+                )
+
+                _esm_end = _esm_dt.now(_esm_UTC)
+                _esm_start = _esm_end - _esm_td(days=_esm_days)
+                _esm_from = _esm_start.strftime("%Y-%m-%d")
+                _esm_to = _esm_end.strftime("%Y-%m-%d")
+
+                esm_client = ESMPlusClient(
+                    esm_hosting_id, esm_secret_key, seller_id, site=_esm_site
+                )
+                _clients_to_close.append(esm_client)
+
+                _esm_seen: set[str] = set()
+                _esm_total = 0
+                # OrderStatus 루프 — 1=결제완료, 2=배송준비, 3=배송중, 4=배송완료, 5=구매결정
+                # search_orders 내부 _esm_order_throttle()로 5.2초 인터벌 보장
+                for _esm_status in (1, 2, 3, 4, 5):
+                    _esm_page_index = 1
+                    while True:
+                        try:
+                            _esm_resp = await esm_client.search_orders(
+                                {
+                                    "siteType": _esm_site_type,
+                                    "orderStatus": _esm_status,
+                                    "requestDateType": 1,
+                                    "requestDateFrom": _esm_from,
+                                    "requestDateTo": _esm_to,
+                                    "pageIndex": _esm_page_index,
+                                    "pageSize": 500,
+                                }
+                            )
+                        except Exception as _esm_e:
+                            logger.warning(
+                                f"[주문동기화] {label}: ESM 주문 조회 실패 "
+                                f"status={_esm_status} page={_esm_page_index} — {_esm_e}"
+                            )
+                            break
+                        _esm_data = (
+                            _esm_resp.get("Data")
+                            if isinstance(_esm_resp, dict)
+                            else None
+                        ) or {}
+                        _esm_items = _esm_data.get("RequestOrders") or []
+                        if not _esm_items:
+                            break
+                        for _esm_it in _esm_items:
+                            if not isinstance(_esm_it, dict):
+                                continue
+                            _oid = str(_esm_it.get("OrderNo") or "")
+                            if not _oid or _oid in _esm_seen:
+                                continue
+                            _esm_seen.add(_oid)
+                            orders_data.append(
+                                _parse_esmplus_order(
+                                    _esm_it, account["id"], label, market_type
+                                )
+                            )
+                            _esm_total += 1
+                        # 다음 페이지 종료 조건 — 500 미만이면 끝
+                        if len(_esm_items) < 500:
+                            break
+                        _esm_page_index += 1
+                logger.info(
+                    f"[주문동기화] {label}: ESM({market_type}) 주문 {_esm_total}건 조회"
+                )
+
             else:
                 results.append(
                     {
@@ -5708,16 +6038,35 @@ async def sync_orders_from_markets(
                             _fee = get_fee_rate_for_category(_cat_for_fee)
                             _bse_cmsn = int(_slamt * _fee / 100)
                             _pcs_cmsn = int(_slamt * _pcs_rate / 100)
-                            # 셀러 정산공식: slAmt − 셀러부담할인 − 기본수수료 − PCS수수료
-                            # (당사부담할인은 수수료 환급으로 상쇄, 별도 차감 X)
-                            _revenue = max(0, _slamt - _slr_dc - _bse_cmsn - _pcs_cmsn)
+                            # ─────────────────────────────────────────────────────────────
+                            # 롯데ON 정산예상 공식 [영구 가드 · 절대 변경 금지 · 2026-05-23 확정]
+                            #
+                            # 정산예상 = _customer_paid − _bse_cmsn − _pcs_cmsn
+                            #         (= actualAmt − 기본수수료 − PCS수수료)
+                            #
+                            # 샵마인 셀러센터 "정산내역" 모달 공식과 동일:
+                            #   공급금액   = 총주문금액 − 마켓수수료
+                            #   정산예상   = 공급금액 − 할인금액
+                            #            = (slAmt − bseCmsn) − fvrAmtSum
+                            #            = actualAmt − bseCmsn   (actualAmt는 전체할인 차감 후)
+                            #
+                            # ⛔ 회귀 방지 — 다음 패턴 절대 추가 금지:
+                            #   1. `_slamt − _slr_dc` 또는 `_slamt − _slr_dc − _lotte_dc`
+                            #      → actualAmt가 이미 전체할인(셀러+롯데+제휴몰) 반영했는데
+                            #        다시 일부 할인만 차감 = 항상 한쪽이 깨짐 (a401c15e 사고)
+                            #   2. `+ _lotte_dc` 환급 가산 (a91b2221 가짜 가정 — raw에 환급 필드 없음)
+                            #   3. `_slamt − _slr_dc − fvrAmtSum` (66fc0837 이중차감 사고)
+                            #
+                            # 핵심 원칙: 할인은 _customer_paid 계산 단계(5701~5712)에서 한 번만 반영.
+                            #          revenue 식에서는 _customer_paid를 그대로 쓰고 수수료만 차감.
+                            # bseCmsn은 raw에 없어도 카테고리 fee_rate × slAmt 폴백으로 충분 (샵마인도 동일).
+                            # 확정값 필요시 SettleItmdSales.pymtAmt 매칭(4010~4029) — 구매확정 후 덮어씀.
+                            # ─────────────────────────────────────────────────────────────
+                            _revenue = max(0, _customer_paid - _bse_cmsn - _pcs_cmsn)
                             order_data["revenue"] = _revenue
-                            # 화면 수수료율 — (총수수료 − 환급) / 실결제 기준 (롯데ON 화면 정의와 동일)
-                            _net_cmsn_display = max(
-                                0, _bse_cmsn + _pcs_cmsn - _lotte_dc
-                            )
+                            # 화면 수수료율 — 마켓수수료/실결제 기준 (롯데ON 정산내역 "실수수료율" 정의)
                             order_data["fee_rate"] = (
-                                round(_net_cmsn_display / _customer_paid * 100, 2)
+                                round((_bse_cmsn + _pcs_cmsn) / _customer_paid * 100, 2)
                                 if _customer_paid > 0
                                 else 0
                             )
@@ -5839,19 +6188,20 @@ async def sync_orders_from_markets(
                 # proc_seq는 주문 상태 변경 시 바뀌므로 중복 체크에서 제외
                 _normalize_synced_order_status(order_data)
                 if order_data.get("source") == "lotteon" and order_data.get("od_no"):
+                    # 중복 차단 — channel_id 제외하고 (tenant_id, od_no, od_seq)로만 매칭.
+                    # 동일 API key를 공유한 2개 마켓계정이 같은 주문을 양쪽 channel에 중복
+                    # 저장하던 사고 방지(2026-05-25).
                     _lo_row = await session.execute(
                         _sa_text(
                             "SELECT id FROM samba_order "
                             "WHERE source = 'lotteon' "
                             "AND tenant_id IS NOT DISTINCT FROM :tid "
-                            "AND channel_id = :cid "
                             "AND od_no = :od_no "
                             "AND od_seq = :od_seq "
                             "LIMIT 1"
                         ),
                         {
                             "tid": order_data.get("tenant_id"),
-                            "cid": order_data.get("channel_id"),
                             "od_no": order_data["od_no"],
                             "od_seq": order_data.get("od_seq", "1"),
                         },
@@ -6021,6 +6371,14 @@ async def sync_orders_from_markets(
                     # 마켓 상품번호 보충 (기존 주문에 없으면 채움)
                     if order_data.get("product_id") and not existing.product_id:
                         update_fields["product_id"] = order_data["product_id"]
+                    # issue #213 — 롯데ON quantity 자기치유: known-bad(=1) 일 때만 교정
+                    if order_data.get("source") == "lotteon":
+                        try:
+                            _new_qty = int(order_data.get("quantity") or 0)
+                        except (TypeError, ValueError):
+                            _new_qty = 0
+                        if _new_qty > 1 and (existing.quantity or 1) == 1:
+                            update_fields["quantity"] = _new_qty
                     # 송장전송완료/배송중 이상 상태는 덮어쓰지 않음
                     # 단, 롯데ON은 발송완료/배송중/배송완료로 진행된 경우 갱신 허용
                     new_ship_status = order_data.get("shipping_status")
@@ -6070,14 +6428,20 @@ async def sync_orders_from_markets(
                                 update_fields["shipping_status"] = new_ship_status
                         elif new_ship_status in exchange_statuses:
                             # 교환 상태는 항상 갱신 (배송완료 → 교환요청 등 역행 허용)
-                            # 단, 이미 반품 상태인 주문은 교환으로 되돌리지 않음
+                            # 단, 이미 반품/취소 상태인 주문은 교환으로 되돌리지 않음
+                            # 취소 상태 보호 — samba_return 활성 stale 레코드(type=exchange)로
+                            # 인해 status=cancelled 주문이 매 sync마다 '교환요청'으로 덮어쓰여
+                            # inconsistent state 되는 사고 방지 (issue #224, 롯데ON 6건 사례)
                             if existing.shipping_status in (
                                 "반품요청",
                                 "반품완료",
                                 "반품거부",
+                                "취소요청",
+                                "취소처리중",
+                                "취소완료",
                             ):
                                 logger.info(
-                                    f"[주문동기화] 반품 상태 보호: {order_data.get('order_number')} "
+                                    f"[주문동기화] 반품/취소 상태 보호: {order_data.get('order_number')} "
                                     f"{existing.shipping_status} → {new_ship_status} 차단"
                                 )
                             else:
@@ -6087,6 +6451,22 @@ async def sync_orders_from_markets(
                             and new_ship_status in advanced
                         ):
                             update_fields["shipping_status"] = new_ship_status
+                        elif new_ship_status in (
+                            "반품요청",
+                            "반품완료",
+                            "반품거부",
+                        ) and existing.shipping_status in (
+                            "취소요청",
+                            "취소처리중",
+                            "취소완료",
+                        ):
+                            # 취소 종결/진행 상태는 마켓 진실의 원천 — 반품으로 덮지 않음
+                            # samba_return 활성 stale 레코드(type=return)로 인한
+                            # 매 sync 덮어쓰기 차단 (issue #224)
+                            logger.info(
+                                f"[주문동기화] 취소 상태 보호: {order_data.get('order_number')} "
+                                f"{existing.shipping_status} → {new_ship_status} 차단"
+                            )
                         elif (
                             new_ship_status in ("반품요청", "반품완료", "반품거부")
                             and existing.shipping_status in exchange_statuses
@@ -6126,6 +6506,8 @@ async def sync_orders_from_markets(
                             "반품완료",
                             "반품거부",
                             "회수확정",
+                            "취소요청",
+                            "취소처리중",
                             "취소완료",
                         ):
                             update_fields["shipping_status"] = new_ship_status
@@ -6150,6 +6532,23 @@ async def sync_orders_from_markets(
                         and existing.status != "cancel_requested"
                     ):
                         update_fields["status"] = "cancel_requested"
+                        # 자동 발주취소 트리거 — fire-and-forget, 4중 가드 내장
+                        from backend.domain.samba.proxy.sourcing_queue import (
+                            SourcingQueue as _SQ,
+                        )
+
+                        asyncio.create_task(
+                            _SQ.maybe_trigger_auto_cancel(
+                                order_id=existing.id,
+                                source_site=existing.source_site,
+                                sourcing_order_number=existing.sourcing_order_number,
+                                sourcing_account_id=existing.sourcing_account_id,
+                                new_status="cancel_requested",
+                                shipping_status=update_fields.get("shipping_status")
+                                or existing.shipping_status,
+                                prev_status=existing.status,
+                            )
+                        )
                     # 플레이오토 미등록 주문의 취소요청/취소완료는 status 드롭다운도 동기화.
                     # 신규 insert는 _normalize_synced_order_status 예외에서 처리되지만,
                     # 이미 DB에 'pending'으로 들어가 있는 기존 주문은 여기서 갱신해야 함.
@@ -6516,7 +6915,10 @@ async def sync_orders_from_markets(
               AND o.shipping_status NOT IN (
                   '교환요청', '교환회수완료', '교환재배송', '교환완료',
                   '반품요청', '반품완료', '반품거부',
-                  '취소완료',
+                  -- 취소 라벨은 마켓 종결/진행 신호. samba_return type=return/exchange
+                  -- 활성 stale 레코드가 남아있어도 마켓 취소 상태를 반품/교환요청으로
+                  -- 덮지 않음 (issue #224, status=cancelled + ship='교환요청' 사고)
+                  '취소요청', '취소처리중', '취소완료',
                   -- 마켓이 송장/배송 단계로 진행한 주문은 좀비 cancel return으로
                   -- 되돌리지 않음 (송장출력→배송대기중 단계에선 마켓이 이미 셀러
                   -- 수락 후 처리 진행 중이라 취소요청 표시 부적절)
@@ -6585,7 +6987,6 @@ def _parse_smartstore_order(
     # 클레임 상태 (취소/반품/교환 요청)
     # 우선순위: 호출자가 전달한 claim 서브 객체 → productOrder 최상위 순으로 fallback
     _ci = claim_info or {}
-    claim_type = _ci.get("claimType") or po.get("claimType", "") or ""
     claim_status = _ci.get("claimStatus") or po.get("claimStatus", "") or ""
 
     claim_status_map = {
@@ -6906,6 +7307,19 @@ def _parse_coupang_order(
     }
 
 
+def _coerce_lotteon_quantity(item: dict) -> int:
+    """롯데ON 주문 수량 안전 파싱 — odQty 우선, float/str 모두 처리 (issue #213)."""
+    for key in ("odQty", "slQty"):
+        v = item.get(key)
+        if v in (None, "", 0, "0"):
+            continue
+        try:
+            return max(1, int(float(v)))
+        except (TypeError, ValueError):
+            continue
+    return 1
+
+
 def _parse_lotteon_order(item: dict, account_id: str, label: str) -> dict:
     """롯데ON 주문 데이터 → SambaOrder dict 변환."""
 
@@ -7012,8 +7426,9 @@ def _parse_lotteon_order(item: dict, account_id: str, label: str) -> dict:
         "product_id": str(item.get("spdNo", "") or ""),
         "product_name": item.get("spdNm", "") or "",
         "product_option": item.get("sitmNm", "") or "",
-        # 롯데ON 주문 응답 수량 필드는 slQty(판매 수량) — odQty는 존재하지 않아 폴백값 1로 박혔던 버그
-        "quantity": int(item.get("slQty") or item.get("odQty") or 1),
+        # issue #213 — odQty/slQty 응답이 float("5.0") 또는 str로 올 수 있어 int(float()) 사용
+        # SellerDeliveryProgressStateSearch/SellerDeliveryOrdersSearch는 odQty, getSROrderList는 둘 다 부재
+        "quantity": _coerce_lotteon_quantity(item),
         "sale_price": int(item.get("slAmt", 0) or item.get("slPrc", 0) or 0),
         "cost": 0,
         "status": status,
@@ -7673,7 +8088,15 @@ def _parse_lottehome_order(
 
     # 송장전송(registDeliver.lotte)에 ord_no + ord_dtl_sn 둘 다 필수.
     # ext_order_number 에 "ord_no:ord_dtl_sn" 형식으로 합쳐 저장한다.
-    ord_dtl_sn = str(prod_info.get("OrdDtlSn") or prod_info.get("DlvUnitSn") or "")
+    # issue #216 — 신규주문 API(searchNewOrdLstOpenApi.lotte)는 OrdDtlSn/DlvUnitSn 키 없음.
+    # OrgOrdDtlSn(=같은 값) 또는 ProdSeq 폴백 필수, 누락 시 송장 전송 시 형식 오류로 즉시 실패.
+    ord_dtl_sn = str(
+        prod_info.get("OrdDtlSn")
+        or prod_info.get("DlvUnitSn")
+        or prod_info.get("OrgOrdDtlSn")
+        or prod_info.get("ProdSeq")
+        or ""
+    )
     ext_order_number = (
         f"{order_no}:{ord_dtl_sn}" if (order_no and ord_dtl_sn) else order_no
     )
@@ -7781,4 +8204,119 @@ def _parse_lottehome_order(
         "source": "lottehome",
         "shipment_id": order_no,
         "ext_order_number": ext_order_number,
+    }
+
+
+def _parse_esmplus_order(
+    item: dict,
+    account_id: str,
+    label: str,
+    market_type: str,
+) -> dict[str, Any]:
+    """ESM Plus(G마켓/옥션) RequestOrders 응답 item → SambaOrder dict.
+
+    응답 키 PascalCase. 주요 필드:
+      OrderNo, OutOrderNo, OrderStatus(1~5), OrderDate, PayDate(KST naive),
+      SiteGoodsNo, GoodsName, SalePrice(string), OrderAmount, ContrAmount,
+      ServiceFee, ShippingFee, BuyerName, ReceiverName, HpNo, TelNo,
+      ZipCode, DelFrontAddress, DelBackAddress, DelMemo,
+      TakbaeName, NoSongjang, ItemOptionSelectList[]
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    from zoneinfo import ZoneInfo as _ZI
+
+    def _s(v: Any) -> str:
+        return str(v or "").strip()
+
+    def _f(v: Any) -> float:
+        try:
+            return float(str(v or "0"))
+        except (ValueError, TypeError):
+            return 0.0
+
+    def _i(v: Any, default: int = 0) -> int:
+        try:
+            return int(_f(v))
+        except (ValueError, TypeError):
+            return default
+
+    def _kst_to_utc(val: str | None) -> datetime | None:
+        if not val:
+            return None
+        try:
+            s = str(val).strip()
+            if "." in s:
+                s = s.split(".")[0]
+            dt = _dt.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_ZI("Asia/Seoul"))
+            return dt.astimezone(_tz.utc)
+        except (ValueError, TypeError):
+            return None
+
+    # 내부 status / shipping_status 매핑
+    # ESM OrderStatus: 1=결제완료, 2=배송준비, 3=배송중, 4=배송완료, 5=구매결정
+    _status = _i(item.get("OrderStatus"), 1)
+    status_map = {
+        1: ("pending", "결제완료"),
+        2: ("pending", "배송준비중"),
+        3: ("shipped", "국내배송중"),
+        4: ("delivered", "배송완료"),
+        5: ("delivered", "구매확정"),
+    }
+    internal_status, shipping_status = status_map.get(_status, ("pending", "결제완료"))
+
+    # 옵션 문자열 — ItemOptionSelectList[{ItemOptionValue, ItemOptionOrderCnt}]
+    options = item.get("ItemOptionSelectList") or []
+    opt_parts: list[str] = []
+    if isinstance(options, list):
+        for opt in options:
+            if isinstance(opt, dict):
+                ov = _s(opt.get("ItemOptionValue"))
+                if ov:
+                    opt_parts.append(ov)
+    product_option = " / ".join(opt_parts)
+
+    # 가격 / 수량
+    sale_price = _f(item.get("SalePrice"))
+    quantity = _i(item.get("ContrAmount"), 1) or 1
+    order_amount = _f(item.get("OrderAmount"))
+    service_fee = _f(item.get("ServiceFee"))
+    fee_rate = round(service_fee / order_amount * 100, 2) if order_amount > 0 else 0.0
+    revenue = order_amount - service_fee if order_amount > 0 else sale_price * quantity
+
+    # 주소
+    front_addr = _s(item.get("DelFrontAddress"))
+    back_addr = _s(item.get("DelBackAddress"))
+    full_addr = _s(item.get("DelFullAddress")) or f"{front_addr} {back_addr}".strip()
+
+    return {
+        "order_number": _s(item.get("OrderNo")),
+        "shipment_id": _s(item.get("OrderNo")),
+        "channel_id": account_id,
+        "channel_name": label,
+        "product_id": _s(item.get("SiteGoodsNo")) or _s(item.get("OutGoodsNo")),
+        "product_name": _s(item.get("GoodsName")),
+        "product_option": product_option,
+        "product_image": "",
+        "customer_name": _s(item.get("ReceiverName")) or _s(item.get("BuyerName")),
+        "orderer_name": _s(item.get("BuyerName")),
+        "customer_phone": _s(item.get("HpNo")) or _s(item.get("TelNo")),
+        "customer_address": front_addr or full_addr,
+        "customer_address_detail": back_addr,
+        "customer_postal_code": _s(item.get("ZipCode")) or None,
+        "customer_note": _s(item.get("DelMemo")),
+        "quantity": quantity,
+        "sale_price": sale_price,
+        "total_payment_amount": order_amount or (sale_price * quantity),
+        "cost": 0,
+        "fee_rate": fee_rate,
+        "revenue": revenue,
+        "status": internal_status,
+        "shipping_status": shipping_status,
+        "shipping_company": _s(item.get("TakbaeName")),
+        "tracking_number": _s(item.get("NoSongjang")),
+        "paid_at": _kst_to_utc(item.get("PayDate") or item.get("OrderDate")),
+        "source": market_type,
+        "ext_order_number": _s(item.get("OutOrderNo")),
     }

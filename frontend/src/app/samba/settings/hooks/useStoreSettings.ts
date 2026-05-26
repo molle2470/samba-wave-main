@@ -45,6 +45,7 @@ export interface StoreSettingsActions {
   testStoreAuth: (marketKey: string) => Promise<void>
   handleAccountToggle: (id: string) => Promise<void>
   handleAccountDelete: (id: string) => Promise<void>
+  handleAccountSetDefault: (id: string) => Promise<void>
   togglePasswordVisibility: (key: string) => void
   setStoreTab: (tab: string) => void
   setStoreData: React.Dispatch<React.SetStateAction<Record<string, Record<string, string>>>>
@@ -221,7 +222,8 @@ export function useStoreSettings(): StoreSettingsState & StoreSettingsActions {
         }
       }
       const data = merged
-      await forbiddenApi.saveSetting(`store_${marketKey}`, data)
+      // (2026-05-25) store_* samba_settings 저장 폐기 — samba_market_account 단일 진실 출처.
+      // 아래 accountApi.create/update 가 market_account 저장 담당.
 
       // lottehome: proxy client는 lottehome_credentials 키를 읽으므로 함께 동기화
       if (marketKey === 'lottehome') {
@@ -306,19 +308,32 @@ export function useStoreSettings(): StoreSettingsState & StoreSettingsActions {
           delete safeData[field]
         }
       }
-      // 먼저 설정 저장
-      await forbiddenApi.saveSetting(`store_${marketKey}`, safeData)
+      // (2026-05-25) 인증 테스트 진입점은 저장 안 함 — saveStoreSettings 가 저장 담당.
+      // 폼 데이터는 인증 테스트 endpoint 에 payload 로 직접 전송 (4-1/4-2 적용).
       setSavedStoreData(prev => ({ ...prev, [marketKey]: { ...safeData } }))
       // 마켓별 인증 테스트
       let result: { success: boolean; message: string }
       if (marketKey === 'smartstore') {
         result = await proxyApi.smartstoreAuthTest()
       } else if (marketKey === '11st') {
-        result = await proxyApi.elevenstAuthTest()
+        result = await proxyApi.elevenstAuthTest({
+          api_key: String(safeData.apiKey || ''),
+        })
       } else if (marketKey === 'coupang') {
-        result = await proxyApi.coupangAuthTest()
+        result = await proxyApi.coupangAuthTest({
+          access_key: String(safeData.accessKey || ''),
+          secret_key: String(safeData.secretKey || ''),
+          vendor_id: String(safeData.vendorId || ''),
+        })
       } else if (marketKey === 'lotteon') {
-        const lotteonResult = await proxyApi.lotteonAuthTest()
+        // 멀티계정 환경 대응(2026-05-25) — 폼 입력값을 직접 전송.
+        // store_lotteon 단일 키 폴백을 거치지 않고 폼값으로 인증 → 신규 등록 정확.
+        const lotteonResult = await proxyApi.lotteonAuthTest({
+          api_key: String(safeData.apiKey || ''),
+          dv_cst_pol_no: String(safeData.dvCstPolNo || ''),
+          owhp_no: String(safeData.owhpNo || ''),
+          rtrp_no: String(safeData.rtrpNo || ''),
+        })
         result = lotteonResult
         // 인증 성공 시 배송비정책/출고지/회수지 목록 자동 로드
         if (lotteonResult.success) {
@@ -330,9 +345,15 @@ export function useStoreSettings(): StoreSettingsState & StoreSettingsActions {
           if (whRes.success) setLotteonWarehouseOptions({ departure: whRes.departure, return_: whRes.return_ })
         }
       } else if (marketKey === 'ssg') {
-        result = await proxyApi.ssgAuthTest()
+        result = await proxyApi.ssgAuthTest({
+          api_key: String(safeData.apiKey || ''),
+        })
       } else if (marketKey === 'gsshop') {
-        result = await proxyApi.gsshopAuthTest()
+        result = await proxyApi.gsshopAuthTest({
+          store_id: String(safeData.storeId || ''),
+          api_key_dev: String(safeData.apiKeyDev || ''),
+          api_key_prod: String(safeData.apiKeyProd || ''),
+        })
       } else if (marketKey === 'lottehome') {
         const userId = safeData.storeId || ''
         const password = safeData.password || ''
@@ -343,7 +364,9 @@ export function useStoreSettings(): StoreSettingsState & StoreSettingsActions {
           result = await proxyApi.lottehomeAuth({ userId, password, agncNo, env: safeData.env || 'prod' })
         }
       } else if (marketKey === 'playauto') {
-        result = await proxyApi.playautoAuthTest()
+        result = await proxyApi.playautoAuthTest({
+          api_key: String(safeData.apiKey || ''),
+        })
       } else {
         result = await proxyApi.marketAuthTest(marketKey)
       }
@@ -459,6 +482,26 @@ export function useStoreSettings(): StoreSettingsState & StoreSettingsActions {
     setAccounts(prev => prev.map(a => a.id === id ? { ...a, is_active: !a.is_active } : a))
     await loadAccounts()
   }
+  const handleAccountSetDefault = async (id: string) => {
+    // 라디오 동작 — 백엔드가 같은 (tenant, market_type) 다른 계정 is_default=false 강제.
+    // 낙관적 갱신: 즉시 로컬에서 라디오 상태 반영 → 백엔드 응답 후 재조회.
+    const target = accounts.find(a => a.id === id)
+    if (!target) return
+    setAccounts(prev => prev.map(a =>
+      a.market_type === target.market_type
+        ? { ...a, is_default: a.id === id }
+        : a
+    ))
+    try {
+      await accountApi.setDefault(id)
+    } catch (e) {
+      // 실패 시 원복
+      await loadAccounts()
+      throw e
+    }
+    await loadAccounts()
+  }
+
   const handleAccountDelete = async (id: string) => {
     if (!await showConfirm('삭제하시겠습니까?')) return
     await accountApi.delete(id)
@@ -517,6 +560,7 @@ export function useStoreSettings(): StoreSettingsState & StoreSettingsActions {
     testStoreAuth,
     handleAccountToggle,
     handleAccountDelete,
+    handleAccountSetDefault,
     togglePasswordVisibility,
     setStoreTab,
     setStoreData,

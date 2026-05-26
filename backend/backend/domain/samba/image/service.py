@@ -7,7 +7,7 @@ import hashlib
 import io
 import logging
 import os
-import uuid
+import re
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -950,7 +950,13 @@ class ImageTransformService:
                     continue
 
                 # 차단 도메인 — 다운로드 후 R2 업로드
-                image_bytes = await self._download_image(url)
+                # msscdn(무신사) _NNN.jpg(예: _500.jpg, _320.jpg) → _big.jpg(1500x1800) 강제
+                # ESM 옥션 600x600 한도 미만은 reject → 다운로드 단계에서 큰 사이즈로 swap
+                # 원본 url은 키로 유지(detail_html 치환용), 다운로드용 fetch_url만 swap
+                fetch_url = url
+                if "msscdn.net" in host:
+                    fetch_url = re.sub(r"_\d{3,4}\.jpg$", "_big.jpg", url)
+                image_bytes = await self._download_image(fetch_url)
                 # 11번가 등 일부 마켓은 webp 거부 + magic bytes 검증 수행
                 # → 받은 바이트를 PIL로 열어서 무조건 JPEG로 변환 후 업로드
                 # (AI 가공 경로 _save_image 와 동일한 정규화 정책)
@@ -1195,16 +1201,19 @@ class ImageTransformService:
             return html
         import re as _re
 
-        pattern = _re.compile(r'src=(["\'])(https?://[^"\']+)\1', _re.IGNORECASE)
-        candidates: list[str] = []
+        # protocol-relative(//host/...)와 절대(https?://...) 양쪽 매칭
+        pattern = _re.compile(r'src=(["\'])((?:https?:)?//[^"\']+)\1', _re.IGNORECASE)
+        # orig(원본 문자열) -> normalized(https://...) 매핑
+        orig_to_norm: dict[str, str] = {}
         for m in pattern.finditer(html):
             url = m.group(2)
-            if url not in candidates:
-                candidates.append(url)
-        if not candidates:
+            if url in orig_to_norm:
+                continue
+            orig_to_norm[url] = ("https:" + url) if url.startswith("//") else url
+        if not orig_to_norm:
             return html
         _, url_map = await self.mirror_oversized_to_r2(
-            candidates,
+            list(orig_to_norm.values()),
             max_bytes=max_bytes,
             max_dim=max_dim,
             min_dim=min_dim,
@@ -1213,8 +1222,10 @@ class ImageTransformService:
         if not url_map:
             return html
         new_html = html
-        for orig, new in url_map.items():
-            new_html = new_html.replace(orig, new)
+        for orig, norm in orig_to_norm.items():
+            new = url_map.get(norm)
+            if new:
+                new_html = new_html.replace(orig, new)
         return new_html
 
     async def mirror_urls_in_html(self, html: str) -> str:
@@ -1222,28 +1233,38 @@ class ImageTransformService:
 
         detail_html처럼 사전 생성된 HTML 안의 <img src="..."> URL이 미러링을
         우회하여 11번가 서버에 워터마크 응답을 받는 것을 방지.
+
+        protocol-relative URL(`//image.msscdn.net/...`)도 처리 — 무신사
+        goodsContents 배너가 `<img src="//image.msscdn.net/...">` 형식이므로
+        `https?://`만 매칭하면 미러링 우회되어 핫링크 차단으로 깨진 이미지 노출.
         """
         if not html:
             return html
         import re as _re
 
-        # src="...", src='...' 매칭 — 양쪽 따옴표 모두 처리
-        pattern = _re.compile(r'src=(["\'])(https?://[^"\']+)\1', _re.IGNORECASE)
-        candidates: list[str] = []
+        # protocol-relative(//host/...)와 절대(https?://...) 양쪽 매칭
+        pattern = _re.compile(r'src=(["\'])((?:https?:)?//[^"\']+)\1', _re.IGNORECASE)
+        # orig(원본 문자열) -> normalized(https://...) 매핑
+        orig_to_norm: dict[str, str] = {}
         for m in pattern.finditer(html):
             url = m.group(2)
-            if self.is_hotlink_blocked_url(url) and url not in candidates:
-                candidates.append(url)
-        if not candidates:
+            if url in orig_to_norm:
+                continue
+            norm = ("https:" + url) if url.startswith("//") else url
+            if self.is_hotlink_blocked_url(norm):
+                orig_to_norm[url] = norm
+        if not orig_to_norm:
             return html
 
-        _, url_map = await self.mirror_external_to_r2(candidates)
+        _, url_map = await self.mirror_external_to_r2(list(orig_to_norm.values()))
         if not url_map:
             return html
 
         new_html = html
-        for orig, new in url_map.items():
-            new_html = new_html.replace(orig, new)
+        for orig, norm in orig_to_norm.items():
+            new = url_map.get(norm)
+            if new:
+                new_html = new_html.replace(orig, new)
         return new_html
 
     async def transform_single_image(
@@ -1831,6 +1852,8 @@ async def _split_single_image(
         y = bottom
 
     # 텍스트 이미지 필터링 후 R2에 업로드
+    # [2026-05-24] content_hash 기반 결정적 키 + HeadObject 가드로 중복 PUT 차단
+    # 기존: uuid.uuid4() 가 키에 박혀 같은 segment 매번 새 객체 PUT → GCP egress 누수 주범
     url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
     uploaded: list[str] = []
     for idx, seg in enumerate(segments):
@@ -1840,18 +1863,30 @@ async def _split_single_image(
         buf = io.BytesIO()
         # 마켓 API 호환을 위해 JPEG로 저장 (WebP는 11번가 등에서 거부됨)
         seg.convert("RGB").save(buf, format="JPEG", quality=88, optimize=True)
-        buf.seek(0)
-        filename = f"split_{url_hash}_{idx}_{uuid.uuid4().hex[:6]}.jpg"
-        await asyncio.to_thread(
-            partial(
-                r2_client.upload_fileobj,
-                buf,
-                bucket_name,
-                f"split/{filename}",
-                ExtraArgs={"ContentType": "image/jpeg"},
-            ),
-        )
-        uploaded.append(f"{public_url}/split/{filename}")
+        seg_bytes = buf.getvalue()
+        content_hash = hashlib.md5(seg_bytes).hexdigest()[:16]
+        filename = f"split_{url_hash}_{idx}_{content_hash}.jpg"
+        key = f"split/{filename}"
+
+        def _exists(_key: str = key) -> bool:
+            try:
+                r2_client.head_object(Bucket=bucket_name, Key=_key)
+                return True
+            except Exception:
+                return False
+
+        if not await asyncio.to_thread(_exists):
+            buf.seek(0)
+            await asyncio.to_thread(
+                partial(
+                    r2_client.upload_fileobj,
+                    buf,
+                    bucket_name,
+                    key,
+                    ExtraArgs={"ContentType": "image/jpeg"},
+                ),
+            )
+        uploaded.append(f"{public_url}/{key}")
 
     logger.info(f"[이미지분할] {url} → {len(uploaded)}장 ({w}x{h})")
     return uploaded

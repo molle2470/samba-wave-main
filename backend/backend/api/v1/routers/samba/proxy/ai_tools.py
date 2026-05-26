@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, File, Header, Query, UploadFile
@@ -10,6 +10,7 @@ from fastapi.responses import Response
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from backend.db.orm import get_read_session_dependency, get_write_session_dependency
+from backend.domain.samba.tenant.middleware import get_optional_tenant_id
 from backend.utils.logger import logger
 
 from ._helpers import _get_setting, _set_setting
@@ -41,9 +42,10 @@ def _default_tenant_id() -> str | None:
 @router.post("/claude/test")
 async def claude_api_test(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """Claude API 키 유효성 검증 — 최소 메시지 전송 테스트."""
-    creds = await _get_setting(session, "claude")
+    creds = await _get_setting(session, "claude", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "Claude API 설정이 저장되지 않았습니다."}
 
@@ -99,9 +101,10 @@ async def claude_api_test(
 @router.post("/gemini/test")
 async def gemini_api_test(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """Gemini API 키 유효성 검증."""
-    creds = await _get_setting(session, "gemini")
+    creds = await _get_setting(session, "gemini", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "Gemini API 설정이 저장되지 않았습니다."}
 
@@ -146,9 +149,10 @@ async def gemini_api_test(
 @router.post("/r2/test")
 async def r2_test(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """Cloudflare R2 연결 테스트."""
-    creds = await _get_setting(session, "cloudflare_r2")
+    creds = await _get_setting(session, "cloudflare_r2", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "R2 settings not found"}
 
@@ -185,9 +189,10 @@ async def r2_upload_image(
     filename: str = Query(...),
     file: UploadFile = File(...),
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """브라우저 WASM 배경 제거 결과 이미지를 R2에 업로드."""
-    creds = await _get_setting(session, "cloudflare_r2")
+    creds = await _get_setting(session, "cloudflare_r2", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "R2 설정이 저장되지 않았습니다"}
 
@@ -315,9 +320,10 @@ async def image_fetch_proxy(url: str = Query(...)) -> Response:
 @router.get("/fal/status")
 async def fal_ai_status(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """fal.ai 계정 상태 확인 (잔액 부족 여부)."""
-    creds = await _get_setting(session, "fal_ai")
+    creds = await _get_setting(session, "fal_ai", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"status": "no_key", "message": "API 키 미등록"}
 
@@ -383,6 +389,38 @@ async def transform_images(
 
     if not product_ids:
         return {"success": False, "message": "No products selected"}
+
+    # 이미 배경제거(__ai_image__) 완료된 상품 재처리 스킵 (이슈 #234)
+    # scope.skip_processed=true 시 product_ids 중 __ai_image__ 태그 보유분을 enqueue 전에 제외.
+    # → total 정확, 워커 디스패치/R2 업로드/rembg CPU 절감.
+    # 주의: __ai_image__는 상품 단위 태그(thumbnail/additional/detail scope 구분 없음).
+    #       썸네일만 처리된 상품도 제외되므로 상세 재처리 용도엔 부적합.
+    if scope.get("skip_processed") and product_ids:
+        from sqlalchemy import select as sa_select, text as _text_jsonb
+
+        from backend.domain.samba.collector.model import SambaCollectedProduct
+
+        _ai_img = _text_jsonb("'[\"__ai_image__\"]'::jsonb")
+        _done_stmt = sa_select(SambaCollectedProduct.id).where(
+            SambaCollectedProduct.id.in_(product_ids),
+            SambaCollectedProduct.tags.op("@>")(_ai_img),
+        )
+        _done_res = await session.execute(_done_stmt)
+        _done_ids = {r[0] for r in _done_res.all()}
+        if _done_ids:
+            product_ids = [pid for pid in product_ids if pid not in _done_ids]
+            logger.info(
+                f"[배경제거][skip_processed] 이미 처리된 {len(_done_ids)}개 제외 → "
+                f"{len(product_ids)}개 처리 대상"
+            )
+        if not product_ids:
+            return {
+                "success": True,
+                "status": "skipped",
+                "message": "모든 상품이 이미 처리됨 (skip_processed)",
+                "total_transformed": 0,
+                "total_failed": 0,
+            }
 
     # 배경제거는 로컬 워커 큐에 등록 (Cloud Run에서 처리 안 함)
     if mode == "background":
@@ -451,7 +489,6 @@ async def bg_jobs_config(
     from ._helpers import _set_setting
 
     _tid = _default_tenant_id()
-    env_token = os.environ.get("BG_WORKER_TOKEN", "")
     cfg = await _get_setting(session, "bg_worker", tenant_id=_tid)
     db_token = (cfg or {}).get("worker_token", "") if isinstance(cfg, dict) else ""
 

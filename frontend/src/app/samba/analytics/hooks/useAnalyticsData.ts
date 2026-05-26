@@ -3,7 +3,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react'
 import {
   accountApi, collectorApi, orderApi,
-  type SambaMarketAccount, type SambaOrder,
+  type SambaMarketAccount, type AnalyticsAggregateRow,
 } from '@/lib/samba/api/commerce'
 import {
   analyticsApi,
@@ -16,12 +16,18 @@ interface Args {
   searchMonth: number
   setSelectedSites: (v: string[]) => void
   setSelectedMarkets: (v: string[]) => void
+  hasStoredMarkets: boolean
+  hasStoredSites: boolean
 }
 
-export function useAnalyticsData({ searchYear, searchMonth, setSelectedSites, setSelectedMarkets }: Args) {
+export function useAnalyticsData({
+  searchYear, searchMonth, setSelectedSites, setSelectedMarkets,
+  hasStoredMarkets, hasStoredSites,
+}: Args) {
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [marketAccounts, setMarketAccounts] = useState<SambaMarketAccount[]>([])
-  const [orders, setOrders] = useState<SambaOrder[]>([])
+  const [aggregate, setAggregate] = useState<AnalyticsAggregateRow[]>([])
   const [, setChannelData] = useState<{ channel_name: string; sales: number; orders: number; profit: number }[]>([])
   const [dailyData, setDailyData] = useState<{ date: string; sales: number; orders: number; profit: number }[]>([])
   const [sourcingRoi, setSourcingRoi] = useState<SourcingRoi[]>([])
@@ -30,6 +36,7 @@ export function useAnalyticsData({ searchYear, searchMonth, setSelectedSites, se
 
   const load = useCallback(async () => {
     setLoading(true)
+    setError(null)
     try {
       const start = searchMonth > 0
         ? `${searchYear}-${String(searchMonth).padStart(2, '0')}-01`
@@ -37,8 +44,17 @@ export function useAnalyticsData({ searchYear, searchMonth, setSelectedSites, se
       const end = searchMonth > 0
         ? `${searchYear}-${String(searchMonth).padStart(2, '0')}-${new Date(searchYear, searchMonth, 0).getDate()}`
         : `${searchYear}-12-31`
-      const allOrders = await orderApi.listByDateRange(start, end).catch(() => [])
-      setOrders(allOrders)
+
+      // 사전집계 엔드포인트 — 실패 시 사용자에게 에러 노출(silent [] 회귀 차단)
+      let rows: AnalyticsAggregateRow[] = []
+      try {
+        const resp = await orderApi.analyticsAggregate(start, end)
+        rows = resp.rows || []
+      } catch (e) {
+        setError(e instanceof Error ? e.message : '매출 데이터 조회 실패')
+        rows = []
+      }
+      setAggregate(rows)
 
       const [ch, daily, roi, best, brands] = await Promise.all([
         analyticsApi.channels().catch(() => []),
@@ -52,36 +68,39 @@ export function useAnalyticsData({ searchYear, searchMonth, setSelectedSites, se
       setSourcingRoi(roi)
       setBestSellers(best)
       setBrandData(brands)
-    } catch {}
-    setLoading(false)
+    } finally {
+      setLoading(false)
+    }
   }, [searchYear, searchMonth])
 
   useEffect(() => { load() }, [load])
 
-  // 마켓 계정 목록 + 소싱사이트 기본값
   useEffect(() => {
     const init = async () => {
       const accounts = await accountApi.listActive().catch(() => [] as SambaMarketAccount[])
       setMarketAccounts(accounts)
-      const allData = await collectorApi.scrollProducts({ limit: 1 }).catch(() => null)
-      if (allData) {
-        const collectedSites = (allData.sites || []).filter((s: string) => SOURCE_SITES.includes(s))
-        if (collectedSites.length > 0) setSelectedSites(collectedSites)
+      // 소싱사이트 기본값 — localStorage 저장값 없을 때만 채움(사용자 선택 덮어쓰기 금지)
+      if (!hasStoredSites) {
+        const allData = await collectorApi.scrollProducts({ limit: 1 }).catch(() => null)
+        if (allData) {
+          const collectedSites = (allData.sites || []).filter((s: string) => SOURCE_SITES.includes(s))
+          if (collectedSites.length > 0) setSelectedSites(collectedSites)
+        }
       }
     }
     init()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // 마켓 기본값: 주문 데이터에서 마켓 추출
+  // 마켓 기본값: aggregate에서 채널명 추출 — localStorage 저장값 없을 때만 1회
   const initialMarketSet = useRef(false)
   useEffect(() => {
-    if (!initialMarketSet.current && orders.length > 0) {
+    if (!initialMarketSet.current && aggregate.length > 0 && !hasStoredMarkets) {
       initialMarketSet.current = true
       const orderMarkets = new Set<string>()
-      for (const o of orders) {
-        if (o.channel_name) {
-          const name = o.channel_name
+      for (const r of aggregate) {
+        if (r.channel_name) {
+          const name = r.channel_name
           const idx = name.indexOf('(')
           orderMarkets.add(idx > 0 ? name.substring(0, idx) : name)
         }
@@ -89,10 +108,10 @@ export function useAnalyticsData({ searchYear, searchMonth, setSelectedSites, se
       if (orderMarkets.size > 0) setSelectedMarkets([...orderMarkets])
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [orders])
+  }, [aggregate])
 
   return {
-    loading, marketAccounts, orders,
+    loading, error, marketAccounts, aggregate,
     dailyData, sourcingRoi, bestSellers, brandData,
     load,
   }

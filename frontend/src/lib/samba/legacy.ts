@@ -113,9 +113,18 @@ export interface OrderDashboardStats {
   thisMonth: { count: number; sales: number; fulfillmentSales: number; fulfillmentCount: number; fulfillment: number }
   lastMonth: { count: number; sales: number; fulfillmentSales: number; fulfillmentCount: number; fulfillment: number }
   salesChange: number
-  weekly: { date: string; sales: number; count: number; fulfillmentSales: number; fulfillmentCount: number; newRegistered: number; marketDeleted: number; registeredCount: number; collectedCount: number }[]
+  weekly: { date: string; sales: number; count: number; fulfillmentSales: number; fulfillmentCount: number; newRegistered: number | null; marketDeleted: number; registeredCount: number | null; collectedCount: number }[]
   monthly: { month: number; sales: number; fulfillmentSales: number }[]
   marketRegisteredCount: number
+}
+
+export interface AnalyticsAggregateRow {
+  date: string
+  channel_name: string
+  source_site: string
+  status: string
+  sales: number
+  orders: number
 }
 
 export interface PaginatedOrderList {
@@ -196,6 +205,8 @@ export const orderApi = {
   },
   listByDateRange: (start: string, end: string) =>
     request<SambaOrder[]>(`${SAMBA_PREFIX}/orders/by-date-range?start=${start}&end=${end}`),
+  analyticsAggregate: (start: string, end: string) =>
+    request<{ rows: AnalyticsAggregateRow[] }>(`${SAMBA_PREFIX}/orders/analytics-aggregate?start=${start}&end=${end}`),
   listByDateRangePaged: (params: {
     start: string
     end: string
@@ -445,7 +456,7 @@ export const orderApi = {
     request<TrackingInfo>(`${SAMBA_PREFIX}/orders/tracking?carrier=${encodeURIComponent(carrier)}&invoice=${encodeURIComponent(invoice)}`),
 };
 
-export interface TrackingEvent {
+interface TrackingEvent {
   time: string | null
   status: string | null
   status_code: string | null
@@ -939,7 +950,7 @@ export const collectorApi = {
   autotuneStop: (deviceId?: string) =>
     request<{ ok: boolean; status: string }>(`${SAMBA_PREFIX}/collector/autotune/stop`, { method: 'POST', body: JSON.stringify({ device_id: deviceId || undefined }) }),
   autotuneStatus: (deviceId?: string) =>
-    request<{ running: boolean; last_tick: string | null; cycle_count: number; restart_count: number; target: string; refreshed_count: number; breaker_tripped: Record<string, number>; site_intervals?: Record<string, number>; site_autotune_concurrency?: Record<string, number>; running_pcs?: string[]; traffic?: { collecting: boolean; transmitting: boolean; busy: boolean } }>(`${SAMBA_PREFIX}/collector/autotune/status${deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : ''}`),
+    request<{ running: boolean; enabled?: boolean; last_tick: string | null; cycle_count: number; restart_count: number; target: string; refreshed_count: number; breaker_tripped: Record<string, number>; site_intervals?: Record<string, number>; site_autotune_concurrency?: Record<string, number>; running_pcs?: string[]; traffic?: { collecting: boolean; transmitting: boolean; busy: boolean } }>(`${SAMBA_PREFIX}/collector/autotune/status${deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : ''}`),
   autotuneUpdateInterval: (site: string, interval: number) =>
     request<{ ok: boolean; site: string; interval: number }>(`${SAMBA_PREFIX}/collector/autotune/interval`, { method: 'POST', body: JSON.stringify({ site, interval }) }),
   autotuneGetConcurrency: () =>
@@ -966,19 +977,47 @@ export const collectorApi = {
 
 export interface SambaMarketAccount {
   id: string;
+  tenant_id?: string;
   market_type: string;
   market_name: string;
   account_label: string;
   seller_id?: string;
   business_name?: string;
   is_active: boolean;
+  is_default?: boolean;
   additional_fields?: Record<string, unknown>;
   created_at: string;
 }
 
+const ACTIVE_ACCOUNTS_CACHE_KEY = 'samba_active_accounts_v1'
+
 export const accountApi = {
   list: () => request<SambaMarketAccount[]>(`${SAMBA_PREFIX}/accounts`),
   listActive: () => request<SambaMarketAccount[]>(`${SAMBA_PREFIX}/accounts/active`),
+  // SWR 패턴: localStorage 캐시 즉시 반영 후 백그라운드 갱신.
+  // 드롭다운/필터처럼 화면 진입 즉시 보여줘야 하는 곳에서 사용.
+  listActiveCached: (setter: (accounts: SambaMarketAccount[]) => void): Promise<SambaMarketAccount[] | undefined> => {
+    if (typeof window !== 'undefined') {
+      try {
+        const cached = window.localStorage.getItem(ACTIVE_ACCOUNTS_CACHE_KEY)
+        if (cached) {
+          const parsed = JSON.parse(cached) as SambaMarketAccount[]
+          if (Array.isArray(parsed) && parsed.length > 0) setter(parsed)
+        }
+      } catch { /* ignore */ }
+    }
+    return request<SambaMarketAccount[]>(`${SAMBA_PREFIX}/accounts/active`)
+      .then(fresh => {
+        setter(fresh)
+        try {
+          if (typeof window !== 'undefined') {
+            window.localStorage.setItem(ACTIVE_ACCOUNTS_CACHE_KEY, JSON.stringify(fresh))
+          }
+        } catch { /* ignore */ }
+        return fresh
+      })
+      .catch(() => undefined)
+  },
   getMarkets: () => request<unknown[]>(`${SAMBA_PREFIX}/accounts/markets`),
   get: (id: string) => request<SambaMarketAccount>(`${SAMBA_PREFIX}/accounts/${id}`),
   create: (data: Partial<SambaMarketAccount>) =>
@@ -987,6 +1026,13 @@ export const accountApi = {
     request<SambaMarketAccount>(`${SAMBA_PREFIX}/accounts/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   toggle: (id: string) =>
     request<SambaMarketAccount>(`${SAMBA_PREFIX}/accounts/${id}/toggle`, { method: "PUT" }),
+  setDefault: (id: string) =>
+    request<SambaMarketAccount>(`${SAMBA_PREFIX}/accounts/${id}/set-default`, { method: "PUT" }),
+  upsertFromStoreForm: (body: { market_type: string; form_data: Record<string, unknown>; account_id?: string }) =>
+    request<SambaMarketAccount>(`${SAMBA_PREFIX}/accounts/from-store-form`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   delete: (id: string) =>
     request<{ ok: boolean }>(`${SAMBA_PREFIX}/accounts/${id}`, { method: "DELETE" }),
   getSecrets: (id: string) =>
@@ -1009,7 +1055,7 @@ export interface SambaShipment {
 
 // ── 스스그룹 타입 ──
 
-export interface GroupPreviewProduct {
+interface GroupPreviewProduct {
   id: string
   name: string
   color: string | null
@@ -1020,7 +1066,7 @@ export interface GroupPreviewProduct {
   same_day_delivery?: boolean
 }
 
-export interface GroupPreviewGroup {
+interface GroupPreviewGroup {
   group_key: string
   group_name: string
   products: GroupPreviewProduct[]
@@ -1416,16 +1462,18 @@ export const proxyApi = {
     request<MessageLog[]>(`${SAMBA_PREFIX}/proxy/messages/by-order/${encodeURIComponent(orderId)}`),
   fetchSentFlags: (orderIds: string[]) =>
     request<Record<string, { sms: boolean; kakao: boolean }>>(`${SAMBA_PREFIX}/proxy/messages/sent-flags?order_ids=${orderIds.map(encodeURIComponent).join(',')}`),
-  playautoAuthTest: () =>
+  playautoAuthTest: (payload?: { api_key?: string; account_id?: string }) =>
     request<{ success: boolean; message: string }>(
-      `${SAMBA_PREFIX}/proxy/playauto/auth-test`, { method: 'POST' }),
+      `${SAMBA_PREFIX}/proxy/playauto/auth-test`,
+      { method: 'POST', body: JSON.stringify(payload || {}) }),
   smartstoreAuthTest: () =>
     request<{ success: boolean; message: string; token_preview?: string }>(
       `${SAMBA_PREFIX}/proxy/smartstore/auth-test`, { method: 'POST' }),
-  elevenstAuthTest: () =>
+  elevenstAuthTest: (payload?: { api_key?: string; account_id?: string }) =>
     request<{ success: boolean; message: string }>(
-      `${SAMBA_PREFIX}/proxy/11st/auth-test`, { method: 'POST' }),
-  elevenstSellerInfo: () =>
+      `${SAMBA_PREFIX}/proxy/11st/auth-test`,
+      { method: 'POST', body: JSON.stringify(payload || {}) }),
+  elevenstSellerInfo: (payload?: { api_key?: string; account_id?: string }) =>
     request<{
       success: boolean
       message: string
@@ -1441,10 +1489,12 @@ export const proxyApi = {
         inboundList?: unknown
       }
     }>(
-      `${SAMBA_PREFIX}/proxy/11st/seller-info`, { method: 'POST' }),
-  coupangAuthTest: () =>
+      `${SAMBA_PREFIX}/proxy/11st/seller-info`,
+      { method: 'POST', body: JSON.stringify(payload || {}) }),
+  coupangAuthTest: (payload?: { access_key?: string; secret_key?: string; vendor_id?: string; account_id?: string }) =>
     request<{ success: boolean; message: string }>(
-      `${SAMBA_PREFIX}/proxy/coupang/auth-test`, { method: 'POST' }),
+      `${SAMBA_PREFIX}/proxy/coupang/auth-test`,
+      { method: 'POST', body: JSON.stringify(payload || {}) }),
   coupangShippingPlaces: (accountId?: string) =>
     request<{
       success: boolean
@@ -1457,21 +1507,30 @@ export const proxyApi = {
       `${SAMBA_PREFIX}/proxy/coupang/shipping-places`,
       { method: 'POST', body: JSON.stringify({ account_id: accountId || null }) }
     ),
-  lotteonAuthTest: () =>
+  lotteonAuthTest: (payload?: {
+    api_key?: string
+    account_id?: string
+    dv_cst_pol_no?: string
+    owhp_no?: string
+    rtrp_no?: string
+  }) =>
     request<{ success: boolean; message: string; data?: Record<string, string> }>(
-      `${SAMBA_PREFIX}/proxy/lotteon/auth-test`, { method: 'POST' }),
-  lotteonDeliveryPolicies: () =>
+      `${SAMBA_PREFIX}/proxy/lotteon/auth-test`,
+      { method: 'POST', body: JSON.stringify(payload || {}) }
+    ),
+  lotteonDeliveryPolicies: (accountId?: string) =>
     request<{ success: boolean; policies: { value: string; label: string }[] }>(
-      `${SAMBA_PREFIX}/proxy/lotteon/delivery-policies`),
-  lotteonWarehouses: () =>
+      `${SAMBA_PREFIX}/proxy/lotteon/delivery-policies${accountId ? `?account_id=${encodeURIComponent(accountId)}` : ''}`),
+  lotteonWarehouses: (accountId?: string) =>
     request<{
       success: boolean
       departure: { value: string; label: string }[]
       return_: { value: string; label: string }[]
-    }>(`${SAMBA_PREFIX}/proxy/lotteon/warehouses`),
-  ssgAuthTest: () =>
+    }>(`${SAMBA_PREFIX}/proxy/lotteon/warehouses${accountId ? `?account_id=${encodeURIComponent(accountId)}` : ''}`),
+  ssgAuthTest: (payload?: { api_key?: string; account_id?: string }) =>
     request<{ success: boolean; message: string }>(
-      `${SAMBA_PREFIX}/proxy/ssg/auth-test`, { method: 'POST' }),
+      `${SAMBA_PREFIX}/proxy/ssg/auth-test`,
+      { method: 'POST', body: JSON.stringify(payload || {}) }),
   ssgShippingPolicies: (accountId?: string) =>
     request<{ success: boolean; policies: { shppcstId: string; feeAmt: number; prpayCodDivNm: string; shppcstAplUnitNm: string; divCd: number }[] }>(
       `${SAMBA_PREFIX}/proxy/ssg/shipping-policies${accountId ? `?account_id=${encodeURIComponent(accountId)}` : ''}`),
@@ -1484,9 +1543,10 @@ export const proxyApi = {
   esmDeliveryInfo: (market: string, accountId?: string) =>
     request<{ success: boolean; places: { placeNo: number; placeNm: string; placeType: number }[]; dispatchPolicies: { dispatchPolicyNo: number; policyNm: string }[]; message?: string }>(
       `${SAMBA_PREFIX}/proxy/esm/${market}/delivery-info${accountId ? `?account_id=${encodeURIComponent(accountId)}` : ''}`),
-  gsshopAuthTest: () =>
+  gsshopAuthTest: (payload?: { store_id?: string; api_key_dev?: string; api_key_prod?: string; account_id?: string }) =>
     request<{ success: boolean; message: string }>(
-      `${SAMBA_PREFIX}/proxy/gsshop/auth-test`, { method: 'POST' }),
+      `${SAMBA_PREFIX}/proxy/gsshop/auth-test`,
+      { method: 'POST', body: JSON.stringify(payload || {}) }),
   marketAuthTest: (marketKey: string) =>
     request<{ success: boolean; message: string }>(
       `${SAMBA_PREFIX}/proxy/market/auth-test/${marketKey}`, { method: 'POST' }),
@@ -1864,15 +1924,6 @@ export const csInquiryApi = {
 
 // ── Analytics ──
 
-export interface AnalyticsStats {
-  total_sales: number;
-  total_orders: number;
-  total_profit: number;
-  avg_order_value: number;
-  profit_rate: number;
-}
-
-
 // ── Detail Templates ──
 
 export interface SambaDetailTemplate {
@@ -2095,8 +2146,13 @@ export const monitorApi = {
     request<{ sources: DashboardStats['site_health']; markets: DashboardStats['market_health'] }>(
       `${SAMBA_PREFIX}/monitor/site-health`,
     ),
-  refreshLogs: (sinceIdx = 0) =>
-    request<RefreshLogsResponse>(`${SAMBA_PREFIX}/monitor/refresh-logs?since_idx=${sinceIdx}`),
+  refreshLogs: (sinceIdx = 0, deviceId = '') => {
+    const params = new URLSearchParams({ since_idx: String(sinceIdx) })
+    if (deviceId) params.set('device_id', deviceId)
+    return request<RefreshLogsResponse>(
+      `${SAMBA_PREFIX}/monitor/refresh-logs?${params.toString()}`,
+    )
+  },
   storeScores: () =>
     request<Record<string, { account_id: string; account_label: string; market_type: string; grade: string; grade_code: string; good_service: Record<string, number> | null; penalty: number | null; penalty_rate: number | null; updated_at: string }>>(`${SAMBA_PREFIX}/monitor/store-scores`),
   refreshStoreScores: () =>
@@ -2109,26 +2165,6 @@ export const monitorApi = {
     request<Record<string, Record<string, Array<{ id: string; event_id: string; created_at: string; source_site: string | null; market_product_no: string | null; site_product_id: string | null; account_id: string; account_label: string; product_id: string | null; product_name: string | null; detail: Record<string, unknown> | null }>>>>(
       `${SAMBA_PREFIX}/monitor/events/market-changes?limit=${limit}`,
     ),
-}
-
-// ── S3 이미지 헬퍼 ──
-
-const S3_BUCKET = process.env.NEXT_PUBLIC_S3_BUCKET || ''
-const S3_REGION = process.env.NEXT_PUBLIC_S3_REGION || 'ap-northeast-2'
-
-/** S3 key → 공개 URL 변환 */
-export function getS3Url(key: string): string {
-  return `https://${S3_BUCKET}.s3.${S3_REGION}.amazonaws.com/${key}`
-}
-
-/** Presigned PUT URL로 파일 직접 업로드 */
-export async function uploadToS3(presignedUrl: string, file: File): Promise<void> {
-  const res = await fetch(presignedUrl, {
-    method: 'PUT',
-    headers: { 'Content-Type': file.type },
-    body: file,
-  })
-  if (!res.ok) throw new Error(`S3 업로드 실패: ${res.status}`)
 }
 
 // ── 사용자(로그인 계정) 관리 ──
@@ -2171,7 +2207,7 @@ export const userApi = {
 
 // ── AI Sourcing (AI 소싱기) ──
 
-export interface AISourcingBrand {
+interface AISourcingBrand {
   brand: string
   count: number
   score: number
@@ -2196,7 +2232,7 @@ export interface AISourcingCombination {
   safety_reason: string
 }
 
-export interface AISourcingSummary {
+interface AISourcingSummary {
   total_brands_found: number
   safe_brands: number
   unsafe_brands: number
@@ -2415,14 +2451,6 @@ export interface ChromeProfile {
   display_name: string
 }
 
-export interface BalanceResult {
-  id: string
-  label: string
-  balance: number | null
-  status: string
-  message?: string
-}
-
 export const sourcingAccountApi = {
   list: (siteName?: string) => {
     const p = new URLSearchParams()
@@ -2454,7 +2482,7 @@ export const sourcingAccountApi = {
 
 // ── Rewards (적립금 자동 적립) ──
 
-export interface RewardActionMeta {
+interface RewardActionMeta {
   id: string
   site: string
   label: string
@@ -2527,35 +2555,6 @@ export const rewardsApi = {
       method: 'POST',
       body: JSON.stringify({ interval_hours: intervalHours }),
     }),
-}
-
-// ── Tenant (티어/사용량) ──
-
-export interface TenantInfo {
-  id: string
-  name: string
-  plan: string
-  limits: { max_products: number; max_markets: number; max_sourcing: number }
-  autotune_enabled: boolean
-  subscription_start: string | null
-  subscription_end: string | null
-  is_active: boolean
-}
-
-export interface TenantUsage {
-  plan: string
-  autotune_enabled: boolean
-  subscription_end: string | null
-  usage: {
-    products: { current: number; max: number }
-    markets: { current: number; max: number }
-    sourcing: { current: number; max: number }
-  }
-}
-
-export const tenantApi = {
-  getMyInfo: () => request<{ tenant: TenantInfo | null }>(`${SAMBA_PREFIX}/tenants/me/info`),
-  getMyUsage: () => request<TenantUsage>(`${SAMBA_PREFIX}/tenants/me/usage`),
 }
 
 // ── Analytics ──

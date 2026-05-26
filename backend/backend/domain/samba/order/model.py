@@ -36,10 +36,13 @@ class SambaOrder(SQLModel, table=True):
             "ord_prd_seq",
             unique=True,
         ),
+        # 롯데ON 중복 차단 — 동일 테넌트 내 (od_no, od_seq) 단위 unique.
+        # channel_id 포함 시 동일 API key를 공유하는 2개 마켓계정이 같은 주문을
+        # 양쪽 채널에 중복 저장하던 사고 발생(2026-05-25). channel_id 제거로
+        # 테넌트 전역 단일 행 보장.
         Index(
             "ix_samba_order_lotteon_line",
             "tenant_id",
-            "channel_id",
             "od_no",
             "od_seq",
             unique=True,

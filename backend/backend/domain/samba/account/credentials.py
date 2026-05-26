@@ -1,0 +1,304 @@
+"""마켓 계정 자격증명 표준 접근자 (2026-05-25).
+
+`samba_market_account` 행을 마켓별 표준 dict 로 변환한다.
+기존 `store_*` samba_settings 단일 키 구조와 동일한 키 명명을 유지해 호출자 코드 변경 최소화.
+
+설계 원칙:
+- 각 마켓의 cred dict 키는 camelCase (기존 store_* JSON 호환)
+- api_key/api_secret/seller_id 는 컬럼에서 추출
+- 그 외 마켓별 필드는 additional_fields(JSON) 에서 추출
+- OAuth 토큰은 oauth_* 별도 컬럼에서 추출
+- account 가 None 이면 빈 dict 반환 → 호출자가 폴백/에러 처리
+
+표준 키 명세는 backend/domain/samba/account/credentials.py 상단 주석 표 참조.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from backend.domain.samba.account.model import SambaMarketAccount
+
+
+def _extras(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
+    if account is None:
+        return {}
+    extras = getattr(account, "additional_fields", None)
+    return extras if isinstance(extras, dict) else {}
+
+
+def lotteon_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
+    """롯데ON — apiKey + 배송인프라(dvCstPolNo/owhpNo/rtrpNo)."""
+    if account is None:
+        return {}
+    ext = _extras(account)
+    return {
+        "apiKey": account.api_key or "",
+        "dvCstPolNo": ext.get("dvCstPolNo", ""),
+        "owhpNo": ext.get("owhpNo", ""),
+        "rtrpNo": ext.get("rtrpNo", ""),
+    }
+
+
+def elevenst_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
+    """11번가 — apiKey 단일."""
+    if account is None:
+        return {}
+    return {"apiKey": account.api_key or ""}
+
+
+def coupang_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
+    """쿠팡 — accessKey + secretKey + vendorId."""
+    if account is None:
+        return {}
+    return {
+        "accessKey": account.api_key or "",
+        "secretKey": account.api_secret or "",
+        "vendorId": account.seller_id or "",
+    }
+
+
+def ssg_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
+    """SSG — apiKey 단일 (DB api_key 컬럼) + 부속 정책 JSON."""
+    if account is None:
+        return {}
+    ext = _extras(account)
+    return {
+        "apiKey": account.api_key or "",
+        "sellerId": account.seller_id or "",
+        "brandList": ext.get("brandList", []),
+        "shippingPolicyId": ext.get("shippingPolicyId", ""),
+        "outboundAddressId": ext.get("outboundAddressId", ""),
+        "inboundAddressId": ext.get("inboundAddressId", ""),
+    }
+
+
+def smartstore_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
+    """스마트스토어 — clientId + clientSecret."""
+    if account is None:
+        return {}
+    return {
+        "clientId": account.api_key or "",
+        "clientSecret": account.api_secret or "",
+    }
+
+
+def gsshop_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
+    """GSShop — supCd + aesKey + dev/prod 키 + subSupCd + env."""
+    if account is None:
+        return {}
+    ext = _extras(account)
+    return {
+        "supCd": account.seller_id or "",
+        "aesKey": account.api_key or "",
+        "apiKeyDev": ext.get("apiKeyDev", ""),
+        "apiKeyProd": ext.get("apiKeyProd", ""),
+        "subSupCd": ext.get("subSupCd", ""),
+        "env": ext.get("env", "dev"),
+    }
+
+
+def lottehome_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
+    """롯데홈쇼핑 — userId + password + agncNo + env."""
+    if account is None:
+        return {}
+    ext = _extras(account)
+    return {
+        "userId": account.api_key or "",
+        "password": account.api_secret or "",
+        "agncNo": account.seller_id or "",
+        "env": ext.get("env", "prod"),
+    }
+
+
+def playauto_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
+    """플레이오토 — apiKey + hostingId."""
+    if account is None:
+        return {}
+    return {
+        "apiKey": account.api_key or "",
+        "hostingId": account.seller_id or "",
+    }
+
+
+def ebay_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
+    """eBay — clientId + clientSecret + devId + OAuth + 정책 ID."""
+    if account is None:
+        return {}
+    ext = _extras(account)
+    return {
+        "clientId": account.api_key or "",
+        "clientSecret": account.api_secret or "",
+        "devId": ext.get("devId", ""),
+        "oauthToken": account.oauth_access_token or "",
+        "refreshToken": account.oauth_refresh_token or "",
+        "fulfillmentPolicyId": ext.get("fulfillmentPolicyId", ""),
+        "paymentPolicyId": ext.get("paymentPolicyId", ""),
+        "returnPolicyId": ext.get("returnPolicyId", ""),
+    }
+
+
+def cafe24_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
+    """카페24 — mallId + OAuth(clientId/clientSecret/access/refresh)."""
+    if account is None:
+        return {}
+    return {
+        "mallId": account.seller_id or "",
+        "clientId": account.api_key or "",
+        "clientSecret": account.api_secret or "",
+        "accessToken": account.oauth_access_token or "",
+        "refreshToken": account.oauth_refresh_token or "",
+    }
+
+
+def amazon_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
+    """Amazon — clientId + clientSecret + storeId + region + refreshToken."""
+    if account is None:
+        return {}
+    ext = _extras(account)
+    return {
+        "clientId": account.api_key or "",
+        "clientSecret": account.api_secret or "",
+        "storeId": account.seller_id or "",
+        "region": ext.get("region", "fe"),
+        "refreshToken": account.oauth_refresh_token or "",
+    }
+
+
+def esm_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
+    """옥션/G마켓(ESMPlus) — apiKey + sellerId."""
+    if account is None:
+        return {}
+    return {
+        "apiKey": account.api_key or "",
+        "sellerId": account.seller_id or "",
+    }
+
+
+def kream_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
+    """KREAM — token + cookie (additional_fields 에 저장)."""
+    if account is None:
+        return {}
+    ext = _extras(account)
+    return {
+        "token": ext.get("token", ""),
+        "cookie": ext.get("cookie", ""),
+    }
+
+
+def musinsa_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
+    """무신사 — cookie (additional_fields 에 저장)."""
+    if account is None:
+        return {}
+    ext = _extras(account)
+    return {"cookie": ext.get("cookie", "")}
+
+
+def toss_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
+    """토스 — apiKey + apiSecret."""
+    if account is None:
+        return {}
+    return {
+        "apiKey": account.api_key or "",
+        "apiSecret": account.api_secret or "",
+    }
+
+
+# 마켓 → 빌더 매핑 — 동적 디스패치용
+CRED_BUILDERS = {
+    "lotteon": lotteon_creds,
+    "11st": elevenst_creds,
+    "elevenst": elevenst_creds,
+    "coupang": coupang_creds,
+    "ssg": ssg_creds,
+    "smartstore": smartstore_creds,
+    "gsshop": gsshop_creds,
+    "lottehome": lottehome_creds,
+    "playauto": playauto_creds,
+    "ebay": ebay_creds,
+    "cafe24": cafe24_creds,
+    "amazon": amazon_creds,
+    "auction": esm_creds,
+    "gmarket": esm_creds,
+    "esm": esm_creds,
+    "kream": kream_creds,
+    "musinsa": musinsa_creds,
+    "toss": toss_creds,
+}
+
+
+def build_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
+    """account.market_type 에 따라 적절한 빌더 호출. 매핑 없으면 빈 dict."""
+    if account is None:
+        return {}
+    builder = CRED_BUILDERS.get((account.market_type or "").lower())
+    if builder is None:
+        return {}
+    return builder(account)
+
+
+# 마켓별 form 키 → SambaMarketAccount 컬럼 매핑.
+# (api_key_field, api_secret_field, seller_id_field)
+# None = 해당 컬럼 미사용 (additional_fields 에만 저장).
+_FORM_TO_COLUMNS: dict[str, tuple[Optional[str], Optional[str], Optional[str]]] = {
+    "lotteon": ("apiKey", None, None),
+    "11st": ("apiKey", None, None),
+    "elevenst": ("apiKey", None, None),
+    "coupang": ("accessKey", "secretKey", "vendorId"),
+    "ssg": ("apiKey", None, "sellerId"),
+    "smartstore": ("clientId", "clientSecret", None),
+    "gsshop": (None, None, "storeId"),
+    "lottehome": ("userId", "password", "agncNo"),
+    "playauto": ("apiKey", None, "hostingId"),
+    "ebay": ("clientId", "clientSecret", None),
+    "cafe24": ("clientId", "clientSecret", "mallId"),
+    "amazon": ("clientId", "clientSecret", "storeId"),
+    "auction": ("apiKey", None, "sellerId"),
+    "gmarket": ("apiKey", None, "sellerId"),
+    "esm": ("apiKey", None, "sellerId"),
+    "kream": (None, None, None),
+    "musinsa": (None, None, None),
+    "toss": ("apiKey", "apiSecret", None),
+}
+
+
+def form_to_account_payload(
+    market_type: str,
+    form_data: dict[str, Any],
+    tenant_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """설정 페이지 폼 dict → SambaMarketAccount create/update payload 변환.
+
+    api_key/api_secret/seller_id 는 컬럼으로, 그 외는 additional_fields 로.
+    None 컬럼 매핑은 해당 마켓에서 미사용 (form 에 없거나 무관).
+    매핑 누락 마켓은 form_data 전체를 additional_fields 에 저장.
+    """
+    cols = _FORM_TO_COLUMNS.get(market_type.lower(), (None, None, None))
+    api_key_field, api_secret_field, seller_id_field = cols
+
+    payload: dict[str, Any] = {
+        "market_type": market_type,
+        "tenant_id": tenant_id,
+        "is_active": True,
+    }
+    if api_key_field:
+        payload["api_key"] = form_data.get(api_key_field, "") or ""
+    if api_secret_field:
+        payload["api_secret"] = form_data.get(api_secret_field, "") or ""
+    if seller_id_field:
+        payload["seller_id"] = form_data.get(seller_id_field, "") or ""
+
+    # business_name 폼 키 보존
+    if "businessName" in form_data:
+        payload["business_name"] = form_data.get("businessName", "") or ""
+
+    # additional_fields = form 전체 (컬럼 추출분도 남겨둠 — 기존 코드 호환).
+    # 빈 값은 제거해 noise 감소.
+    extras = {
+        k: v
+        for k, v in form_data.items()
+        if v not in (None, "", []) and k != "businessName"
+    }
+    payload["additional_fields"] = extras
+    return payload

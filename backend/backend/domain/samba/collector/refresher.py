@@ -428,6 +428,20 @@ _refresh_log_buffer: deque[Dict[str, Any]] = deque(maxlen=300)
 _refresh_log_total: int = 0  # 누적 카운터 (밀려나도 증가만)
 
 
+def _get_current_device_id() -> str:
+    """autotune cycle 의 현재 PC owner device_id — 로그 device_id 태깅용.
+
+    cycle 시작 시 collector_autotune.current_pc_owner contextvar 가 세팅됨.
+    HTTP/cycle 컨텍스트 없는 경우 빈 문자열(글로벌 메시지로 간주).
+    """
+    try:
+        from backend.api.v1.routers.samba.collector_autotune import current_pc_owner
+
+        return current_pc_owner.get() or ""
+    except Exception:
+        return ""
+
+
 def _log_refresh(
     site: str,
     product_id: str,
@@ -438,7 +452,11 @@ def _log_refresh(
     total: int = 0,
     source: str = "autotune",
 ) -> None:
-    """갱신 로그를 링 버퍼에 추가. 오토튠 로그만 저장, 나머지(transmit/manual)는 버림."""
+    """갱신 로그를 링 버퍼에 추가. 오토튠 로그만 저장, 나머지(transmit/manual)는 버림.
+
+    device_id 태깅: 현재 cycle PC owner 자동 첨부. frontend 에서 자기 device_id 로 필터
+    하면 다른 PC 잡 로그가 화면에 안 보임 (PC 분리, 2026-05-25 사용자 일주일째 요청).
+    """
     current_source = _current_refresh_source.get()
     if current_source != "autotune":
         return
@@ -460,6 +478,7 @@ def _log_refresh(
             "msg": full_msg,
             "level": level,
             "source": source,
+            "device_id": _get_current_device_id(),
         }
     )
     _refresh_log_total += 1
@@ -473,10 +492,15 @@ def clear_refresh_logs() -> None:
 
 
 def get_refresh_logs(
-    since_idx: int = 0, source_filter: str = ""
+    since_idx: int = 0,
+    source_filter: str = "",
+    device_id_filter: str = "",
 ) -> tuple[List[Dict[str, Any]], int]:
     """로그 조회. since_idx 이후 로그만 반환 + 누적 인덱스.
+
     source_filter: "autotune"이면 오토튠 로그만, ""이면 전체.
+    device_id_filter: 지정 시 그 device_id 로그만 + 글로벌(device_id 없거나 빈값) 로그
+      도 함께 표시 (쿠키 로테이션 등 PC 무관 메시지). 빈 문자열이면 전체(레거시).
     """
     global _refresh_log_total
     buf_len = len(_refresh_log_buffer)
@@ -492,6 +516,15 @@ def get_refresh_logs(
 
     if source_filter:
         logs = [l for l in logs if l.get("source") == source_filter]
+    if device_id_filter:
+        # 쉼표 분리 다중 device_id 허용(브라우저+본인 데몬) + 빈 device_id(글로벌/태깅
+        # 누락) 통과. 다른 PC tagged 로그만 명시 차단. ContextVar 가 cycle 안 일부 경로
+        # 에서 propagate 안 돼 device_id 빈채로 찍히는 로그가 다수 — strict 차단 시
+        # 페이지 0건 사고 (2026-05-25). empty 는 본인 글로벌로 간주.
+        allow = {d.strip() for d in device_id_filter.split(",") if d.strip()}
+        logs = [
+            l for l in logs if not l.get("device_id") or l.get("device_id") in allow
+        ]
     return logs, _refresh_log_total
 
 
@@ -598,6 +631,8 @@ class RefreshResult:
     new_sale_price: Optional[float] = None
     new_original_price: Optional[float] = None
     new_cost: Optional[float] = None
+    # 무신사 보유 적립금 사용 제외 cost (정책 토글 excludeHeldPoint=True에서 사용)
+    new_cost_excl_held_point: Optional[float] = None
     new_sale_status: str = "in_stock"  # in_stock / sold_out
     new_options: Optional[list] = None
     # 수집 시점 일부 경로 버그로 name/brand 가 빈 문자열로 저장된 케이스 백필용.
@@ -743,6 +778,34 @@ async def _get_musinsa_cookie() -> str:
     return await get_musinsa_cookie()
 
 
+async def _get_autologin_musinsa_cookie() -> str:
+    """자동로그인계정(is_login_default=True) 쿠키 반환 — cost 계산 단일 진실.
+
+    SambaSourcingAccount 풀에서 site_name=MUSINSA + is_login_default=True 계정 1개 선택.
+    cookie_expired=True이거나 미설정이면 빈 문자열 반환 → 호출부에서 cost 갱신 차단.
+    """
+    try:
+        from backend.db.orm import get_read_session
+        from backend.domain.samba.sourcing_account.service import (
+            SambaSourcingAccountService,
+        )
+        from backend.domain.samba.sourcing_account.repository import (
+            SambaSourcingAccountRepository,
+        )
+
+        async with get_read_session() as session:
+            svc = SambaSourcingAccountService(SambaSourcingAccountRepository(session))
+            acc = await svc.get_login_default("MUSINSA")
+            if not acc:
+                return ""
+            af = acc.additional_fields or {}
+            if af.get("cookie_expired"):
+                return ""
+            return af.get("musinsa_cookie", "") or ""
+    except Exception:
+        return ""
+
+
 async def _get_musinsa_cookies() -> list[str]:
     """DB에서 무신사 쿠키 목록 조회 (musinsa_cookies JSON 배열 또는 musinsa_cookie 단일).
 
@@ -780,11 +843,11 @@ async def _parse_musinsa(product: Any) -> RefreshResult:
     if not site_product_id:
         return RefreshResult(product_id=product.id, error="site_product_id 없음")
 
-    # 벌크 모드면 로테이션 쿠키, 아니면 단일 쿠키
-    if _bulk_musinsa_cache.get("cookies"):
-        cookie = _rotate_musinsa_cookie()
-    else:
-        cookie = _bulk_musinsa_cache.get("cookie") or await _get_musinsa_cookie()
+    # 자동로그인계정(is_login_default=True) 쿠키 단일 사용 — cost 일관성 보장
+    # 미설정/만료 시 cost 갱신 자체 차단 (계정별 등급/적립률 차이로 인한 stale 방지)
+    cookie = await _get_autologin_musinsa_cookie()
+    if not cookie:
+        return RefreshResult(product_id=product.id, error="MUSINSA_AUTH_MISSING")
     # 오토튠이면 메인↔프록시 IP 로테이션
     _is_autotune = _current_refresh_source.get() == "autotune"
     _proxy = _get_rotated_proxy() if _is_autotune else None
@@ -856,6 +919,15 @@ async def _parse_musinsa(product: Any) -> RefreshResult:
         # Retry-After가 있으면 대기 후 1회 재시도 (상한 60초)
         if e.retry_after > 0:
             capped_wait = min(e.retry_after, 60)
+            _log_refresh(
+                "MUSINSA",
+                product.id,
+                getattr(product, "name", ""),
+                f"[차단대기] Retry-After {capped_wait}초 대기 후 재시도 (원본 {e.retry_after}초)",
+                level="warning",
+                idx=_idx,
+                total=_total,
+            )
             logger.warning(
                 f"[refresher] {site_product_id} 차단({e.status}), {capped_wait}초 후 재시도 (원본 Retry-After={e.retry_after})"
             )
@@ -882,6 +954,15 @@ async def _parse_musinsa(product: Any) -> RefreshResult:
                     product_id=product.id, error=f"차단 후 재시도 실패: HTTP {e.status}"
                 )
         else:
+            _log_refresh(
+                "MUSINSA",
+                product.id,
+                getattr(product, "name", ""),
+                f"[차단] HTTP {e.status} — Retry-After 없음, 건너뜀",
+                level="warning",
+                idx=_idx,
+                total=_total,
+            )
             return RefreshResult(product_id=product.id, error=f"차단: HTTP {e.status}")
     except asyncio.TimeoutError:
         # 45초 안에 응답 없음 → 건너뛰기
@@ -1029,6 +1110,10 @@ def _process_musinsa_detail(
     new_cost = detail.get("bestBenefitPrice")
     if new_cost is not None and new_cost <= 0:
         new_cost = None
+    # 보유 적립금 사용 제외 cost (정책 토글용) — 무신사만 별도 계산값 제공
+    new_cost_excl_held_point = detail.get("bestBenefitPriceExclHeldPoint")
+    if new_cost_excl_held_point is not None and new_cost_excl_held_point <= 0:
+        new_cost_excl_held_point = None
     new_sale_status = detail.get("saleStatus", "in_stock")
     new_options = detail.get("options")
 
@@ -1049,6 +1134,10 @@ def _process_musinsa_detail(
         old_cost = getattr(product, "cost", None)
         if old_cost and old_cost > 0:
             new_cost = old_cost
+    if new_sale_status == "sold_out" and new_cost_excl_held_point is None:
+        old_excl = getattr(product, "cost_excl_held_point", None)
+        if old_excl and old_excl > 0:
+            new_cost_excl_held_point = old_excl
 
     # 품절 상품 옵션 가격 0 → 기존 옵션 가격 보존
     if new_sale_status == "sold_out" and new_options:
@@ -1148,6 +1237,7 @@ def _process_musinsa_detail(
         new_sale_price=new_sale_price,
         new_original_price=new_original_price,
         new_cost=new_cost,
+        new_cost_excl_held_point=new_cost_excl_held_point,
         new_sale_status=new_sale_status,
         new_options=new_options,
         new_is_point_restricted=detail.get("isPointRestricted"),
@@ -1411,6 +1501,7 @@ async def refresh_products_bulk(
     source: str = "autotune",
     max_concurrency: dict[str, int] | int | None = None,
     on_result: Any = None,
+    global_counter: dict | None = None,
 ) -> tuple[List[RefreshResult], BulkRefreshResult]:
     """여러 상품을 소싱처별로 그룹핑 후 병렬 갱신.
 
@@ -1479,6 +1570,26 @@ async def refresh_products_bulk(
                     )
                 _counter["i"] += 1
                 _idx = _counter["i"]
+                # 사이클 전체 카운터 (호출측에서 주입) — 로그 prefix [idx/total] 분모를
+                # 배치 크기(200) 가 아닌 사이클 전체(N만) 기준으로 통일.
+                if global_counter:
+                    _gk = global_counter.get("key")
+                    # `or {}` 금지 — idx_ref가 빈 dict({})면 falsy라 매번 새 throwaway dict가
+                    # 생성돼 증가분이 모듈 dict에 안 남는다(순번 1 고정 버그). None일 때만 폴백.
+                    _idx_ref = global_counter.get("idx_ref")
+                    if _idx_ref is None:
+                        _idx_ref = {}
+                    _total_ref = global_counter.get("total_ref")
+                    if _total_ref is None:
+                        _total_ref = {}
+                    _idx_ref[_gk] = _idx_ref.get(_gk, 0) + 1
+                    _g_idx = _idx_ref[_gk]
+                    _g_total = _total_ref.get(_gk, 0)
+                else:
+                    _g_idx = 0
+                    _g_total = 0
+                _log_idx = _g_idx if (_g_idx and _g_total) else _idx
+                _log_total = _g_total if (_g_idx and _g_total) else _site_total
                 _product_timeout = get_product_timeout(site)
                 try:
                     r = await asyncio.wait_for(
@@ -1492,6 +1603,8 @@ async def refresh_products_bulk(
                         getattr(p, "name", ""),
                         f"전체 처리 타임아웃 ({_product_timeout}초) — 건너뜀",
                         level="warning",
+                        idx=_log_idx,
+                        total=_log_total,
                     )
                     r = RefreshResult(
                         product_id=getattr(p, "id", "unknown"),
@@ -1522,8 +1635,8 @@ async def refresh_products_bulk(
                                 getattr(p, "id", "unknown"),
                                 _rl,
                                 "재시도 성공",
-                                idx=_idx,
-                                total=_site_total,
+                                idx=_log_idx,
+                                total=_log_total,
                             )
                     except asyncio.TimeoutError:
                         pass  # 재시도도 실패 → 원래 에러 유지
@@ -1544,13 +1657,13 @@ async def refresh_products_bulk(
                         _rl,
                         f"실패: {_err_short}",
                         level="warning",
-                        idx=_idx,
-                        total=_site_total,
+                        idx=_log_idx,
+                        total=_log_total,
                     )
                 # 콜백 호출 (리프레시 직후 즉시 전송 등)
                 if on_result and not r.error:
                     try:
-                        await on_result(p, r, _idx, _site_total)
+                        await on_result(p, r, _log_idx, _log_total)
                     except Exception as cb_err:
                         logger.warning("[오토튠] on_result 콜백 오류: %s", cb_err)
                 # 소싱처별 적응형 인터벌 (기본값은 소싱처별 base_interval, 최소 0.1초)

@@ -1,6 +1,31 @@
 .pnpm-store
 .worktrees/
 
+# LOTTEON 데몬 빌드 산출물 — 배포는 GitHub Release, 저장소엔 소스만
+tools/lotteon_daemon/.venv/
+tools/lotteon_daemon/dist/
+tools/lotteon_daemon/build/
+tools/lotteon_daemon/playwright_browsers/
+tools/lotteon_daemon/*.spec
+tools/lotteon_daemon/build.log
+
+# Obsidian (개인 UI 상태만 제외, 설정/플러그인은 공유)
+.obsidian/workspace*
+.obsidian/cache
+.obsidian/appearance.json
+
+# graphify 코드 그래프 (로컬 산출물, 캐시 대용량)
+graphify-out/
+
+# Obsidian 개인 설정 전체 (워크스페이스/플러그인 등)
+.obsidian/
+
+# 일회성 로컬 디버그 스크립트 (API 키/DB 자격증명 하드코딩 위험)
+/_*.py
+
+# 일일 메모 (개인 노트)
+/20[0-9][0-9]-[0-1][0-9]-[0-3][0-9].md
+
 # 임시 개발 파일
 tmp_*
 backend/result.txt

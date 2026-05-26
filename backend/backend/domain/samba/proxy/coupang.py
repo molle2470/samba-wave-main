@@ -1278,36 +1278,44 @@ class CoupangClient:
         now = datetime.now(timezone.utc)
         since = now - timedelta(days=days)
 
+        # 쿠팡 API 변경: status 또는 orderId 중 하나 필수 — 미전달 시 400 (#228)
+        # 호출자가 status 미지정 시 4개 상태 전부 합산 조회
+        statuses = [status] if status else ["RU", "CC", "PR", "UC"]
         all_returns: list[dict[str, Any]] = []
-        next_token = ""
 
-        for _ in range(100):  # 무한루프 방지
-            params: dict[str, str] = {
-                "createdAtFrom": since.strftime("%Y-%m-%d"),
-                "createdAtTo": now.strftime("%Y-%m-%d"),
-                "maxPerPage": str(max_per_page),
-            }
-            if status:
-                params["status"] = status
-            if next_token:
-                params["nextToken"] = next_token
+        for st in statuses:
+            next_token = ""
+            for _ in range(100):  # 무한루프 방지
+                params: dict[str, str] = {
+                    "createdAtFrom": since.strftime("%Y-%m-%d"),
+                    "createdAtTo": now.strftime("%Y-%m-%d"),
+                    "maxPerPage": str(max_per_page),
+                    "status": st,
+                }
+                if next_token:
+                    params["nextToken"] = next_token
 
-            path = f"/v2/providers/openapi/apis/api/v4/vendors/{self.vendor_id}/returnRequests"
-            result = await self._call_api("GET", path, params=params)
+                path = f"/v2/providers/openapi/apis/api/v4/vendors/{self.vendor_id}/returnRequests"
+                result = await self._call_api("GET", path, params=params)
 
-            data = result.get("data", []) if isinstance(result, dict) else []
-            if isinstance(data, list):
-                all_returns.extend(data)
-            elif isinstance(data, dict):
-                items = data.get("returnRequests", data.get("content", []))
-                if isinstance(items, list):
-                    all_returns.extend(items)
+                data = result.get("data", []) if isinstance(result, dict) else []
+                if isinstance(data, list):
+                    all_returns.extend(data)
+                elif isinstance(data, dict):
+                    items = data.get("returnRequests", data.get("content", []))
+                    if isinstance(items, list):
+                        all_returns.extend(items)
 
-            next_token = result.get("nextToken", "") if isinstance(result, dict) else ""
-            if not next_token:
-                break
+                next_token = (
+                    result.get("nextToken", "") if isinstance(result, dict) else ""
+                )
+                if not next_token:
+                    break
 
-        logger.info(f"[쿠팡] 반품요청 조회 완료: {len(all_returns)}건 (최근 {days}일)")
+        logger.info(
+            f"[쿠팡] 반품요청 조회 완료: {len(all_returns)}건 "
+            f"(최근 {days}일, status={statuses})"
+        )
         return all_returns
 
     async def approve_return(
@@ -1325,7 +1333,7 @@ class CoupangClient:
 
     async def get_exchange_requests(
         self,
-        days: int = 30,
+        days: int = 7,
         status: str = "",
         max_per_page: int = 50,
     ) -> list[dict[str, Any]]:
@@ -1333,17 +1341,20 @@ class CoupangClient:
 
         쿠팡 Wing API: GET /v2/.../vendors/{vendorId}/exchangeRequests
         페이징: nextToken 기반 커서 방식
+        주의: 쿠팡 API는 createdAtTo - createdAtFrom이 7일 이내여야 함 (#231)
         """
         now = datetime.now(timezone.utc)
+        days = min(days, 7)
         since = now - timedelta(days=days)
 
         all_exchanges: list[dict[str, Any]] = []
         next_token = ""
 
         for _ in range(100):  # 무한루프 방지
+            # 쿠팡 API 요구: createdAtFrom/To는 yyyy-MM-ddTHH:mm:ss 포맷 (#228)
             params: dict[str, str] = {
-                "createdAtFrom": since.strftime("%Y-%m-%d"),
-                "createdAtTo": now.strftime("%Y-%m-%d"),
+                "createdAtFrom": since.strftime("%Y-%m-%dT%H:%M:%S"),
+                "createdAtTo": now.strftime("%Y-%m-%dT%H:%M:%S"),
                 "maxPerPage": str(max_per_page),
             }
             if status:

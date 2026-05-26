@@ -301,7 +301,8 @@ export default function OrderInfoCell(props: Props) {
           }
         }} style={{ fontSize: '0.7rem', padding: '0.125rem 0.375rem', background: 'transparent', border: '1px solid #2D2D2D', borderRadius: '4px', color: '#B0B0B0', cursor: 'pointer' }}>마켓상품삭제</button>
         <button onClick={() => {
-          if (o.ext_order_number) { window.open(o.ext_order_number, '_blank'); return }
+          // issue #215 — ext_order_number는 URL/단순번호 polymorphic. URL일 때만 직접 오픈
+          if (o.ext_order_number && /^https?:\/\//i.test(o.ext_order_number)) { window.open(o.ext_order_number, '_blank'); return }
           const srcNo = o.sourcing_order_number || ''
           if (!srcNo) { showAlert('소싱 주문번호가 없습니다', 'info'); return }
           const isGift = hasActionTag(activeActions[o.id] ?? o.action_tag, 'gift')

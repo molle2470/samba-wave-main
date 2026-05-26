@@ -252,6 +252,11 @@ async def refresh_products(
         # 원가는 가격 변동 여부와 무관하게 항상 최신값으로 갱신
         if r.new_cost is not None:
             updates["cost"] = r.new_cost
+        # 보유 적립금 제외 cost — 무신사만 별도 값 제공, 그 외는 cost 동일값 저장
+        if r.new_cost_excl_held_point is not None:
+            updates["cost_excl_held_point"] = r.new_cost_excl_held_point
+        elif r.new_cost is not None:
+            updates["cost_excl_held_point"] = r.new_cost
 
         if r.changed:
             if r.new_sale_price is not None:
@@ -501,9 +506,6 @@ async def refresh_products(
         # 품절 상품 → 마켓 판매중지/삭제 → 삼바 DB 삭제
         import asyncio
         from backend.domain.samba.shipment.dispatcher import delete_from_market
-        from backend.domain.samba.account.repository import SambaMarketAccountRepository
-
-        account_repo = SambaMarketAccountRepository(session)
 
         # 계정 배치 조회 (N+1 방지)
         all_acc_ids = set()
@@ -674,6 +676,7 @@ async def refresh_products(
             from backend.domain.samba.shipment.service import (
                 SambaShipmentService,
                 calc_market_price,
+                resolve_cost_for_policy,
             )
             from backend.domain.samba.shipment.repository import SambaShipmentRepository
             from backend.domain.samba.account.model import SambaMarketAccount as _PCA
@@ -703,9 +706,12 @@ async def refresh_products(
                 _pol = policies_map.get(p.applied_policy_id)
                 if not _pol or not _pol.pricing:
                     continue
-                _cost = p.cost or 0
-                _last_sent: dict = p.last_sent_data or {}
                 _source_site = p.source_site or ""
+                # 토글 excludeHeldPoint=True 이면 보유적립금 제외 cost 사용
+                _cost = resolve_cost_for_policy(p, _pol.pricing, _source_site) or (
+                    p.cost or 0
+                )
+                _last_sent: dict = p.last_sent_data or {}
                 _pm_data = _pol.market_policies or {}
 
                 for _acc_id in p.registered_accounts:

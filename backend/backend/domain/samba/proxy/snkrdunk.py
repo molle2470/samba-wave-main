@@ -31,6 +31,10 @@ KEYWORDS_URL = f"{BASE}/en/v1/search/keywords"
 TRADING_CARDS_URL = f"{BASE}/en/v1/trading-cards"
 DETAIL_SNEAKER_URL = f"{BASE}/en/sneakers/{{id}}"
 DETAIL_STREETWEAR_URL = f"{BASE}/en/streetwears/{{id}}"
+DETAIL_TRADING_CARD_URL = f"{BASE}/en/trading-cards/{{id}}"
+# 트레이딩카드 컨디션(옵션)별 중고 리스팅 API
+# 상품코드는 SW---{id} 형식. isOnlyOnSale=true → 판매중(재고) 리스팅만
+USED_LISTINGS_URL = f"{BASE}/en/v1/products/SW---{{id}}/used-listings"
 # 브랜드+카테고리 URL 패턴: https://snkrdunk.com/en/brands/{brand}/trading-cards?categoryId={cat}
 BRAND_TRADING_CARDS_URL_RE = re.compile(
     r"https?://snkrdunk\.com/en/brands/([^/?]+)/trading-cards(?:\?[^#]*?categoryId=(\d+))?",
@@ -56,6 +60,10 @@ HEADERS = {
 # 추출할 통화 코드 (영문 사이트 결제 통화)
 TARGET_CURRENCY = "USD"
 
+# 트레이딩카드 상세 SSR HTML의 productNumber(품번, 예: pkmn-tcg-SV-P-261) 추출
+# Vue SSR prop `:trading-card="{...}"` 안에 HTML 엔티티(&#34;=")로 임베드됨
+_PRODUCT_NUMBER_RE = re.compile(r"productNumber&#34;:&#34;([^&]+)&#34;")
+
 
 _CATEGORY_LABELS = {
     "sneaker": "스니커즈",
@@ -74,8 +82,10 @@ def _is_streetwear_id(site_product_id: str) -> bool:
 
 
 def _detail_url(site_product_id: str, snkr_type: str | None = None) -> str:
-    # trading-card 도 streetwears 경로를 사용 (검색 API에서 streetwears 배열에 포함)
-    if snkr_type in ("streetwear", "trading-card") or (
+    # 트레이딩카드는 전용 상세 경로 사용 (/en/trading-cards/{id})
+    if snkr_type == "trading-card":
+        return DETAIL_TRADING_CARD_URL.format(id=site_product_id)
+    if snkr_type == "streetwear" or (
         snkr_type is None and _is_streetwear_id(site_product_id)
     ):
         return DETAIL_STREETWEAR_URL.format(id=site_product_id)
@@ -145,16 +155,16 @@ class SnkrdunkClient:
         bc = parse_brand_category_url(keyword)
         if bc is not None:
             brand_id, category_id = bc
+            # 호출자 max_count 존중 — 강제 10000 제거(검색 120초 타임아웃 유발)
             return await self.collect_brand_cards(
                 brand_id=brand_id,
                 category_id=category_id,
-                max_count=max(max_count, 10000),
+                max_count=max_count,
             )
         # 전역 트레이딩카드 리스트 URL (예: /en/trading-cards?type=hottest&slide=right)
         if GLOBAL_TRADING_CARDS_URL_RE.search(keyword or ""):
-            return await self.collect_listing_cards(
-                url=keyword, max_count=max(max_count, 1000)
-            )
+            # 호출자 max_count 존중 — 강제 1000 제거(검색 120초 타임아웃 유발)
+            return await self.collect_listing_cards(url=keyword, max_count=max_count)
         products: list[dict[str, Any]] = []
         total = 0
         async with httpx.AsyncClient(
@@ -251,7 +261,8 @@ class SnkrdunkClient:
         category_id: str = "",
         per_page: int = 100,
         max_count: int = 50000,
-        sleep_between_pages: float = 0.5,
+        sleep_between_pages: float = 0.2,
+        max_pages: int = 15,
     ) -> dict[str, Any]:
         """브랜드+카테고리의 트레이딩카드 전체 페이지네이션 수집.
 
@@ -260,6 +271,7 @@ class SnkrdunkClient:
             category_id: ex) "25" (없으면 빈 문자열)
             per_page: 페이지당 (최대 100)
             max_count: 상한 (안전장치)
+            max_pages: 페이지 상한 — 검색 120초 타임아웃 방지 (req_count 불명 시 가드)
         """
         import asyncio
 
@@ -270,7 +282,7 @@ class SnkrdunkClient:
         ) as client:
             page = 1
             seen: set[str] = set()
-            while len(products) < max_count:
+            while len(products) < max_count and page <= max_pages:
                 params: dict[str, Any] = {
                     "brandId": brand_id,
                     "perPage": per_page,
@@ -314,13 +326,16 @@ class SnkrdunkClient:
         url: str,
         per_page: int = 100,
         max_count: int = 1000,
-        sleep_between_pages: float = 0.5,
+        sleep_between_pages: float = 0.2,
+        max_pages: int = 15,
     ) -> dict[str, Any]:
         """전역 트레이딩카드 리스트 URL 페이지네이션 수집.
 
         예: `/en/trading-cards?type=hottest&slide=right`
         URL의 쿼리스트링(type/slide/brandId/categoryId 등)을 그대로
         `/en/v1/trading-cards` API에 전달.
+
+        max_pages: 페이지 상한 — 검색 120초 타임아웃 방지 (req_count 불명 시 가드)
         """
         import asyncio
         from urllib.parse import urlparse, parse_qs
@@ -346,7 +361,7 @@ class SnkrdunkClient:
             headers=HEADERS, timeout=self._timeout, follow_redirects=True
         ) as client:
             page = 1
-            while len(products) < max_count:
+            while len(products) < max_count and page <= max_pages:
                 params: dict[str, Any] = {
                     **base_params,
                     "perPage": per_page,
@@ -440,10 +455,135 @@ class SnkrdunkClient:
             )
         return results
 
+    async def get_trading_card_detail(self, card_id: str) -> dict[str, Any]:
+        """트레이딩카드 컨디션(옵션)별 최저가 수집.
+
+        SNKRDUNK 트레이딩카드는 sneakers/streetwears 와 달리 JSON-LD 가 없고
+        `/en/v1/products/SW---{id}/used-listings` API 로 컨디션별 중고 리스팅을 제공한다.
+
+        규칙:
+          - isOnlyOnSale=true → 판매중(재고 있는) 리스팅만 조회
+          - 컨디션(PSA 10 / A / B ...)별로 그룹핑해 **최저가** 1건씩 옵션 생성
+          - 재고(판매중 리스팅) 없는 컨디션은 옵션에서 제외 (수집 안 함)
+          - stock = 해당 컨디션 판매중 리스팅 수 (실재고)
+          - 통화 USD
+        """
+        import asyncio
+
+        code_id = card_id
+        name = ""
+        image = ""
+        product_number = ""
+        cond_min: dict[str, int] = {}
+        cond_cnt: dict[str, int] = {}
+
+        async with httpx.AsyncClient(
+            headers=HEADERS, timeout=self._timeout, follow_redirects=True
+        ) as client:
+            page = 1
+            # perPage=100 (상한). Pikachu 등 인기카드 최대 600+건 → 안전상 50페이지 캡
+            while page <= 50:
+                params = {
+                    "perPage": 100,
+                    "page": page,
+                    "sortType": "latest",
+                    "isOnlyOnSale": "true",
+                }
+                try:
+                    r = await client.get(
+                        USED_LISTINGS_URL.format(id=code_id), params=params
+                    )
+                    r.raise_for_status()
+                    data = r.json()
+                except Exception as e:
+                    logger.warning(
+                        f"[SNKRDUNK] 카드 리스팅 실패 id={card_id} page={page}: {e}"
+                    )
+                    break
+                if page == 1:
+                    prod = data.get("product") or {}
+                    name = (prod.get("name") or "").strip()
+                    image = prod.get("thumbnailUrl") or ""
+                listings = data.get("usedListings") or []
+                if not listings:
+                    break
+                for x in listings:
+                    if not isinstance(x, dict):
+                        continue
+                    # 판매완료(재고 없음)는 제외 — isOnlyOnSale=true 와 이중 안전장치
+                    if x.get("isSold"):
+                        continue
+                    cond = (x.get("condition") or "기본").strip()
+                    price = x.get("priceAmount")
+                    if not isinstance(price, (int, float)) or price <= 0:
+                        continue
+                    price = int(price)
+                    if cond not in cond_min or price < cond_min[cond]:
+                        cond_min[cond] = price
+                    cond_cnt[cond] = cond_cnt.get(cond, 0) + 1
+                if len(listings) < 100:
+                    break
+                page += 1
+                await asyncio.sleep(0.3)
+
+            # 품번(productNumber) 추출 — 상세 SSR HTML의 :trading-card prop
+            # 예: pkmn-tcg-SV-P-261 (used-listings/variations API엔 없음)
+            try:
+                hr = await client.get(DETAIL_TRADING_CARD_URL.format(id=card_id))
+                _pm = _PRODUCT_NUMBER_RE.search(hr.text)
+                if _pm:
+                    product_number = _pm.group(1).strip()
+            except Exception as e:
+                logger.warning(f"[SNKRDUNK] 품번 추출 실패 {card_id}: {e}")
+
+        # 재고 있는 컨디션만 옵션화 → 가격 오름차순 정렬
+        options = [
+            {"name": cond, "price": cond_min[cond], "stock": cond_cnt[cond]}
+            for cond in cond_min
+        ]
+        options.sort(key=lambda o: o["price"])
+
+        sale_price = options[0]["price"] if options else 0
+        sale_status = "in_stock" if options else "sold_out"
+        url = _detail_url(card_id, "trading-card")
+        return {
+            "site_product_id": card_id,
+            "name": name,
+            "brand": "",
+            "sale_price": sale_price,
+            "original_price": sale_price,
+            "images": [image] if image else [],
+            "options": options,
+            "category": _category_label("trading-card"),
+            "category1": "SNKRDUNK",
+            "category2": _category_label("trading-card"),
+            "category3": "",
+            "source_site": "SNKRDUNK",
+            "source_url": url,
+            "url": url,
+            "video_url": url,
+            "detail_html": "",
+            "sale_status": sale_status,
+            "free_shipping": False,
+            "color": "",
+            "style_code": product_number,  # 품번 = productNumber (예: pkmn-tcg-SV-P-261)
+            "extra_data": {
+                "snkr_type": "trading-card",
+                "currency": TARGET_CURRENCY,
+                "product_number": product_number,
+                "condition_count": {k: cond_cnt[k] for k in cond_cnt},
+            },
+        }
+
     async def get_detail(
         self, site_product_id: str, snkr_type: str | None = None
     ) -> dict[str, Any]:
-        """상품 상세 조회 — SSR HTML의 JSON-LD 추출."""
+        """상품 상세 조회 — SSR HTML의 JSON-LD 추출.
+
+        트레이딩카드는 JSON-LD 가 없으므로 컨디션별 used-listings API 로 분기.
+        """
+        if snkr_type == "trading-card":
+            return await self.get_trading_card_detail(site_product_id)
         url = _detail_url(site_product_id, snkr_type)
         async with httpx.AsyncClient(
             headers=HEADERS, timeout=self._timeout, follow_redirects=True

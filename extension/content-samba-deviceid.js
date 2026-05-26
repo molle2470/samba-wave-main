@@ -54,9 +54,20 @@
     } catch {}
   }
 
+  // 키 보유 여부를 페이지에 알림 → layout 이 키 없으면 자동 발급(SAMBA_SET_API_KEY).
+  // 매 로그인 발급 X — hasKey=false 일 때만 발급해 키 스팸 방지.
+  function sendApiKeyStatus(hasKey) {
+    try {
+      window.postMessage(
+        { source: 'samba-extension', type: 'API_KEY_STATUS', hasKey: !!hasKey },
+        window.location.origin,
+      )
+    } catch {}
+  }
+
   // content_script는 chrome.storage.local 접근 가능
   syncProxyUrlForPage()
-  chrome.storage.local.get(['deviceId', 'allowedSites'], (data) => {
+  chrome.storage.local.get(['deviceId', 'allowedSites', 'apiKey'], (data) => {
     if (data && data.deviceId) {
       sendDeviceId(data.deviceId)
       // 페이지가 이후에 mount되는 React 컴포넌트에서도 받을 수 있도록 재전송 스케줄
@@ -75,6 +86,11 @@
     sendAllowedSites(sites)
     setTimeout(() => sendAllowedSites(sites), 800)
     setTimeout(() => sendAllowedSites(sites), 2500)
+    // 키 보유 여부 알림 — 페이지 mount 후 수신하도록 재전송
+    const hasKey = !!(data && data.apiKey)
+    sendApiKeyStatus(hasKey)
+    setTimeout(() => sendApiKeyStatus(hasKey), 1000)
+    setTimeout(() => sendApiKeyStatus(hasKey), 3000)
   })
 
   // 화면(프론트엔드)이 체크박스 변경을 알릴 때 chrome.storage 동기화
@@ -107,7 +123,12 @@
     }
     // 확장앱 연결 페이지(/samba/extension-link)에서 발급된 키 저장
     if (msg.type === 'SAMBA_SET_API_KEY' && msg.apiKey) {
-      chrome.storage.local.set({ apiKey: msg.apiKey })
+      chrome.storage.local.set({ apiKey: msg.apiKey }, () => {
+        // 저장 완료 → 연결 페이지 탭 자동 닫기 (사용자 수동 닫기 제거)
+        setTimeout(() => {
+          try { chrome.runtime.sendMessage({ type: 'SAMBA_CLOSE_LINK_TAB' }) } catch {}
+        }, 1200)
+      })
     }
   })
 })()

@@ -261,7 +261,6 @@ async def collect_by_url(
             skipped_boutique = 0
             _batch_buf: list[dict] = []
             _BATCH_SIZE = 10
-            rate_limited = False
 
             async def _flush_batch() -> int:
                 """버퍼에 쌓인 상품을 한번에 DB 저장."""
@@ -301,13 +300,15 @@ async def collect_by_url(
                         await asyncio.sleep(_site_intervals.get("MUSINSA", 1.0))
                         continue
 
-                    # 최대혜택가 체크 시 bestBenefitPrice, 미체크 시 salePrice
+                    # 최대혜택가 체크(use_max_discount=True) 시 bestBenefitPrice 추출 실패
+                    # → cost=None (정가 폴백 금지). 다음 사이클 정상 수집 시 채움.
+                    # 미체크 시는 사용자가 명시적으로 salePrice를 cost로 선택한 모드.
                     if use_max_discount:
                         _raw_cost = detail.get("bestBenefitPrice")
                         new_cost = (
                             _raw_cost
                             if (_raw_cost is not None and _raw_cost > 0)
-                            else (detail.get("salePrice") or 0)
+                            else None
                         )
                     else:
                         new_cost = detail.get("salePrice") or 0
@@ -351,7 +352,6 @@ async def collect_by_url(
                     logger.warning(
                         f"[무신사] 요청 제한 감지 — 수집 중단 (수집완료: {saved}/{len(targets)})"
                     )
-                    rate_limited = True
                     break
                 except Exception as e:
                     logger.warning(f"[수집 실패] {goods_no}: {e}")
@@ -829,12 +829,15 @@ async def collect_by_url(
                         await asyncio.sleep(_site_intervals.get("SSG", 1.0))
                         continue
 
+                    # 최대혜택가 체크(use_max_discount=True) 시 bestBenefitPrice 추출 실패
+                    # → cost=None (정가 폴백 금지). 다음 사이클 정상 수집 시 채움.
+                    # 미체크 시는 사용자가 명시적으로 salePrice를 cost로 선택한 모드.
                     if use_max_discount:
                         _raw_cost = detail.get("bestBenefitPrice")
                         new_cost = (
                             _raw_cost
                             if (_raw_cost is not None and _raw_cost > 0)
-                            else (detail.get("salePrice") or 0)
+                            else None
                         )
                     else:
                         new_cost = detail.get("salePrice") or 0
@@ -1131,7 +1134,8 @@ async def collect_by_url(
 
                     if use_max_discount:
                         # 확장앱 DOM에서 실제 "나의 혜택가" 수집
-                        new_cost = _sale_price  # 폴백: 판매가
+                        # 추출 실패 시 cost=None (정가 폴백 금지). 다음 사이클 정상 수집 시 채움.
+                        new_cost = None
                         try:
                             from backend.domain.samba.proxy.sourcing_queue import (
                                 SourcingQueue,
@@ -1156,7 +1160,7 @@ async def collect_by_url(
                                     )
                         except asyncio.TimeoutError:
                             logger.info(
-                                f"[LOTTEON] 수집 확장앱 타임아웃: {item_id} — 판매가({_sale_price:,}) 사용"
+                                f"[LOTTEON] 수집 확장앱 타임아웃: {item_id} — cost=None 저장 (다음 사이클 채움)"
                             )
                         except Exception as _ext_err:
                             logger.debug(

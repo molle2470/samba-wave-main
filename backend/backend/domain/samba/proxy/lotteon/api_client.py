@@ -578,22 +578,27 @@ class LotteonClient:
         size: int = 100,
         reg_strt_dttm: str = "20260417000000",
         reg_end_dttm: str = "20261231235959",
+        sl_stat_cd: Optional[str] = None,
     ) -> dict[str, Any]:
         """셀러 등록 상품 목록 페이지 조회 (마이그레이션용).
 
         reg_strt_dttm / reg_end_dttm: yyyymmdd 포맷, 즉시할인 도입 시점(2026-04-17) 이후로 기본 설정.
+        sl_stat_cd: SALE/SOUT/END 등 판매상태 필터 (None이면 전체).
         """
+        body: dict[str, Any] = {
+            "trGrpCd": self.tr_grp_cd,
+            "trNo": self.tr_no,
+            "pageNo": page,
+            "pageSize": size,
+            "regStrtDttm": reg_strt_dttm,
+            "regEndDttm": reg_end_dttm,
+        }
+        if sl_stat_cd:
+            body["slStatCd"] = sl_stat_cd
         return await self._call_api(
             "POST",
             "/v1/openapi/product/v1/product/list",
-            body={
-                "trGrpCd": self.tr_grp_cd,
-                "trNo": self.tr_no,
-                "pageNo": page,
-                "pageSize": size,
-                "regStrtDttm": reg_strt_dttm,
-                "regEndDttm": reg_end_dttm,
-            },
+            body=body,
         )
 
     async def save_lpoint_accumulation(
@@ -891,26 +896,23 @@ class LotteonClient:
             self.get_delivery_progress_states(days=days),
         )
 
-        # 중복 제거: (odNo, odSeq) 기준 — procSeq는 API/상태에 따라 달라지므로 제외
-        # progress_orders 우선: 같은 주문이 delivery에서 구 상태(11)로, progress에서 현재 상태(12)로 올 때
-        # progress를 먼저 처리해야 최신 상태가 보존됨
-        seen: set[tuple] = set()
-        merged: list[dict] = []
-        for item in progress_orders:
-            key = (item.get("odNo"), item.get("odSeq"))
-            if key not in seen:
-                seen.add(key)
-                merged.append(item)
-        for item in sr_orders:
-            key = (item.get("odNo"), item.get("odSeq"))
-            if key not in seen:
-                seen.add(key)
-                merged.append(item)
-        for item in delivery_orders:
-            key = (item.get("odNo"), item.get("odSeq"))
-            if key not in seen:
-                seen.add(key)
-                merged.append(item)
+        # issue #213 — first-wins 머지 시 step=10 응답의 빈 odQty가 step=11+ 의 실제 수량을 가림.
+        # field-level enrichment: 먼저 들어온 응답을 기준으로 None/""/빈컬렉션은 후속 응답으로 덮어쓰기.
+        # 우선순위는 progress > sr > delivery (기존 first-wins 의도 보존).
+        merged_map: dict[tuple, dict] = {}
+        for src in (progress_orders, sr_orders, delivery_orders):
+            for item in src:
+                key = (item.get("odNo"), item.get("odSeq"))
+                tgt = merged_map.get(key)
+                if tgt is None:
+                    merged_map[key] = dict(item)
+                    continue
+                for k, v in item.items():
+                    if v in (None, "", [], {}):
+                        continue
+                    if tgt.get(k) in (None, "", [], {}):
+                        tgt[k] = v
+        merged: list[dict] = list(merged_map.values())
 
         logger.info(
             f"[롯데ON] 병행 조회 완료: getSROrderList={len(sr_orders)}건, delivery={len(delivery_orders)}건, progress={len(progress_orders)}건, 최종={len(merged)}건"

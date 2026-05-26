@@ -198,11 +198,16 @@ async def get_setting(
 ):
     from backend.domain.samba.forbidden.model import SambaSettings
 
-    # tenant_id가 있으면 테넌트 전용 키(tenant_id:key)로 조회
+    # tenant_id가 있으면 테넌트 전용 키(tenant_id:key) 우선 조회
+    # 멀티테넌트 격리 이전(2026-05-18)에는 bare 키로 저장됨 → 폴백으로 bare 키 시도
     effective_key = f"{tenant_id}:{key}" if tenant_id is not None else key
     stmt = select(SambaSettings).where(SambaSettings.key == effective_key)
     result = await session.execute(stmt)
     row = result.scalars().first()
+    if row is None and tenant_id is not None:
+        stmt = select(SambaSettings).where(SambaSettings.key == key)
+        result = await session.execute(stmt)
+        row = result.scalars().first()
     value = row.value if row else None
     # None이면 빈 dict 반환 (프론트에서 .catch(() => null) 호환)
     return value if value is not None else {}
@@ -219,6 +224,19 @@ async def save_setting(
 
     from backend.domain.samba.forbidden.model import SambaSettings
     from backend.utils.masking import drop_masked_secret_fields
+
+    # (2026-05-25) store_* deprecation 경고 — 마켓 자격증명은 samba_market_account 로 통일 중.
+    # frontend 가 accountApi.create/update 로 전환 완료(7d) 후 410 차단 예정.
+    # 지금은 호환을 위해 저장 허용하되 로그로 사용 빈도 추적.
+    if key.startswith("store_") and key not in ("store_network_ips",):
+        from backend.utils.logger import logger as _lg
+
+        _lg.warning(
+            "[deprecated] PUT /forbidden/settings/%s — 마켓 자격증명 store_* 저장 경로 폐기 예정. "
+            "POST /api/v1/samba/accounts 로 이전 필요 (tenant_id=%s)",
+            key,
+            tenant_id,
+        )
 
     value = body.get("value")
     # tenant_id가 있으면 테넌트 전용 키(tenant_id:key)로 upsert

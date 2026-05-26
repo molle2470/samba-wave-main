@@ -32,6 +32,112 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/collector", tags=["samba-collector"])
 
 
+# ── 활성 소싱처 distinct 결과 글로벌 캐시 ──
+# 코디네이터가 5초마다 distinct(source_site)를 풀스캔 → PC 11대 동시 실행 시
+# IPC/BufferIO 대기로 active 쿼리 60초까지 누적. 결과는 모든 PC에서 동일하므로
+# 30초 TTL 글로벌 캐시 1개로 통합 → 부하 12배+ 감소.
+_ACTIVE_SITES_CACHE_TTL = 30.0
+_active_sites_cache: dict = {"ts": 0.0, "data": None}
+_active_sites_cache_lock = asyncio.Lock()
+
+
+async def _get_active_sites_cached() -> list[str]:
+    """모든 PC가 공유하는 활성 소싱처 distinct 결과 (TTL 30s).
+
+    독립된 read session 사용 — 호출자의 write session 점유 시간 단축.
+    Cold start 시 lock 대기는 read pool에서만 발생, write pool 영향 없음.
+    """
+    from backend.api.v1.routers.samba.collector_common import (
+        build_market_registered_conditions,
+    )
+    from backend.db.orm import get_read_session
+    from backend.domain.samba.collector.model import SambaCollectedProduct as _CP
+
+    now_ts = time.monotonic()
+    cached = _active_sites_cache.get("data")
+    if (
+        cached is not None
+        and (now_ts - _active_sites_cache["ts"]) < _ACTIVE_SITES_CACHE_TTL
+    ):
+        return list(cached)
+
+    # lock 점유 중이면 다른 코루틴이 갱신 중 → stale 반환(없으면 직접 조회)
+    if _active_sites_cache_lock.locked() and cached is not None:
+        return list(cached)
+
+    async with _active_sites_cache_lock:
+        # double-check
+        cached = _active_sites_cache.get("data")
+        now_ts = time.monotonic()
+        if (
+            cached is not None
+            and (now_ts - _active_sites_cache["ts"]) < _ACTIVE_SITES_CACHE_TTL
+        ):
+            return list(cached)
+
+        market_cond = build_market_registered_conditions(_CP)
+        stmt = select(func.distinct(_CP.source_site)).where(
+            *market_cond,
+            _CP.applied_policy_id != None,
+            _CP.source_site != None,
+            _CP.source_site != "",
+        )
+        async with get_read_session() as rs:
+            result = await rs.execute(stmt)
+            sites = [r[0] for r in result.all() if r[0]]
+        _active_sites_cache["data"] = sites
+        _active_sites_cache["ts"] = time.monotonic()
+        return list(sites)
+
+
+# ── autotune/status refreshed_24h 글로벌 캐시 ──
+# /autotune/status 엔드포인트가 매 호출마다 count(last_refreshed_at>=24h) 풀스캔.
+# PC 8대 폴링 시 동시 8개 → IPC/BufferIO 누적. 60초 TTL이면 충분.
+_REFRESHED_24H_CACHE_TTL = 60.0
+_refreshed_24h_cache: dict = {"ts": 0.0, "value": None}
+_refreshed_24h_cache_lock = asyncio.Lock()
+
+
+async def _get_refreshed_24h_cached() -> int:
+    """24h 갱신 건수 글로벌 캐시 (TTL 60s)."""
+    from backend.db.orm import get_read_session
+    from backend.domain.samba.collector.model import SambaCollectedProduct as _CP2
+
+    now_ts = time.monotonic()
+    cached = _refreshed_24h_cache.get("value")
+    if (
+        cached is not None
+        and (now_ts - _refreshed_24h_cache["ts"]) < _REFRESHED_24H_CACHE_TTL
+    ):
+        return int(cached)
+
+    if _refreshed_24h_cache_lock.locked() and cached is not None:
+        return int(cached)
+
+    async with _refreshed_24h_cache_lock:
+        cached = _refreshed_24h_cache.get("value")
+        now_ts = time.monotonic()
+        if (
+            cached is not None
+            and (now_ts - _refreshed_24h_cache["ts"]) < _REFRESHED_24H_CACHE_TTL
+        ):
+            return int(cached)
+
+        try:
+            since_24h = datetime.now(timezone.utc) - timedelta(hours=24)
+            async with get_read_session() as rs:
+                cnt_stmt = select(func.count(_CP2.id)).where(
+                    _CP2.last_refreshed_at >= since_24h
+                )
+                value = (await rs.execute(cnt_stmt)).scalar() or 0
+        except Exception:
+            value = 0
+
+        _refreshed_24h_cache["value"] = int(value)
+        _refreshed_24h_cache["ts"] = time.monotonic()
+        return int(value)
+
+
 def _is_stale_conn_error(exc: BaseException) -> bool:
     """좀비 connection/끊긴 트랜잭션 감지.
 
@@ -69,6 +175,34 @@ _pc_site_last_ticks: dict[str, dict[str, str]] = {}
 _pc_site_empty_hits: dict[str, dict[str, int]] = {}
 _pc_site_heartbeats: dict[str, dict[str, float]] = {}
 _pc_target_ids: dict[str, Optional[set]] = {}
+# 사이트별 적응 배치 크기 (device_id → site → int).
+# 직전 배치 소요시간 기준으로 다음 배치 SELECT limit 자동 조정. 미설정 시 env 기본값 사용.
+_pc_site_batch_size: dict[str, dict[str, int]] = {}
+
+
+def _pc_bs(dev: str) -> dict[str, int]:
+    return _pc_site_batch_size.setdefault(dev, {})
+
+
+def _adapt_batch_size(dev: str, site: str, elapsed: float, env_max: int) -> None:
+    """직전 배치 elapsed 기반 다음 배치 크기 조정. 하한 50, 상한 max(env_max, 400).
+
+    - elapsed > 120초: 절반으로 (사이클 길어짐 → 풀/응답 부담 완화)
+    - elapsed < 30초: +50 (여유 있으면 처리량 증가)
+    - 그 사이: 유지
+    """
+    _bs = _pc_bs(dev)
+    _cur = _bs.get(site, env_max)
+    _hi = max(env_max, 400)
+    if elapsed > 120:
+        _new = max(50, _cur // 2)
+    elif elapsed < 30:
+        _new = min(_hi, _cur + 50)
+    else:
+        _new = _cur
+    if _new != _cur:
+        _bs[site] = _new
+
 
 # 잡 발행자 PC를 사이트별/상품별 호출 컨텍스트에 전파 (sourcing_queue.get_autotune_owner가 읽음).
 # 사이트 루프 진입 시 set, 종료 시 reset. PC별 독립 실행 → 컨텍스트 격리 보장.
@@ -203,6 +337,7 @@ def _cleanup_pc_instance(dev: str) -> None:
     _pc_site_empty_hits.pop(dev, None)
     _pc_site_heartbeats.pop(dev, None)
     _pc_target_ids.pop(dev, None)
+    _pc_site_batch_size.pop(dev, None)
 
 
 def any_pc_running() -> bool:
@@ -213,6 +348,15 @@ def any_pc_running() -> bool:
 # 오토튠 필터 설정 키 (samba_settings)
 AUTOTUNE_FILTER_SOURCES_KEY = "autotune_enabled_sources"
 AUTOTUNE_FILTER_MARKETS_KEY = "autotune_enabled_markets"
+
+# autotune_get_filters available_sources/markets 캐시 (2026-05-24).
+# registered 78k 스캔이 distinct(21초)+registered_accounts 전체 fetch(80초)=~100초라
+# 매 호출 시 프론트 fetch 무한대기 → 그동안 availSources 빈 채 → 소싱처/판매처
+# 체크박스가 화면에서 통째로 사라지던 버그. available_* 는 거의 안 변하므로 TTL 캐시.
+# Lock 으로 동시 cache-miss 시 중복 무거운 쿼리 차단(read 풀 고갈 방지).
+_FILTERS_AVAIL_TTL = 600.0  # 10분
+_filters_avail_cache: dict = {}  # {"sources":[...], "markets":[...], "ts":float}
+_filters_avail_lock = asyncio.Lock()
 
 # 오토튠 전송 글로벌 동시실행 제한 — refresher가 fire-and-forget으로 띄운 transmit task가
 # OOM 일으키지 않도록 상한. 너무 낮으면 backlog, 너무 높으면 메모리 폭주.
@@ -254,8 +398,68 @@ async def _run_transmit_in_background(coro_factory):
 _pc_allowed_sites: dict[str, set[str]] = {}
 _pc_last_seen: dict[str, float] = {}
 PC_LAST_SEEN_TTL = 86400.0  # 24시간
+
+# Gunicorn 다중 worker 환경에서 in-memory dict 는 worker 마다 별도.
+# lifecycle background task 가 매 10초 sync_pc_allowed_sites_from_db 호출 → 모든
+# worker 의 _pc_allowed_sites 가 DB 진실 출처와 일치.
+
+
+async def sync_pc_allowed_sites_from_db() -> None:
+    """DB autotune_pc_allowed_sites 를 in-memory _pc_allowed_sites 로 동기화.
+
+    Gunicorn 다중 worker 환경에서 UI POST 가 1개 worker 만 갱신해 다른 worker 가
+    잡 발행 시 stale → "데몬 미등록 skip" 발생. lifecycle background task 가 10초마다
+    호출해 모든 worker 의 in-memory 를 DB 진실 출처와 일치시킴.
+
+    last_seen 은 보존 — 데몬/확장앱 폴링 시점 그대로. 새 device 는 last_seen=now 박음.
+    """
+    try:
+        from backend.db.orm import get_read_session
+        from backend.api.v1.routers.samba.proxy._helpers import _get_setting
+
+        async with get_read_session() as _sess:
+            data = await _get_setting(_sess, "autotune_pc_allowed_sites")
+        if not isinstance(data, dict):
+            return
+        now = time.time()
+        seen: set[str] = set()
+        for dev, sites in data.items():
+            if not isinstance(dev, str) or not isinstance(sites, list):
+                continue
+            dev_clean = dev.strip()
+            if not dev_clean:
+                continue
+            new_set = {s.strip() for s in sites if isinstance(s, str) and s.strip()}
+            _pc_allowed_sites[dev_clean] = new_set
+            if dev_clean not in _pc_last_seen:
+                _pc_last_seen[dev_clean] = now
+            seen.add(dev_clean)
+        # DB 에 없는 device 정리 — UI 에서 사용자가 토글 off 한 분담
+        for dev in list(_pc_allowed_sites.keys()):
+            if dev not in seen:
+                _pc_allowed_sites.pop(dev, None)
+                _pc_last_seen.pop(dev, None)
+    except Exception as _exc:
+        logging.getLogger("autotune").warning(
+            f"[sync_pc_allowed_sites_from_db] sync 실패(무시): {_exc}"
+        )
+
+
+# deviceId당 최근 폴링된 사이트셋 이력 — {device_id: {frozenset(sites): last_ts}}.
+# 같은 deviceId 를 여러 PC(예: 프로필 복사/시드로 deviceId 중복)가 서로 다른
+# X-Allowed-Sites 로 폴링하면 register 가 매 폴링 last-write 로 덮어써 active_sites 가
+# flip-flop(예: [LOTTEON]↔[ABCmart,SSG...]) → 일부 소싱처가 계속 탈락하던 문제.
+# deviceId 단위로 TTL 내 폴링된 사이트셋을 합집합(union)해 안정화한다.
+# (서로 다른 deviceId 간 PC분담은 영향 없음 — 같은 deviceId 충돌만 합쳐짐.)
+_pc_site_history: dict[str, dict[frozenset, float]] = {}
+_PC_SITE_UNION_TTL = 90.0  # 90초 — 폴링 끊긴 사이트셋은 만료돼 자연 축소
 # 다음 폴링 시 해당 PC에게만 forceStop 신호를 전달할 집합 (개별 중지용)
 _pc_force_stop_set: set[str] = set()
+# 사용자 의도(전역 enabled) 인메모리 미러 — DB autotune_enabled 와 동기.
+# autotune_status 가 매 폴링마다 DB 안 읽도록 미러. 단일 작성처 _save_autotune_state +
+# auto_start_if_enabled 에서 갱신. 프론트 자동재합류가 "사용자 정지(enabled=False)"를
+# 구분해, 정지를 무시하고 60초마다 재시작하던 루프를 막는 데 쓴다.
+_autotune_enabled_flag: bool = False
 
 
 def update_pc_last_seen(device_id: str) -> None:
@@ -264,15 +468,41 @@ def update_pc_last_seen(device_id: str) -> None:
         _pc_last_seen[device_id.strip()] = time.time()
 
 
+def touch_daemon_presence(device_id: str) -> bool:
+    """데몬 폴링/concurrency 조회 도착 시 호출.
+
+    last_seen 갱신 + 미등록 데몬은 빈 분담([])으로 1회 등록해 UI '연결된 데몬' 목록에
+    뜨게 한다. 이미 등록(UI 지정)된 데몬의 사이트는 건드리지 않는다 — 데몬 헤더가
+    배정을 부풀리지 못하게 함(union 스킵). 신규 등록 발생 시 True 반환(DB 영속화용).
+    """
+    dev = (device_id or "").strip()
+    if not dev:
+        return False
+    _pc_last_seen[dev] = time.time()
+    if dev not in _pc_allowed_sites:
+        _pc_allowed_sites[dev] = set()
+        _pc_site_history[dev] = {}
+        return True
+    return False
+
+
 PC_ALLOWED_SITES_DB_KEY = "autotune_pc_allowed_sites"
 
 
-def register_pc_allowed_sites(device_id: str, sites: list[str] | None) -> bool:
+def register_pc_allowed_sites(
+    device_id: str, sites: list[str] | None, *, authoritative: bool = False
+) -> bool:
     """PC 분담 등록/갱신 (UI/폴링용 메타데이터).
 
     sites=None → 등록 제거
     sites=[] → 빈 분담 (이 PC는 아무 사이트 안 받음)
     sites=[...] → 명시 사이트만 받음
+
+    authoritative=True (UI에서 데몬 사이트 지정 시) → 폴링 union 이력 무시하고
+      입력값을 그대로 확정 등록. 데몬은 자기 사이트를 폴링 헤더로 선언하지 않으므로
+      (sourcing.collect-queue 가 데몬 device 는 union 등록 스킵) UI 지정값이 유일한
+      출처가 되어 체크 해제 시 실제로 사이트가 빠진다(눈가림 아님).
+    authoritative=False (확장앱 폴링) → 기존 union 이력 누적(같은 deviceId flip-flop 방지).
 
     실제 변경이 발생했을 때 True 반환 — 호출자가 DB 영속화 필요 여부 판단용.
     """
@@ -283,12 +513,40 @@ def register_pc_allowed_sites(device_id: str, sites: list[str] | None) -> bool:
         existed = dev in _pc_allowed_sites or dev in _pc_last_seen
         _pc_allowed_sites.pop(dev, None)
         _pc_last_seen.pop(dev, None)
+        _pc_site_history.pop(dev, None)
         return existed
-    new_set = {s.strip() for s in sites if s and s.strip()}
+    # 데몬 전용 사이트 strip — 비데몬 dev 분담에 4개 사이트 절대 박히지 않음.
+    # 옛 확장앱이 X-Allowed-Sites 헤더에 SSG/ABC/GrandStage/LOTTEON 박아 보내도
+    # backend 가 무시. 사용자 룰 (3일 강조) 영구 차단 단일 진실 출처.
+    if not dev.startswith("samba-daemon-"):
+        from backend.domain.samba.proxy.sourcing_queue import DAEMON_ONLY_SITES
+
+        _block = {s.upper() for s in DAEMON_ONLY_SITES}
+        sites = [s for s in sites if (s or "").strip().upper() not in _block]
+    new_set = frozenset(s.strip() for s in sites if s and s.strip())
+    now = time.time()
+    # authoritative: UI 확정 지정 — union 이력 비우고 입력값 그대로 박는다.
+    if authoritative:
+        _pc_site_history[dev] = {new_set: now}
+        prev = _pc_allowed_sites.get(dev)
+        changed = prev != set(new_set)
+        _pc_allowed_sites[dev] = set(new_set)
+        _pc_last_seen[dev] = now
+        return changed
+    # deviceId 단위 사이트셋 이력에 기록 + TTL 만료 정리 후 union 산출.
+    # 같은 deviceId 를 여러 PC가 다른 사이트셋으로 폴링해도 union 으로 안정화
+    # (last-write 덮어쓰기로 인한 active_sites flip-flop 차단).
+    hist = _pc_site_history.setdefault(dev, {})
+    hist[new_set] = now
+    for _fs in [_fs for _fs, _ts in hist.items() if now - _ts > _PC_SITE_UNION_TTL]:
+        del hist[_fs]
+    union: set[str] = set()
+    for _fs in hist:
+        union |= _fs
     prev = _pc_allowed_sites.get(dev)
-    changed = prev != new_set
-    _pc_allowed_sites[dev] = new_set
-    _pc_last_seen[dev] = time.time()
+    changed = prev != union
+    _pc_allowed_sites[dev] = union
+    _pc_last_seen[dev] = now
     return changed
 
 
@@ -312,27 +570,44 @@ async def restore_pc_allowed_sites_from_db() -> int:
 
     last_seen은 복원하지 않음 — 24h TTL이 의미를 잃음. 첫 폴링 도착 시 갱신.
     그러나 분담 매핑 자체는 `get_pc_allowed_sites()`에서 사용되므로 복원 효과 충분.
+
+    자가치유 (2026-05-25): 옛 DB snapshot 에 비데몬 dev 분담에 4개 사이트
+    (SSG/ABCmart/GrandStage/LOTTEON) 박혀있으면 strip + 1회 재기록. 다음 부팅엔
+    안 떠야 정상. register_pc_allowed_sites 진입 가드와 짝.
     """
     _log = logging.getLogger("autotune")
     try:
         from backend.db.orm import get_read_session
         from backend.api.v1.routers.samba.proxy._helpers import _get_setting
+        from backend.domain.samba.proxy.sourcing_queue import DAEMON_ONLY_SITES
 
         async with get_read_session() as _sess:
             data = await _get_setting(_sess, PC_ALLOWED_SITES_DB_KEY)
         if not isinstance(data, dict):
             return 0
         count = 0
+        dirty = False
         now = time.time()
+        _block = {s.upper() for s in DAEMON_ONLY_SITES}
         for dev, sites in data.items():
             if not isinstance(dev, str) or not isinstance(sites, list):
                 continue
             dev_clean = dev.strip()
             if not dev_clean:
                 continue
-            _pc_allowed_sites[dev_clean] = {
-                s.strip() for s in sites if isinstance(s, str) and s.strip()
-            }
+            raw_set = {s.strip() for s in sites if isinstance(s, str) and s.strip()}
+            if not dev_clean.startswith("samba-daemon-"):
+                stripped = {s for s in raw_set if s.upper() in _block}
+                if stripped:
+                    _log.warning(
+                        "[오토튠] PC 분담 복원 시 데몬전용 사이트 strip: "
+                        "dev=%s removed=%s",
+                        dev_clean,
+                        sorted(stripped),
+                    )
+                    dirty = True
+                    raw_set -= stripped
+            _pc_allowed_sites[dev_clean] = raw_set
             # last_seen은 복원 시점으로 표시 — 첫 폴링까지 stale 정리 방지
             _pc_last_seen[dev_clean] = now
             count += 1
@@ -342,6 +617,19 @@ async def restore_pc_allowed_sites_from_db() -> int:
                 count,
                 sorted(_pc_allowed_sites.keys()),
             )
+        # 자가치유 — DB snapshot 더러우면 1회 재기록
+        if dirty:
+            try:
+                from backend.db.orm import get_write_session
+
+                async with get_write_session() as _ws:
+                    await persist_pc_allowed_sites(_ws)
+                    await _ws.commit()
+                _log.info(
+                    "[오토튠] DB snapshot 자가치유 완료 — 데몬전용 사이트 제거 후 재저장"
+                )
+            except Exception as _e2:
+                _log.warning("[오토튠] 자가치유 재저장 실패(무시): %s", _e2)
         return count
     except Exception as _e:
         _log.warning("[오토튠] PC 분담 복원 실패(무시): %s", _e)
@@ -355,6 +643,7 @@ def get_active_pcs() -> dict[str, set[str]]:
     for d in stale:
         _pc_last_seen.pop(d, None)
         _pc_allowed_sites.pop(d, None)
+        _pc_site_history.pop(d, None)
     return {d: sites for d, sites in _pc_allowed_sites.items() if d in _pc_last_seen}
 
 
@@ -520,6 +809,8 @@ async def _site_autotune_loop(device_id: str, site: str):
                     _AUTOTUNE_CYCLE_BATCH = int(
                         os.environ.get("AUTOTUNE_CYCLE_BATCH", "200")
                     )
+                    # 적응 배치: 직전 배치 소요시간 기반 자동 조정값 우선 (없으면 env 기본)
+                    _batch_limit = _pc_bs(device_id).get(site, _AUTOTUNE_CYCLE_BATCH)
                     stmt = (
                         select(_CP)
                         .where(*_where)
@@ -532,7 +823,7 @@ async def _site_autotune_loop(device_id: str, site: str):
                         )
                     )
                     if not _target_ids:
-                        stmt = stmt.limit(_AUTOTUNE_CYCLE_BATCH)
+                        stmt = stmt.limit(_batch_limit)
                     result = await session.exec(stmt)
                     _seen_ids: set[str] = set()
                     products = []
@@ -602,20 +893,21 @@ async def _site_autotune_loop(device_id: str, site: str):
                         except Exception:
                             _total_global = filtered_count
                         _gkey = (device_id, site)
-                        # 한 바퀴 회전 완료(분자 ≥ 분모) 또는 분모 변동 시 0부터 재시작
+                        # 한 바퀴 회전 완료(분자 ≥ 분모) 시 0부터 재시작
+                        # 분모 변동(신규 수집/삭제로 인한 total 증감)은 idx 유지하고 분모만 갱신
+                        # → 사이클 도중 신규 상품 들어와도 진행률이 [N/new_total]로 자연 갱신됨
                         _prev_idx = _autotune_global_idx.get(_gkey, 0)
-                        _prev_total = _autotune_global_total.get(_gkey, 0)
-                        if (
-                            _prev_idx >= _total_global
-                            or _total_global <= 0
-                            or _prev_total != _total_global
-                        ):
+                        if _prev_idx >= _total_global or _total_global <= 0:
                             _autotune_global_idx[_gkey] = 0
                             _autotune_cycle_stats[_gkey] = _new_cycle_stats()
                             _autotune_cycle_stats[_gkey]["started_at"] = now.isoformat()
                         elif _gkey not in _autotune_cycle_stats:
                             _autotune_cycle_stats[_gkey] = _new_cycle_stats()
                             _autotune_cycle_stats[_gkey]["started_at"] = now.isoformat()
+                        # idx dict 시드 — 비어 있으면 refresher가 빈 dict로 오판해 순번이
+                        # 1에 갇힌다(aa3beeb7에서 시드해주던 리셋 조건이 빠진 뒤 노출된 버그).
+                        # 키를 미리 0으로 등록해 누적 카운팅이 정상 동작하도록 보장.
+                        _autotune_global_idx.setdefault(_gkey, 0)
                         _autotune_global_total[_gkey] = _total_global
                         log.info(
                             "[오토튠][디버그][%s][%s] 사이클 #%d SELECT 완료: %d건 대상 / 전체 %d건 (진행 %d) (elapsed=%.1fs)",
@@ -633,12 +925,6 @@ async def _site_autotune_loop(device_id: str, site: str):
                         from backend.domain.samba.shipment.service import (
                             calc_market_price,
                         )
-                        from backend.domain.samba.policy.repository import (
-                            SambaPolicyRepository,
-                        )
-                        from backend.domain.samba.account.repository import (
-                            SambaMarketAccountRepository,
-                        )
                         from backend.domain.samba.shipment.dispatcher import (
                             delete_from_market,
                         )
@@ -647,9 +933,6 @@ async def _site_autotune_loop(device_id: str, site: str):
                         product_map: dict[str, object] = {p.id: p for p in products}
                         _policy_cache: dict[str, object] = {}
                         _account_cache: dict[str, object] = {}
-                        account_repo = SambaMarketAccountRepository(session)
-                        policy_repo = SambaPolicyRepository(session)
-
                         # 계정 사전 로드
                         _all_account_ids: set[str] = set()
                         for _p in products:
@@ -874,19 +1157,19 @@ async def _site_autotune_loop(device_id: str, site: str):
                                     if _site_pid
                                     else _name_part
                                 )
-                                # 진행도 표시 — 사이클 배치(200) 기준이 아닌 "전체 대상" 누계 기준
-                                _autotune_global_idx[_gkey] = (
-                                    _autotune_global_idx.get(_gkey, 0) + 1
-                                )
-                                _g_idx = _autotune_global_idx[_gkey]
-                                _g_total = _autotune_global_total.get(_gkey, 0)
-                                _idx_prefix = (
-                                    f"[{_g_idx:,}/{_g_total:,}] "
-                                    if _g_idx and _g_total
-                                    else (
-                                        f"[{idx:,}/{total:,}] " if idx and total else ""
+                                # 진행도 표시 — refresher._limited 가 작업별로 캡처해 넘긴 idx/total 우선 사용.
+                                # 전역 dict 재조회는 동시성 N 배치에서 모든 in-flight 작업이
+                                # 같은 값을 보게 되어 금지 (예: 4건이 모두 [16/40,004] 표시 버그).
+                                if idx and total:
+                                    _idx_prefix = f"[{idx:,}/{total:,}] "
+                                else:
+                                    _g_idx = _autotune_global_idx.get(_gkey, 0)
+                                    _g_total = _autotune_global_total.get(_gkey, 0)
+                                    _idx_prefix = (
+                                        f"[{_g_idx:,}/{_g_total:,}] "
+                                        if _g_idx and _g_total
+                                        else ""
                                     )
-                                )
 
                                 # 원가: 항상 최신 계산값 사용
                                 if r.new_cost is not None:
@@ -942,6 +1225,13 @@ async def _site_autotune_loop(device_id: str, site: str):
                                     updates["original_price"] = r.new_original_price
                                 if r.new_cost is not None:
                                     updates["cost"] = r.new_cost
+                                # 보유 적립금 제외 cost (무신사 토글용)
+                                if r.new_cost_excl_held_point is not None:
+                                    updates["cost_excl_held_point"] = (
+                                        r.new_cost_excl_held_point
+                                    )
+                                elif r.new_cost is not None:
+                                    updates["cost_excl_held_point"] = r.new_cost
                                 if r.new_options is not None:
                                     updates["options"] = r.new_options
                                 # 적립금 사용 제한 여부 (무신사 등) — 오토튠에서 함께 갱신
@@ -1295,6 +1585,21 @@ async def _site_autotune_loop(device_id: str, site: str):
                                 # DB 먼저 업데이트 (전송 전에 최신 데이터 반영)
                                 await _partial_update(r.product_id, updates)
 
+                                # 인메모리 product 객체도 갱신 — _partial_update 는 DB만 UPDATE 하므로
+                                # product.cost 등이 옛값으로 남는다. 아래 expected_price 계산이
+                                # resolve_cost_for_policy(product) → product.cost 를 읽으므로, 갱신 안 하면
+                                # 새 원가가 무시돼 expected==last → 원가만 바뀐 상품이 전송 스킵되는 버그.
+                                for _k in (
+                                    "cost",
+                                    "cost_excl_held_point",
+                                    "is_point_restricted",
+                                ):
+                                    if _k in updates:
+                                        try:
+                                            setattr(product, _k, updates[_k])
+                                        except Exception:
+                                            pass
+
                                 # ★ 마켓별 최종 판매가 비교 → 전송 판정
                                 new_cost = _cur_cost
                                 reg_accounts = product.registered_accounts or []
@@ -1352,9 +1657,18 @@ async def _site_autotune_loop(device_id: str, site: str):
                                     # (모든 lottehome 상품마다 외부 API를 부르던 비용 99% 감소)
 
                                     if policy and policy.pricing:
+                                        # 토글 excludeHeldPoint=True 이면 보유적립금 제외 cost 사용
+                                        from backend.domain.samba.shipment.service import (
+                                            resolve_cost_for_policy,
+                                        )
+
+                                        _resolved_cost = resolve_cost_for_policy(
+                                            product, policy.pricing, site
+                                        )
+                                        _cost_for_calc = _resolved_cost or new_cost
                                         cost_info = await convert_cost_by_source_site(
                                             session,
-                                            new_cost,
+                                            _cost_for_calc,
                                             site,
                                             getattr(product, "tenant_id", None),
                                         )
@@ -1516,6 +1830,56 @@ async def _site_autotune_loop(device_id: str, site: str):
                                         if acc_last
                                         else False
                                     )
+
+                                    # 초기 cost 교정 — 이전 전송 cost가 정가 폴백(과거 추출실패 잔재)인 경우
+                                    # 새로 정확한 혜택가가 들어와도 "가격변동"으로 인식되어 전송되는 사고 차단.
+                                    # 조건: 이전 acc_last.cost == product.original_price (정가 폴백 의심)
+                                    # AND 새 cost가 정가보다 작음 (혜택가 교정)
+                                    # 처리: 전송 스킵 + last_sent_data.cost만 silent 갱신 (다음 사이클부터 정상)
+                                    _last_cost_pre = (
+                                        int(acc_last.get("cost", 0) or 0)
+                                        if acc_last
+                                        else 0
+                                    )
+                                    _orig_p_int = int(
+                                        getattr(product, "original_price", 0) or 0
+                                    )
+                                    _is_initial_cost_correction = (
+                                        site in ("LOTTEON", "MUSINSA", "SSG")
+                                        and _last_cost_pre > 0
+                                        and _orig_p_int > 0
+                                        and _last_cost_pre == _orig_p_int
+                                        and int(new_cost) > 0
+                                        and int(new_cost) < _last_cost_pre
+                                        and not _has_failed_mark
+                                    )
+                                    if (
+                                        _is_initial_cost_correction
+                                        and expected_price != last_price
+                                    ):
+                                        _nontx_actions.append(
+                                            f"[초기cost·{acc_label}] 이전 cost={_last_cost_pre:,}(정가폴백) "
+                                            f"→ 새 cost={int(new_cost):,} 내부 보정만 (마켓 전송 없음)"
+                                        )
+                                        log.info(
+                                            "[오토튠][초기cost] %s acc=%s: "
+                                            "이전 cost=%s(=정가) → 새 cost=%s 교정 → 전송 스킵",
+                                            _prod_label,
+                                            acc_id[:20],
+                                            _last_cost_pre,
+                                            int(new_cost),
+                                        )
+                                        # last_sent_data.cost만 silent 갱신 (다음 사이클부터 정상 비교)
+                                        _new_acc_last = dict(acc_last)
+                                        _new_acc_last["cost"] = int(new_cost)
+                                        _new_last_sent = dict(last_sent)
+                                        _new_last_sent[acc_id] = _new_acc_last
+                                        await _partial_update(
+                                            r.product_id,
+                                            {"last_sent_data": _new_last_sent},
+                                        )
+                                        continue
+
                                     if (
                                         expected_price != last_price or _has_failed_mark
                                     ) and not _price_blocked:
@@ -1669,7 +2033,10 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                 import json as _json
 
                                                 _ssg_af = (
-                                                    getattr(acc, "additional_fields", None) or {}
+                                                    getattr(
+                                                        acc, "additional_fields", None
+                                                    )
+                                                    or {}
                                                 )
                                                 if isinstance(_ssg_af, str):
                                                     _ssg_af = _json.loads(_ssg_af)
@@ -1685,13 +2052,17 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                         .get("sellStatCd", "")
                                                         or ""
                                                     )
-                                                    if _sell_stat == "10":  # 승인대기 → 스킵
+                                                    if (
+                                                        _sell_stat == "10"
+                                                    ):  # 승인대기 → 스킵
                                                         log.info(
                                                             "[오토튠] %s → SSG 승인대기 중, 전송 스킵",
                                                             product.id,
                                                         )
                                                         _acc_items.clear()
-                                                    elif _sell_stat == "05":  # 반려 → 강제 재신청
+                                                    elif (
+                                                        _sell_stat == "05"
+                                                    ):  # 반려 → 강제 재신청
                                                         log.info(
                                                             "[오토튠] %s → SSG 반려 감지(sellStatCd=05), 재신청",
                                                             product.id,
@@ -2162,6 +2533,11 @@ async def _site_autotune_loop(device_id: str, site: str):
                             products,
                             max_concurrency=dict(_SAC),
                             on_result=_on_result_releasing,
+                            global_counter={
+                                "key": _gkey,
+                                "idx_ref": _autotune_global_idx,
+                                "total_ref": _autotune_global_total,
+                            },
                         )
                         log.info(
                             "[오토튠][디버그][%s][%s] 사이클 #%d bulk 종료: "
@@ -2176,6 +2552,15 @@ async def _site_autotune_loop(device_id: str, site: str):
                             time.time() - _bulk_start_ts,
                             time.time() - _cycle_started_ts,
                         )
+
+                        # 적응 배치: 이번 배치 소요시간으로 다음 배치 크기 조정 (단일 타겟 제외)
+                        if not _target_ids:
+                            _adapt_batch_size(
+                                device_id,
+                                site,
+                                time.time() - _cycle_started_ts,
+                                _AUTOTUNE_CYCLE_BATCH,
+                            )
 
                         # 에러 결과 후처리 (콜백에서 처리 안 된 에러 건)
                         for r in results:
@@ -2259,19 +2644,7 @@ async def _site_autotune_loop(device_id: str, site: str):
                         _g_total_now = _autotune_global_total.get(_gkey, 0)
                         _is_full_cycle = _g_total_now > 0 and _g_idx_now >= _g_total_now
 
-                        # 배치 완료 로그 (매 배치마다)
-                        _ref_mod._refresh_log_buffer.append(
-                            {
-                                "ts": _now.isoformat(),
-                                "site": site,
-                                "product_id": "",
-                                "name": "",
-                                "msg": f"[{_kst.strftime('%H:%M:%S')}] -- [{site}] 배치 완료 [{_g_idx_now:,}/{_g_total_now:,}]: {_ok_count:,}건 성공, {_err_count:,}건 실패{_err_detail} / 총 {len(results):,}건, 가격전송 {len(_all_price_pids):,}건, 재고전송 {len(_all_stock_pids):,}건, 동기 {_synced_count:,}건, 마켓삭제 {deleted_count:,}건 --",
-                                "level": "info",
-                                "source": "autotune",
-                            }
-                        )
-                        _ref_mod._refresh_log_total += 1
+                        # 배치 완료 로그 — UI 실시간 로그에는 미노출(불필요), 서버 로그만 유지
                         log.info(
                             "[오토튠] 배치 완료 [%s/%s]: %d성공, %d실패%s / %d건",
                             f"{_g_idx_now:,}",
@@ -2815,9 +3188,6 @@ async def _autotune_loop(device_id: str):
 
                 # 공통 사전 작업 (분류, 쿠키)
                 async with get_write_session() as session:
-                    from backend.domain.samba.collector.model import (
-                        SambaCollectedProduct as _CP,
-                    )
                     from backend.api.v1.routers.samba.proxy import _get_setting
 
                     # 롯데ON 쿠키 갱신
@@ -2829,21 +3199,8 @@ async def _autotune_loop(device_id: str):
                     if _lt_cookie:
                         set_lotteon_cookie(str(_lt_cookie))
 
-                    # 활성 소싱처 목록 파악
-                    from backend.api.v1.routers.samba.collector_common import (
-                        build_market_registered_conditions,
-                    )
-
-                    market_cond = build_market_registered_conditions(_CP)
-
-                    site_stmt = select(func.distinct(_CP.source_site)).where(
-                        *market_cond,
-                        _CP.applied_policy_id != None,
-                        _CP.source_site != None,
-                        _CP.source_site != "",
-                    )
-                    site_result = await session.execute(site_stmt)
-                    active_sites = [r[0] for r in site_result.all() if r[0]]
+                    # 활성 소싱처 목록 파악 (글로벌 30s 캐시 — 모든 PC 공유, read pool 전용)
+                    active_sites = await _get_active_sites_cached()
 
                     # 이 PC가 처리할 사이트만 — _pc_allowed_sites 기준
                     # 미등록(None) → 이 PC가 모든 사이트 처리 (단일 PC 운영)
@@ -3018,6 +3375,59 @@ class AutotuneStartRequest(BaseModel):
     device_id: Optional[str] = None
 
 
+async def _add_running_device(dev: str) -> None:
+    """배포/재시작 시 자동 복원용 — 실행 중 PC device set 에 dev 추가 (멀티 PC).
+
+    legacy autotune_owner_device_id 는 단일 PC만 저장 → 멀티 PC 환경에서
+    배포 후 1개 PC 만 자동 시작되고 나머지는 stop 상태로 SSG/ABC 분담 owner=None →
+    "데몬 미등록" 잡 발행 실패. set 으로 저장해 모든 PC 복원.
+    """
+    import json
+    from backend.db.orm import get_write_session
+    from backend.api.v1.routers.samba.proxy import _get_setting, _set_setting
+
+    try:
+        async with get_write_session() as session:
+            raw = (await _get_setting(session, "autotune_running_devices")) or "[]"
+            try:
+                current = set(json.loads(raw)) if isinstance(raw, str) else set()
+            except Exception:
+                current = set()
+            current.add(dev)
+            await _set_setting(
+                session,
+                "autotune_running_devices",
+                json.dumps(sorted(current)),
+            )
+            await session.commit()
+    except Exception as e:
+        logger.warning(f"[오토튠] running_devices 추가 실패 dev={dev}: {e}")
+
+
+async def _remove_running_device(dev: str) -> None:
+    """실행 중 PC device set 에서 dev 제거 (정지 시)."""
+    import json
+    from backend.db.orm import get_write_session
+    from backend.api.v1.routers.samba.proxy import _get_setting, _set_setting
+
+    try:
+        async with get_write_session() as session:
+            raw = (await _get_setting(session, "autotune_running_devices")) or "[]"
+            try:
+                current = set(json.loads(raw)) if isinstance(raw, str) else set()
+            except Exception:
+                current = set()
+            current.discard(dev)
+            await _set_setting(
+                session,
+                "autotune_running_devices",
+                json.dumps(sorted(current)),
+            )
+            await session.commit()
+    except Exception as e:
+        logger.warning(f"[오토튠] running_devices 제거 실패 dev={dev}: {e}")
+
+
 async def _save_autotune_state(enabled: bool, device_id: str = ""):
     """DB에 오토튠 ON/OFF 상태 + 소유자 deviceId 저장.
 
@@ -3025,6 +3435,8 @@ async def _save_autotune_state(enabled: bool, device_id: str = ""):
     복원하면서 소유자 deviceId까지 함께 복구해야, SSG/롯데온 탭 작업이
     다른 PC의 확장앱으로 새나가지 않는다.
     """
+    global _autotune_enabled_flag
+    _autotune_enabled_flag = enabled
     try:
         from backend.db.orm import get_write_session
         from backend.api.v1.routers.samba.proxy import _set_setting
@@ -3085,6 +3497,8 @@ async def auto_start_if_enabled():
                     async with _get_ws() as _ws:
                         await _ss(_ws, "autotune_enabled", False)
                         await _ws.commit()
+                    global _autotune_enabled_flag
+                    _autotune_enabled_flag = False
                 except Exception as _e:
                     logger.warning(f"[오토튠] enabled=False 동기화 실패: {_e}")
 
@@ -3136,22 +3550,49 @@ async def auto_start_if_enabled():
 
             from backend.domain.samba.collector.refresher import clear_bulk_cancel
 
-            if not _is_pc_running(saved_device_id):
-                _site_empty_skip_until.clear()
-                clear_bulk_cancel("autotune")
-                clear_bulk_cancel("transmit")
-                ev = _get_pc_event(saved_device_id)
+            # 멀티 PC 복원 — autotune_running_devices set 의 모든 PC 자동 재시작
+            # (legacy saved_device_id 1개만 시작하면 다른 PC SSG/ABC owner=None →
+            # "데몬 미등록" 잡 발행 실패. 2026-05-26 SSG 800건 실패 사고 차단.)
+            import json as _json
+
+            async with get_read_session() as _ds:
+                _raw_devs = await _get_setting(_ds, "autotune_running_devices") or "[]"
+            try:
+                _running_devs = (
+                    set(_json.loads(_raw_devs)) if isinstance(_raw_devs, str) else set()
+                )
+            except Exception:
+                _running_devs = set()
+            # legacy 단일 device 도 포함
+            _running_devs.add(saved_device_id)
+
+            _site_empty_skip_until.clear()
+            clear_bulk_cancel("autotune")
+            clear_bulk_cancel("transmit")
+            _started_count = 0
+            for _dev in sorted(_running_devs):
+                _dev = (_dev or "").strip()
+                if not _dev:
+                    continue
+                if _is_pc_running(_dev):
+                    continue
+                ev = _get_pc_event(_dev)
                 ev.set()
-                _pc_cycle_count[saved_device_id] = 0
-                _pc_restart_count[saved_device_id] = 0
-                _pc_main_task[saved_device_id] = asyncio.create_task(
-                    _autotune_loop(saved_device_id),
-                    name=f"autotune-main-{saved_device_id[:8]}",
+                _pc_cycle_count[_dev] = 0
+                _pc_restart_count[_dev] = 0
+                _pc_main_task[_dev] = asyncio.create_task(
+                    _autotune_loop(_dev),
+                    name=f"autotune-main-{_dev[:8]}",
                 )
-                logger.info(
-                    "[오토튠] 서버 시작 — DB 설정에 따라 자동 시작 (owner=%s)",
-                    saved_device_id[:8],
-                )
+                _started_count += 1
+                logger.info("[오토튠] 서버 시작 — 자동 재개 (dev=%s)", _dev[:8])
+            if _started_count:
+                _autotune_enabled_flag = True
+            logger.info(
+                "[오토튠] 자동 복원 완료 — %d PC 재개 (목록 %s)",
+                _started_count,
+                ",".join(d[:8] for d in sorted(_running_devs) if d),
+            )
     except Exception as e:
         logger.warning(f"[오토튠] 자동 시작 실패: {e}")
 
@@ -3317,7 +3758,6 @@ async def autotune_start(
     request: Request = None,
 ):
     """오토튠 무한 루프 시작 — 메인 이벤트 루프에서 실행."""
-    # 플랜 제한(check_autotune_access) 영구 제거 (2026-05-20)
     from backend.domain.samba.collector.refresher import clear_bulk_cancel
 
     dev = (body.device_id or "").strip()
@@ -3396,6 +3836,8 @@ async def autotune_start(
     if not body.target_product_no:
         # 서버 재시작 후 자동 복원 — 한 PC라도 켜져 있었다는 사실 + 마지막 owner deviceId 저장
         await _save_autotune_state(True, dev)
+        # 멀티 PC 복원용 — 실행 중 PC set 에 추가 (배포 후 모든 PC 자동 재시작)
+        await _add_running_device(dev)
     return {"ok": True, "status": "started", "target": "registered"}
 
 
@@ -3405,51 +3847,60 @@ class AutotuneStopRequest(BaseModel):
 
 @router.post("/autotune/stop")
 async def autotune_stop(body: AutotuneStopRequest = AutotuneStopRequest()):
-    """오토튠 정지 — 이 PC 인스턴스만 정지. 다른 PC는 영향 없음."""
-    from backend.domain.samba.collector.refresher import request_bulk_cancel_all
+    """오토튠 정지 — 요청 dev 인스턴스만 정지 (다른 PC 영향 없음).
 
+    이전 구현은 전역 정지(모든 실행 dev + bulk_cancel_all + SourcingQueue.cancel_all +
+    autotune_enabled=False) 였으나, 멀티 PC 환경에서 1개 PC 정지가 전체 PC를 죽이는
+    사고 → dev 한정 정지로 전환 (2026-05-25 사용자 재요청 "분리되어야해").
+
+    dev 비어있고 실행 중인 PC가 1개뿐이면 그 PC를 정지 (UI device_id 누락 가드 보조).
+    여러 PC 실행 중이고 dev 없으면 거절 (전역 영향 차단).
+    """
     dev = (body.device_id or "").strip()
+    running_devs = {d for d, ev in _pc_running.items() if ev.is_set()}
+
     if not dev:
-        return {"ok": False, "error": "device_id 필수"}
+        if len(running_devs) == 0:
+            await _save_autotune_state(False)
+            return {"ok": True, "status": "already_stopped"}
+        if len(running_devs) == 1:
+            dev = next(iter(running_devs))
+        else:
+            return {
+                "ok": False,
+                "error": "device_id 필수 — 다중 PC 실행 중, 전역 정지 차단",
+            }
 
-    if not _is_pc_running(dev):
-        return {"ok": True, "status": "already_stopped"}
-
-    # 다음 폴링 시 이 PC 확장앱에 forceStop 신호 전달
+    # dev 한 개만 정지
     _pc_force_stop_set.add(dev)
-
     ev = _pc_running.get(dev)
     if ev is not None:
         ev.clear()
-
-    # 이 PC의 소싱처 루프 모두 취소
     _site_tasks = _pc_site_tasks.get(dev) or {}
     for _st in list(_site_tasks.values()):
         if not _st.done():
             _st.cancel()
     _site_tasks.clear()
-
-    # 메인 코디네이터 태스크 취소
     _main = _pc_main_task.get(dev)
     if _main and not _main.done():
         _main.cancel()
     _pc_main_task.pop(dev, None)
-
-    # 어떤 PC도 안 돌면 전역 bulk cancel + DB 상태 OFF로 표시
-    if not any_pc_running():
-        request_bulk_cancel_all()
-        try:
-            from backend.domain.samba.proxy.sourcing_queue import SourcingQueue
-
-            SourcingQueue.cancel_all("all PCs stopped")
-        except Exception:
-            pass
-        await _save_autotune_state(False)
-
-    # 인스턴스 상태 cleanup
     _cleanup_pc_instance(dev)
 
-    return {"ok": True, "status": "stopped"}
+    # 실행 중 PC set 에서 제거 (배포 후 이 PC 자동 재시작 차단)
+    await _remove_running_device(dev)
+
+    # 다른 PC가 한 대도 안 돌고 있으면만 전역 enabled=False (재시작 차단)
+    other_running = {d for d, ev in _pc_running.items() if d != dev and ev.is_set()}
+    if not other_running:
+        await _save_autotune_state(False)
+
+    return {
+        "ok": True,
+        "status": "stopped",
+        "stopped_device": dev,
+        "remaining_devices": len(other_running),
+    }
 
 
 class PcAllowedSitesRequest(BaseModel):
@@ -3466,8 +3917,49 @@ class PcAllowedSitesRequest(BaseModel):
 
 @router.post("/autotune/pc-allowed-sites")
 async def autotune_pc_allowed_sites_set(body: PcAllowedSitesRequest):
-    """PC 분담 등록 — 이 PC가 처리할 사이트 목록. 변경 시 DB 영속화."""
-    if register_pc_allowed_sites(body.device_id, body.sites):
+    """PC 분담 등록 — 이 PC가 처리할 사이트 목록. 변경 시 DB 영속화.
+
+    UI 명시 POST 는 모두 authoritative — 사용자가 체크박스로 직접 지정한 값을 폴링
+    union 이 덮어쓰지 않도록 강제. PC 간섭 방지 (2026-05-25 사용자 재요청
+    "무조건 서로 간섭없이"). 폴링(X-Allowed-Sites 헤더)은 여전히 union 유지 —
+    같은 deviceId 다중 PC flip-flop 가드.
+
+    device_id 가 active key 인지 검증 (2026-05-25) — frontend localStorage 의 옛
+    daemonDev 가 revoked device 분담 박는 사고 차단. dead device 잡 라우팅 → 60s
+    타임아웃 → 재시도 → 매우 느림 사고 원천 차단.
+    """
+    dev = (body.device_id or "").strip()
+    if not dev:
+        return {"ok": False, "error": "device_id 필수"}
+
+    # device_id active 검증 — samba_extension_key 에 revoke 안 된 키 존재해야 함.
+    # 단 빈 분담 [] 로 등록 해제는 항상 허용 (사용자가 PC 분담 비우기).
+    if body.sites:
+        try:
+            from backend.db.orm import get_read_session
+            from sqlalchemy import text
+
+            async with get_read_session() as _sess:
+                _row = await _sess.execute(
+                    text(
+                        "SELECT 1 FROM samba_extension_key "
+                        "WHERE device_id = :d AND revoked_at IS NULL "
+                        "AND (expires_at IS NULL OR expires_at > now()) LIMIT 1"
+                    ),
+                    {"d": dev},
+                )
+                if _row.first() is None:
+                    return {
+                        "ok": False,
+                        "error": f"device_id 미등록 또는 revoked: {dev[:30]}",
+                        "registered_pcs": 0,
+                    }
+        except Exception as _exc:
+            from backend.utils.logger import logger as _lg
+
+            _lg.warning(f"[pc-allowed-sites] active 검증 실패(무시): {_exc}")
+
+    if register_pc_allowed_sites(body.device_id, body.sites, authoritative=True):
         from backend.db.orm import get_write_session
 
         async with get_write_session() as _sess:
@@ -3477,17 +3969,39 @@ async def autotune_pc_allowed_sites_set(body: PcAllowedSitesRequest):
     return {
         "ok": True,
         "registered_pcs": len(pcs),
-        "this_pc": sorted(pcs.get(body.device_id.strip(), set())),
+        "this_pc": sorted(pcs.get(dev, set())),
     }
 
 
 @router.get("/autotune/pc-allowed-sites")
 async def autotune_pc_allowed_sites_get():
-    """현재 등록된 모든 PC 분담 매핑 조회 (디버그용)."""
+    """현재 등록된 모든 PC 분담 매핑 조회 + 데몬 목록(UI '연결된 데몬'용).
+
+    by_device: {device_id: [sites]} — 전체 매핑(레거시 호환).
+    daemons: [{device_id, sites, last_seen_ago, alive}] — samba-daemon- prefix 만,
+             UI에서 데몬별 사이트 지정 카드 렌더용. last_seen_ago=초, alive=60초내.
+    """
     pcs = get_active_pcs()
+    now = time.time()
+    daemons = []
+    for dev, sites in pcs.items():
+        if not dev.startswith("samba-daemon-"):
+            continue
+        last = _pc_last_seen.get(dev, 0.0)
+        ago = round(now - last) if last else None
+        daemons.append(
+            {
+                "device_id": dev,
+                "sites": sorted(sites),
+                "last_seen_ago": ago,
+                "alive": bool(last and now - last < 60),
+            }
+        )
+    daemons.sort(key=lambda d: d["device_id"])
     return {
         "registered_pcs": len(pcs),
         "by_device": {dev: sorted(sites) for dev, sites in pcs.items()},
+        "daemons": daemons,
     }
 
 
@@ -3498,7 +4012,6 @@ async def autotune_status(device_id: str = ""):
     device_id 지정 시 그 PC 인스턴스 기준 cycle/last_tick/site_loops 반환.
     """
     from backend.db.orm import get_read_session
-    from backend.domain.samba.collector.model import SambaCollectedProduct as _CP2
     from backend.core.tenant_context import current_tenant_id as _ctv
 
     # 본인 테넌트의 device_id 목록 조회 → module-global 상태를 본인 것만 필터링
@@ -3517,18 +4030,8 @@ async def autotune_status(device_id: str = ""):
                 _my_devices = {d for (d,) in _dev_result.all() if d}
         except Exception:
             _my_devices = set()
-        # Fallback (2026-05-20): samba_extension_key 테이블에 device_id 컬럼
-        # 마이그레이션 누락으로 _my_devices 빈 집합이 되면 "오토튠 정지"로 잘못
-        # 표시되던 사고. OWNER_DEVICE_IDS env 화이트리스트를 본인 device로 인정.
-        if not _my_devices:
-            try:
-                from backend.core.config import settings as _st
-
-                _own_raw = (getattr(_st, "owner_device_ids", "") or "").strip()
-                if _own_raw:
-                    _my_devices = {d.strip() for d in _own_raw.split(",") if d.strip()}
-            except Exception:
-                pass
+        # (2026-05-25) owner_device_ids env fallback 제거 — 키-디바이스 TOFU 바인딩으로
+        # samba_extension_key.device_id 가 첫 사용 시 자동 백필되어 _my_devices 자연 충원.
 
     tripped = {
         site: count
@@ -3536,17 +4039,8 @@ async def autotune_status(device_id: str = ""):
         if _site_breaker_tripped.get(site)
     }
 
-    # DB 기반 24h 갱신 수 (서버 재시작해도 유지)
-    refreshed_24h = 0
-    try:
-        since_24h = datetime.now(timezone.utc) - timedelta(hours=24)
-        async with get_read_session() as rs:
-            cnt_stmt = select(func.count(_CP2.id)).where(
-                _CP2.last_refreshed_at >= since_24h
-            )
-            refreshed_24h = (await rs.execute(cnt_stmt)).scalar() or 0
-    except Exception:
-        refreshed_24h = 0
+    # 24h 갱신 건수 — 글로벌 60s 캐시 (PC 8대 동시 폴링 시 IPC/BufferIO 누적 차단)
+    refreshed_24h = await _get_refreshed_24h_cached()
 
     # 소싱처별 인터벌 정보
     from backend.domain.samba.collector.refresher import (
@@ -3592,35 +4086,21 @@ async def autotune_status(device_id: str = ""):
             cycle_count = _pc_cycle_count.get(dev, 0)
             restart_count = _pc_restart_count.get(dev, 0)
     else:
-        # 본인 테넌트의 PC만 합산
+        # device_id 미지정 — 시크릿창/확장앱 미감지 케이스.
+        # (2026-05-25) 타 PC running 합산을 노출하면 시크릿창에서도 "실행 중"으로 보이고
+        # 체크박스가 다 켜진 채 표시돼 다른 PC 분담을 침범하는 사고 발생. strict 빈 응답.
         _active_site_loops = {}
-        for _d, _stasks in _pc_site_tasks.items():
-            if not _is_mine(_d):
-                continue
-            _scc = _pc_site_cycle_counts.get(_d) or {}
-            _shb = _pc_site_heartbeats.get(_d) or {}
-            for s, t in _stasks.items():
-                prev = _active_site_loops.get(s)
-                cycles = _scc.get(s, 0)
-                hb_ago = round(_now_hb - _shb.get(s, _now_hb))
-                if prev is None:
-                    _active_site_loops[s] = {
-                        "running": not t.done(),
-                        "cycles": cycles,
-                        "heartbeat_ago": hb_ago,
-                    }
-                else:
-                    prev["running"] = prev["running"] or not t.done()
-                    prev["cycles"] = prev["cycles"] + cycles
-                    prev["heartbeat_ago"] = min(prev["heartbeat_ago"], hb_ago)
-        running = any(ev.is_set() for d, ev in _pc_running.items() if _is_mine(d))
-        last_tick_vals = [v for d, v in _pc_last_tick.items() if v and _is_mine(d)]
-        last_tick = max(last_tick_vals) if last_tick_vals else None
-        cycle_count = sum(v for d, v in _pc_cycle_count.items() if _is_mine(d))
-        restart_count = sum(v for d, v in _pc_restart_count.items() if _is_mine(d))
+        running = False
+        last_tick = None
+        cycle_count = 0
+        restart_count = 0
 
     return {
         "running": running,
+        # 사용자 의도(전역 enabled) — 프론트 자동재합류가 "정지(False)"를 구분해
+        # 정지 무시 재시작 루프를 막는 데 사용. running 은 코디네이터 실시간 상태,
+        # enabled 는 사용자가 켜둔 상태(정지 누르면 False).
+        "enabled": _autotune_enabled_flag,
         "last_tick": last_tick,
         "cycle_count": cycle_count,
         "restart_count": restart_count,
@@ -3715,57 +4195,91 @@ class AutotuneFilterRequest(BaseModel):
 
 @router.get("/autotune/filters")
 async def autotune_get_filters():
-    """오토튠 필터 설정 + 실제 존재하는 소싱처/판매처(마켓 단위) 목록 반환."""
-    import json as _json
+    """오토튠 필터 설정 + 실제 존재하는 소싱처/판매처(마켓 단위) 목록 반환.
 
+    available_sources/markets 는 registered 78k 스캔이라 느림(~100초) → TTL 캐시.
+    saved_sources/markets(설정값)는 가벼우므로 매 호출 최신 조회.
+    """
     from backend.db.orm import get_read_session
     from backend.api.v1.routers.samba.proxy import _get_setting
     from backend.domain.samba.collector.model import SambaCollectedProduct as _CP
-    from backend.domain.samba.account.model import SambaMarketAccount
-    from sqlalchemy import distinct
+    from sqlalchemy import distinct, text as _text
 
+    global _filters_avail_cache
+
+    # 저장된 필터(설정) — 가벼움, 매번 최신
     async with get_read_session() as session:
-        # 현재 저장된 필터
         saved_sources = await _get_setting(session, AUTOTUNE_FILTER_SOURCES_KEY)
         saved_markets = await _get_setting(session, AUTOTUNE_FILTER_MARKETS_KEY)
 
-        # 마켓 등록 상품이 있는 소싱처만 (수집만 된 것은 제외)
-        src_stmt = select(distinct(_CP.source_site)).where(
-            _CP.source_site != None,
-            _CP.source_site != "",
-            _CP.status == "registered",
-        )
-        src_result = await session.execute(src_stmt)
-        available_sources = sorted([r[0] for r in src_result.all() if r[0]])
-
-        # 등록된 상품의 registered_accounts → 계정 ID 수집
-        reg_stmt = select(_CP.registered_accounts).where(
-            _CP.status == "registered",
-            _CP.registered_accounts.isnot(None),
-        )
-        reg_result = await session.execute(reg_stmt)
-        _acc_ids: set[str] = set()
-        for row in reg_result.all():
-            val = row[0]
-            if not val:
-                continue
-            # JSON 컬럼이 문자열로 반환될 수 있음
-            if isinstance(val, str):
-                try:
-                    val = _json.loads(val)
-                except Exception:
-                    continue
-            if isinstance(val, list):
-                _acc_ids.update(str(a) for a in val if a)
-
-        # 계정 → market_type 매핑 후 중복 제거 (마켓 단위)
-        available_markets: list[str] = []
-        if _acc_ids:
-            acc_stmt = select(distinct(SambaMarketAccount.market_type)).where(
-                SambaMarketAccount.id.in_(list(_acc_ids))
+    async def _compute_available() -> tuple[list[str], list[str]]:
+        """무거운 available_* 계산 — registered 상품 소싱처/마켓."""
+        async with get_read_session() as session:
+            # 마켓 등록 상품이 있는 소싱처만 (수집만 된 것은 제외)
+            src_stmt = select(distinct(_CP.source_site)).where(
+                _CP.source_site != None,
+                _CP.source_site != "",
+                _CP.status == "registered",
             )
-            acc_result = await session.execute(acc_stmt)
-            available_markets = sorted([r[0] for r in acc_result.all() if r[0]])
+            src_result = await session.execute(src_stmt)
+            srcs = sorted([r[0] for r in src_result.all() if r[0]])
+
+            # 판매처(마켓) — registered_accounts 전체 fetch(80초) 대신 EXISTS + @>
+            # (GIN ix_scp_registered_accounts_gin 활용). 계정수(소수)만큼 containment 프로브.
+            mk_stmt = _text(
+                "SELECT DISTINCT a.market_type FROM samba_market_account a "
+                "WHERE a.market_type IS NOT NULL AND EXISTS ("
+                "SELECT 1 FROM samba_collected_product cp "
+                "WHERE cp.status = 'registered' "
+                "AND cp.registered_accounts @> jsonb_build_array(a.id))"
+            )
+            mk_result = await session.execute(mk_stmt)
+            mkts = sorted([r[0] for r in mk_result.all() if r[0]])
+        return srcs, mkts
+
+    # available_* — stale-while-revalidate. cache 있으면 즉시 반환(stale 포함),
+    # stale 이면 백그라운드에서 재계산. cache 자체가 없을 때만 블로킹 (콜드 스타트).
+    # → TTL 만료 시점에 100초 블로킹 → 체크박스 사라짐 사고 방지 (2026-05-25).
+    cached = _filters_avail_cache
+    if cached:
+        available_sources = cached["sources"]
+        available_markets = cached["markets"]
+        if (time.time() - cached.get("ts", 0)) >= _FILTERS_AVAIL_TTL:
+            # stale — 백그라운드 재계산 트리거 (중복 방지: lock locked 면 skip)
+            async def _refresh_in_background():
+                global _filters_avail_cache
+                async with _filters_avail_lock:
+                    # 진입 후 신선해졌으면 skip
+                    c2 = _filters_avail_cache
+                    if c2 and (time.time() - c2.get("ts", 0)) < _FILTERS_AVAIL_TTL:
+                        return
+                    try:
+                        srcs, mkts = await _compute_available()
+                        _filters_avail_cache = {
+                            "sources": srcs,
+                            "markets": mkts,
+                            "ts": time.time(),
+                        }
+                    except Exception as exc:
+                        logger.warning(
+                            f"[오토튠][filters] 백그라운드 재계산 실패: {exc}"
+                        )
+
+            if not _filters_avail_lock.locked():
+                asyncio.create_task(_refresh_in_background())
+    else:
+        async with _filters_avail_lock:
+            cached = _filters_avail_cache
+            if cached:
+                available_sources = cached["sources"]
+                available_markets = cached["markets"]
+            else:
+                available_sources, available_markets = await _compute_available()
+                _filters_avail_cache = {
+                    "sources": available_sources,
+                    "markets": available_markets,
+                    "ts": time.time(),
+                }
 
     return {
         "enabled_sources": saved_sources if isinstance(saved_sources, list) else None,

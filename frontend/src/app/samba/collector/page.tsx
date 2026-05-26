@@ -142,7 +142,7 @@ export default function CollectorPage() {
   const [, setAccounts] = useState<SambaMarketAccount[]>([])
 
   // Proxy & auth status
-  const { proxyStatus, proxyText, musinsaAuth, musinsaAuthText, poolInfo, setProxyStatus, setProxyText } =
+  const { proxyStatus, proxyText, musinsaAuth, musinsaAuthText, musinsaCookieUpdatedAt, poolInfo, setProxyStatus, setProxyText } =
     useProxyAuth()
 
   // 트리 + 드릴다운
@@ -522,6 +522,7 @@ export default function CollectorPage() {
           proxyText={proxyText}
           musinsaAuth={musinsaAuth}
           musinsaAuthText={musinsaAuthText}
+          musinsaCookieUpdatedAt={musinsaCookieUpdatedAt}
           poolInfo={poolInfo}
           setProxyStatus={setProxyStatus}
           setProxyText={setProxyText}

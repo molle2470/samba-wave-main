@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import time
-from typing import Any
+from typing import Any, Optional
 
 import bcrypt
 import httpx
@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from backend.db.orm import get_read_session_dependency
+from backend.domain.samba.tenant.middleware import get_optional_tenant_id
 from backend.utils.logger import logger
 
 from ._helpers import _get_setting, _get_ss_client
@@ -50,9 +51,10 @@ async def smartstore_search_manufacturer(
 @router.post("/smartstore/auth-test")
 async def smartstore_auth_test(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """스마트스토어 Commerce API 인증 테스트 — OAuth2 토큰 발급 시도."""
-    creds = await _get_setting(session, "store_smartstore")
+    creds = await _get_setting(session, "store_smartstore", tenant_id=tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "스마트스토어 설정이 저장되지 않았습니다."}
 
@@ -66,12 +68,27 @@ async def smartstore_auth_test(
 
     try:
         # bcrypt 서명 생성 (네이버 Commerce API 인증 방식)
+        # 네이버 Commerce API clientSecret 은 29자 bcrypt salt 형식.
+        # $2y$ prefix 는 Python bcrypt 가 지원하지 않으므로 $2b$ 로 정규화.
+        # $2a$ / $2b$ 는 그대로 사용해야 서명이 일치한다.
+        salt = client_secret
+        if salt.startswith("$2y$"):
+            salt = "$2b$" + salt[4:]
         timestamp = int(time.time() * 1000)
         password = f"{client_id}_{timestamp}"
-        hashed = bcrypt.hashpw(
-            password.encode("utf-8"),
-            client_secret.encode("utf-8"),
-        )
+        try:
+            hashed = bcrypt.hashpw(
+                password.encode("utf-8"),
+                salt.encode("utf-8"),
+            )
+        except ValueError as ve:
+            return {
+                "success": False,
+                "message": (
+                    f"clientSecret 형식 오류 ({ve}). 네이버 커머스 API 센터에서 "
+                    "발급한 29자 bcrypt salt($2a$/$2b$ prefix)를 그대로 저장하세요."
+                ),
+            }
         client_secret_sign = base64.standard_b64encode(hashed).decode("utf-8")
 
         async with httpx.AsyncClient(timeout=15) as client:

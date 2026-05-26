@@ -56,20 +56,29 @@ class SambaForbiddenService:
         return row.value if row else None
 
     async def save_setting(self, key: str, value: Any) -> SambaSettings:
-        """설정값 upsert."""
-        from datetime import UTC, datetime
+        """설정값 upsert. PostgreSQL ON CONFLICT 로 race condition 차단.
 
-        existing = await self.settings_repo.find_by_async(key=key)
-        if existing:
-            existing.value = value
-            existing.updated_at = datetime.now(UTC)
-            self.settings_repo.session.add(existing)
-            await self.settings_repo.session.commit()
-            await self.settings_repo.session.refresh(existing)
-            return existing
-        return await self.settings_repo.create_async(
-            key=key, value=value, updated_at=datetime.now(UTC)
+        과거 find-then-create 패턴은 동시 호출 시 두 트랜잭션이 모두 None 을 받고
+        INSERT 를 시도해 samba_settings_pkey UniqueViolationError 발생.
+        오토튠 PC 분담 저장처럼 멀티 워커가 동시에 같은 key 를 쓰는 경로에서 빈번.
+        """
+        from datetime import UTC, datetime
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        now = datetime.now(UTC)
+        stmt = (
+            pg_insert(SambaSettings)
+            .values(key=key, value=value, updated_at=now)
+            .on_conflict_do_update(
+                index_elements=["key"],
+                set_={"value": value, "updated_at": now},
+            )
         )
+        session = self.settings_repo.session
+        await session.execute(stmt)
+        await session.commit()
+        # 호출자는 반환값을 쓰지 않음 — 메모리 객체만 구성해 시그니처 호환.
+        return SambaSettings(key=key, value=value, updated_at=now)
 
     # ==================== Filtering Logic ====================
     # Ported from js/modules/forbidden.js

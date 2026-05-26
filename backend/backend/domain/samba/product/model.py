@@ -56,6 +56,8 @@ class SambaProduct(SQLModel, table=True):
     # 가격 정보
     source_price: float = Field(default=0)
     cost: float = Field(default=0)
+    # 무신사 보유 적립금 사용 제외 cost (정책 토글 excludeHeldPoint=True에서 사용)
+    cost_excl_held_point: Optional[float] = Field(default=None)
     margin_rate: float = Field(default=30)
     sale_price: Optional[float] = Field(default=None)
 

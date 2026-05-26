@@ -52,10 +52,11 @@ const saveFilterSourcesToSession = (v: string[] | null): void => {
 }
 
 // 오토튠 실시간 로그 (독립 컴포넌트 — 대시보드 리렌더링 영향 없음)
-const AutotuneLogPanel = memo(function AutotuneLogPanel({ onStatusChange, externalRunning, filterSources }: {
+const AutotuneLogPanel = memo(function AutotuneLogPanel({ onStatusChange, externalRunning, filterSources, deviceId }: {
   onStatusChange?: (running: boolean, cycles: number, lastTick: string | null, refreshed: number) => void
   externalRunning?: boolean
   filterSources?: string[] | null
+  deviceId?: string  // 이 PC device_id — 본인 잡 로그만 표시 (PC 분리, 2026-05-25)
 }) {
   // 로그에 클라이언트 부여 시퀀스 번호 — React key 안정화용
   const [logs, setLogs] = useState<Array<RefreshLogEntry & { __seq: number }>>([])
@@ -126,7 +127,7 @@ const AutotuneLogPanel = memo(function AutotuneLogPanel({ onStatusChange, extern
         // 무거운 status 쿼리(samba_extension_key + count(samba_collected_product 24h))가
         // 500ms마다 read 풀을 점유해 refreshLogs가 직렬 await에 막혀 1분+ 지연 발생.
         const idx = sinceIdxRef.current
-        const res = await monitorApi.refreshLogs(idx)
+        const res = await monitorApi.refreshLogs(idx, deviceId || '')
         if (res.current_idx < idx) {
           sinceIdxRef.current = 0
           pollingRef.current = false
@@ -239,15 +240,6 @@ const card: React.CSSProperties = {
   padding: '1.25rem',
 }
 
-type StoreScore = {
-  account_id: string; account_label: string; market_type: string
-  grade: string; grade_code: string
-  good_service: Record<string, number> | null
-  penalty: number | null; penalty_rate: number | null
-  product_count?: number; max_products?: number
-  updated_at: string
-}
-
 const normalizeWarroomSourceSite = (value: string | null | undefined) => {
   const site = String(value || '').trim()
   if (!site) return ''
@@ -271,8 +263,125 @@ const normalizeWarroomSiteChanges = (
   }, {})
 }
 
+// LOTTEON 데몬 device_id — 본 PC localStorage 영속. 첫 방문 시 자동 생성.
+// 설치 트리거 시 URL 파라미터 ?did=… 로 .exe 다운로드에 전달.
+const AUTOTUNE_DAEMON_DID_KEY = 'samba.autotune.daemon.deviceId'
+const getOrCreateAutotuneDaemonDeviceId = (): string => {
+  if (typeof window === 'undefined') return ''
+  try {
+    const cached = window.localStorage.getItem(AUTOTUNE_DAEMON_DID_KEY)
+    if (cached && cached.startsWith('samba-daemon-')) return cached
+    // 8글자 영숫자 random + samba-daemon- prefix
+    const rnd = Array.from(window.crypto.getRandomValues(new Uint8Array(6)))
+      .map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 12)
+    const did = `samba-daemon-${rnd}`
+    window.localStorage.setItem(AUTOTUNE_DAEMON_DID_KEY, did)
+    return did
+  } catch {
+    return ''
+  }
+}
+
+// 데몬 .exe 다운로드 URL — GitHub Release 직접. 본 메인 backend/CDN 트래픽 0.
+// cross-origin 이라 a.download 무시되지만, 데몬은 hostname 으로 device_id 자동 생성 →
+// 파일명에 정보 박을 필요 없음. backend URL 도 데몬 default 디폴트(env / argv 로 오버라이드 가능).
+// 데몬 설치 exe 다운로드 — 백엔드 프록시(JWT) 경유. 백엔드가 로그인 사용자 테넌트로
+// 1시간 만료 install-token 을 발급해 exe 파일명에 박아 내려준다. 데몬은 첫 실행 시
+// 파일명에서 토큰을 추출해 long-lived 키와 교환 → 사용자는 "다운로드 → 실행"만 하면 됨.
+// (기존 GitHub 직접 링크는 cross-origin 이라 파일명에 키를 못 박아 수동 키 주입이 필요했음)
+async function downloadDaemonInstaller(did: string): Promise<boolean> {
+  try {
+    const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.samba-wave.co.kr'
+    const { fetchWithAuth } = await import('@/lib/samba/legacy')
+    const res = await fetchWithAuth(
+      `${apiBase}/api/v1/samba/extension-keys/daemon-installer?device_id=${encodeURIComponent(did)}`,
+    )
+    if (!res.ok) return false
+    const blob = await res.blob()
+    const cd = res.headers.get('Content-Disposition') || ''
+    const m = cd.match(/filename="(.+?)"/)
+    const fname = m?.[1] || 'autotune-daemon-setup.exe'
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = fname
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    setTimeout(() => URL.revokeObjectURL(url), 10_000)
+    return true
+  } catch {
+    return false
+  }
+}
+
 export default function WarroomPage() {
   useEffect(() => { document.title = 'SAMBA-오토튠' }, [])
+
+  // 무신사 자동로그인계정 상태 — 60s 폴링. 미설정/만료 시 모달 경고.
+  // cost 계산이 자동로그인계정 단일 쿠키만 사용하므로 미설정 시 오토튠 무효.
+  const [musinsaAuthMissing, setMusinsaAuthMissing] = useState<{
+    reason: 'unset' | 'cookie_expired' | 'no_cookie'
+    account_label: string | null
+  } | null>(null)
+  const [musinsaAuthDismissed, setMusinsaAuthDismissed] = useState<boolean>(false)
+  useEffect(() => {
+    let cancelled = false
+    const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.samba-wave.co.kr'
+    const tick = async () => {
+      try {
+        const r = await fetchWithAuth(`${apiBase}/api/v1/samba/sourcing-accounts/musinsa/autologin-status`)
+        if (!r.ok) return
+        const j = await r.json()
+        if (cancelled) return
+        if (j?.missing) {
+          setMusinsaAuthMissing({ reason: j.reason, account_label: j.account_label })
+        } else {
+          setMusinsaAuthMissing(null)
+          setMusinsaAuthDismissed(false)
+        }
+      } catch { /* ignore */ }
+    }
+    tick()
+    const t = setInterval(tick, 60_000)
+    return () => { cancelled = true; clearInterval(t) }
+  }, [])
+
+  // LOTTEON 데몬 health 체크 — 60s 폴링.
+  // 미감지 시 1회 자동 다운로드 트리거 + 토스트 (오토튠 이용 위해 1번 실행 필요).
+  const [autotuneDaemonAlive, setAutotuneDaemonAlive] = useState<boolean | null>(null)
+  const autotuneInstallTriggeredRef = useRef(false)
+  useEffect(() => {
+    let cancelled = false
+    const did = getOrCreateAutotuneDaemonDeviceId()
+    if (!did) return
+    const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.samba-wave.co.kr'
+    const tick = async () => {
+      try {
+        const r = await fetch(
+          `${apiBase}/api/v1/samba/proxy/autotune-daemon/health?device_id=${encodeURIComponent(did)}`
+        )
+        if (!r.ok) return
+        const data = await r.json()
+        if (cancelled) return
+        const alive = Boolean(data?.alive)
+        setAutotuneDaemonAlive(alive)
+        if (!alive && !autotuneInstallTriggeredRef.current) {
+          // 단 한 번만 자동 다운로드 (브라우저 prof 영구). 이후 alive=false 여도
+          // 빨간 배너만 노출 — 사용자가 "다시 다운로드" 버튼 클릭 시만 재트리거.
+          autotuneInstallTriggeredRef.current = true
+          let alreadyDownloaded = false
+          try { alreadyDownloaded = window.localStorage.getItem('samba.autotune.daemon.downloadedOnce') === '1' } catch {}
+          if (alreadyDownloaded) return
+          try { window.localStorage.setItem('samba.autotune.daemon.downloadedOnce', '1') } catch {}
+          await downloadDaemonInstaller(did)
+        }
+      } catch { /* ignore */ }
+    }
+    tick()
+    const t = setInterval(tick, 60_000)
+    return () => { cancelled = true; clearInterval(t) }
+  }, [])
   const [stats, setStats] = useState<DashboardStats | null>(null)
   const [events, setEvents] = useState<MonitorEvent[]>([])
   const [siteChanges, setSiteChanges] = useState<Record<string, Record<string, Array<{ id: string; product_id: string | null; product_name: string | null; detail: Record<string, unknown> | null; created_at: string }>>>>({})
@@ -280,22 +389,53 @@ export default function WarroomPage() {
 
   const [loading, setLoading] = useState(true)
   const [, setLastFetched] = useState<Date | null>(null)
-  const [storeScores, setStoreScores] = useState<Record<string, StoreScore>>({})
-  const [scoreTab, setScoreTab] = useState('smartstore')
-  const [showPenaltyGuide, setShowPenaltyGuide] = useState(false)
-  const [scoreRefreshing, setScoreRefreshing] = useState(false)
   const nextPollRef = useRef(POLL_INTERVAL / 1000)
 
   // 실시간 로그 상태
 
   // 소싱처/마켓 상태
-  const [probeData, setProbeData] = useState<Record<string, Record<string, Record<string, unknown>>>>({})
-  const [probeLoading, setProbeLoading] = useState(false)
 
   // 오토튠 상태
   const [autotuneRunning, setAutotuneRunning] = useState(false)
   const [autotuneCycles, setAutotuneCycles] = useState(0)
   const [autotuneRestarts, setAutotuneRestarts] = useState(0)
+  // 이 PC device_id — 실시간 로그 PC별 분리(2026-05-25)
+  // 브라우저 device + 본인 PC 데몬 device 둘 다 합쳐 보냄 → 데몬 잡 로그도 본인 PC 로그로 표시.
+  // 데몬 device_id 는 localhost:51425/device_id (데몬이 띄운 sync 서버)에서 자동 fetch.
+  // 같은 PC 데몬만 응답(loopback) → 사용자 수동 입력 X, 포크 유저 동일 흐름.
+  const [pcDeviceId, setPcDeviceId] = useState<string>('')
+  useEffect(() => {
+    (async () => {
+      try {
+        const { getDeviceId } = await import('@/lib/samba/deviceId')
+        const dev = getDeviceId()
+        let daemonDev = ''
+        // 1) 데몬 sync 서버 우선
+        try {
+          const ctrl = new AbortController()
+          const t = setTimeout(() => ctrl.abort(), 1500)
+          const r = await fetch('http://localhost:51425/device_id', { signal: ctrl.signal })
+          clearTimeout(t)
+          if (r.ok) {
+            const j = await r.json()
+            if (j && typeof j.device_id === 'string' && j.device_id) {
+              daemonDev = j.device_id
+              window.localStorage.setItem('samba.autotune.daemon.deviceId', daemonDev)
+            }
+          }
+        } catch { /* 데몬 안 켜진 PC — 무시 */ }
+        // 2) fallback: localStorage 캐시
+        if (!daemonDev) {
+          daemonDev = (typeof window !== 'undefined' && (
+            window.localStorage.getItem('samba.autotune.daemon.deviceId') ||
+            window.localStorage.getItem('samba.lotteon.daemon.deviceId')
+          )) || ''
+        }
+        const ids = [dev, daemonDev].filter(Boolean)
+        if (ids.length) setPcDeviceId(ids.join(','))
+      } catch { /* ignore */ }
+    })()
+  }, [])
   const [singleProductNo, setSingleProductNo] = useState('')
   const [, setAutotuneLastTick] = useState<string | null>(null)
   const prevCyclesRef = useRef(0)
@@ -369,8 +509,18 @@ export default function WarroomPage() {
   // 그래서 초기값은 null로 두고, 마운트 직후 useEffect에서 sessionStorage를 읽어 복원한다.
   const [filterSources, setFilterSources] = useState<string[] | null>(null)
   const [filterMarkets, setFilterMarkets] = useState<string[] | null>(null) // null=전체
-  const [availSources, setAvailSources] = useState<string[]>([])
-  const [availMarkets, setAvailMarkets] = useState<string[]>([])
+  // fetch 실패/지연 시에도 체크박스가 항상 보이도록 default 리스트로 즉시 초기화.
+  // 백엔드 filters fetch 가 100초 걸리거나 실패할 때 페이지가 빈 상태로 보이던
+  // 사고 차단 (2026-05-25 포크 유저도 동일 UX 보장).
+  // GrandStage 는 ABCmart 의 a-rt.com 하부 도메인 — UI 별도 노출 X (ABCmart 에 포함).
+  const _DEFAULT_AVAIL_SOURCES = [
+    'ABCmart', 'GSShop', 'LOTTEON', 'MUSINSA', 'SSG',
+  ]
+  const _DEFAULT_AVAIL_MARKETS = [
+    '11번가', '옥션', '쿠팡', '롯데홈쇼핑', '롯데ON', '플레이오토', '스마트스토어', 'SSG', 'G마켓',
+  ]
+  const [availSources, setAvailSources] = useState<string[]>(_DEFAULT_AVAIL_SOURCES)
+  const [availMarkets, setAvailMarkets] = useState<string[]>(_DEFAULT_AVAIL_MARKETS)
   const filterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // load() 폴링 closure stale 방지 — 최신값 ref 동기화
@@ -397,7 +547,7 @@ export default function WarroomPage() {
 
     // 2) 이 PC의 chrome.storage.allowedSites로 체크박스 초기화
     //    null=미설정(전체처리), []=전체해제, [...]=부분선택
-    let registered = false
+    // (2026-05-25) 자동 register 폐기 — registered 플래그도 제거.
     const onMessage = (e: MessageEvent) => {
       if (e.source !== window) return
       const msg = e.data
@@ -420,26 +570,8 @@ export default function WarroomPage() {
       }
       setFilterSources(next)
       saveFilterSourcesToSession(next)
-      // 첫 수신 시 백엔드 PC분담 등록 (heartbeat 시작) — 폴링으로 last_seen 자동 갱신됨
-      if (!registered) {
-        registered = true
-        // 직접 호출 (registerPcAllowedSites는 useCallback이라 effect 의존성 충돌 회피)
-        ;(async () => {
-          try {
-            const { getDeviceId } = await import('@/lib/samba/deviceId')
-            const dev = getDeviceId()
-            if (!dev) return
-            const { API_BASE_URL: apiBase } = await import('@/config/api')
-            // null(전체선택)이면 availSources로 명시 등록 — 레거시 모드 차단
-            // availSources는 아직 비어있을 수 있으므로 null 그대로 전달 (초기화 후 toggleSource에서 재등록됨)
-            await fetchWithAuth(`${apiBase}/api/v1/samba/collector/autotune/pc-allowed-sites`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ device_id: dev, sites: next }),
-            })
-          } catch { /* ignore */ }
-        })()
-      }
+      // (2026-05-25) 자동 register 폐기 — 페이지 접속만으로 backend 분담 박히는 사고 차단.
+      // 사용자가 "오토튠 활성" 토글 ON 한 경우만 register 호출.
     }
     window.addEventListener('message', onMessage)
     // SPA 라우팅으로 페이지에 재진입한 경우 content_script가 다시 실행되지 않으므로
@@ -450,13 +582,8 @@ export default function WarroomPage() {
     return () => window.removeEventListener('message', onMessage)
   }, [])
 
-  // availSources 로드 완료 후 전체선택(null) 상태면 명시 목록으로 PC분담 재등록
-  // 초기 ALLOWED_SITES 수신 시 availSources가 아직 비어 null로 등록됐을 경우 보정
-  useEffect(() => {
-    if (availSources.length === 0) return
-    if (filterSources !== null) return  // 부분선택 상태는 이미 올바르게 등록됨
-    registerPcAllowedSites([...availSources])
-  }, [availSources]) // eslint-disable-line react-hooks/exhaustive-deps
+  // (2026-05-25) availSources 로드 완료 후 자동 register 폐기.
+  // 페이지 접속 자동 분담 박힘 차단 — 사용자 "오토튠 활성" 토글 ON 시만 register.
 
   // 소싱처 체크 변경 시 익스텐션 chrome.storage 동기화 (PC별 분담 헤더용)
   // null=전체처리(미설정), []=전체해제, [...]=부분선택 — 구분 그대로 전달
@@ -489,16 +616,49 @@ export default function WarroomPage() {
       const dev = getDeviceId()
       if (!dev) return
       const { API_BASE_URL: apiBase } = await import('@/config/api')
-      // sites=null(전체체크)은 등록 자체를 제거(다른 PC들의 union이 그대로 사용됨)
-      // sites=[](전체해제)는 빈 분담으로 명시 등록
-      // sites=[...]는 명시 사이트만 등록
-      // 백엔드는 모든 등록 PC의 합집합으로 active_sites 결정.
-      // 단일 PC 운영 + 모두 체크 = 등록 0개 → 백엔드 legacy 동작(전체 처리) 유지
-      await fetchWithAuth(`${apiBase}/api/v1/samba/collector/autotune/pc-allowed-sites`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ device_id: dev, sites }),
-      })
+      // 사이트별 dev 분리 (2026-05-25 사용자 룰):
+      //  - 데몬 전용(SSG/ABCmart/GrandStage/LOTTEON) → 데몬 dev 에만 분담
+      //  - 브라우저 전용(무신사/GSShop) → 브라우저 dev 에만 분담
+      // 4개 사이트는 확장앱 절대 관여 X — 데몬에만 박는다.
+      const daemonDev = (typeof window !== 'undefined' &&
+        window.localStorage.getItem('samba.autotune.daemon.deviceId')) || ''
+      const _DAEMON_ONLY = new Set(['SSG', 'ABCmart', 'GrandStage', 'LOTTEON'])
+      // ABCmart 체크 = ABCmart + GrandStage 자동 expand (같은 a-rt.com 도메인)
+      const _SITE_EXPAND: Record<string, string[]> = {
+        ABCmart: ['ABCmart', 'GrandStage'],
+      }
+      const expanded = sites === null
+        ? null
+        : sites.flatMap(s => _SITE_EXPAND[s] || [s])
+      // 사이트 분리
+      const browserSites = expanded === null
+        ? null
+        : expanded.filter(s => !_DAEMON_ONLY.has(s))
+      const daemonSites = expanded === null
+        ? null
+        : expanded.filter(s => _DAEMON_ONLY.has(s))
+      const calls: Promise<unknown>[] = []
+      // 브라우저 dev — 비데몬 사이트만 (또는 null=전체)
+      calls.push(fetchWithAuth(
+        `${apiBase}/api/v1/samba/collector/autotune/pc-allowed-sites`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ device_id: dev, sites: browserSites }),
+        },
+      ))
+      // 데몬 dev — 데몬 전용 사이트만
+      if (daemonDev) {
+        calls.push(fetchWithAuth(
+          `${apiBase}/api/v1/samba/collector/autotune/pc-allowed-sites`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ device_id: daemonDev, sites: daemonSites }),
+          },
+        ))
+      }
+      await Promise.all(calls)
     } catch { /* ignore */ }
   }, [])
 
@@ -565,50 +725,15 @@ export default function WarroomPage() {
     }
   }, [])
 
-  const runProbe = async () => {
-    setProbeLoading(true)
-    try {
-      const data = await collectorApi.probeRun() as Record<string, Record<string, Record<string, unknown>>>
-      setProbeData(data)
-    } catch { /* ignore */ }
-    setProbeLoading(false)
-  }
-
   const load = useCallback(async () => {
     // 각 API를 독립 발사 — 도착하는 대로 setState (Promise.all 블로킹 제거).
-    // dashboard만 도착하면 setLoading(false) → 가장 무거운 API에 묶이지 않고
-    // 화면이 즉시 표시되고, 나머지 영역은 자기 데이터가 도착하는 대로 채워진다.
+    // 이벤트 타임라인 3개 (recentEvents/siteChanges/marketChanges) 는 30분 폴링용 별도 useEffect 로 분리.
+    // setLoading(false) 는 dashboard fetch 와 무관하게 즉시 — 페이지 골격 우선 표시.
+    // dashboard 빈 구조(_warming:true) 도착 시 stats 영역은 자체 폴링으로 데이터 채워짐.
+    setLoading(false)
     monitorApi.dashboard()
       .then(d => { if (d) setStats(d) })
       .catch(() => { /* ignore */ })
-      .finally(() => setLoading(false))
-
-    monitorApi.recentEvents(100)
-      .then(rows => {
-        setEvents(rows.map(row => ({
-          ...row,
-          source_site: normalizeWarroomSourceSite(row.source_site),
-        })))
-      })
-      .catch(() => { /* ignore */ })
-
-    monitorApi.siteChanges(5)
-      .then(c => {
-        if (!c || Object.keys(c).length === 0) return
-        setSiteChanges(normalizeWarroomSiteChanges(c))
-      })
-      .catch(() => { /* ignore */ })
-
-    monitorApi.marketChanges(5)
-      .then(c => { if (c && Object.keys(c).length > 0) setMarketChanges(c) })
-      .catch(() => { /* ignore */ })
-
-    monitorApi.storeScores()
-      .then(s => { if (s && Object.keys(s).length > 0) setStoreScores(s) })
-      .catch(() => { /* ignore */ })
-
-    ;(collectorApi.probeStatus().catch(() => ({})) as Promise<Record<string, Record<string, Record<string, unknown>>>>)
-      .then(p => { if (p && Object.keys(p).length > 0) setProbeData(p) })
 
     ;(async () => {
       const { getDeviceId } = await import('@/lib/samba/deviceId')
@@ -617,12 +742,21 @@ export default function WarroomPage() {
       return { st, dev }
     })()
       .then(async ({ st: atStatus, dev }) => {
-        // 본인 PC 인스턴스 기준 running/cycle 사용
+        // PC별 분리 표시 — 본인 dev 의 running 만 사용 (테넌트 합산 OR 제거).
+        // 이전: 다른 PC 가 켜지면 본인 UI 도 "실행중" 으로 뜨던 사고 → 2026-05-25 strict per-PC.
+        // did 불일치(서버 재시작 자동복원) 케이스는 사용자가 시작 버튼 누르면 본인 dev 로 정렬됨.
         handleAutotuneStatus(atStatus.running, atStatus.cycle_count, atStatus.last_tick, atStatus.refreshed_count || 0)
         setAutotuneRestarts(atStatus.restart_count || 0)
         // 본인 PC가 서버에서 실행 중으로 확인되면 intent='start'로 복원 (페이지 새로고침 대응)
+        // 단, 백엔드 enabled=false(사용자가 정지)면 intent를 'stop'으로 내려 자동재합류 차단.
+        // 정지 직후 코디네이터가 채 안 죽은 순간의 status 폴링이 intent를 'start'로 되살려
+        // 60초마다 재시작하던 "정지 안 됨" 루프의 근본 원인을 막는다.
         try {
-          if (atStatus.running && dev && (atStatus.running_pcs || []).includes(dev)) {
+          if (atStatus.enabled === false) {
+            if (window.localStorage.getItem('samba.autotune.userIntent') !== 'stop') {
+              window.localStorage.setItem('samba.autotune.userIntent', 'stop')
+            }
+          } else if (atStatus.running && dev && (atStatus.running_pcs || []).includes(dev)) {
             if (window.localStorage.getItem('samba.autotune.userIntent') !== 'start') {
               window.localStorage.setItem('samba.autotune.userIntent', 'start')
             }
@@ -640,27 +774,9 @@ export default function WarroomPage() {
           try {
             _lastAutoRejoinAt = Number(window.localStorage.getItem('samba.autotune.autoRejoinAt') || '0')
           } catch { /* ignore */ }
-          const cooldownPassed = now - Math.max(autoRejoinAtRef.current, _lastAutoRejoinAt) > 60_000
-          if (intent === 'start' && meMissing && cooldownPassed) {
-            autoRejoinAtRef.current = now
-            try { window.localStorage.setItem('samba.autotune.autoRejoinAt', String(now)) } catch { /* ignore */ }
-            // PC분담 재등록 — load() 클로저 stale 방지를 위해 ref에서 최신값 사용
-            const curFilter = filterSourcesOuterRef.current
-            const curAvail = availSourcesOuterRef.current
-            const sites = curFilter === null ? [...curAvail] : curFilter
-            await registerPcAllowedSites(sites)
-            // 오토튠 재시작 (본인 PC 한정)
-            await collectorApi.autotuneStart('registered', undefined, dev || undefined)
-            // 확장앱에도 재합류 신호
-            window.postMessage(
-              { source: 'samba-page', type: 'AUTOTUNE_SET_JOIN', joined: true, sourceSites: curFilter },
-              window.location.origin,
-            )
-            falseCountRef.current = 0
-            setAutotuneRunning(true)
-            // eslint-disable-next-line no-console
-            console.info('[오토튠] 백엔드 재시작 감지 — 자동 재등록 완료')
-          }
+          const cooldownPassed = now - Math.max(autoRejoinAtRef.current, _lastAutoRejoinAt) > 10_000
+          // (2026-05-25) 자동재합류 폐기 — 사용자가 명시 "오토튠 활성" 토글 ON 한 경우만 시작.
+          // 페이지 접속 + intent==='start' 흔적만으로 자동 register/autotuneStart 호출하던 사고 차단.
         } catch { /* ignore */ }
         // 소싱처 인터벌 동기화 (마운트 시 초기값 포함) — 별도 useEffect 제거하고 여기서 일원화
         if (atStatus.site_intervals) {
@@ -698,6 +814,34 @@ export default function WarroomPage() {
     const poll = setInterval(() => load(), POLL_INTERVAL)
     return () => clearInterval(poll)
   }, [load])
+
+  // 이벤트 타임라인 — 30분 폴링 (load() 10초 폴링에서 분리). autotune cycle 진행 시(handleAutotuneStatus) 즉시 갱신 트리거 유지.
+  useEffect(() => {
+    const fetchEventTimeline = () => {
+      monitorApi.recentEvents(100)
+        .then(rows => {
+          setEvents(rows.map(row => ({
+            ...row,
+            source_site: normalizeWarroomSourceSite(row.source_site),
+          })))
+        })
+        .catch(() => { /* ignore */ })
+
+      monitorApi.siteChanges(5)
+        .then(c => {
+          if (!c || Object.keys(c).length === 0) return
+          setSiteChanges(normalizeWarroomSiteChanges(c))
+        })
+        .catch(() => { /* ignore */ })
+
+      monitorApi.marketChanges(5)
+        .then(c => { if (c && Object.keys(c).length > 0) setMarketChanges(c) })
+        .catch(() => { /* ignore */ })
+    }
+    fetchEventTimeline()
+    const timer = setInterval(fetchEventTimeline, 30 * 60 * 1000)
+    return () => clearInterval(timer)
+  }, [])
 
   // 이벤트 필터링 — scheduler_cycle(1바퀴 단위) 소싱처별 최신 2건 표시
   // scheduler_tick(200건 배치 단위)은 타임라인에서 숨김 — 디버깅용 DB 잔존
@@ -749,6 +893,87 @@ export default function WarroomPage() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+      {/* 무신사 자동로그인계정 미설정/만료 경고 모달 */}
+      {musinsaAuthMissing && !musinsaAuthDismissed && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(4px)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ background: '#1A1A1A', border: '2px solid #FF4444', borderRadius: '16px', padding: '2rem', maxWidth: '480px', width: '90%', boxShadow: '0 8px 32px rgba(255,68,68,0.3)', position: 'relative' }}>
+            <button
+              aria-label='알람 닫기'
+              title='닫기'
+              onClick={() => setMusinsaAuthDismissed(true)}
+              style={{ position: 'absolute', top: '0.75rem', right: '0.75rem', width: '28px', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'transparent', border: 'none', borderRadius: '6px', color: '#AAA', fontSize: '1.25rem', fontWeight: 700, cursor: 'pointer', lineHeight: 1 }}
+            >
+              &#10005;
+            </button>
+            <div style={{ textAlign: 'center', marginBottom: '1.5rem' }}>
+              <div style={{ fontSize: '3rem', marginBottom: '0.75rem' }}>&#9888;</div>
+              <h3 style={{ fontSize: '1.25rem', fontWeight: 700, color: '#FF6B6B', marginBottom: '0.5rem' }}>무신사 원가 갱신 중단</h3>
+              <p style={{ fontSize: '0.875rem', color: '#AAA', lineHeight: 1.5 }}>
+                {musinsaAuthMissing.reason === 'cookie_expired'
+                  ? <>자동로그인계정 <b style={{ color: '#FFD' }}>{musinsaAuthMissing.account_label}</b>의 쿠키가 만료됨. 무신사 재로그인 필요.</>
+                  : musinsaAuthMissing.reason === 'no_cookie'
+                  ? <>자동로그인계정 <b style={{ color: '#FFD' }}>{musinsaAuthMissing.account_label}</b>에 쿠키 없음. 무신사 로그인 필요.</>
+                  : <>무신사 자동로그인계정 미설정. <b style={{ color: '#FFD' }}>설정 → 소싱처계정</b>에서 자동로그인 계정을 지정하세요.</>}
+                <br/>
+                <span style={{ color: '#FF8888' }}>cost 계산이 일관되지 않아 자동 갱신을 차단했습니다.</span>
+              </p>
+            </div>
+            <div style={{ display: 'flex', gap: '0.5rem' }}>
+              <button
+                onClick={() => setMusinsaAuthDismissed(true)}
+                style={{ flex: 1, padding: '0.75rem', background: 'transparent', border: '1px solid #444', borderRadius: '8px', color: '#AAA', fontSize: '0.9375rem', fontWeight: 600, cursor: 'pointer' }}
+              >
+                나중에
+              </button>
+              <button
+                onClick={() => { window.location.href = '/samba/settings#sourcing-accounts-MUSINSA' }}
+                style={{ flex: 2, padding: '0.75rem', background: '#FF4444', border: 'none', borderRadius: '8px', color: '#fff', fontSize: '0.9375rem', fontWeight: 700, cursor: 'pointer' }}
+              >
+                지금 설정하기
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* LOTTEON 데몬 미감지 안내 — 자동 다운로드 후 1번 실행 안내 */}
+      {autotuneDaemonAlive === false && (
+        <div style={{
+          padding: '0.75rem 1.25rem',
+          background: '#3D1F1F',
+          border: '1px solid #FF6B6B',
+          borderRadius: '8px',
+          color: '#FFE4E4',
+          fontSize: '0.875rem',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '1rem',
+        }}>
+          <div>
+            <strong style={{ color: '#FF8888' }}>오토튠 데몬 미감지</strong>
+            <span style={{ marginLeft: '0.5rem' }}>
+              방금 다운로드된 <code>autotune-daemon-setup*.exe</code> 를 1번만 실행해 주세요. 이후 자동으로 동작.
+            </span>
+          </div>
+          <button
+            onClick={() => { downloadDaemonInstaller(getOrCreateAutotuneDaemonDeviceId()) }}
+            style={{
+              padding: '0.4rem 0.8rem',
+              background: '#FF6B6B',
+              color: '#FFF',
+              border: 'none',
+              borderRadius: '6px',
+              fontSize: '0.8rem',
+              fontWeight: 700,
+              cursor: 'pointer',
+            }}
+          >
+            다시 다운로드
+          </button>
+        </div>
+      )}
+
       {/* A. 상단 상태바 */}
       <div
         style={{
@@ -765,11 +990,21 @@ export default function WarroomPage() {
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
             <span style={{ width: 8, height: 8, borderRadius: '50%', background: autotuneRunning ? '#51CF66' : '#FF6B6B', display: 'inline-block' }} />
             <span style={{ fontWeight: 700, color: '#FF8C00', fontSize: '0.875rem' }}>오토튠 모니터링</span>
-            {autotuneRunning && <span style={{ fontSize: '0.75rem', color: '#51CF66' }}>실행 중</span>}
-            {autotuneRunning && autotuneRestarts > 0 && <span style={{ fontSize: '0.75rem', color: '#FF6B6B' }}>재시작 {fmtNum(autotuneRestarts)}회</span>}
-            {!autotuneRunning && <span style={{ fontSize: '0.75rem', color: '#FF6B6B' }}>정지</span>}
+            {!pcDeviceId && <span style={{ fontSize: '0.75rem', color: '#FFB020' }}>확장앱 미감지 (시크릿창/포크 — 본인 PC만 제어 가능)</span>}
+            {pcDeviceId && autotuneRunning && <span style={{ fontSize: '0.75rem', color: '#51CF66' }}>실행 중</span>}
+            {pcDeviceId && autotuneRunning && autotuneRestarts > 0 && <span style={{ fontSize: '0.75rem', color: '#FF6B6B' }}>재시작 {fmtNum(autotuneRestarts)}회</span>}
+            {pcDeviceId && !autotuneRunning && <span style={{ fontSize: '0.75rem', color: '#FF6B6B' }}>정지</span>}
           </div>
           <div style={{ display: 'flex', gap: '0.5rem', fontSize: '0.8rem', color: '#888', alignItems: 'center' }}>
+            <button
+              onClick={() => { downloadDaemonInstaller(getOrCreateAutotuneDaemonDeviceId()) }}
+              title="데몬 설치/재설치 — 미감지 배너 없어도 항상 다운로드 가능"
+              style={{
+                padding: '0.25rem 0.6rem',
+                background: 'rgba(76,154,255,0.12)', border: '1px solid rgba(76,154,255,0.35)',
+                borderRadius: '6px', color: '#4C9AFF', fontSize: '0.75rem', fontWeight: 600, cursor: 'pointer',
+              }}
+            >데몬 다운로드</button>
             <input
               type="text"
               placeholder="상품번호"
@@ -784,6 +1019,7 @@ export default function WarroomPage() {
             />
             <button
             id="btn-autotune-start"
+            disabled={!pcDeviceId}
             onClick={async () => {
               try {
                 const { API_BASE_URL: apiBase } = await import('@/config/api')
@@ -802,6 +1038,13 @@ export default function WarroomPage() {
                   showAlert(res.error || '시작 실패', 'error')
                   return
                 }
+                // (옵션 C) 데몬 device 도 사이클 시작 — 같은 PC 의 데몬 분담 사이트 (SSG/ABC/GS/LOTTEON) 사이클 트리거
+                try {
+                  const daemonDev = (typeof window !== 'undefined' && window.localStorage.getItem('samba.autotune.daemon.deviceId')) || ''
+                  if (daemonDev) {
+                    await collectorApi.autotuneStart('registered', pno, daemonDev)
+                  }
+                } catch { /* 데몬 사이클 시작 실패는 무시 */ }
                 // 이 PC의 확장앱에만 폴링 합류 신호 전달 (다른 PC는 자동 편승 안 함)
                 // sourceSites: null=전체, [...]=지정 소싱처 — 불필요한 pre-login 차단
                 window.postMessage({ source: 'samba-page', type: 'AUTOTUNE_SET_JOIN', joined: true, sourceSites: filterSources }, window.location.origin)
@@ -810,30 +1053,38 @@ export default function WarroomPage() {
                 setAutotuneCycles(0)
                 if (pno) setSingleProductNo('')
                 // 사용자 의도 저장 — 백엔드 재시작 시 자동 재등록 트리거용
-                try { window.localStorage.setItem('samba.autotune.userIntent', 'start') } catch { /* ignore */ }
+                try {
+                  window.localStorage.setItem('samba.autotune.userIntent', 'start')
+                  // 정지 때 박아둔 24h autoRejoin 잠금 해제 — 사용자 명시 start 의도
+                  window.localStorage.removeItem('samba.autotune.autoRejoinAt')
+                } catch { /* ignore */ }
+                autoRejoinAtRef.current = 0
               } catch { /* ignore */ }
             }}
             style={{
               padding: '0.25rem 0.75rem',
-              background: 'rgba(34,197,94,0.12)',
-              border: '1px solid rgba(34,197,94,0.35)',
+              background: pcDeviceId ? 'rgba(34,197,94,0.12)' : 'rgba(100,100,100,0.12)',
+              border: `1px solid ${pcDeviceId ? 'rgba(34,197,94,0.35)' : 'rgba(100,100,100,0.35)'}`,
               borderRadius: '6px',
-              color: '#22C55E',
+              color: pcDeviceId ? '#22C55E' : '#666',
               fontSize: '0.8125rem',
               fontWeight: 600,
-              cursor: 'pointer',
+              cursor: pcDeviceId ? 'pointer' : 'not-allowed',
             }}
+            title={pcDeviceId ? '' : '확장앱/데몬 미감지 — 시크릿창에서는 제어 불가'}
           >시작</button>
           <button
+            disabled={!pcDeviceId}
             onClick={async () => {
               const { showAlert } = await import('@/components/samba/Modal')
               try {
                 const { API_BASE_URL: apiBase } = await import('@/config/api')
                 const { getDeviceId } = await import('@/lib/samba/deviceId')
                 const dev = getDeviceId()
-                // device_id 누락 가드 — 빈값으로 호출 시 백엔드가 HTTP 200 + {ok:false}로 응답해 silent fail 발생
+                // device_id 누락 가드 — 시크릿창/확장앱 미설치 시 버튼 자체가 disabled.
+                // 여기 도달 시 데몬 device 만 있는 케이스 → 정지 호출 불가 (확장앱 없음).
                 if (!dev) {
-                  showAlert('device_id 누락 — 확장앱 재로드 필요 (정지 안 됨)', 'error')
+                  showAlert('확장앱 device_id 미감지 — 시크릿창/확장앱 미설치에서는 정지 불가', 'error')
                   return
                 }
                 // 본인 PC만 정지 — 다른 PC는 영향 없음
@@ -848,7 +1099,26 @@ export default function WarroomPage() {
                   window.postMessage({ source: 'samba-page', type: 'AUTOTUNE_SET_JOIN', joined: false }, window.location.origin)
                   setAutotuneRunning(false)
                   falseCountRef.current = 0
-                  try { window.localStorage.setItem('samba.autotune.userIntent', 'stop') } catch { /* ignore */ }
+                  // (2026-05-25) 정지 시 분담 비우기 — backend pick_any_owner 매칭 차단.
+                  // 본인 PC device + 데몬 device 둘 다 register([]) → 다른 PC 가 잡 발행해도 본인 PC 미매칭.
+                  try {
+                    await registerPcAllowedSites([])
+                    const daemonDev = (typeof window !== 'undefined' && window.localStorage.getItem('samba.autotune.daemon.deviceId')) || ''
+                    if (daemonDev) {
+                      await fetchWithAuth(`${apiBase}/api/v1/samba/collector/autotune/pc-allowed-sites`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ device_id: daemonDev, sites: [] }),
+                      })
+                    }
+                  } catch { /* ignore */ }
+                  try {
+                    window.localStorage.setItem('samba.autotune.userIntent', 'stop')
+                    // 자동 재합류 24시간 잠금 — 다른 PC 실행 중이면 enabled=true 유지되어
+                    // cooldown 만료 후 autoRejoin 발동하던 사고 차단(2026-05-25 사용자 재요청).
+                    window.localStorage.setItem('samba.autotune.autoRejoinAt', String(Date.now() + 86400_000))
+                  } catch { /* ignore */ }
+                  autoRejoinAtRef.current = Date.now() + 86400_000
                   showAlert('이 PC 오토튠 정지 완료', 'success')
                 } else if (r.ok && data.ok === false) {
                   showAlert(`정지 실패 — ${data.error || '백엔드 거절'}`, 'error')
@@ -864,19 +1134,21 @@ export default function WarroomPage() {
             }}
             style={{
               padding: '0.25rem 0.75rem',
-              background: 'rgba(239,68,68,0.12)',
-              border: '1px solid rgba(239,68,68,0.35)',
+              background: pcDeviceId ? 'rgba(239,68,68,0.12)' : 'rgba(100,100,100,0.12)',
+              border: `1px solid ${pcDeviceId ? 'rgba(239,68,68,0.35)' : 'rgba(100,100,100,0.35)'}`,
               borderRadius: '6px',
-              color: '#EF4444',
+              color: pcDeviceId ? '#EF4444' : '#666',
               fontSize: '0.8125rem',
               fontWeight: 600,
-              cursor: 'pointer',
+              cursor: pcDeviceId ? 'pointer' : 'not-allowed',
             }}
+            title={pcDeviceId ? '' : '확장앱/데몬 미감지 — 시크릿창에서는 제어 불가'}
             >오토튠 정지</button>
           </div>
         </div>
-        {/* 소싱처 체크박스 */}
-        {availSources.length > 0 && (
+        {/* 소싱처 체크박스 — device_id 없으면 (시크릿창) 숨김.
+            null=전체체크 렌더가 다른 PC 분담을 침범하는 사고 차단(2026-05-25). */}
+        {availSources.length > 0 && pcDeviceId && (
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
             <span style={{ fontSize: '0.75rem', color: '#9AA5C0', fontWeight: 600, whiteSpace: 'nowrap' }}>소싱처</span>
             {availSources.map(src => {
@@ -896,8 +1168,8 @@ export default function WarroomPage() {
             })}
           </div>
         )}
-        {/* 판매처 체크박스 (마켓 단위) */}
-        {availMarkets.length > 0 && (
+        {/* 판매처 체크박스 (마켓 단위) — device_id 없으면 숨김 */}
+        {availMarkets.length > 0 && pcDeviceId && (
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
             <span style={{ fontSize: '0.75rem', color: '#9AA5C0', fontWeight: 600, whiteSpace: 'nowrap' }}>판매처</span>
             {availMarkets.map(mt => {
@@ -980,6 +1252,7 @@ export default function WarroomPage() {
         onStatusChange={handleAutotuneStatus}
         externalRunning={autotuneRunning}
         filterSources={filterSources}
+        deviceId={pcDeviceId}
       />
 
       {/* 이벤트 타임라인 (로그 아래) */}
@@ -1468,424 +1741,8 @@ export default function WarroomPage() {
         )}
       </div>
 
-      {/* A-2. 마켓별 스토어 현황 분석 */}
-      {false && (() => {
-        const MARKET_TABS = [
-          { key: 'smartstore', label: '스마트스토어', color: '#51CF66' },
-          { key: 'coupang', label: '쿠팡', color: '#FF6B6B' },
-          { key: '11st', label: '11번가', color: '#FFD93D' },
-          { key: 'lotteon', label: '롯데ON', color: '#FB923C' },
-          { key: 'ssg', label: 'SSG', color: '#A78BFA' },
-        ]
-        const GRADE_COLORS: Record<string, string> = {
-          '빅파워': '#FF8C00', '파워': '#4C9AFF', '프리미엄': '#51CF66', '새싹': '#34D399', '씨앗': '#888',
-          '연결됨': '#51CF66', '등록됨': '#4C9AFF', '인증 실패': '#FF6B6B', 'Vendor ID 없음': '#FFD93D',
-        }
-        const tabAccounts = Object.values(storeScores).filter(s => s.market_type === scoreTab)
 
-        return (
-          <div style={{ ...card, padding: '1rem 1.25rem' }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                <span style={{ fontSize: '0.875rem', fontWeight: 700, color: '#E5E5E5' }}>스토어 현황 분석</span>
-                <span style={{ fontSize: '0.7rem', color: '#666' }}>{fmtNum(tabAccounts.length)}개 계정</span>
-              </div>
-              <button
-                onClick={async () => {
-                  setScoreRefreshing(true)
-                  try {
-                    await monitorApi.refreshStoreScores()
-                    const scores = await monitorApi.storeScores()
-                    if (scores) setStoreScores(scores)
-                  } catch { /* ignore */ }
-                  setScoreRefreshing(false)
-                }}
-                style={{
-                  padding: '0.2rem 0.6rem', fontSize: '0.72rem', borderRadius: '5px', cursor: 'pointer',
-                  background: 'rgba(255,140,0,0.1)', border: '1px solid rgba(255,140,0,0.3)', color: '#FF8C00',
-                }}
-              >{scoreRefreshing ? '조회 중...' : '등급 새로고침'}</button>
-              {scoreTab === 'smartstore' && (
-                <button
-                  onClick={() => setShowPenaltyGuide(true)}
-                  style={{
-                    padding: '0.2rem 0.6rem', fontSize: '0.72rem', borderRadius: '5px', cursor: 'pointer',
-                    background: 'rgba(66,133,244,0.1)', border: '1px solid rgba(66,133,244,0.3)', color: '#4285F4',
-                  }}
-                >판매관리 기준</button>
-              )}
-            </div>
-            {/* 마켓 탭 */}
-            <div style={{ display: 'flex', gap: '0', marginBottom: '0.75rem', borderBottom: '1px solid #2D2D2D' }}>
-              {MARKET_TABS.map(tab => (
-                <button key={tab.key} onClick={() => setScoreTab(tab.key)} style={{
-                  padding: '0.4rem 1rem', fontSize: '0.78rem', fontWeight: scoreTab === tab.key ? 600 : 400, cursor: 'pointer',
-                  background: 'transparent', border: 'none', color: scoreTab === tab.key ? tab.color : '#666',
-                  borderBottom: scoreTab === tab.key ? `2px solid ${tab.color}` : '2px solid transparent',
-                }}>{tab.label}</button>
-              ))}
-            </div>
-            {/* 계정 카드 */}
-            {tabAccounts.length === 0 ? (
-              <div style={{ padding: '2rem', textAlign: 'center', color: '#555', fontSize: '0.8rem' }}>
-                등급 새로고침 버튼을 눌러 계정 정보를 조회하세요
-              </div>
-            ) : (
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '0.75rem' }}>
-                {tabAccounts.map(acc => (
-                  <div key={acc.account_id} style={{
-                    background: 'rgba(20,20,20,0.6)', border: '1px solid #2D2D2D', borderRadius: '10px', padding: '0.875rem',
-                  }}>
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.6rem' }}>
-                      <span style={{ fontSize: '0.78rem', fontWeight: 600, color: '#E5E5E5' }}>{acc.account_label}</span>
-                      {acc.grade && (
-                        <span style={{
-                          fontSize: '0.7rem', fontWeight: 700, padding: '2px 8px', borderRadius: '4px',
-                          background: `${GRADE_COLORS[acc.grade] || '#888'}20`,
-                          color: GRADE_COLORS[acc.grade] || '#888',
-                          border: `1px solid ${GRADE_COLORS[acc.grade] || '#888'}50`,
-                        }}>{acc.grade}</span>
-                      )}
-                    </div>
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem' }}>
-                      <div>
-                        <div style={{ fontSize: '0.65rem', color: '#666', marginBottom: '0.3rem' }}>굿서비스 점수</div>
-                        {acc.good_service ? (
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.2rem' }}>
-                            {Object.entries(acc.good_service).map(([k, v]) => (
-                              <div key={k} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem' }}>
-                                <span style={{ color: '#999' }}>{k}</span>
-                                <span style={{ color: v >= 80 ? '#51CF66' : v >= 50 ? '#FFD93D' : '#FF6B6B', fontWeight: 600 }}>{v}점</span>
-                              </div>
-                            ))}
-                          </div>
-                        ) : (
-                          <span style={{ fontSize: '0.7rem', color: '#555' }}>—</span>
-                        )}
-                      </div>
-                      <div>
-                        <div style={{ fontSize: '0.65rem', color: '#666', marginBottom: '0.3rem' }}>판매 패널티</div>
-                        <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.4rem' }}>
-                          <span style={{
-                            fontSize: '0.85rem', fontWeight: 700,
-                            color: (acc.penalty ?? 0) > 0 ? '#FF6B6B' : '#51CF66',
-                          }}>{acc.penalty ?? 0}점</span>
-                          <span style={{ fontSize: '0.68rem', color: '#888' }}>{acc.penalty_rate ?? 0}%</span>
-                        </div>
-                      </div>
-                      {(acc.max_products !== undefined && acc.max_products > 0) && (
-                      <div>
-                        <div style={{ fontSize: '0.65rem', color: '#666', marginBottom: '0.3rem' }}>등록 상품</div>
-                        <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.4rem' }}>
-                          <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#4C9AFF' }}>
-                            {fmtNum(acc.product_count ?? 0)}
-                          </span>
-                          <span style={{ fontSize: '0.68rem', color: '#888' }}>/ {fmtNum(acc.max_products)}</span>
-                        </div>
-                      </div>
-                      )}
-                    </div>
-                    {acc.updated_at && (
-                      <div style={{ fontSize: '0.58rem', color: '#444', marginTop: '0.4rem', textAlign: 'right' }}>
-                        {new Date(acc.updated_at).toLocaleString('ko')}
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )
-      })()}
 
-      {/* C. 소싱처/마켓 헬스 */}
-      <div style={{ display: 'none', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
-        {/* 소싱처 헬스 */}
-        <div style={card}>
-          <div style={{ fontSize: '0.8rem', fontWeight: 600, color: '#FF8C00', marginBottom: '0.75rem' }}>소싱처 상태</div>
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem' }}>
-            <thead>
-              <tr style={{ borderBottom: '1px solid #2D2D2D' }}>
-                <th style={{ textAlign: 'left', padding: '0.4rem 0.5rem', color: '#888', fontWeight: 500 }}>소싱처</th>
-                <th style={{ textAlign: 'center', padding: '0.4rem 0.5rem', color: '#888', fontWeight: 500 }}>상태</th>
-                <th style={{ textAlign: 'center', padding: '0.4rem 0.5rem', color: '#888', fontWeight: 500 }}>인터벌</th>
-                <th style={{ textAlign: 'center', padding: '0.4rem 0.5rem', color: '#888', fontWeight: 500 }}>에러</th>
-                <th style={{ textAlign: 'center', padding: '0.4rem 0.5rem', color: '#888', fontWeight: 500 }}>응답</th>
-              </tr>
-            </thead>
-            <tbody>
-              {Object.entries(site_health).map(([site, h]) => (
-                <tr key={site} style={{ borderBottom: '1px solid #1D1D1D' }}>
-                  <td style={{ padding: '0.4rem 0.5rem', color: '#E5E5E5' }}>{site}</td>
-                  <td style={{ padding: '0.4rem 0.5rem', textAlign: 'center' }}>
-                    <span style={{
-                      display: 'inline-flex', alignItems: 'center', gap: '0.25rem',
-                      color: h.probe_ok === true ? '#51CF66' : h.probe_ok === false ? '#FF6B6B' : '#888',
-                      fontSize: '0.75rem',
-                    }}>
-                      <span style={{
-                        width: 6, height: 6, borderRadius: '50%', display: 'inline-block',
-                        background: h.probe_ok === true ? '#51CF66' : h.probe_ok === false ? '#FF6B6B' : '#888',
-                      }} />
-                      {h.probe_ok === true ? '정상' : h.probe_ok === false ? '이상' : site === 'KREAM' ? '확장앱' : '-'}
-                    </span>
-                  </td>
-                  <td style={{ padding: '0.4rem 0.5rem', textAlign: 'center', color: h.interval > 2 ? '#FFD93D' : '#E5E5E5' }}>
-                    {h.interval.toFixed(1)}s
-                  </td>
-                  <td style={{ padding: '0.4rem 0.5rem', textAlign: 'center', color: h.errors > 0 ? '#FF6B6B' : '#E5E5E5' }}>
-                    {fmtNum(h.errors)}
-                  </td>
-                  <td style={{ padding: '0.4rem 0.5rem', textAlign: 'center', color: '#E5E5E5' }}>
-                    {h.latency_ms != null ? `${h.latency_ms}ms` : '-'}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-
-        {/* 마켓 헬스 */}
-        <div style={card}>
-          <div style={{ fontSize: '0.8rem', fontWeight: 600, color: '#FF8C00', marginBottom: '0.75rem' }}>마켓 상태</div>
-          {Object.keys(market_health).length === 0 ? (
-            <div style={{ fontSize: '0.8rem', color: '#666', padding: '1rem 0' }}>마켓 Probe 데이터 없음</div>
-          ) : (
-            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem' }}>
-              <thead>
-                <tr style={{ borderBottom: '1px solid #2D2D2D' }}>
-                  <th style={{ textAlign: 'left', padding: '0.4rem 0.5rem', color: '#888', fontWeight: 500 }}>마켓</th>
-                  <th style={{ textAlign: 'center', padding: '0.4rem 0.5rem', color: '#888', fontWeight: 500 }}>상태</th>
-                  <th style={{ textAlign: 'center', padding: '0.4rem 0.5rem', color: '#888', fontWeight: 500 }}>응답</th>
-                </tr>
-              </thead>
-              <tbody>
-                {Object.entries(market_health).map(([mt, h]) => (
-                  <tr key={mt} style={{ borderBottom: '1px solid #1D1D1D' }}>
-                    <td style={{ padding: '0.4rem 0.5rem', color: '#E5E5E5' }}>{mt}</td>
-                    <td style={{ padding: '0.4rem 0.5rem', textAlign: 'center' }}>
-                      <span style={{
-                        display: 'inline-flex', alignItems: 'center', gap: '0.25rem',
-                        color: h.probe_ok ? '#51CF66' : '#FF6B6B',
-                        fontSize: '0.75rem',
-                      }}>
-                        <span style={{
-                          width: 6, height: 6, borderRadius: '50%', display: 'inline-block',
-                          background: h.probe_ok ? '#51CF66' : '#FF6B6B',
-                        }} />
-                        {h.probe_ok ? '정상' : h.error || '이상'}
-                      </span>
-                    </td>
-                    <td style={{ padding: '0.4rem 0.5rem', textAlign: 'center', color: '#E5E5E5' }}>
-                      {h.latency_ms}ms
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </div>
-      </div>
-
-      {/* D. 24시간 가격 변동 추이 */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '1rem' }}>
-        {/* 24시간 세로 바 차트 */}
-        <div style={card}>
-          <div style={{ fontSize: '0.8rem', fontWeight: 600, color: '#FF8C00', marginBottom: '0.75rem' }}>24시간 가격 변동 추이</div>
-          <div style={{ display: 'flex', alignItems: 'flex-end', gap: '2px', height: '120px' }}>
-            {hourly_changes.map((v, i) => {
-              const heightPct = (v / maxHourly) * 100
-              return (
-                <div
-                  key={i}
-                  style={{
-                    flex: 1,
-                    display: 'flex',
-                    flexDirection: 'column',
-                    alignItems: 'center',
-                    justifyContent: 'flex-end',
-                    height: '100%',
-                  }}
-                >
-                  {v > 0 && (
-                    <span style={{ fontSize: '0.6rem', color: '#888', marginBottom: '2px' }}>{v}</span>
-                  )}
-                  <div
-                    style={{
-                      width: '100%',
-                      height: `${Math.max(heightPct, v > 0 ? 4 : 1)}%`,
-                      background: v > 0 ? '#FF8C00' : '#2D2D2D',
-                      borderRadius: '2px 2px 0 0',
-                      minHeight: '2px',
-                      transition: 'height 0.3s',
-                    }}
-                  />
-                </div>
-              )
-            })}
-          </div>
-          <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '4px', fontSize: '0.6rem', color: '#666' }}>
-            <span>0시</span>
-            <span>6시</span>
-            <span>12시</span>
-            <span>18시</span>
-            <span>23시</span>
-          </div>
-        </div>
-
-      </div>
-
-      {/* 소싱처/마켓 상태 대시보드 */}
-      <div style={{ ...card, display: 'none', padding: '1.5rem' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '1.25rem', flexWrap: 'wrap' }}>
-          <span style={{ fontSize: '0.9375rem', fontWeight: 700, color: '#51CF66' }}>소싱처/마켓 상태</span>
-          <span style={{ fontSize: '0.8125rem', color: '#666' }}>소싱처 API 구조 변경 및 마켓 인증 상태를 실시간으로 확인합니다.</span>
-          <button
-            onClick={runProbe}
-            disabled={probeLoading}
-            style={{ marginLeft: 'auto', background: probeLoading ? 'rgba(50,50,50,0.5)' : 'rgba(50,50,50,0.8)', border: '1px solid #3D3D3D', color: probeLoading ? '#666' : '#C5C5C5', padding: '0.3rem 0.875rem', borderRadius: '6px', fontSize: '0.8125rem', cursor: probeLoading ? 'default' : 'pointer' }}
-          >{probeLoading ? '체크 중...' : '수동 체크'}</button>
-        </div>
-
-        {/* 소싱처 */}
-        <div style={{ marginBottom: '1rem' }}>
-          <div style={{ fontSize: '0.8125rem', fontWeight: 600, color: '#888', marginBottom: '0.5rem' }}>소싱처</div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
-            {Object.entries(probeData?.sources || {}).length === 0 ? (
-              <span style={{ fontSize: '0.8125rem', color: '#555' }}>수동 체크 버튼으로 상태를 확인하세요</span>
-            ) : (
-              Object.entries(probeData?.sources || {}).map(([site, info]) => {
-                const d = info as Record<string, unknown>
-                const isOk = d.ok === true
-                const latency = Number(d.latency_ms || 0)
-                const missing = (d.missing_fields as string[]) || []
-                const error = d.error as string | null
-                const checkedAt = d.checked_at ? new Date(d.checked_at as string).toLocaleString('ko-KR', { hour12: false }) : '-'
-                return (
-                  <div key={site} style={{ padding: '0.625rem 1rem', borderRadius: '8px', minWidth: '200px', background: isOk ? 'rgba(81,207,102,0.08)' : 'rgba(255,107,107,0.08)', border: `1px solid ${isOk ? 'rgba(81,207,102,0.3)' : 'rgba(255,107,107,0.3)'}` }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.25rem' }}>
-                      <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: isOk ? '#51CF66' : '#FF6B6B' }} />
-                      <span style={{ fontWeight: 600, fontSize: '0.875rem', color: '#E5E5E5' }}>{site}</span>
-                      <span style={{ fontSize: '0.75rem', color: '#888' }}>{latency}ms</span>
-                    </div>
-                    {missing.length > 0 && <div style={{ fontSize: '0.75rem', color: '#FFD93D' }}>누락 필드: {missing.join(', ')}</div>}
-                    {error && <div style={{ fontSize: '0.75rem', color: '#FF6B6B' }}>{error}</div>}
-                    <div style={{ fontSize: '0.6875rem', color: '#555', marginTop: '0.25rem' }}>{checkedAt}</div>
-                  </div>
-                )
-              })
-            )}
-          </div>
-        </div>
-
-        {/* 마켓 */}
-        <div>
-          <div style={{ fontSize: '0.8125rem', fontWeight: 600, color: '#888', marginBottom: '0.5rem' }}>마켓</div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
-            {Object.entries(probeData?.markets || {}).length === 0 ? (
-              <span style={{ fontSize: '0.8125rem', color: '#555' }}>수동 체크 버튼으로 상태를 확인하세요</span>
-            ) : (
-              Object.entries(probeData?.markets || {}).map(([mt, info]) => {
-                const d = info as Record<string, unknown>
-                const isOk = d.ok === true
-                const latency = Number(d.latency_ms || 0)
-                const error = d.error as string | null
-                const checkedAt = d.checked_at ? new Date(d.checked_at as string).toLocaleString('ko-KR', { hour12: false }) : '-'
-                return (
-                  <div key={mt} style={{ padding: '0.5rem 0.875rem', borderRadius: '8px', minWidth: '140px', background: isOk ? 'rgba(81,207,102,0.06)' : error === '설정 없음' ? 'rgba(100,100,100,0.1)' : 'rgba(255,107,107,0.06)', border: `1px solid ${isOk ? 'rgba(81,207,102,0.25)' : error === '설정 없음' ? 'rgba(100,100,100,0.3)' : 'rgba(255,107,107,0.25)'}` }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.375rem', marginBottom: '0.125rem' }}>
-                      <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: isOk ? '#51CF66' : error === '설정 없음' ? '#555' : '#FF6B6B' }} />
-                      <span style={{ fontWeight: 600, fontSize: '0.8125rem', color: '#E5E5E5' }}>{mt}</span>
-                      {latency > 0 && <span style={{ fontSize: '0.6875rem', color: '#888' }}>{latency}ms</span>}
-                    </div>
-                    {error && <div style={{ fontSize: '0.6875rem', color: error === '설정 없음' ? '#666' : '#FF6B6B' }}>{error}</div>}
-                    <div style={{ fontSize: '0.625rem', color: '#555' }}>{checkedAt}</div>
-                  </div>
-                )
-              })
-            )}
-          </div>
-        </div>
-      </div>
-      {/* 스마트스토어 판매관리 기준 모달 */}
-      {showPenaltyGuide && (
-        <div style={{ position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', background: 'rgba(0,0,0,0.7)', zIndex: 9999, display: 'flex', justifyContent: 'center', alignItems: 'center' }} onClick={() => setShowPenaltyGuide(false)}>
-          <div style={{ background: '#1A1A1A', border: '1px solid #333', borderRadius: '12px', width: '90%', maxWidth: '900px', maxHeight: '85vh', overflow: 'auto', padding: '2rem' }} onClick={e => e.stopPropagation()}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
-              <h2 style={{ fontSize: '1.25rem', fontWeight: 700, color: '#4285F4' }}>스마트스토어 판매관리 프로그램</h2>
-              <button onClick={() => setShowPenaltyGuide(false)} style={{ background: 'none', border: 'none', color: '#888', fontSize: '1.5rem', cursor: 'pointer' }}>x</button>
-            </div>
-            <p style={{ fontSize: '0.8125rem', color: '#AAA', marginBottom: '1.5rem', lineHeight: 1.6 }}>
-              소비자 권익을 해칠 수 있는 판매활동이 확인되면 페널티가 부여되며, 점수가 누적되면 단계적 제재를 받습니다.
-            </p>
-            <h3 style={{ fontSize: '0.9375rem', fontWeight: 700, color: '#FF8C00', marginBottom: '0.75rem' }}>페널티 부과 기준</h3>
-            <div style={{ overflowX: 'auto', marginBottom: '1.5rem' }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.75rem', minWidth: '700px' }}>
-                <thead>
-                  <tr style={{ background: 'rgba(255,140,0,0.1)' }}>
-                    <th style={{ padding: '0.5rem', textAlign: 'left', color: '#FFB84D', borderBottom: '1px solid #333' }}>항목</th>
-                    <th style={{ padding: '0.5rem', textAlign: 'left', color: '#FFB84D', borderBottom: '1px solid #333' }}>상세 기준</th>
-                    <th style={{ padding: '0.5rem', textAlign: 'center', color: '#FFB84D', borderBottom: '1px solid #333' }}>일반</th>
-                    <th style={{ padding: '0.5rem', textAlign: 'center', color: '#FFB84D', borderBottom: '1px solid #333' }}>오늘출발</th>
-                    <th style={{ padding: '0.5rem', textAlign: 'center', color: '#FFB84D', borderBottom: '1px solid #333' }}>정기구독</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {[
-                    ['발송처리 지연', '발송처리기한까지 미발송', '1점', '1점', '1점'],
-                    ['발송처리 지연 (4영업일)', '발송처리기한 +4영업일 경과 후 미발송', '3점', '3점', '3점'],
-                    ['발송지연 후 미발송', '발송지연 처리 후 발송예정일까지 미발송', '2점', '3점', '3점'],
-                    ['허위 송장 (국내)', '송장 입력 +2영업일까지 배송상태 없음', '3점', '3점', '3점'],
-                    ['허위 송장 (해외)', '송장 입력 +15영업일까지 배송상태 없음', '3점', '3점', '3점'],
-                    ['품절취소', '취소 사유가 품절', '2점', '2점', '3점'],
-                    ['품절취소 (선물하기)', '선물하기 주문 품절 취소', '3점', '3점', '-'],
-                    ['반품 처리지연', '수거 완료일 +3영업일 이상 경과', '1점', '1점', '1점'],
-                    ['교환 처리지연', '수거 완료일 +3영업일 이상 경과', '1점', '1점', '1점'],
-                  ].map(([item, desc, normal, today, sub], i) => (
-                    <tr key={i} style={{ borderBottom: '1px solid rgba(45,45,45,0.5)' }}>
-                      <td style={{ padding: '0.5rem', color: '#E5E5E5', fontWeight: 600 }}>{item}</td>
-                      <td style={{ padding: '0.5rem', color: '#AAA' }}>{desc}</td>
-                      <td style={{ padding: '0.5rem', textAlign: 'center', color: '#FF6B6B', fontWeight: 600 }}>{normal}</td>
-                      <td style={{ padding: '0.5rem', textAlign: 'center', color: '#FF6B6B', fontWeight: 600 }}>{today}</td>
-                      <td style={{ padding: '0.5rem', textAlign: 'center', color: '#FF6B6B', fontWeight: 600 }}>{sub}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <h3 style={{ fontSize: '0.9375rem', fontWeight: 700, color: '#FF8C00', marginBottom: '0.75rem' }}>발송처리기한</h3>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem', marginBottom: '1.5rem' }}>
-              {[
-                ['일반 발송', '결제완료일 + 3영업일'],
-                ['오늘 출발', '설정시간 내 결제 → 당일 / 이후 → +1영업일'],
-                ['정기 구독', '결제완료일 + 1영업일'],
-                ['희망배송일', '희망배송일 당일'],
-              ].map(([type, limit], i) => (
-                <div key={i} style={{ background: 'rgba(30,30,30,0.8)', padding: '0.625rem 0.75rem', borderRadius: '6px', border: '1px solid #2D2D2D' }}>
-                  <span style={{ fontSize: '0.75rem', fontWeight: 600, color: '#FFB84D' }}>{type}</span>
-                  <span style={{ fontSize: '0.75rem', color: '#AAA', marginLeft: '0.5rem' }}>{limit}</span>
-                </div>
-              ))}
-            </div>
-            <h3 style={{ fontSize: '0.9375rem', fontWeight: 700, color: '#FF8C00', marginBottom: '0.75rem' }}>단계별 제재</h3>
-            <p style={{ fontSize: '0.75rem', color: '#888', marginBottom: '0.75rem' }}>최근 30일 페널티 10점 이상 + 페널티 비율 40% 이상 시 적용 (마지막 제재일로부터 1년간 누적)</p>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '0.75rem' }}>
-              <div style={{ background: 'rgba(255,200,50,0.08)', padding: '1rem', borderRadius: '8px', border: '1px solid rgba(255,200,50,0.2)' }}>
-                <div style={{ fontSize: '0.875rem', fontWeight: 700, color: '#FFD93D', marginBottom: '0.5rem' }}>1단계 — 주의</div>
-                <p style={{ fontSize: '0.7rem', color: '#AAA', lineHeight: 1.5 }}>최초 발생 시 주의 통보. 제재 없음.</p>
-              </div>
-              <div style={{ background: 'rgba(255,140,0,0.08)', padding: '1rem', borderRadius: '8px', border: '1px solid rgba(255,140,0,0.2)' }}>
-                <div style={{ fontSize: '0.875rem', fontWeight: 700, color: '#FF8C00', marginBottom: '0.5rem' }}>2단계 — 경고</div>
-                <p style={{ fontSize: '0.7rem', color: '#AAA', lineHeight: 1.5 }}>7일간 신규 상품 등록 금지 (센터 + API)</p>
-              </div>
-              <div style={{ background: 'rgba(255,80,80,0.08)', padding: '1rem', borderRadius: '8px', border: '1px solid rgba(255,80,80,0.2)' }}>
-                <div style={{ fontSize: '0.875rem', fontWeight: 700, color: '#FF6B6B', marginBottom: '0.5rem' }}>3단계 — 이용제한</div>
-                <p style={{ fontSize: '0.7rem', color: '#AAA', lineHeight: 1.5 }}>판매 활동 전면 제한, 정산 비즈월렛 전환</p>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   )
 }

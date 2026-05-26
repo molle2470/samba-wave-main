@@ -951,6 +951,29 @@ class SambaTetrisService:
                 tenant_id, product_ids, market_account_id, source_site, brand_name
             )
 
+        # issue #219 — 레거시 블럭 삭제 후 sync_all 보충등록 재발 방지 영구 마커.
+        # delete_market 잡 완료 후 pending_delete_keys 가드가 풀려도 excluded=True 배치가
+        # 남아있으면 sync_all 레거시 루프가 (site, brand, account) 를 재등록 대상에서 제외.
+        try:
+            _existing = await self._repo.find_existing(
+                tenant_id, source_site, brand_name, market_account_id
+            )
+            if _existing is None:
+                await self._repo.create_async(
+                    tenant_id=tenant_id,
+                    source_site=source_site,
+                    brand_name=brand_name,
+                    market_account_id=market_account_id,
+                    policy_id=None,
+                    position_order=0,
+                    excluded=True,
+                )
+                logger.info(
+                    f"[테트리스] 레거시 영구 배제 마커 생성 — {source_site}/{brand_name} ← {market_account_id}"
+                )
+        except Exception as _e:
+            logger.warning(f"[테트리스] 레거시 영구 배제 마커 생성 실패(무시): {_e}")
+
         logger.info(
             f"[테트리스] remove_by_brand 완료 — {source_site}/{brand_name} ← {market_account_id} "
             f"(pending취소={pending_cancelled}, delete_market잡={len(product_ids)}건)"

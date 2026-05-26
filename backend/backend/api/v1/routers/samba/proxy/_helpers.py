@@ -19,12 +19,36 @@ async def _get_setting(
     """samba_settings 테이블에서 설정값 조회 (암호화 키는 자동 복호화).
 
     tenant_id 지정 시 '{tenant_id}:{key}' 형식으로 조회 — 멀티테넌트 환경 지원.
+    tenant_id 미지정 시 bare 키 우선 → 단일 테넌트 환경에서 '{*}:{key}' 자동 폴백
+    (워커/플러그인이 HTTP 컨텍스트 없이 호출하는 경우 대비).
     """
+    from sqlalchemy import select
     from backend.utils.crypto import is_encrypted_key, decrypt_value
+    from backend.domain.samba.forbidden.model import SambaSettings
 
     effective_key = f"{tenant_id}:{key}" if tenant_id else key
     repo = SambaSettingsRepository(session)
     row = await repo.find_by_async(key=effective_key)
+    # 멀티테넌트 격리(2026-05-18) 이전 저장 데이터는 bare 키로 남아있음 → 폴백
+    if row is None and tenant_id:
+        row = await repo.find_by_async(key=key)
+    # tenant_id 미지정 + bare 미존재 → 테넌트 prefixed 키 자동 폴백
+    # 워커/dispatcher/plugins가 HTTP request 없이 호출하는 경우 처리.
+    # 다중 매칭 시 가장 먼저 발견된 1개 반환 (단일 테넌트 환경 가정).
+    if row is None and not tenant_id:
+        stmt = select(SambaSettings).where(SambaSettings.key.like(f"%:{key}")).limit(2)
+        result = await session.execute(stmt)
+        candidates = result.scalars().all()
+        if len(candidates) == 1:
+            row = candidates[0]
+        elif len(candidates) > 1:
+            from backend.utils.logger import logger as _lg
+
+            _lg.warning(
+                f"[_get_setting] tenant_id 미지정 + 다중 테넌트 후보 {len(candidates)}개 — "
+                f"key={key!r} 첫번째 사용. 호출자 tenant_id 전달 필요."
+            )
+            row = candidates[0]
     if row:
         val = row.value
         if val and is_encrypted_key(key) and isinstance(val, str):

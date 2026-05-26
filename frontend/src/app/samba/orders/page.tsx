@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useCallback, useMemo } from 'react'
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import { useSearchParams } from 'next/navigation'
 import {
   orderApi,
@@ -8,7 +8,6 @@ import {
   accountApi,
   proxyApi,
   collectorApi,
-  forbiddenApi,
   type SambaOrder,
   type SambaChannel,
   type SambaMarketAccount,
@@ -337,25 +336,32 @@ export default function OrdersPage() {
     window.addEventListener('reset-orders-filter', handler)
     return () => window.removeEventListener('reset-orders-filter', handler)
   }, [])
-  // 마운트 1회 — 5개 메타 API를 하나의 useEffect에서 동시 호출 (DB 커넥션 경합 최소화)
+  // 마운트 1회 — 드롭다운 우선 메타데이터 (localStorage 캐시 + 백그라운드 갱신).
   useEffect(() => {
-    Promise.all([
-      channelApi.list().then(setChannels).catch(() => {}),
-      accountApi.listActive().then(setAccounts).catch(() => {}),
-      sourcingAccountApi.list().then(accs => setSourcingAccounts(accs.filter(a => a.is_active))).catch(() => {}),
-      proxyApi.aligoRemain().then(r => { if (r.success) setSmsRemain(r) }).catch(() => {}),
-      forbiddenApi.getSetting('store_playauto').then(data => {
-        const d = data as Record<string, string> | null
-        if (!d) return
-        const map: Record<string, string> = {}
-        for (const k of ['alias1', 'alias2', 'alias3', 'alias4', 'alias5']) {
-          const v = d[k] || ''
-          const { code, alias } = parsePlayautoAliasEntry(v)
-          if (code && alias) map[code] = alias
-        }
-        setSiteAliasMap(map)
-      }).catch(() => {}),
-    ])
+    channelApi.list().then(setChannels).catch(() => {})
+    accountApi.listActiveCached(setAccounts)
+    sourcingAccountApi.list().then(accs => setSourcingAccounts(accs.filter(a => a.is_active))).catch(() => {})
+  }, [])
+
+  // 별칭 매핑 — 2026-05-25 store_* samba_settings 폐기 후 samba_market_account.additional_fields 가
+  // 단일 진실 출처. 활성 playauto 계정들의 alias1~5 모두 머지 (멀티계정 환경 대응).
+  useEffect(() => {
+    const map: Record<string, string> = {}
+    for (const acc of accounts) {
+      if (acc.market_type !== 'playauto' || !acc.is_active) continue
+      const af = (acc.additional_fields || {}) as Record<string, unknown>
+      for (const k of ['alias1', 'alias2', 'alias3', 'alias4', 'alias5']) {
+        const v = String(af[k] || '')
+        const { code, alias } = parsePlayautoAliasEntry(v)
+        if (code && alias) map[code] = alias
+      }
+    }
+    setSiteAliasMap(map)
+  }, [accounts])
+
+  // 외부 알리고 SMS 잔여건수 — 외부 API 지연이 드롭다운 표시를 막지 않도록 분리.
+  useEffect(() => {
+    proxyApi.aligoRemain().then(r => { if (r.success) setSmsRemain(r) }).catch(() => {})
   }, [])
 
   const { syncing, syncAccountId, setSyncAccountId, handleFetch } = useOrderSync({
@@ -474,8 +480,15 @@ export default function OrdersPage() {
 
   // 모달이 열려있고 처리 중인 잡(PENDING/DISPATCHED)이 있으면 5초 폴링
   // 배치 id로만 조회하므로 행 추가/제거 없이 셀 값만 갱신 — 리스트 출렁임 없음
+  // SENT_TO_MARKET 카운트 증가 감지 시 주문 테이블 reload —
+  // 백엔드가 dispatch 성공 시 order.status='shipping' / shipping_status='국내배송중'
+  // 으로 갱신하므로 드롭박스가 자동으로 '국내배송중' 으로 바뀐다.
+  const lastSentCountRef = useRef<number>(0)
   useEffect(() => {
-    if (!trackingStatusOpen) return
+    if (!trackingStatusOpen) {
+      lastSentCountRef.current = 0
+      return
+    }
     refreshTrackingStatus()
     const interval = setInterval(() => {
       const inFlight = (trackingStatusData?.counts.PENDING || 0)
@@ -484,6 +497,15 @@ export default function OrdersPage() {
     }, 5000)
     return () => clearInterval(interval)
   }, [trackingStatusOpen, trackingStatusData, refreshTrackingStatus])
+
+  // dispatch 성공 카운트(SENT_TO_MARKET) 증가 감지 → 드롭박스 즉시 갱신
+  useEffect(() => {
+    const sentCount = trackingStatusData?.counts.SENT_TO_MARKET || 0
+    if (sentCount > lastSentCountRef.current) {
+      lastSentCountRef.current = sentCount
+      loadOrders()
+    }
+  }, [trackingStatusData, loadOrders])
 
   const handleTrackingSyncOne = async (o: SambaOrder) => {
     try {
@@ -553,55 +575,6 @@ export default function OrdersPage() {
   
   return (
     <div style={{ color: '#E5E5E5' }}>
-      <OrdersTopBar
-        notifications={notifications}
-        setNotifications={setNotifications}
-        setStatusFilter={setStatusFilter}
-        setMarketStatus={setMarketStatus}
-        setCustomStart={setCustomStart}
-        setCustomEnd={setCustomEnd}
-        setPeriod={setPeriod}
-        isProductMode={isProductMode}
-        cpId={cpId}
-        cpName={cpName}
-        filteredOrdersCount={totalCount}
-        pendingCount={pendingCount}
-        smsRemain={smsRemain}
-        logMessages={logMessages}
-        setLogMessages={setLogMessages}
-      />
-
-      <OrdersFilterBar
-        isProductMode={isProductMode}
-        period={period} setPeriod={setPeriod}
-        customStart={customStart} setCustomStart={setCustomStart}
-        customEnd={customEnd} setCustomEnd={setCustomEnd}
-        startLocked={startLocked} setStartLocked={setStartLocked}
-        dateLocked={dateLocked} setDateLocked={setDateLocked}
-        syncAccountId={syncAccountId} setSyncAccountId={setSyncAccountId}
-        syncing={syncing} handleFetch={handleFetch}
-        bulkStatus={bulkStatus} setBulkStatus={setBulkStatus}
-        bulkUpdating={bulkUpdating} handleBulkAction={handleBulkAction}
-        selectedIdsSize={selectedIds.size}
-        filteredOrdersCount={totalCount}
-        filteredOrdersTotalSale={totalSale}
-        searchCategory={searchCategory} setSearchCategory={setSearchCategory}
-        searchText={searchText} setSearchText={setSearchText}
-        loadOrders={applySearch}
-        marketFilter={marketFilter} setMarketFilter={setMarketFilter}
-        siteFilter={siteFilter} setSiteFilter={setSiteFilter}
-        accountFilter={accountFilter} setAccountFilter={setAccountFilter}
-        marketStatus={marketStatus} setMarketStatus={setMarketStatus}
-        registrationFilter={registrationFilter} setRegistrationFilter={setRegistrationFilter}
-        inputFilter={inputFilter} setInputFilter={setInputFilter}
-        invoiceFilter={invoiceFilter} setInvoiceFilter={setInvoiceFilter}
-        statusFilter={statusFilter} setStatusFilter={setStatusFilter}
-        sortBy={sortBy} setSortBy={setSortBy}
-        pageSize={pageSize} setPageSize={setPageSize}
-        accounts={accounts} sourcingAccounts={sourcingAccounts}
-        siteOptions={siteOptions}
-      />
-
       {/* 주문 자동실행 토글바 — 주문가져오기 + 송장수집 인터벌 자동 실행 */}
       <div style={{
         padding: '0.75rem 1rem', margin: '6px 0',
@@ -730,6 +703,55 @@ export default function OrdersPage() {
           </div>
         )}
       </div>
+
+      <OrdersTopBar
+        notifications={notifications}
+        setNotifications={setNotifications}
+        setStatusFilter={setStatusFilter}
+        setMarketStatus={setMarketStatus}
+        setCustomStart={setCustomStart}
+        setCustomEnd={setCustomEnd}
+        setPeriod={setPeriod}
+        isProductMode={isProductMode}
+        cpId={cpId}
+        cpName={cpName}
+        filteredOrdersCount={totalCount}
+        pendingCount={pendingCount}
+        smsRemain={smsRemain}
+        logMessages={logMessages}
+        setLogMessages={setLogMessages}
+      />
+
+      <OrdersFilterBar
+        isProductMode={isProductMode}
+        period={period} setPeriod={setPeriod}
+        customStart={customStart} setCustomStart={setCustomStart}
+        customEnd={customEnd} setCustomEnd={setCustomEnd}
+        startLocked={startLocked} setStartLocked={setStartLocked}
+        dateLocked={dateLocked} setDateLocked={setDateLocked}
+        syncAccountId={syncAccountId} setSyncAccountId={setSyncAccountId}
+        syncing={syncing} handleFetch={handleFetch}
+        bulkStatus={bulkStatus} setBulkStatus={setBulkStatus}
+        bulkUpdating={bulkUpdating} handleBulkAction={handleBulkAction}
+        selectedIdsSize={selectedIds.size}
+        filteredOrdersCount={totalCount}
+        filteredOrdersTotalSale={totalSale}
+        searchCategory={searchCategory} setSearchCategory={setSearchCategory}
+        searchText={searchText} setSearchText={setSearchText}
+        loadOrders={applySearch}
+        marketFilter={marketFilter} setMarketFilter={setMarketFilter}
+        siteFilter={siteFilter} setSiteFilter={setSiteFilter}
+        accountFilter={accountFilter} setAccountFilter={setAccountFilter}
+        marketStatus={marketStatus} setMarketStatus={setMarketStatus}
+        registrationFilter={registrationFilter} setRegistrationFilter={setRegistrationFilter}
+        inputFilter={inputFilter} setInputFilter={setInputFilter}
+        invoiceFilter={invoiceFilter} setInvoiceFilter={setInvoiceFilter}
+        statusFilter={statusFilter} setStatusFilter={setStatusFilter}
+        sortBy={sortBy} setSortBy={setSortBy}
+        pageSize={pageSize} setPageSize={setPageSize}
+        accounts={accounts} sourcingAccounts={sourcingAccounts}
+        siteOptions={siteOptions}
+      />
 
       {/* 송장 자동전송 미니바 — 일괄 트리거 + 안내 */}
       <div style={{
@@ -931,6 +953,8 @@ export default function OrdersPage() {
             //  되어 사용자가 결과 보러 닫을 때마다 송장수집 무효화되던 사고 차단)
             // 진짜 취소 의도는 별도 "취소" 버튼 명시 클릭만 인정.
             setTrackingStatusOpen(false)
+            // dispatch 성공으로 status='shipping'(국내배송중) 갱신된 주문 반영
+            loadOrders()
           }}
           style={{
             position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',

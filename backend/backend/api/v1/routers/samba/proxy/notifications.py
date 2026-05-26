@@ -28,9 +28,10 @@ router = APIRouter(tags=["samba-proxy"])
 @router.post("/aligo/remain")
 async def aligo_remain(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """알리고 SMS 잔여건수 조회."""
-    creds = await _get_setting(session, "aligo_sms")
+    creds = await _get_setting(session, "aligo_sms", tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "SMS 설정이 저장되지 않았습니다."}
 
@@ -85,7 +86,7 @@ async def aligo_send_sms(
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """알리고 SMS/LMS 발송."""
-    creds = await _get_setting(session, "aligo_sms")
+    creds = await _get_setting(session, "aligo_sms", tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "SMS 설정이 저장되지 않았습니다."}
 
@@ -185,11 +186,11 @@ async def aligo_send_kakao(
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """알리고 카카오 알림톡/친구톡 발송."""
-    creds = await _get_setting(session, "aligo_sms")
+    creds = await _get_setting(session, "aligo_sms", tenant_id)
     if not creds or not isinstance(creds, dict):
         return {"success": False, "message": "SMS 설정이 저장되지 않았습니다."}
 
-    kakao_creds = await _get_setting(session, "aligo_kakao")
+    kakao_creds = await _get_setting(session, "aligo_kakao", tenant_id)
 
     api_key = creds.get("apiKey", "")
     user_id = creds.get("userId", "")

@@ -1566,7 +1566,9 @@ class SSGClient:
             }
         }
         try:
-            data = await self._call_api("POST", "/api/pd/1/listWarehouseOut.ssg", body=body)
+            data = await self._call_api(
+                "POST", "/api/pd/1/listWarehouseOut.ssg", body=body
+            )
         except Exception as e:
             logger.warning(f"[SSG 출고대기] listWarehouseOut 조회 실패: {e}")
             return []
@@ -1747,12 +1749,12 @@ class SSGClient:
         ord_item_seq = str(raw.get("ordItemSeq", "") or "")
         or_ord_no = str(raw.get("orordNo", "") or "")
         item_id_str = str(raw.get("itemId", "") or "")
-        product_image = ""
-        if len(item_id_str) >= 6:
-            d1, d2, d3 = item_id_str[-2:], item_id_str[-4:-2], item_id_str[-6:-4]
-            product_image = (
-                f"https://sitem.ssgcdn.com/{d1}/{d2}/{d3}/item/{item_id_str}_i1_250.jpg"
-            )
+        # 미등록 주문에 부정확한 사진이 매칭되던 문제로 product_image 자동 합성 제거.
+        # source_url(소싱처 원문)에는 SSG 판매페이지를 넣지 않는다. itemView.ssg?itemId=
+        # 는 신세계몰 '판매' 리스팅이지 소싱처 원문이 아니므로, 화면 소싱처 배지/원문링크/
+        # 원주문링크가 실제 소싱처(예: ABCmart)를 SSG로 오인하게 만든다. 판매링크는 프론트
+        # handleMarketLink가 product_id로 따로 생성하므로 source_url 불필요.
+        source_url = ""
         return {
             "order_number": ord_no,
             # 형식: "|ordItemSeq" (shppNo 없음, 취소신청에는 배송번호 불필요; orordNo는 order_number에 존재)
@@ -1762,7 +1764,8 @@ class SSGClient:
             "product_id": item_id_str,
             "product_name": str(raw.get("itemNm", "") or ""),
             "product_option": str(raw.get("uitemNm", "") or ""),
-            "product_image": product_image,
+            "product_image": "",
+            "source_url": source_url,
             "customer_name": "",
             "customer_phone": "",
             "customer_address": "",
@@ -2019,8 +2022,7 @@ class SSGClient:
         ord_item_div = str(raw.get("ordItemDiv", ""))
         # listWarehouseOut은 lastShppProgStatDtlCd, listShppDirection은 shppProgStatDtlCd
         shpp_prog = str(
-            raw.get("lastShppProgStatDtlCd", "")
-            or raw.get("shppProgStatDtlCd", "")
+            raw.get("lastShppProgStatDtlCd", "") or raw.get("shppProgStatDtlCd", "")
         )
 
         # 상태 매핑
@@ -2033,13 +2035,13 @@ class SSGClient:
         elif shpp_prog == "11":
             status, shipping_status = "pending", "상품준비중"
         elif shpp_prog in ("21", "22", "31"):
-            status, shipping_status = "pending", "출고대기"
+            status, shipping_status = "pending", "주문접수"
         elif shpp_prog == "41":
-            status, shipping_status = "pending", "출고대기"
+            status, shipping_status = "pending", "주문접수"
         elif shpp_prog == "42":
             status, shipping_status = "pending", "출고보류"
         elif shpp_prog == "43":
-            status, shipping_status = "shipped", "배송중"
+            status, shipping_status = "shipped", "국내배송중"
         elif shpp_prog == "51":
             status, shipping_status = "delivered", "배송완료"
         else:
@@ -2048,9 +2050,13 @@ class SSGClient:
         rl_ord_amt = float(raw.get("rlordAmt", 0) or 0)
         dc_amt = float(raw.get("dcAmt", 0) or 0)
         sell_price = float(raw.get("sellprc", 0) or 0) or (rl_ord_amt + dc_amt)
-        spl_prc = float(raw.get("splprc", 0) or raw.get("splPrc", 0) or 0)  # listWarehouseOut은 splPrc
+        spl_prc = float(
+            raw.get("splprc", 0) or raw.get("splPrc", 0) or 0
+        )  # listWarehouseOut은 splPrc
         # 수령인 우선, 없으면 주문자 fallback (str 정규화)
         customer_name = str(raw.get("rcptpeNm", "") or raw.get("ordpeNm", "") or "")
+        # 주문자명 — SSG ordpeNm (수령인 rcptpeNm과 다를 수 있음: 선물하기 등)
+        orderer_name = str(raw.get("ordpeNm", "") or raw.get("rcptpeNm", "") or "")
         # 수령인 연락처 우선 (휴대폰 → 집전화 → 주문자 휴대폰)
         customer_phone = str(
             raw.get("rcptpeHpno", "")
@@ -2064,14 +2070,13 @@ class SSGClient:
             (f"{bsc} {dtl}".strip() if bsc else "") or raw.get("shpplocAddr", "") or ""
         )
 
-        # SSG CDN 이미지 URL 생성 (itemId 끝 6자리 역순 2글자씩)
         item_id_str = str(raw.get("itemId", "") or "")
-        product_image = ""
-        if len(item_id_str) >= 6:
-            d1, d2, d3 = item_id_str[-2:], item_id_str[-4:-2], item_id_str[-6:-4]
-            product_image = (
-                f"https://sitem.ssgcdn.com/{d1}/{d2}/{d3}/item/{item_id_str}_i1_250.jpg"
-            )
+        # 미등록 주문에 부정확한 사진이 매칭되던 문제로 product_image 자동 합성 제거.
+        # source_url(소싱처 원문)에는 SSG 판매페이지를 넣지 않는다. itemView.ssg?itemId=
+        # 는 신세계몰 '판매' 리스팅이지 소싱처 원문이 아니므로, 화면 소싱처 배지/원문링크/
+        # 원주문링크가 실제 소싱처(예: ABCmart)를 SSG로 오인하게 만든다. 판매링크는 프론트
+        # handleMarketLink가 product_id로 따로 생성하므로 source_url 불필요.
+        source_url = ""
 
         item_nm = str(raw.get("itemNm", "") or "")
         raw_keys = list(raw.keys())
@@ -2134,8 +2139,10 @@ class SSGClient:
             "product_id": item_id_str,
             "product_name": item_nm,
             "product_option": str(raw.get("uitemNm", "") or ""),
-            "product_image": product_image,
+            "product_image": "",
+            "source_url": source_url,
             "customer_name": customer_name,
+            "orderer_name": orderer_name,
             "customer_phone": customer_phone,
             "customer_address": customer_address,
             "quantity": raw.get("ordQty", 1) or 1,

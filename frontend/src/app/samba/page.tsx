@@ -136,9 +136,9 @@ export default function SambaDashboard() {
     totalSale: w.sales,
     fulfillmentSale: w.fulfillmentSales,
     rate: w.sales > 0 ? Math.round(w.fulfillmentSales / w.sales * 100) : 0,
-    newRegistered: w.newRegistered ?? 0,
+    newRegistered: w.newRegistered as number | null | undefined,
     marketDeleted: w.marketDeleted ?? 0,
-    registeredCount: w.registeredCount ?? 0,
+    registeredCount: w.registeredCount as number | null | undefined,
     collectedCount: w.collectedCount ?? 0,
   }))
   const monthlyData = stats?.monthly || []
@@ -288,9 +288,9 @@ export default function SambaDashboard() {
                   <td style={{ padding: '0.625rem 0', textAlign: 'right', color: '#E5E5E5' }}>₩{fmtNum(d.totalSale)}</td>
                   <td style={{ padding: '0.625rem 0', textAlign: 'right', color: '#E5E5E5' }}>₩{fmtNum(d.fulfillmentSale)}</td>
                   <td style={{ padding: '0.625rem 0', textAlign: 'right', color: '#E5E5E5' }}>{d.rate}%</td>
-                  <td style={{ padding: '0.625rem 0', textAlign: 'right', color: '#E5E5E5' }}>{fmtNum(d.newRegistered)}</td>
+                  <td style={{ padding: '0.625rem 0', textAlign: 'right', color: '#E5E5E5' }}>{d.newRegistered == null ? '—' : fmtNum(d.newRegistered)}</td>
                   <td style={{ padding: '0.625rem 0', textAlign: 'right', color: '#E5E5E5' }}>{fmtNum(d.marketDeleted)}</td>
-                  <td style={{ padding: '0.625rem 0', textAlign: 'right', color: '#FF8C00' }}>{fmtNum(d.registeredCount)}</td>
+                  <td style={{ padding: '0.625rem 0', textAlign: 'right', color: '#FF8C00' }}>{d.registeredCount == null ? '—' : fmtNum(d.registeredCount)}</td>
                   <td style={{ padding: '0.625rem 0', textAlign: 'right', color: '#E5E5E5' }}>{fmtNum(d.collectedCount)}</td>
                 </tr>
               ))}

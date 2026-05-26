@@ -131,7 +131,6 @@ async def create_user(
     tenant = SambaTenant(
         name=body.name,
         owner_user_id=user.id,
-        plan="free",
     )
     session.add(tenant)
     await session.flush()  # tenant.id 확정

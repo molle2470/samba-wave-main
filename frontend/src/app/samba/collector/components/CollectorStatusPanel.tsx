@@ -25,9 +25,26 @@ type StatusProps = {
   proxyText: string
   musinsaAuth: StatusState
   musinsaAuthText: string
+  musinsaCookieUpdatedAt?: string | null
   poolInfo?: PoolInfo
   setProxyStatus: Dispatch<SetStateAction<StatusState>>
   setProxyText: Dispatch<SetStateAction<string>>
+}
+
+// 쿠키 갱신 시각 → 상대시간 문자열 + 색상
+// 5분 미만: 회색 '방금 갱신', 24시간 미만: 회색 'N분/시간 전 갱신', 24시간 이상: 주황 'N일 전 갱신'
+function formatCookieFreshness(iso: string | null | undefined): { text: string; color: string } | null {
+  if (!iso) return null
+  const ts = Date.parse(iso)
+  if (Number.isNaN(ts)) return null
+  const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000))
+  if (diffSec < 300) return { text: '방금 갱신', color: '#8A95B0' }
+  const diffMin = Math.floor(diffSec / 60)
+  if (diffMin < 60) return { text: `${diffMin}분 전 갱신`, color: '#8A95B0' }
+  const diffHour = Math.floor(diffMin / 60)
+  if (diffHour < 24) return { text: `${diffHour}시간 전 갱신`, color: '#8A95B0' }
+  const diffDay = Math.floor(diffHour / 24)
+  return { text: `${diffDay}일 전 갱신`, color: '#FAB005' }
 }
 
 // 로그 섹션 전용 props (section='log')
@@ -55,10 +72,12 @@ export default function CollectorStatusPanel(props: Props) {
       proxyText,
       musinsaAuth,
       musinsaAuthText,
+      musinsaCookieUpdatedAt,
       poolInfo,
       setProxyStatus,
       setProxyText,
     } = props
+    const cookieFresh = musinsaAuth === 'ok' ? formatCookieFreshness(musinsaCookieUpdatedAt) : null
 
     const poolMax = poolInfo?.pool_max ?? 35
     const wPg = poolInfo?.write?.pg
@@ -96,6 +115,9 @@ export default function CollectorStatusPanel(props: Props) {
             background: musinsaAuth === 'ok' ? '#51CF66' : musinsaAuth === 'error' ? '#FF6B6B' : '#555',
           }} />
           <span style={{ color: musinsaAuth === 'ok' ? '#51CF66' : '#888' }}>{musinsaAuthText}</span>
+          {cookieFresh && (
+            <span style={{ color: cookieFresh.color, fontSize: '0.72rem' }}>· {cookieFresh.text}</span>
+          )}
           <button
             onClick={() => {
               setProxyStatus('checking')

@@ -1,15 +1,12 @@
 // ============================================================
 // SAMBA-WAVE 팝업 UI 로직
-// - 백엔드 URL + API 인증 키 저장
+// - 백엔드 URL 저장 → 키 없으면 연결 페이지 자동 오픈(자동 발급)
 // - 연결 테스트 (/api/v1/health)
-// - 스토어 점수 수집 트리거
 // ============================================================
 
-async function apiFetch(url, init = {}) {
-  const data = await chrome.storage.local.get('apiKey')
-  const headers = { ...(init.headers || {}), 'X-Api-Key': data.apiKey || '' }
-  return fetch(url, { ...init, headers })
-}
+// 키 발급용 연결 페이지 — 저장 시 키가 없으면 자동으로 이 페이지를 열어
+// 로그인 세션 기반으로 키를 발급받고 탭이 자동으로 닫힌다.
+const EXTENSION_LINK = 'https://samba-wave.vercel.app/samba/extension-link'
 
 function $(id) { return document.getElementById(id) }
 
@@ -44,8 +41,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     setStatus(status, '⚠️ 최초 1회 백엔드 URL을 입력하세요', 'err')
   }
 
+  // 연결 상태 뱃지 갱신
+  function updateConn(connected) {
+    const dot = $('connDot')
+    const txt = $('connText')
+    if (connected) {
+      txt.textContent = '연결됨'
+      dot.style.background = '#22c55e'
+    } else {
+      txt.textContent = '미연결 — 저장 시 자동 연결'
+      dot.style.background = '#FF6B6B'
+    }
+  }
+
   // ============================================================
-  // 저장
+  // 저장 → 키 없으면 연결 페이지 자동 오픈(자동 발급)
   // ============================================================
   $('btnSave').addEventListener('click', async () => {
     const url = normalizeUrl(urlInput.value)
@@ -55,11 +65,23 @@ document.addEventListener('DOMContentLoaded', async () => {
       return
     }
 
-    // URL 변경 시 이전 서버 키는 무효 → 새 서버에서 자동 재발급
+    const prev = await chrome.storage.local.get(['proxyUrl', 'apiKey'])
     await chrome.storage.local.set({ proxyUrl: url })
-    await chrome.storage.local.remove('apiKey')
     urlInput.value = url
-    setStatus(status, '✅ 저장됨 — 확장앱이 이 백엔드를 사용합니다', 'ok')
+
+    // URL 동일 + 키 있음 → 기존 연결 유지 (재로그인 불필요)
+    if (prev.proxyUrl === url && prev.apiKey) {
+      setStatus(status, '✅ 저장됨', 'ok')
+      updateConn(true)
+      return
+    }
+
+    // URL 변경 또는 키 없음 → 연결 페이지 자동 오픈.
+    // 로그인돼 있으면 즉시 키 발급 후 탭 자동 닫힘, 미로그인이면 로그인 안내.
+    await chrome.storage.local.remove('apiKey')
+    setStatus(status, '✅ 저장됨 — 자동 연결 중...', 'ok')
+    updateConn(false)
+    chrome.tabs.create({ url: EXTENSION_LINK, active: true })
   })
 
   // ============================================================
@@ -98,69 +120,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   })
 
-  // ============================================================
-  // 웹사이트 로그인 → 확장앱 API 키 발급
-  // ============================================================
-  const loginStatus = $('loginStatus')
-
-  // 현재 저장된 키 유무 표시
+  // 현재 저장된 키 유무로 연결 상태 표시
   const keyData = await chrome.storage.local.get(['apiKey'])
-  if (keyData.apiKey) {
-    setStatus(loginStatus, '✅ API 키 연결됨', 'ok')
-  } else {
-    setStatus(loginStatus, '미연결 — 아래 버튼으로 로그인하세요', '')
-  }
-
-  $('btnLogin').addEventListener('click', async () => {
-    const FRONTEND = 'https://samba-wave.vercel.app'
-    const linkUrl = `${FRONTEND}/samba/extension-link`
-    await chrome.tabs.create({ url: linkUrl, active: true })
-    setStatus(loginStatus, '⏳ 웹페이지에서 키 발급 후 이 팝업을 다시 여세요', '')
-  })
-
-  // ============================================================
-  // 스토어 점수 수집
-  // ============================================================
-  const btn = $('btnStoreScore')
-  const result = $('scoreResult')
-
-  btn.addEventListener('click', async () => {
-    btn.disabled = true
-    btn.textContent = '수집 중...'
-    setStatus(result, '')
-
-    const saved = await chrome.storage.local.get(['proxyUrl'])
-    if (!saved.proxyUrl) {
-      setStatus(result, '❌ 백엔드 URL 미설정', 'err')
-      btn.disabled = false
-      btn.textContent = '스토어 점수 가져오기'
-      return
-    }
-
-    // 백엔드에서 계정 ID 조회
-    let accountId = ''
-    try {
-      const resp = await apiFetch(`${saved.proxyUrl}/api/v1/samba/monitor/store-scores`)
-      const scores = await resp.json()
-      const ssAccounts = Object.entries(scores).filter(([, v]) => v.market_type === 'smartstore')
-      if (ssAccounts.length > 0) {
-        accountId = ssAccounts[0][0]
-      }
-    } catch { /* 무시 */ }
-
-    chrome.runtime.sendMessage(
-      { type: 'SCRAPE_STORE_SCORES', account_id: accountId },
-      (res) => {
-        btn.disabled = false
-        btn.textContent = '스토어 점수 가져오기'
-        if (res?.success) {
-          const gs = res.good_service ? Object.keys(res.good_service).length + '항목' : '-'
-          const pen = res.penalty || '-'
-          setStatus(result, `굿서비스: ${gs} / 패널티: ${pen}점`, 'ok')
-        } else {
-          setStatus(result, res?.message || '실패', 'err')
-        }
-      },
-    )
-  })
+  updateConn(!!keyData.apiKey)
 })

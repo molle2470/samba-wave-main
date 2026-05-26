@@ -23,11 +23,29 @@ _emit_counter = 0  # 100회마다 정리 실행
 _emit_counter_lock = asyncio.Lock()  # 코루틴 race 방지: += 연산 보호
 
 # ── 대시보드 결과 인메모리 캐시 ──
-# 30초 폴링 대상 API이므로 30초 TTL 캐시로 대부분의 중복 연산을 회피.
-# (15초였을 때는 폴링 주기와 어긋나 캐시 미스율이 약 50%였음)
-_DASHBOARD_CACHE_TTL = 30.0  # 초
+# 갱신통계 집계 쿼리(_get_refresh_stats의 last_refreshed_at count + registered JSONB 체크)가
+# 10만+ 상품에서 ~50초 걸려 30초 TTL은 무용(채워지기 전 만료 → 매 폴링마다 재실행 → read 풀 18칸 고갈).
+# TTL을 쿼리 시간보다 충분히 길게 잡아 캐시 실효성 확보 (대시보드라 3분 갱신 간격 무방).
+_DASHBOARD_CACHE_TTL = 180.0  # 초
 _dashboard_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
 _dashboard_cache_lock = asyncio.Lock()
+
+# Cold start 시 페이지 무한 블로킹 차단용 — 빈 구조 즉시 반환
+_DASHBOARD_EMPTY: Dict[str, Any] = {
+    "product_stats": {"total": 0, "by_source": {}, "by_sale_status": {}},
+    "refresh_stats": {
+        "last_refreshed_at": None,
+        "refreshed_1h": 0,
+        "refreshed_24h": 0,
+        "error_products": 0,
+    },
+    "price_change_stats": {"changes_24h": 0, "avg_change_pct": 0, "top_changes": []},
+    "site_health": {},
+    "market_health": {},
+    "event_summary": {},
+    "hourly_changes": {},
+    "_warming": True,
+}
 
 
 class SambaMonitorService:
@@ -103,28 +121,36 @@ class SambaMonitorService:
             return None
 
     async def get_dashboard_stats(self) -> Dict[str, Any]:
-        """대시보드 전체 통계.
+        """대시보드 전체 통계 (stale-while-revalidate 패턴).
 
         개선 포인트:
-        1) 15초 TTL 인메모리 캐시 — 30초 폴링 대상이라 중복 연산을 회피.
-        2) 서브쿼리 7개를 독립 세션으로 asyncio.gather 병렬화 (직렬 → 병렬).
+        1) 캐시 있으면 stale 도 즉시 반환 → 페이지 첫 진입 80~120초 블로킹 차단.
+        2) stale 시 백그라운드 재계산 (lock locked 면 skip → 중복 쿼리 0).
+        3) cold start 만 블로킹 (lifecycle warmup 으로 첫 사용자 부담 최소화).
+        4) 서브쿼리 8개 asyncio.gather 병렬 유지.
         """
-        # 1) 캐시 히트 (짧은 lock으로 thundering-herd 방지)
         now_ts = time.monotonic()
         cached = _dashboard_cache.get("data")
-        if (
-            cached is not None
-            and (now_ts - _dashboard_cache["ts"]) < _DASHBOARD_CACHE_TTL
-        ):
+        if cached is not None:
+            stale = (now_ts - _dashboard_cache["ts"]) >= _DASHBOARD_CACHE_TTL
+            if stale and not _dashboard_cache_lock.locked():
+                # 백그라운드 재계산 trigger (caller 는 stale 즉시 반환)
+                asyncio.create_task(self._refresh_dashboard_in_background())
             return cached
 
+        # Cold start — 블로킹 금지. 빈 구조 즉시 반환 + 백그라운드 계산 1회만 트리거.
+        # (이전: lock 블록 안에서 7개 gather 25~80초 블로킹 → "대시보드 로딩 중" 무한 표시)
+        # 사용자는 _warming:true 응답 받음 → 다음 폴링(10초)에 채워진 데이터 반환.
+        if not _dashboard_cache_lock.locked():
+            asyncio.create_task(self._refresh_dashboard_in_background())
+        return _DASHBOARD_EMPTY
+
+    async def _compute_dashboard_now(self) -> Dict[str, Any]:
+        """동기 cold-compute (lifecycle warmup 전용)."""
+
         async with _dashboard_cache_lock:
-            # lock 획득 사이에 다른 요청이 이미 채웠을 수 있음
             cached = _dashboard_cache.get("data")
-            if (
-                cached is not None
-                and (time.monotonic() - _dashboard_cache["ts"]) < _DASHBOARD_CACHE_TTL
-            ):
+            if cached is not None:
                 return cached
 
             now = datetime.now(timezone.utc)
@@ -167,6 +193,19 @@ class SambaMonitorService:
             _dashboard_cache["data"] = data
             _dashboard_cache["ts"] = time.monotonic()
             return data
+
+    async def _refresh_dashboard_in_background(self) -> None:
+        """stale·cold 캐시 백그라운드 재계산 — 페이지 응답 차단 X. 중복 시 lock 으로 skip.
+
+        _compute_dashboard_now 가 lock 잡고 7쿼리 gather 후 캐시에 결과 박음.
+        다음 호출부터 stale-while-revalidate 정상 동작.
+        """
+        if _dashboard_cache_lock.locked():
+            return
+        try:
+            await self._compute_dashboard_now()
+        except Exception as exc:
+            logger.warning(f"[monitor] dashboard 백그라운드 재계산 실패: {exc}")
 
     async def _get_product_stats(self) -> Dict[str, Any]:
         """상품 통계: 전체, 소싱처별, 상태별 — 단일 쿼리."""

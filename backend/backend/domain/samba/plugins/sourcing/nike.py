@@ -78,7 +78,17 @@ class NikePlugin(SourcingPlugin):
             return RefreshResult(product_id=product_id, error=str(e))
 
         if fresh.get("error"):
-            return RefreshResult(product_id=product_id, error=fresh["error"])
+            err = fresh["error"]
+            # search_not_found = 검색 인덱스 누락/단종 → sold_out 이벤트 경로 진입
+            # (abcmart/gsshop/lotteon/musinsa의 404 처리와 동일 패턴)
+            if err == "search_not_found":
+                return RefreshResult(
+                    product_id=product_id,
+                    new_sale_status="sold_out",
+                    changed=True,
+                    deleted_from_source=True,
+                )
+            return RefreshResult(product_id=product_id, error=err)
 
         new_sale_price = fresh.get("sale_price")
         new_original_price = fresh.get("original_price")

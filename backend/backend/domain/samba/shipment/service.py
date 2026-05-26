@@ -63,6 +63,28 @@ def _get_source_site_margin(pricing: dict, source_site: str) -> dict:
     return {}
 
 
+def resolve_cost_for_policy(
+    product: Any,
+    policy_pricing: dict | None,
+    source_site: str = "",
+) -> float:
+    """정책 토글에 따라 product.cost 또는 cost_excl_held_point 선택.
+
+    excludeHeldPoint=True 이고 cost_excl_held_point 값이 있으면 그것을 반환,
+    그 외에는 cost 반환.
+    """
+    cost = getattr(product, "cost", None) or 0
+    if not policy_pricing or not source_site:
+        return cost
+    ssm = _get_source_site_margin(policy_pricing, source_site)
+    if not bool(ssm.get("excludeHeldPoint")):
+        return cost
+    excl = getattr(product, "cost_excl_held_point", None)
+    if excl and excl > 0:
+        return excl
+    return cost
+
+
 def calc_market_price(
     cost: float,
     policy_pricing: dict,
@@ -554,8 +576,12 @@ class SambaShipmentService:
 
                 # 정책 기반 판매가 계산 (기존 _transmit_product 라인 313-341 동일 패턴)
                 if policy and policy.pricing:
+                    # 토글 excludeHeldPoint=True 이면 보유적립금 제외 cost 사용
+                    _resolved_cost = resolve_cost_for_policy(
+                        p, policy.pricing, p.source_site or ""
+                    )
                     cost = (
-                        pd.get("cost")
+                        _resolved_cost
                         or pd.get("sale_price")
                         or pd.get("original_price")
                         or 0
@@ -1595,8 +1621,14 @@ class SambaShipmentService:
                         acct_product,
                         template_id_override=_detail_tpl_id,
                     )
+                # 토글 excludeHeldPoint=True 이면 보유적립금 제외 cost 사용
+                _resolved_cost = resolve_cost_for_policy(
+                    product_row,
+                    policy.pricing if policy else None,
+                    product_row.source_site or "",
+                )
                 cost = (
-                    acct_product.get("cost")
+                    _resolved_cost
                     or acct_product.get("sale_price")
                     or acct_product.get("original_price")
                     or 0

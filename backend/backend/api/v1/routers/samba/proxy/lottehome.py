@@ -10,6 +10,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from backend.db.orm import get_read_session_dependency, get_write_session_dependency
 from backend.domain.samba.proxy.lottehome import LotteApiError, LotteHomeClient
+from backend.domain.samba.tenant.middleware import get_optional_tenant_id
 
 from backend.utils.logger import logger
 
@@ -28,11 +29,12 @@ class LotteAuthRequest(BaseModel):
 @router.get("/lottehome/policy")
 async def get_lottehome_policy(
     session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """롯데홈쇼핑 정책 조회."""
     from ._helpers import _get_setting
 
-    policy = await _get_setting(session, "lottehome_policy") or {}
+    policy = await _get_setting(session, "lottehome_policy", tenant_id=tenant_id) or {}
     return {"success": True, "data": policy}
 
 
@@ -40,11 +42,12 @@ async def get_lottehome_policy(
 async def save_lottehome_policy(
     body: dict,
     write_session: AsyncSession = Depends(get_write_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """롯데홈쇼핑 정책 저장."""
     from ._helpers import _set_setting
 
-    await _set_setting(write_session, "lottehome_policy", body)
+    await _set_setting(write_session, "lottehome_policy", body, tenant_id=tenant_id)
     return {"success": True}
 
 
@@ -52,6 +55,7 @@ async def save_lottehome_policy(
 async def lottehome_auth(
     body: LotteAuthRequest,
     write_session: AsyncSession = Depends(get_write_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
     """롯데홈쇼핑 인증키 발급."""
     if not body.userId or not body.password:
@@ -61,8 +65,13 @@ async def lottehome_auth(
     # 기존 credentials와 정책 로드 (정책의 배송지/MD상품군/카테고리 병합)
     from ._helpers import _get_setting
 
-    existing_creds = await _get_setting(write_session, "lottehome_credentials") or {}
-    policy = await _get_setting(write_session, "lottehome_policy") or {}
+    existing_creds = (
+        await _get_setting(write_session, "lottehome_credentials", tenant_id=tenant_id)
+        or {}
+    )
+    policy = (
+        await _get_setting(write_session, "lottehome_policy", tenant_id=tenant_id) or {}
+    )
 
     creds_to_save = dict(existing_creds)
     creds_to_save.update(
@@ -99,6 +108,7 @@ async def lottehome_auth(
         write_session,
         "lottehome_credentials",
         creds_to_save,
+        tenant_id=tenant_id,
     )
     client = LotteHomeClient(
         user_id=body.userId,

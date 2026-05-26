@@ -8,6 +8,7 @@ import ctypes
 import gc
 import json
 import logging
+import os
 import re
 import time as _time
 from collections import deque
@@ -386,9 +387,14 @@ class JobWorker:
         # 동일 계정 delete_market 잡 직렬화 — transmit 락과 독립 (전송/삭제 별개 실행)
         self._delete_account_locks: dict[str, asyncio.Lock] = {}
         # transmit 글로벌 동시 실행 한도 — write pool 여유 확보 (오토튠 점유분 고려)
-        self._transmit_semaphore = asyncio.Semaphore(5)
+        # 기본 5 유지. 풀 한도 50 고려 — VM .env에서 8~10 선 점진 상향 + pg_stat_activity 모니터링.
+        self._transmit_semaphore = asyncio.Semaphore(
+            int(os.environ.get("JOB_TRANSMIT_MAX_CONCURRENCY", "5"))
+        )
         # delete_market 전용 세마포어 — transmit 세마포어와 분리하여 전송 포화 시에도 즉시 실행
-        self._delete_semaphore = asyncio.Semaphore(2)
+        self._delete_semaphore = asyncio.Semaphore(
+            int(os.environ.get("JOB_DELETE_MAX_CONCURRENCY", "2"))
+        )
         # brand_all 잡 직렬화 — SSG+MUSINSA 동시 실행 시 DB/메모리 고갈 방지
         self._brand_all_running: bool = False
         self._poll_count = 0
@@ -999,6 +1005,7 @@ class JobWorker:
         )
         from backend.domain.samba.account.repository import SambaMarketAccountRepository
         from backend.db.orm import get_write_session
+        from backend.domain.samba.job.repository import SambaJobRepository
 
         # tetris 매칭 사전 로드
         # (source_site_norm, brand_norm) → list[market_account_id] (브랜드당 여러 마켓 배정 가능)
@@ -1079,6 +1086,9 @@ class JobWorker:
             await session.commit()
             return
         await repo.update_progress(job.id, start_from, total)
+        # 초기 진행률 즉시 커밋 — 이후 progress/완료 처리는 fresh 단명 세션으로 격리하므로
+        # 장수명 main session이 루프 내내 idle-in-transaction으로 남지 않도록 트랜잭션 종료
+        await session.commit()
 
         # 이어하기: 이전 실행의 카운트 복원
         prev_result = job.result or {}
@@ -1387,36 +1397,45 @@ class JobWorker:
                 logger.info(f"[잡워커] 메모리 회수 ({i_last + 1}/{total}건)")
 
             # 잡 progress 업데이트 (배치 완료 후)
+            # 장수명 main session 재사용 시 pool_recycle(2분)/idle 타임아웃으로 커넥션이
+            # 닫히면 greenlet_spawn 잡 실패가 드물게 발생 → is_cancelled/_on_progress 패턴처럼
+            # 매 배치 fresh 단명 세션으로 격리(main session 의존 제거 → 항상 healthy 커넥션).
             try:
-                await repo.update_progress(job.id, i_last + 1, total)
-                _job = await repo.get_async(job.id)
-                if _job:
-                    _job.result = {
-                        "success": success_count,
-                        "skipped": skip_count,
-                        "failed": fail_count,
-                    }
-                await session.commit()
+                async with get_write_session() as _prog_sess:
+                    _prog_repo = SambaJobRepository(_prog_sess)
+                    await _prog_repo.update_progress(job.id, i_last + 1, total)
+                    _pjob = await _prog_repo.get_async(job.id)
+                    if _pjob:
+                        _pjob.result = {
+                            "success": success_count,
+                            "skipped": skip_count,
+                            "failed": fail_count,
+                        }
+                        _prog_sess.add(_pjob)
+                    await _prog_sess.commit()
             except Exception as pg_err:
-                logger.error(f"[잡워커] progress 업데이트 실패: {job.id} — {pg_err}")
+                logger.warning(
+                    f"[잡워커] progress 업데이트 실패(무시): {job.id} — {pg_err}"
+                )
                 _add_job_log(
                     job.id,
                     f"[{i_last + 1}/{total}] DB 세션 오류 — 다음 건 계속 진행",
                 )
-                try:
-                    await session.rollback()
-                except Exception as exc:
-                    logger.warning(f"[잡워커] 세션 롤백 실패: {job.id} — {exc}")
 
         final_fail = fail_count
         _add_job_log(
             job.id,
             f"전송 완료 — 성공 {success_count}건, 스킵 {skip_count}건, 실패 {final_fail}건",
         )
-        await repo.complete_job(
-            job.id,
-            {"success": success_count, "skipped": skip_count, "failed": final_fail},
-        )
+        # 완료 처리도 fresh 단명 세션 — 장수명 main session이 pool_recycle로 닫혀도
+        # 잡 완료 상태가 유실되거나 greenlet_spawn으로 잡이 실패 처리되지 않도록 격리
+        async with get_write_session() as _done_sess:
+            _done_repo = SambaJobRepository(_done_sess)
+            await _done_repo.complete_job(
+                job.id,
+                {"success": success_count, "skipped": skip_count, "failed": final_fail},
+            )
+            await _done_sess.commit()
         logger.info(
             f"[잡워커] 전송 완료: {job.id} (성공 {success_count}, 스킵 {skip_count}, 실패 {final_fail}/{total}건)"
         )
@@ -5373,6 +5392,11 @@ class JobWorker:
                                 pdp_url=item.get("url") or item.get("source_url"),
                                 base_info=item,
                             )
+                        elif site == "SNKRDUNK":
+                            # 트레이딩카드는 컨디션별 used-listings API 분기 필요 →
+                            # 검색 결과의 snkr_type 을 그대로 전달
+                            _snkr_type = (item.get("extra_data") or {}).get("snkr_type")
+                            detail = await client.get_detail(p_id, _snkr_type)
                         else:
                             detail = await client.get_detail(p_id)
                         # ABCmart/GrandStage: 선취합에서 누락된 경우이므로 sleep 불필요
@@ -5395,6 +5419,22 @@ class JobWorker:
                     original_price = (
                         int(detail.get("originalPrice", 0) or 0) or sale_price
                     )
+
+            # SNKRDUNK 트레이딩카드: 컨디션별 used-listings(재고 한정) 최저가로 가격 갱신
+            # 검색 리스트의 minPrice 가 아니라 in-stock only 최저가를 정본으로 사용
+            if (
+                site == "SNKRDUNK"
+                and detail
+                and (detail.get("extra_data") or {}).get("snkr_type") == "trading-card"
+            ):
+                _d_sale = int(detail.get("sale_price", 0) or 0)
+                if _d_sale > 0:
+                    sale_price = _d_sale
+                    original_price = (
+                        int(detail.get("original_price", 0) or 0) or _d_sale
+                    )
+                if detail.get("name"):
+                    p_name = detail.get("name") or p_name
 
             # 이미지: 확장앱 결과와 검색 API 중 더 많은 쪽 사용
             _detail_imgs = detail.get("images") or []

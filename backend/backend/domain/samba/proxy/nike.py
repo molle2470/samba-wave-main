@@ -397,12 +397,10 @@ class NikeClient:
                     pdp_url = p.get("url")
                     _base = p
                     break
-            if not pdp_url and products:
-                pdp_url = products[0].get("url")
-                _base = products[0]
-
-        if not pdp_url:
-            return {"error": f"상품 {style_color}의 PDP URL을 찾을 수 없습니다."}
+            # exact 매칭 못 찾으면 다른 색상 PDP 잡지 말 것 (false sold_out 방지).
+            # 검색 결과에 없으면 단종/검색 인덱스 누락 → search_not_found 시그널 전파.
+            if not pdp_url:
+                return {"error": "search_not_found"}
 
         # PDP 직접 fetch → 상세 정보 (이미지, 색상, 제조국)
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
@@ -655,7 +653,8 @@ class NikeClient:
             gender_kr = gender_map.get(gender_en, gender_en)
 
         # 사이즈 옵션: productGroups.sizes → localizedLabel + GTIN + status
-        sizes_data = prod_data.get("sizes") or []
+        # prod_data.sizes 가 비면 selectedProduct.sizes 폴백 (PDP styleColor mismatch 안전망).
+        sizes_data = prod_data.get("sizes") or sp.get("sizes") or []
         if sizes_data:
             options = []
             for s in sizes_data:

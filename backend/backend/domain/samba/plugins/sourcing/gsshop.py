@@ -131,6 +131,13 @@ class GsShopSourcingPlugin(SourcingPlugin):
             old_sale = getattr(product, "sale_price", 0) or 0
             old_status = getattr(product, "sale_status", "in_stock")
             new_sale_status = "sold_out" if is_sold_out else "in_stock"
+            # GS샵은 품절 시 상세 페이지에서 옵션(attrTypList)이 통째로 사라진다.
+            # 옵션 0개면 count_stock_transitions 가 셀 대상이 없어 항상 0을 반환 →
+            # 전체품절인데도 stock_changed=False 가 되어 '재고변동' 기록이 누락됨.
+            # 따라서 옵션 유무와 무관하게 in_stock↔sold_out 전환 자체를 재고변동으로 인정한다.
+            _status_flip = new_sale_status != old_status and (
+                new_sale_status == "sold_out" or old_status == "sold_out"
+            )
             changed = (float(new_sale_price or 0) != float(old_sale or 0)) or (
                 new_sale_status != old_status
             )
@@ -145,7 +152,7 @@ class GsShopSourcingPlugin(SourcingPlugin):
                 new_sale_status=new_sale_status,
                 new_options=new_options,
                 changed=changed,
-                stock_changed=_stock_changes > 0,
+                stock_changed=(_stock_changes > 0) or _status_flip,
             )
 
         except ProductNotFoundError:
