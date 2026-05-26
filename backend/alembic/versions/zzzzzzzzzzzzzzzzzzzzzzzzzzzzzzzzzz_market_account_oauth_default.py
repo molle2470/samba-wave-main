@@ -12,8 +12,15 @@
 - oauth_expires_at (Timestamp with TZ, nullable)
 - is_default (Boolean, default false, indexed)
 
+운영 DDL 표준 — lock_timeout + retry DO 블록 필수:
+- blue 컨테이너 폴러/sync 잡이 samba_market_account 에 RowExclusiveLock 점유 중인 상태에서
+  ALTER 의 AccessExclusiveLock 단발 30s 대기 후 fail → 배포 abort (issue #241, 2026-05-25)
+- 단발 대기 대신 SET LOCAL lock_timeout = '3s' + 30회 retry + pg_sleep(2) 로 양보·재시도
+- 외부 마켓 API 호출이 끝나는 순간(폴러 cycle 종료)에 통과
+- 표준 패턴 참고: zzzzz_tags_jsonb_gin.py (2026-05-07 deadlock 사고 후 도입)
+
 idempotent:
-- ADD COLUMN IF NOT EXISTS — 재실행 안전 (entrypoint stamp 재배포 대비)
+- ADD COLUMN IF NOT EXISTS + CREATE INDEX IF NOT EXISTS — 재실행 안전
 - samba_market_account 는 hot 테이블 아님(설정성 데이터) — CONCURRENTLY 인덱스 불필요
 
 데이터 마이그레이션은 별도 단계에서 SQL 스크립트로 실행 (자동 INSERT 는 본 파일 미포함).
@@ -26,7 +33,6 @@ Create Date: 2026-05-25 12:00:00.000000
 from typing import Sequence, Union
 
 from alembic import op
-import sqlalchemy as sa
 
 
 revision: str = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_market_account_oauth_default"
@@ -37,55 +43,67 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
-def _column_exists(conn, table: str, column: str) -> bool:
-    """information_schema 조회 — ALTER TABLE 자체 안 하면 AccessExclusiveLock 안 잡힘.
-    hot 테이블 데드락 방지 (CLAUDE.md '마이그레이션 hot 테이블 데드락 방지' 참조).
+def _retry_block(body_sql: str) -> str:
+    """ALTER/CREATE INDEX 단일 SQL 을 lock_timeout=3s + 30회 retry DO 블록으로 감쌈.
+
+    blue 컨테이너 트랜잭션이 테이블 lock 점유 중일 때 단발 30s 대기 후 fail 대신
+    3s 단위로 양보·재시도. 최대 ~150s 동안 폴러 cycle 종료 틈을 노림.
+    body_sql 에는 IF NOT EXISTS 포함된 idempotent SQL 전달.
     """
-    return bool(
-        conn.execute(
-            sa.text(
-                "SELECT 1 FROM information_schema.columns "
-                "WHERE table_name=:t AND column_name=:c"
-            ),
-            {"t": table, "c": column},
-        ).first()
-    )
-
-
-def _index_exists(conn, name: str) -> bool:
-    return bool(
-        conn.execute(
-            sa.text("SELECT 1 FROM pg_indexes WHERE indexname=:n"), {"n": name}
-        ).first()
-    )
+    return f"""
+        DO $$
+        DECLARE
+            attempts INTEGER := 0;
+            max_attempts INTEGER := 30;
+        BEGIN
+            LOOP
+                attempts := attempts + 1;
+                BEGIN
+                    SET LOCAL lock_timeout = '3s';
+                    {body_sql}
+                    EXIT;
+                EXCEPTION
+                    WHEN lock_not_available OR deadlock_detected THEN
+                        IF attempts >= max_attempts THEN RAISE; END IF;
+                        PERFORM pg_sleep(2);
+                END;
+            END LOOP;
+        END
+        $$;
+    """
 
 
 def upgrade() -> None:
-    conn = op.get_bind()
-    # hot 테이블 데드락 방지 — 컬럼 이미 있으면 ALTER 스킵 (AccessExclusiveLock 회피)
-    if not _column_exists(conn, "samba_market_account", "oauth_access_token"):
-        op.execute(
-            "ALTER TABLE samba_market_account ADD COLUMN oauth_access_token TEXT"
-        )
-    if not _column_exists(conn, "samba_market_account", "oauth_refresh_token"):
-        op.execute(
-            "ALTER TABLE samba_market_account ADD COLUMN oauth_refresh_token TEXT"
-        )
-    if not _column_exists(conn, "samba_market_account", "oauth_expires_at"):
-        op.execute(
+    op.execute(
+        _retry_block(
             "ALTER TABLE samba_market_account "
-            "ADD COLUMN oauth_expires_at TIMESTAMP WITH TIME ZONE"
+            "ADD COLUMN IF NOT EXISTS oauth_access_token TEXT;"
         )
-    if not _column_exists(conn, "samba_market_account", "is_default"):
-        op.execute(
+    )
+    op.execute(
+        _retry_block(
             "ALTER TABLE samba_market_account "
-            "ADD COLUMN is_default BOOLEAN NOT NULL DEFAULT false"
+            "ADD COLUMN IF NOT EXISTS oauth_refresh_token TEXT;"
         )
-    if not _index_exists(conn, "ix_smk_default_per_market"):
-        op.execute(
-            "CREATE INDEX ix_smk_default_per_market "
-            "ON samba_market_account (tenant_id, market_type, is_default)"
+    )
+    op.execute(
+        _retry_block(
+            "ALTER TABLE samba_market_account "
+            "ADD COLUMN IF NOT EXISTS oauth_expires_at TIMESTAMP WITH TIME ZONE;"
         )
+    )
+    op.execute(
+        _retry_block(
+            "ALTER TABLE samba_market_account "
+            "ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT false;"
+        )
+    )
+    op.execute(
+        _retry_block(
+            "CREATE INDEX IF NOT EXISTS ix_smk_default_per_market "
+            "ON samba_market_account (tenant_id, market_type, is_default);"
+        )
+    )
 
 
 def downgrade() -> None:
