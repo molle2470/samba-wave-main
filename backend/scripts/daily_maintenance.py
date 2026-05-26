@@ -522,64 +522,81 @@ async def task_ai_tags(conn: asyncpg.Connection) -> dict:
     return {"applied": applied, "no_match": no_match}
 
 
-# ===== TASK 3: 정책 동기화 =====
-async def task_policy_sync(conn: asyncpg.Connection) -> dict:
-    """정책 없는 그룹에 같은 (source_site, 브랜드)의 기존 정책을 상속."""
-    print("\n[TASK 3] 정책 동기화 시작")
+# ===== TASK 3: 정책 미적용 그룹 → '가디정책' 일괄 적용 =====
+async def task_apply_default_policy(conn: asyncpg.Connection) -> dict:
+    """applied_policy_id IS NULL 인 그룹에 tenant별 '가디정책'을 일괄 적용.
 
-    count_before = await conn.fetchval("""
-        SELECT COUNT(*) FROM samba_search_filter
-        WHERE is_folder = false AND applied_policy_id IS NULL
-    """)
+    - 정책명 '가디정책' 으로 tenant_id별 1건 매칭
+    - 같은 tenant 내 미적용 그룹만 UPDATE
+    - 그룹 정책 → 소속 상품(cp.applied_policy_id) 동기화
+    """
+    print("\n[TASK 3] 정책 미적용 그룹 → '가디정책' 일괄 적용 시작")
 
-    if count_before == 0:
-        print("  정책 미적용 그룹 없음 — 완료")
-        return {"applied": 0, "skipped": 0}
+    policies = await conn.fetch(
+        """
+        SELECT id, tenant_id, name
+        FROM samba_policy
+        WHERE name = '가디정책' AND tenant_id IS NOT NULL
+        """
+    )
+    if not policies:
+        print("  '가디정책' 없음 — 종료")
+        return {"applied": 0, "skipped_no_policy": True}
 
-    print(f"  정책 없는 그룹: {count_before:,}개")
+    total_applied = 0
+    tenant_results: dict[str, int] = {}
+    for p in policies:
+        tenant_id = p["tenant_id"]
+        policy_id = p["id"]
 
-    # 같은 (source_site, 브랜드) 내 다른 그룹의 정책 상속
-    result = await conn.execute("""
-        UPDATE samba_search_filter sf1
-        SET applied_policy_id = (
-            SELECT sf2.applied_policy_id
-            FROM samba_search_filter sf2
-            WHERE sf2.source_site = sf1.source_site
-              AND split_part(sf2.name, '_', 2) = split_part(sf1.name, '_', 2)
-              AND sf2.is_folder = false
-              AND sf2.applied_policy_id IS NOT NULL
-              AND sf2.id != sf1.id
-            LIMIT 1
-        ), updated_at = NOW()
-        WHERE sf1.is_folder = false
-          AND sf1.applied_policy_id IS NULL
-          AND sf1.source_site IS NOT NULL
-          AND sf1.name IS NOT NULL
-          AND EXISTS (
-              SELECT 1 FROM samba_search_filter sf2
-              WHERE sf2.source_site = sf1.source_site
-                AND split_part(sf2.name, '_', 2) = split_part(sf1.name, '_', 2)
-                AND sf2.is_folder = false
-                AND sf2.applied_policy_id IS NOT NULL
-                AND sf2.id != sf1.id
-          )
-    """)
-    applied = int(result.split()[-1]) if result else 0
-    skipped = count_before - applied
+        count_before = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM samba_search_filter
+            WHERE is_folder = false
+              AND applied_policy_id IS NULL
+              AND tenant_id = $1
+            """,
+            tenant_id,
+        )
+        if not count_before:
+            tenant_results[tenant_id] = 0
+            continue
 
-    # 그룹 정책 → 상품에도 동기화
-    await conn.execute("""
-        UPDATE samba_collected_product cp
-        SET applied_policy_id = sf.applied_policy_id, updated_at = NOW()
-        FROM samba_search_filter sf
-        WHERE cp.search_filter_id = sf.id
-          AND sf.is_folder = false
-          AND sf.applied_policy_id IS NOT NULL
-          AND (cp.applied_policy_id IS NULL OR cp.applied_policy_id != sf.applied_policy_id)
-    """)
+        result = await conn.execute(
+            """
+            UPDATE samba_search_filter
+            SET applied_policy_id = $1, updated_at = NOW()
+            WHERE is_folder = false
+              AND applied_policy_id IS NULL
+              AND tenant_id = $2
+            """,
+            policy_id,
+            tenant_id,
+        )
+        applied = int(result.split()[-1]) if result else 0
+        tenant_results[tenant_id] = applied
+        total_applied += applied
 
-    print(f"  완료: 상속 {applied:,}개, 스킵(동일브랜드 정책없음) {skipped:,}개")
-    return {"applied": applied, "skipped": skipped}
+        # 그룹 정책 → 상품 동기화
+        await conn.execute(
+            """
+            UPDATE samba_collected_product cp
+            SET applied_policy_id = sf.applied_policy_id, updated_at = NOW()
+            FROM samba_search_filter sf
+            WHERE cp.search_filter_id = sf.id
+              AND sf.is_folder = false
+              AND sf.applied_policy_id = $1
+              AND (cp.applied_policy_id IS NULL OR cp.applied_policy_id != $1)
+            """,
+            policy_id,
+        )
+
+        print(
+            f"  tenant={tenant_id}: {applied:,}/{count_before:,}개 적용 (policy={policy_id})"
+        )
+
+    print(f"  완료: 총 {total_applied:,}개 그룹 적용 ({len(policies)} tenant)")
+    return {"applied": total_applied, "tenants": tenant_results}
 
 
 # ===== TASK 4: 품절 처리 =====
@@ -902,20 +919,16 @@ async def task_daily_snapshot(conn: asyncpg.Connection) -> dict:
     return {"date": snapshot_date, "count": count}
 
 
-# ===== TASK 5b: 신규 그룹 AI 태그 + 가디 정책 확인 =====
+# ===== TASK 5b: 신규 그룹 AI 태그 확인 =====
 async def task_new_group_check(conn: asyncpg.Connection) -> dict:
-    """수집 잡 완료 후 생성된 신규 그룹에 AI 태그 + 가디 정책 적용 여부 확인."""
+    """수집 잡 완료 후 생성된 신규 그룹에 AI 태그 적용 여부 확인."""
     missing_tag = await conn.fetchval("""
         SELECT COUNT(DISTINCT sf.id) FROM samba_search_filter sf
         JOIN samba_collected_product cp ON cp.search_filter_id = sf.id
         WHERE sf.is_folder = false
           AND (cp.tags IS NULL OR cp.tags::text NOT LIKE '%__ai_tagged__%')
     """)
-    missing_policy = await conn.fetchval("""
-        SELECT COUNT(*) FROM samba_search_filter
-        WHERE is_folder = false AND applied_policy_id IS NULL
-    """)
-    return {"missing_tag_groups": missing_tag, "missing_policy_groups": missing_policy}
+    return {"missing_tag_groups": missing_tag}
 
 
 # ===== 메인 =====
@@ -976,7 +989,9 @@ async def run():
             await task_ai_tags(conn) if cfg["task2_enabled"] else {"skipped": True}
         )
         results["policy"] = (
-            await task_policy_sync(conn) if cfg["task3_enabled"] else {"skipped": True}
+            await task_apply_default_policy(conn)
+            if cfg["task3_enabled"]
+            else {"skipped": True}
         )
         results["soldout"] = (
             await task_soldout_cleanup(conn)
@@ -1002,13 +1017,11 @@ async def run():
     print("일일 유지보수 완료")
     print(f"  카테고리 매핑: {results['category']}")
     print(f"  AI 태그:       {results['ai_tags']}")
-    print(f"  정책 동기화:   {results['policy']}")
+    print(f"  정책 적용:     {results['policy']}")
     print(f"  품절 처리:     {results['soldout']}")
     print(f"  수집 잡 생성:  {results['collect']}")
     print(f"  스냅샷:        {results.get('snapshot')}")
-    print(
-        f"  신규그룹 확인: 미태그={check['missing_tag_groups']:,}, 미정책={check['missing_policy_groups']:,}"
-    )
+    print(f"  신규그룹 확인: 미태그={check['missing_tag_groups']:,}")
     print("=" * 60)
 
 
@@ -1025,8 +1038,6 @@ async def run_tasks(task_ids: list[int]):
     try:
         # TASK 6(등록상품수 스냅샷)을 가장 먼저 실행 — 정리 작업(5/4/3) 중
         # 하나가 예외를 던져도 그날 0시 스냅샷은 반드시 기록되도록 보장 (#235).
-        # 과거 6이 맨 뒤라 앞 작업 실패 시 스냅샷이 누락되어 등록상품수가
-        # 날짜별로 쌓이지 않던 버그가 있었음.
         if 6 in task_ids:
             results["snapshot"] = await task_daily_snapshot(conn)
         if 5 in task_ids:
@@ -1034,7 +1045,7 @@ async def run_tasks(task_ids: list[int]):
         if 4 in task_ids:
             results["soldout"] = await task_soldout_cleanup(conn)
         if 3 in task_ids:
-            results["policy"] = await task_policy_sync(conn)
+            results["policy"] = await task_apply_default_policy(conn)
         if 2 in task_ids:
             results["ai_tags"] = await task_ai_tags(conn)
         if 1 in task_ids:
