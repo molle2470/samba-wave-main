@@ -6532,23 +6532,8 @@ async def sync_orders_from_markets(
                         and existing.status != "cancel_requested"
                     ):
                         update_fields["status"] = "cancel_requested"
-                        # 자동 발주취소 트리거 — fire-and-forget, 4중 가드 내장
-                        from backend.domain.samba.proxy.sourcing_queue import (
-                            SourcingQueue as _SQ,
-                        )
-
-                        asyncio.create_task(
-                            _SQ.maybe_trigger_auto_cancel(
-                                order_id=existing.id,
-                                source_site=existing.source_site,
-                                sourcing_order_number=existing.sourcing_order_number,
-                                sourcing_account_id=existing.sourcing_account_id,
-                                new_status="cancel_requested",
-                                shipping_status=update_fields.get("shipping_status")
-                                or existing.shipping_status,
-                                prev_status=existing.status,
-                            )
-                        )
+                        # 자동 발주취소 트리거는 SambaOrder after_flush event listener 가 단일 진입점.
+                        # 여기 별도 호출 추가 시 중복 잡 발행(dedup race) 발생 — 절대 금지.
                     # 플레이오토 미등록 주문의 취소요청/취소완료는 status 드롭다운도 동기화.
                     # 신규 insert는 _normalize_synced_order_status 예외에서 처리되지만,
                     # 이미 DB에 'pending'으로 들어가 있는 기존 주문은 여기서 갱신해야 함.

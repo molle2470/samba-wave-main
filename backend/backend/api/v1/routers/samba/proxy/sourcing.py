@@ -465,7 +465,11 @@ async def sourcing_cancel_result(body: dict[str, Any]) -> dict[str, Any]:
     if not order_id:
         return {"ok": True, "applied": False, "reason": "orderId 미상"}
 
-    now_kst_tag = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    # KST 단일 — UTC 표기 절대 금지 (사용자 룰 feedback_report_kst_only)
+    from datetime import timedelta as _td
+
+    _kst = timezone(_td(hours=9))
+    now_kst_tag = datetime.now(_kst).strftime("%Y-%m-%d %H:%M:%S KST")
     note_line = ""
     update_values: dict[str, Any] = {}
 
@@ -484,9 +488,21 @@ async def sourcing_cancel_result(body: dict[str, Any]) -> dict[str, Any]:
             f"({site} ord={sourcing_order_number})"
         )
     else:
+        # details (확장앱이 반환한 라인아이템별 결과) 첨부 — 실패 원인 즉시 확인용
+        details = body.get("details")
+        details_str = ""
+        if details:
+            try:
+                import json as _json
+
+                details_str = (
+                    " details=" + _json.dumps(details, ensure_ascii=False)[:600]
+                )
+            except Exception:
+                pass
         note_line = (
             f"[{now_kst_tag}] 소싱처 자동취소 실패: {error or reason or 'unknown'} "
-            f"({site} ord={sourcing_order_number})"
+            f"({site} ord={sourcing_order_number}){details_str}"
         )
 
     try:
