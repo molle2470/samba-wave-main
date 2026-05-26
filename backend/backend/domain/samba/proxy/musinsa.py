@@ -107,6 +107,34 @@ class MusinsaClient:
             return f"https:{path}"
         return f"https://image.msscdn.net{path}"
 
+    # 추적 픽셀/트래커/외부 분석 도메인 차단 — 롯데홈쇼핑 [1036] 등 확장자 검증 마켓 보호
+    # (셀러가 desc HTML 혹은 goodsImages에 트래커 URL을 박아넣는 케이스 다수)
+    _TRACKER_PATTERNS = (
+        "trace.smartwiz",
+        "trace.",
+        "pixel.",
+        "/logger/",
+        "doubleclick.net",
+        "google-analytics.com",
+        "googletagmanager.com",
+        "facebook.com/tr",
+        "/track?",
+        "/track/",
+    )
+    _IMG_EXT_RE = re.compile(
+        r"\.(?:jpg|jpeg|png|gif|webp|bmp)(?:[?#].*)?$", re.IGNORECASE
+    )
+
+    @classmethod
+    def _is_valid_image_url(cls, url: str) -> bool:
+        """이미지 등록 가능 URL 판별 — 트래커 차단 + 이미지 확장자 화이트리스트."""
+        if not url:
+            return False
+        low = url.lower()
+        if any(p in low for p in cls._TRACKER_PATTERNS):
+            return False
+        return bool(cls._IMG_EXT_RE.search(url.split("?", 1)[0]))
+
     @staticmethod
     def _floor_to_10(amount: float) -> int:
         return int(amount / 10) * 10
@@ -237,7 +265,10 @@ class MusinsaClient:
                     all_images.append(
                         self._to_image_url(img.get("imageUrl") or img.get("url", ""))
                     )
-                all_images = [i for i in all_images if i]
+                # 트래커/확장자 없는 URL drop — 마켓 등록 [1036] 등 차단 방지
+                all_images = [
+                    i for i in all_images if i and self._is_valid_image_url(i)
+                ]
                 unique_images = list(dict.fromkeys(all_images))[:9]
                 logger.info(
                     f"[무신사 이미지 최종] {goods_no}: images={len(unique_images)}개, detail_images={len(detail_images)}개"
@@ -1562,7 +1593,12 @@ class MusinsaClient:
         )
         for match in pattern.finditer(desc_html):
             src = MusinsaClient._to_image_url(match.group(1))
-            if src and "icon" not in src and "btn_" not in src:
+            if (
+                src
+                and "icon" not in src
+                and "btn_" not in src
+                and MusinsaClient._is_valid_image_url(src)
+            ):
                 if src not in detail_images:
                     detail_images.append(src)
         return detail_images
