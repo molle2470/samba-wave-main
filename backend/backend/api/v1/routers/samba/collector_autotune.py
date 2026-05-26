@@ -2899,10 +2899,21 @@ async def _site_autotune_loop(device_id: str, site: str):
                                             ):
                                                 deleted_count += 1
                                                 _sp_deleted_ids.append(_del_acc_id)
+                                                _sp_site_tag = (
+                                                    f"[{_sp.source_site}] "
+                                                    if _sp.source_site
+                                                    else ""
+                                                )
+                                                _sp_brand = (
+                                                    getattr(_sp, "brand", "") or ""
+                                                )
+                                                _sp_brand_part = (
+                                                    f"{_sp_brand} " if _sp_brand else ""
+                                                )
                                                 _log_line(
                                                     _sp.source_site or "",
                                                     _sp.id,
-                                                    f"{_sp.name or _sp.id}: 품절잔존 → {_del_label} 마켓삭제 완료",
+                                                    f"{_sp_site_tag}{_sp_brand_part}{_sp.name or _sp.id}: 품절잔존 → {_del_label} 마켓삭제 완료",
                                                 )
                                             else:
                                                 log.warning(
@@ -2937,10 +2948,23 @@ async def _site_autotune_loop(device_id: str, site: str):
                                         if _sp_reg and not _new_reg:
                                             try:
                                                 await repo.delete_async(_sp.id)
+                                                _sp_site_tag2 = (
+                                                    f"[{_sp.source_site}] "
+                                                    if _sp.source_site
+                                                    else ""
+                                                )
+                                                _sp_brand2 = (
+                                                    getattr(_sp, "brand", "") or ""
+                                                )
+                                                _sp_brand_part2 = (
+                                                    f"{_sp_brand2} "
+                                                    if _sp_brand2
+                                                    else ""
+                                                )
                                                 _log_line(
                                                     _sp.source_site or "",
                                                     _sp.id,
-                                                    f"{_sp.name or _sp.id}: 품절잔존 전 마켓 삭제 성공 → 상품 DB 삭제 완료",
+                                                    f"{_sp_site_tag2}{_sp_brand_part2}{_sp.name or _sp.id}: 품절잔존 전 마켓 삭제 성공 → 상품 DB 삭제 완료",
                                                 )
                                             except Exception as _pd_err:
                                                 log.error(

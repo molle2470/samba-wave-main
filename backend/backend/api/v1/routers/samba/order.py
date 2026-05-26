@@ -1230,6 +1230,185 @@ async def list_orders_by_collected_product_paged(
     )
 
 
+class ExcelExportRequest(BaseModel):
+    """엑셀 다운로드 요청 — 선택ID 우선, 없으면 필터 전체."""
+
+    order_ids: Optional[list[str]] = None
+    start: Optional[str] = None
+    end: Optional[str] = None
+    market_filter: str = ""
+    site_filter: str = ""
+    account_filter: str = ""
+    market_status: str = ""
+    status_filter: str = ""
+    input_filter: str = ""
+    invoice_filter: str = ""
+    registration_filter: str = ""
+    search_text: str = ""
+    search_category: str = "customer"
+    sort_by: str = "date_desc"
+
+
+@router.post("/excel-export")
+async def export_orders_excel(
+    payload: ExcelExportRequest,
+    session: AsyncSession = Depends(get_read_session_dependency),
+    tenant_id: Optional[str] = Depends(get_optional_tenant_id),
+):
+    """주문 엑셀 다운로드 — 사진 UB1 포맷 (10컬럼).
+
+    - 체크박스 선택 ID 우선 (`order_ids`), 없으면 필터 전체.
+    - 필터 모드는 50,000건 상한, 초과 시 400.
+    """
+    from datetime import timedelta, timezone
+    from io import BytesIO
+    from urllib.parse import quote
+
+    from fastapi.responses import StreamingResponse
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from sqlalchemy import select
+
+    from backend.utils import kst_date_range_to_utc
+
+    MAX_FILTER_ROWS = 50_000
+
+    if payload.order_ids:
+        ids = [oid for oid in payload.order_ids if oid]
+        if not ids:
+            raise HTTPException(status_code=400, detail="선택된 주문이 없습니다.")
+        stmt = select(SambaOrder).where(SambaOrder.id.in_(ids))
+        if tenant_id is not None:
+            from sqlalchemy import or_
+
+            stmt = stmt.where(
+                or_(
+                    SambaOrder.tenant_id == tenant_id,
+                    SambaOrder.tenant_id == None,  # noqa: E711
+                )
+            )
+        stmt = stmt.order_by(_build_order_sort(payload.sort_by))
+        rows = list((await session.execute(stmt)).scalars().all())
+    else:
+        if not payload.start or not payload.end:
+            raise HTTPException(
+                status_code=400, detail="start/end 또는 order_ids 가 필요합니다."
+            )
+        start_dt, end_dt = kst_date_range_to_utc(payload.start, payload.end)
+        filters = await _build_order_filters(
+            session,
+            tenant_id,
+            market_filter=payload.market_filter,
+            site_filter=payload.site_filter,
+            account_filter=payload.account_filter,
+            market_status=payload.market_status,
+            status_filter=payload.status_filter,
+            input_filter=payload.input_filter,
+            invoice_filter=payload.invoice_filter,
+            registration_filter=payload.registration_filter,
+            search_text=payload.search_text,
+            search_category=payload.search_category,
+        )
+        extra = [
+            SambaOrder.paid_at != None,  # noqa: E711
+            SambaOrder.paid_at >= start_dt,
+            SambaOrder.paid_at <= end_dt,
+        ]
+        stmt = (
+            select(SambaOrder)
+            .where(*filters, *extra)
+            .order_by(_build_order_sort(payload.sort_by))
+            .limit(MAX_FILTER_ROWS + 1)
+        )
+        rows = list((await session.execute(stmt)).scalars().all())
+        if len(rows) > MAX_FILTER_ROWS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"결과 {len(rows):,}건이 상한 {MAX_FILTER_ROWS:,}건을 초과했습니다. 필터를 좁혀주세요.",
+            )
+
+    # 채널명 괄호 파싱: "11번가(sogyung)" -> ("11번가", "sogyung")
+    paren_re = re.compile(r"^(.*?)\s*\(([^()]+)\)\s*$")
+
+    def split_channel(name: Optional[str]) -> tuple[str, str]:
+        if not name:
+            return ("", "")
+        m = paren_re.match(name)
+        if not m:
+            return (name, "")
+        return (m.group(1).strip(), m.group(2).strip())
+
+    KST = timezone(timedelta(hours=9))
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "orders"
+    headers = [
+        "마켓주문일자",
+        "마켓명",
+        "마켓아이디",
+        "수령인명",
+        "마켓상품명",
+        "마켓주문번호",
+        "구매가격",
+        "국제운송료",
+        "사이트주문번호",
+        "옵션1",
+    ]
+    ws.append(headers)
+    yellow = PatternFill("solid", fgColor="FFFF00")
+    bold = Font(bold=True)
+    center = Alignment(horizontal="center")
+    for c in ws[1]:
+        c.font = bold
+        c.fill = yellow
+        c.alignment = center
+
+    for o in rows:
+        market_name, market_account = split_channel(o.channel_name)
+        paid_kst = ""
+        if o.paid_at:
+            paid = o.paid_at
+            if paid.tzinfo is None:
+                paid = paid.replace(tzinfo=timezone.utc)
+            paid_kst = paid.astimezone(KST).strftime("%Y-%m-%d")
+        ws.append(
+            [
+                paid_kst,
+                market_name,
+                market_account,
+                o.customer_name or "",
+                o.product_name or "",
+                o.order_number or "",
+                int(o.cost or 0),
+                int(o.shipping_fee or 0),
+                o.sourcing_order_number or "",
+                o.product_option or "",
+            ]
+        )
+
+    widths = [13, 10, 12, 10, 55, 22, 10, 10, 22, 16]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[chr(64 + i)].width = w
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    if payload.order_ids:
+        fname = f"주문_선택{len(rows)}건.xlsx"
+    else:
+        fname = f"주문_{payload.start}_{payload.end}.xlsx"
+    quoted = quote(fname)
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename=\"orders.xlsx\"; filename*=UTF-8''{quoted}"
+        },
+    )
+
+
 @router.get("/analytics-aggregate")
 async def analytics_aggregate(
     start: str = Query(..., description="시작일 YYYY-MM-DD"),

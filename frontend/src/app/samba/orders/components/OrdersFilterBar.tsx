@@ -1,11 +1,13 @@
 'use client'
 
-import React, { Dispatch, SetStateAction } from 'react'
+import React, { Dispatch, SetStateAction, useState } from 'react'
 import { type SambaMarketAccount } from '@/lib/samba/api/commerce'
 import { type SambaSourcingAccount } from '@/lib/samba/api/operations'
+import { orderApi } from '@/lib/samba/legacy'
 import { PERIOD_BUTTONS } from '@/lib/samba/constants'
 import { inputStyle, fmtNum } from '@/lib/samba/styles'
 import { formatDateInput, getPeriodStart, getPeriodEnd } from '@/lib/samba/utils'
+import { showAlert } from '@/components/samba/Modal'
 import { STATUS_MAP } from '../constants'
 
 interface Props {
@@ -59,6 +61,7 @@ interface Props {
   accounts: SambaMarketAccount[]
   sourcingAccounts: SambaSourcingAccount[]
   siteOptions: Array<{ value: string; label: string }>
+  selectedOrderIds: string[]
 }
 
 export default function OrdersFilterBar(props: Props) {
@@ -76,7 +79,43 @@ export default function OrdersFilterBar(props: Props) {
     inputFilter, setInputFilter, invoiceFilter, setInvoiceFilter, statusFilter, setStatusFilter,
     sortBy, setSortBy, pageSize, setPageSize,
     accounts, sourcingAccounts, siteOptions,
+    selectedOrderIds,
   } = props
+
+  const [excelDownloading, setExcelDownloading] = useState(false)
+  const handleExcelDownload = async () => {
+    if (excelDownloading) return
+    setExcelDownloading(true)
+    try {
+      if (selectedOrderIds.length > 0) {
+        await orderApi.downloadExcel({ order_ids: selectedOrderIds, sort_by: sortBy })
+      } else {
+        if (!customStart || !customEnd) {
+          showAlert('날짜 범위를 선택해주세요', 'info')
+          return
+        }
+        await orderApi.downloadExcel({
+          start: customStart,
+          end: customEnd,
+          market_filter: marketFilter,
+          site_filter: siteFilter,
+          account_filter: accountFilter,
+          market_status: marketStatus,
+          status_filter: statusFilter,
+          input_filter: inputFilter,
+          invoice_filter: invoiceFilter,
+          registration_filter: registrationFilter,
+          search_text: searchText,
+          search_category: searchCategory,
+          sort_by: sortBy,
+        })
+      }
+    } catch (e) {
+      showAlert((e as Error)?.message || '엑셀 다운로드 실패', 'error')
+    } finally {
+      setExcelDownloading(false)
+    }
+  }
 
   return (
     <>
@@ -256,6 +295,27 @@ export default function OrdersFilterBar(props: Props) {
             <option value={200}>200개</option>
             <option value={500}>500개</option>
           </select>
+          <button
+            onClick={handleExcelDownload}
+            disabled={excelDownloading}
+            style={{
+              padding: '0.22rem 0.65rem',
+              fontSize: '0.75rem',
+              background: selectedOrderIds.length > 0 ? '#1F6F3A' : 'rgba(50,50,50,0.9)',
+              border: '1px solid #3D3D3D',
+              color: selectedOrderIds.length > 0 ? '#fff' : '#C5C5C5',
+              borderRadius: '4px',
+              cursor: excelDownloading ? 'not-allowed' : 'pointer',
+              whiteSpace: 'nowrap',
+            }}
+            title={selectedOrderIds.length > 0 ? `선택 ${fmtNum(selectedOrderIds.length)}건 다운로드` : '현재 필터 전체 다운로드'}
+          >
+            {excelDownloading
+              ? '다운로드 중...'
+              : selectedOrderIds.length > 0
+                ? `엑셀 다운(${fmtNum(selectedOrderIds.length)})`
+                : '엑셀 다운'}
+          </button>
         </div>
       </div>
     </>

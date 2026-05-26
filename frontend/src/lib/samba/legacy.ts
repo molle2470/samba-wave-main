@@ -279,6 +279,51 @@ export const orderApi = {
     })
     return request<PaginatedOrderList>(`${SAMBA_PREFIX}/orders/by-collected-product-paged?${q}`)
   },
+  downloadExcel: async (params: {
+    order_ids?: string[]
+    start?: string
+    end?: string
+    market_filter?: string
+    site_filter?: string
+    account_filter?: string
+    market_status?: string
+    status_filter?: string
+    input_filter?: string
+    invoice_filter?: string
+    registration_filter?: string
+    search_text?: string
+    search_category?: string
+    sort_by?: string
+  }) => {
+    const res = await fetchWithAuth(`${SAMBA_PREFIX}/orders/excel-export`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    })
+    if (!res.ok) {
+      let msg = `엑셀 다운로드 실패 (${res.status})`
+      try {
+        const j = await res.json()
+        if (j?.detail) msg = j.detail
+      } catch {}
+      throw new Error(msg)
+    }
+    const blob = await res.blob()
+    const cd = res.headers.get('Content-Disposition') || ''
+    let fname = 'orders.xlsx'
+    const m = cd.match(/filename\*=UTF-8''([^;]+)/)
+    if (m) {
+      try { fname = decodeURIComponent(m[1]) } catch {}
+    }
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = fname
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+  },
   dashboardStats: () => request<OrderDashboardStats>(`${SAMBA_PREFIX}/orders/dashboard-stats`),
   get: (id: string) => request<SambaOrder>(`${SAMBA_PREFIX}/orders/${id}`),
   search: (q: string) => request<SambaOrder[]>(`${SAMBA_PREFIX}/orders/search?q=${encodeURIComponent(q)}`),

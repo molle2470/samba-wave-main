@@ -758,6 +758,7 @@ export default function OrdersPage() {
         pageSize={pageSize} setPageSize={setPageSize}
         accounts={accounts} sourcingAccounts={sourcingAccounts}
         siteOptions={siteOptions}
+        selectedOrderIds={Array.from(selectedIds)}
       />
 
       {/* 송장 자동전송 미니바 — 일괄 트리거 + 안내 */}
