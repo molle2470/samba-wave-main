@@ -3434,26 +3434,49 @@ class AutotuneStartRequest(BaseModel):
 async def _add_running_device(dev: str) -> None:
     """배포/재시작 시 자동 복원용 — 실행 중 PC device set 에 dev 추가 (멀티 PC).
 
-    legacy autotune_owner_device_id 는 단일 PC만 저장 → 멀티 PC 환경에서
-    배포 후 1개 PC 만 자동 시작되고 나머지는 stop 상태로 SSG/ABC 분담 owner=None →
-    "데몬 미등록" 잡 발행 실패. set 으로 저장해 모든 PC 복원.
-    """
-    import json
-    from backend.db.orm import get_write_session
-    from backend.api.v1.routers.samba.proxy import _get_setting, _set_setting
+    [근본 fix 2026-05-26] 옛 구현 = `_get_setting` (READ) + `set.add` + `_set_setting` (WRITE).
+    여러 PC 가 거의 동시에 시작 클릭 시 race condition — 두 호출 모두 옛 raw 읽고
+    각자 dev add → 마지막 WRITE 가 다른 dev 덮어씀 → DB running = 한 device 만 박힘
+    → 다른 PC publisher 안 시작 → 그 사이트 사이클 발행 0 (일주일 사고).
 
+    fix: PostgreSQL atomic UPDATE — 옛 value 를 직접 jsonb_array_elements 로 읽고
+    새 dev 와 union → distinct array_agg → 단일 SQL row-update. race 원천 차단.
+    """
+    from backend.db.orm import get_write_session
+    from sqlalchemy import text as _sa_text
+
+    if not (dev or "").strip():
+        return
     try:
         async with get_write_session() as session:
-            raw = (await _get_setting(session, "autotune_running_devices")) or "[]"
-            try:
-                current = set(json.loads(raw)) if isinstance(raw, str) else set()
-            except Exception:
-                current = set()
-            current.add(dev)
-            await _set_setting(
-                session,
-                "autotune_running_devices",
-                json.dumps(sorted(current)),
+            # samba_settings 가 없으면 INSERT, 있으면 UPDATE 동시 처리.
+            # 기존 value 의 array 와 신규 dev 를 union → distinct → 정렬 array.
+            await session.execute(
+                _sa_text(
+                    """
+                    INSERT INTO samba_settings (key, value, updated_at)
+                    VALUES (
+                        'autotune_running_devices',
+                        to_jsonb(ARRAY[:dev]::text[])::text,
+                        NOW()
+                    )
+                    ON CONFLICT (key) DO UPDATE SET
+                        value = (
+                            SELECT to_jsonb(array_agg(DISTINCT x ORDER BY x))::text
+                            FROM (
+                                SELECT jsonb_array_elements_text(
+                                    CASE WHEN samba_settings.value::text ~ '^\\[' THEN samba_settings.value::jsonb
+                                         ELSE '[]'::jsonb END
+                                ) AS x
+                                UNION ALL
+                                SELECT :dev
+                            ) sub
+                            WHERE x IS NOT NULL AND x != ''
+                        ),
+                        updated_at = NOW()
+                    """
+                ),
+                {"dev": dev},
             )
             await session.commit()
     except Exception as e:
@@ -3461,23 +3484,33 @@ async def _add_running_device(dev: str) -> None:
 
 
 async def _remove_running_device(dev: str) -> None:
-    """실행 중 PC device set 에서 dev 제거 (정지 시)."""
-    import json
-    from backend.db.orm import get_write_session
-    from backend.api.v1.routers.samba.proxy import _get_setting, _set_setting
+    """실행 중 PC device set 에서 dev 제거 (정지 시) — atomic SQL.
 
+    [근본 fix 2026-05-26] _add_running_device 와 동일한 race condition 차단.
+    """
+    from backend.db.orm import get_write_session
+    from sqlalchemy import text as _sa_text
+
+    if not (dev or "").strip():
+        return
     try:
         async with get_write_session() as session:
-            raw = (await _get_setting(session, "autotune_running_devices")) or "[]"
-            try:
-                current = set(json.loads(raw)) if isinstance(raw, str) else set()
-            except Exception:
-                current = set()
-            current.discard(dev)
-            await _set_setting(
-                session,
-                "autotune_running_devices",
-                json.dumps(sorted(current)),
+            await session.execute(
+                _sa_text(
+                    """
+                    UPDATE samba_settings SET
+                        value = COALESCE((
+                            SELECT to_jsonb(array_agg(x ORDER BY x))::text
+                            FROM jsonb_array_elements_text(
+                                CASE WHEN value::text ~ '^\\[' THEN value::jsonb ELSE '[]'::jsonb END
+                            ) AS x
+                            WHERE x != :dev AND x IS NOT NULL AND x != ''
+                        ), '[]'),
+                        updated_at = NOW()
+                    WHERE key = 'autotune_running_devices'
+                    """
+                ),
+                {"dev": dev},
             )
             await session.commit()
     except Exception as e:
