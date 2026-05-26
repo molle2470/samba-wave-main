@@ -1391,6 +1391,37 @@ class JobWorker:
                     skip_count += _sk
                     fail_count += _f
 
+            # 모든 target 계정이 등록 한도 초과 등으로 차단됨 → 잡 조기 종료 (다음 잡으로 이동)
+            # 테트리스 잡(target_account_ids 비어있음)은 계정 동적 매핑이라 제외
+            if (
+                blocked_account_ids
+                and target_account_ids
+                and all(a in blocked_account_ids for a in target_account_ids)
+            ):
+                remaining = total - (i_last + 1)
+                if remaining > 0:
+                    skip_count += remaining
+                    _add_job_log(
+                        job.id,
+                        f"잡 조기 종료 — 모든 대상 계정 차단({len(blocked_account_ids):,}개), "
+                        f"남은 {remaining:,}건 스킵 (다음 잡으로 이동)",
+                    )
+                    logger.warning(
+                        f"[잡워커] 잡 조기 종료: {job.id} — 모든 target 계정 차단, "
+                        f"remaining={remaining}"
+                    )
+                # progress를 total로 강제하여 완료 처리
+                try:
+                    async with get_write_session() as _early_sess:
+                        _early_repo = SambaJobRepository(_early_sess)
+                        await _early_repo.update_progress(job.id, total, total)
+                        await _early_sess.commit()
+                except Exception as exc:
+                    logger.warning(
+                        f"[잡워커] 조기 종료 progress 갱신 실패: {job.id} — {exc}"
+                    )
+                break
+
             # OOM 방지: 50건마다 gc + malloc_trim으로 RSS 회수
             if (i_last + 1) % 50 < BATCH_SIZE:
                 _force_free_memory()
