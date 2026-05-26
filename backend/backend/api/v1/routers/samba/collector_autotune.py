@@ -364,25 +364,28 @@ _filters_avail_lock = asyncio.Lock()
 _AUTOTUNE_TRANSMIT_MAX_CONCURRENCY = int(
     os.environ.get("AUTOTUNE_TRANSMIT_MAX_CONCURRENCY", "3")
 )
+# 사이트별 transmit 슬롯 — 사이트 특성 (가격변동 빈도/마켓 응답 속도) 반영.
+# 무신사 = 6 (대용량 + 잦은 변동), GSShop = 1 (정책 변동 적음 + 보수적),
+# 나머지 = 3 (default).
+SITE_TRANSMIT_CONCURRENCY: dict[str, int] = {
+    "MUSINSA": 6,
+    "GSShop": 1,
+}
 # PC × 사이트별 transmit 세마포어 — (device_id, site) 단위 분리.
-# 사이트별 3 슬롯. PC 가 N 사이트 담당하면 그 PC 총 동시 transmit = N × 3.
-# 예: PC1 (무신사+GS+ABC) = 9, PC2 (SSG) = 3, PC3 (LOTTE) = 3.
-# DB write pool 50 한도 내 안전 (PC 5개 × 5 사이트 × 3 = 75 까지 가능하지만
-# 일반적 분담 시 30~40 슬롯 수준).
+# 한 PC 의 한 사이트 transmit 점유가 다른 사이트/다른 PC 영향 X.
 # 옛 글로벌 단일 세마포어 = MUSINSA transmit 점유 시 ABC cycle blocked 사고
 # (2026-05-26 ABC starvation).
 _autotune_transmit_sems: dict[tuple[str, str], asyncio.Semaphore] = {}
 
 
 def _get_transmit_sem(device_id: str = "", site: str = "") -> asyncio.Semaphore:
-    """PC × 사이트별 세마포어 lazy init.
-
-    한 PC 의 한 사이트 transmit 점유가 다른 사이트/다른 PC 영향 X.
-    """
-    key = ((device_id or "").strip() or "_default", (site or "").strip() or "_any")
+    """PC × 사이트별 세마포어 lazy init — 사이트별 cap 적용."""
+    _site = (site or "").strip()
+    key = ((device_id or "").strip() or "_default", _site or "_any")
     sem = _autotune_transmit_sems.get(key)
     if sem is None:
-        sem = asyncio.Semaphore(_AUTOTUNE_TRANSMIT_MAX_CONCURRENCY)
+        cap = SITE_TRANSMIT_CONCURRENCY.get(_site, _AUTOTUNE_TRANSMIT_MAX_CONCURRENCY)
+        sem = asyncio.Semaphore(cap)
         _autotune_transmit_sems[key] = sem
     return sem
 
