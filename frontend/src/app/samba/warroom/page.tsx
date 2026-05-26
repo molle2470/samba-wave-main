@@ -290,14 +290,29 @@ const getOrCreateAutotuneDaemonDeviceId = (): string => {
 // 파일명에서 토큰을 추출해 long-lived 키와 교환 → 사용자는 "다운로드 → 실행"만 하면 됨.
 // (기존 GitHub 직접 링크는 cross-origin 이라 파일명에 키를 못 박아 수동 키 주입이 필요했음)
 async function downloadDaemonInstaller(did: string): Promise<boolean> {
+  const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.samba-wave.co.kr'
+  const { showAlert } = await import('@/components/samba/Modal')
   try {
-    const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.samba-wave.co.kr'
     const { fetchWithAuth } = await import('@/lib/samba/legacy')
     const res = await fetchWithAuth(
       `${apiBase}/api/v1/samba/extension-keys/daemon-installer?device_id=${encodeURIComponent(did)}`,
     )
-    if (!res.ok) return false
+    if (!res.ok) {
+      let body = ''
+      try { body = (await res.text()).slice(0, 300) } catch { /* ignore */ }
+      if (res.status === 401 || res.status === 403) {
+        showAlert(`로그인 만료 — 재로그인 후 다시 시도 (status=${res.status})`, 'error')
+      } else {
+        showAlert(`데몬 다운로드 실패: status=${res.status}\n${body}`, 'error')
+      }
+      return false
+    }
     const blob = await res.blob()
+    if (!blob || blob.size < 1_000_000) {
+      // 정상 데몬 exe = 59MB. 1MB 미만이면 redirect HTML 또는 에러 페이지 가능.
+      showAlert(`다운로드 응답 비정상 (size=${blob?.size || 0} bytes). backend 로그 확인 필요`, 'error')
+      return false
+    }
     const cd = res.headers.get('Content-Disposition') || ''
     const m = cd.match(/filename="(.+?)"/)
     const fname = m?.[1] || 'autotune-daemon-setup.exe'
@@ -310,7 +325,9 @@ async function downloadDaemonInstaller(did: string): Promise<boolean> {
     document.body.removeChild(a)
     setTimeout(() => URL.revokeObjectURL(url), 10_000)
     return true
-  } catch {
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    showAlert(`데몬 다운로드 예외: ${msg}`, 'error')
     return false
   }
 }
@@ -738,7 +755,28 @@ export default function WarroomPage() {
     ;(async () => {
       const { getDeviceId } = await import('@/lib/samba/deviceId')
       const dev = getDeviceId()
-      const st = await collectorApi.autotuneStatus(dev || undefined)
+      // (2026-05-26) chrome dev + 데몬 dev 둘 다 status 체크 → 둘 중 하나라도 running 이면 본인 PC 작동.
+      // 이전: chrome dev 만 보다가 데몬 device 가 실제 사이클을 돌리는데 "정지" 잘못 표시되던 사고.
+      const daemonDev = (typeof window !== 'undefined' && window.localStorage.getItem('samba.autotune.daemon.deviceId')) || ''
+      const [stChrome, stDaemon] = await Promise.all([
+        dev ? collectorApi.autotuneStatus(dev) : Promise.resolve(null),
+        daemonDev ? collectorApi.autotuneStatus(daemonDev) : Promise.resolve(null),
+      ])
+      const st = (() => {
+        const a = stChrome || ({} as Record<string, unknown>)
+        const b = stDaemon || ({} as Record<string, unknown>)
+        const _running = !!(a as { running?: boolean }).running || !!(b as { running?: boolean }).running
+        const _enabled = ((a as { enabled?: boolean }).enabled ?? (b as { enabled?: boolean }).enabled) ?? null
+        const _last = [(a as { last_tick?: string | null }).last_tick, (b as { last_tick?: string | null }).last_tick].filter(Boolean).sort().pop() || null
+        const _cycle = Math.max(((a as { cycle_count?: number }).cycle_count) || 0, ((b as { cycle_count?: number }).cycle_count) || 0)
+        const _refreshed = Math.max(((a as { refreshed_count?: number }).refreshed_count) || 0, ((b as { refreshed_count?: number }).refreshed_count) || 0)
+        const _restart = ((a as { restart_count?: number }).restart_count) || ((b as { restart_count?: number }).restart_count) || 0
+        const _running_pcs_raw = [...(((a as { running_pcs?: string[] }).running_pcs) || []), ...(((b as { running_pcs?: string[] }).running_pcs) || [])]
+        const _running_pcs = [...new Set(_running_pcs_raw)]
+        const _site_intervals = (a as { site_intervals?: Record<string, unknown> }).site_intervals || (b as { site_intervals?: Record<string, unknown> }).site_intervals
+        const _site_autotune_concurrency = (a as { site_autotune_concurrency?: Record<string, unknown> }).site_autotune_concurrency || (b as { site_autotune_concurrency?: Record<string, unknown> }).site_autotune_concurrency
+        return { ...a, ...b, running: _running, enabled: _enabled, last_tick: _last, cycle_count: _cycle, refreshed_count: _refreshed, restart_count: _restart, running_pcs: _running_pcs, site_intervals: _site_intervals, site_autotune_concurrency: _site_autotune_concurrency }
+      })()
       return { st, dev }
     })()
       .then(async ({ st: atStatus, dev }) => {
