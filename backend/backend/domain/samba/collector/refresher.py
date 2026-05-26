@@ -43,25 +43,25 @@ SITE_CONCURRENCY: dict[str, int] = {
 SITE_AUTOTUNE_CONCURRENCY: dict[str, int] = {
     "MUSINSA": 4,  # 일반 갱신은 SITE_CONCURRENCY=20, 오토튠만 4
 }
-# 소싱처별 기본 인터벌 (초)
+# 소싱처별 기본 인터벌 (초) — 전 사이트 0 하드코딩 (2026-05-26 사용자 요구).
+# 차단 시 _site_intervals[site] 자동 증가 로직은 유지 (refresher 안 2배 backoff).
 SITE_BASE_INTERVAL: dict[str, float] = {
-    "MUSINSA": 1.0,
-    "KREAM": 1.0,
-    "DANAWA": 1.0,
-    "FashionPlus": 1.0,
-    "Nike": 1.0,
-    "Adidas": 1.0,
-    "ABCmart": 1.0,
-    "GrandStage": 1.0,
-    "REXMONDE": 1.0,
-    # 실행 PC 1대 처리 기준 큐 적체 방지 (동시 2건 × 3초 간격 = 초당 0.67건 큐잉)
-    "SSG": 3.0,
-    "LOTTEON": 3.0,
-    "GSShop": 1.0,
-    "ElandMall": 1.0,
-    "SSF": 1.0,
-    "NAVERSTORE": 0.5,
-    "SNKRDUNK": 1.0,
+    "MUSINSA": 0,
+    "KREAM": 0,
+    "DANAWA": 0,
+    "FashionPlus": 0,
+    "Nike": 0,
+    "Adidas": 0,
+    "ABCmart": 0,
+    "GrandStage": 0,
+    "REXMONDE": 0,
+    "SSG": 0,
+    "LOTTEON": 0,
+    "GSShop": 0,
+    "ElandMall": 0,
+    "SSF": 0,
+    "NAVERSTORE": 0,
+    "SNKRDUNK": 0,
 }
 # 소싱처별 최소 인터벌 (초)
 SITE_MIN_INTERVAL: dict[str, float] = {

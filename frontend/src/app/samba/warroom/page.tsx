@@ -1313,34 +1313,8 @@ export default function WarroomPage() {
             })}
           </div>
         )}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
-          <span style={{ fontSize: '0.75rem', color: '#9AA5C0', fontWeight: 600, whiteSpace: 'nowrap' }}>수집인터벌</span>
-          {INTERVAL_SITES.map(({ key, label }) => (
-            <span key={key} style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
-              <span style={{ fontSize: '0.7rem', color: '#aaa', whiteSpace: 'nowrap' }}>{label}</span>
-              <input
-                type="text"
-                inputMode="decimal"
-                value={siteIntervals[key] ?? ''}
-                onChange={e => handleIntervalChange(key, e.target.value)}
-                style={{
-                  width: '2.5rem',
-                  padding: '0.1rem 0.25rem',
-                  background: 'rgba(255,255,255,0.06)',
-                  border: '1px solid rgba(255,255,255,0.15)',
-                  borderRadius: '4px',
-                  color: '#FF8C00',
-                  fontSize: '0.75rem',
-                  textAlign: 'center',
-                  outline: 'none',
-                }}
-                onFocus={e => { e.target.style.borderColor = '#FF8C00' }}
-                onBlur={e => { e.target.style.borderColor = 'rgba(255,255,255,0.15)' }}
-              />
-            </span>
-          ))}
-          <span style={{ fontSize: '0.65rem', color: '#666' }}>초</span>
-        </div>
+        {/* 수집인터벌 영역 제거 (2026-05-26 사용자 요구) — backend SITE_BASE_INTERVAL=0 하드코딩.
+            차단 시 자동 backoff 로직은 refresher.py 안에 유지. */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap', marginTop: '0.4rem' }}>
           <span style={{ fontSize: '0.75rem', color: '#9AA5C0', fontWeight: 600, whiteSpace: 'nowrap' }}>동시실행</span>
           {INTERVAL_SITES.map(({ key, label }) => (
