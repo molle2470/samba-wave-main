@@ -231,6 +231,29 @@ async def musinsa_set_cookie(
     except Exception as exc:  # pragma: no cover — fallback 실패해도 단수는 저장됨
         logger.warning(f"[set-cookie] musinsa_cookies 풀 갱신 실패 (무시): {exc}")
 
+    # 이슈 244 — refresher 가 cost 갱신 시 읽는 sourcing_account 위치에도 동기화.
+    # 확장앱이 samba_settings 만 갱신해 sync 위치 mismatch → "원가 갱신 중단" 모달 영구.
+    # is_login_default=True 무신사 계정 1건에 cookie 박고 cookie_expired 클리어.
+    try:
+        from backend.domain.samba.sourcing_account.service import (
+            SambaSourcingAccountService,
+        )
+        from backend.domain.samba.sourcing_account.repository import (
+            SambaSourcingAccountRepository,
+        )
+
+        _svc = SambaSourcingAccountService(
+            SambaSourcingAccountRepository(write_session)
+        )
+        _acc = await _svc.get_login_default("MUSINSA")
+        if _acc:
+            _extra = dict(_acc.additional_fields or {})
+            _extra["musinsa_cookie"] = body.cookie
+            _extra["cookie_expired"] = False
+            await _svc.repo.update_async(_acc.id, additional_fields=_extra)
+    except Exception as exc:
+        logger.warning(f"[set-cookie] sourcing_account 동기화 실패 (무시): {exc}")
+
     return result
 
 
