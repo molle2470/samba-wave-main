@@ -358,6 +358,8 @@ interface ActiveCycle {
   last_tick: string
   heartbeat_ago_sec: number | null
   avg_sec_per_item: number | null
+  started_at: string | null
+  elapsed_sec: number | null
 }
 
 function ActiveCyclesPanel(): React.ReactElement {
@@ -420,6 +422,8 @@ function ActiveCyclesPanel(): React.ReactElement {
               <th style={{ textAlign: 'right', padding: '0.4rem' }}>진행</th>
               <th style={{ textAlign: 'right', padding: '0.4rem' }}>처리속도</th>
               <th style={{ textAlign: 'right', padding: '0.4rem' }}>사이클#</th>
+              <th style={{ textAlign: 'left', padding: '0.4rem' }}>시작 시각</th>
+              <th style={{ textAlign: 'right', padding: '0.4rem' }}>경과</th>
               <th style={{ textAlign: 'right', padding: '0.4rem' }}>최근 활동</th>
               <th style={{ textAlign: 'center', padding: '0.4rem' }}>중단</th>
             </tr>
@@ -431,6 +435,26 @@ function ActiveCyclesPanel(): React.ReactElement {
               const avgStr = c.avg_sec_per_item === null || c.avg_sec_per_item === undefined
                 ? '-'
                 : `${c.avg_sec_per_item.toFixed(1)}초/1건`
+              // 시작 시각 → KST HH:MM:SS
+              let startedStr = '-'
+              if (c.started_at) {
+                try {
+                  const d = new Date(c.started_at)
+                  const kst = new Date(d.getTime() + 9 * 3600 * 1000)
+                  startedStr = kst.toISOString().slice(11, 19)
+                } catch { /* ignore */ }
+              }
+              // 경과 시간 → 분:초 또는 시:분:초
+              let elapsedStr = '-'
+              if (c.elapsed_sec !== null && c.elapsed_sec !== undefined) {
+                const s = c.elapsed_sec
+                const h = Math.floor(s / 3600)
+                const m = Math.floor((s % 3600) / 60)
+                const sec = s % 60
+                elapsedStr = h > 0
+                  ? `${fmtNum(h)}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`
+                  : `${fmtNum(m)}:${String(sec).padStart(2,'0')}`
+              }
               return (
                 <tr key={k} style={{ borderBottom: '1px solid #2A2A2A' }}>
                   <td style={{ padding: '0.4rem', fontFamily: 'monospace', fontSize: '0.75rem' }}>{c.device_id.slice(0, 28)}</td>
@@ -438,6 +462,8 @@ function ActiveCyclesPanel(): React.ReactElement {
                   <td style={{ padding: '0.4rem', textAlign: 'right' }}>{fmtNum(c.idx)} / {fmtNum(c.total)}</td>
                   <td style={{ padding: '0.4rem', textAlign: 'right', color: '#FFB84D' }}>{avgStr}</td>
                   <td style={{ padding: '0.4rem', textAlign: 'right' }}>{fmtNum(c.cycle_count)}</td>
+                  <td style={{ padding: '0.4rem', fontFamily: 'monospace', fontSize: '0.75rem', color: '#9AA5C0' }}>{startedStr}</td>
+                  <td style={{ padding: '0.4rem', textAlign: 'right', color: '#9AA5C0' }}>{elapsedStr}</td>
                   <td style={{ padding: '0.4rem', textAlign: 'right', color: '#888' }}>{hbStr}</td>
                   <td style={{ padding: '0.4rem', textAlign: 'center' }}>
                     <button

@@ -4186,22 +4186,26 @@ async def autotune_active_cycles():
             last_tick = _pc_site_last_ticks.get(dev, {}).get(site, "")
             hb = _pc_site_heartbeats.get(dev, {}).get(site, 0)
             hb_ago = int(now_ts - hb) if hb else None
-            # 현 사이클 시작 시각 기반 건당 평균 처리 시간
+            # 현 사이클 시작 시각 + 경과 시간 + 건당 평균 처리 시간
             avg_sec: Optional[float] = None
+            started_at_iso: Optional[str] = None
+            elapsed_sec: Optional[int] = None
             try:
                 _cstats = _autotune_cycle_stats.get(gkey) or {}
                 _started_iso = _cstats.get("started_at")
-                if _started_iso and idx > 0:
+                if _started_iso:
+                    started_at_iso = str(_started_iso)
                     _started_dt = datetime.fromisoformat(
-                        str(_started_iso).replace("Z", "+00:00")
+                        started_at_iso.replace("Z", "+00:00")
                     )
                     _elapsed = (
                         datetime.now(timezone.utc) - _started_dt
                     ).total_seconds()
-                    if _elapsed > 0:
+                    elapsed_sec = int(_elapsed)
+                    if idx > 0 and _elapsed > 0:
                         avg_sec = round(_elapsed / idx, 2)
             except Exception:
-                avg_sec = None
+                pass
             cycles.append(
                 {
                     "device_id": dev,
@@ -4212,6 +4216,8 @@ async def autotune_active_cycles():
                     "last_tick": last_tick,
                     "heartbeat_ago_sec": hb_ago,
                     "avg_sec_per_item": avg_sec,
+                    "started_at": started_at_iso,
+                    "elapsed_sec": elapsed_sec,
                 }
             )
     cycles.sort(key=lambda c: (c["device_id"], c["site"]))
