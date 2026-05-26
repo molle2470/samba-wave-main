@@ -10,6 +10,7 @@ export const STATUS_MAP: Record<string, { label: string; bg: string; text: strin
   returning: { label: '반품중', bg: 'rgba(200,100,200,0.15)', text: '#CC5DE8' },
   exchanging: { label: '교환중', bg: 'rgba(255,182,193,0.15)', text: '#FFB6C1' },
   cancel_requested: { label: '취소요청', bg: 'rgba(255,80,80,0.2)', text: '#FF5050' },
+  cancel_reject_pending: { label: '취소거부(수동)', bg: 'rgba(139,92,246,0.2)', text: '#8B5CF6' },
   return_requested: { label: '반품요청', bg: 'rgba(200,100,200,0.2)', text: '#CC5DE8' },
   cancelled: { label: '취소완료', bg: 'rgba(255,107,107,0.15)', text: '#FF6B6B' },
   returned: { label: '반품완료', bg: 'rgba(180,80,180,0.15)', text: '#B44EB4' },

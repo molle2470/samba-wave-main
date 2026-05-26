@@ -185,6 +185,16 @@ export interface SambaOrder {
   updated_at: string;
   has_sms_sent?: boolean;
   has_kakao_sent?: boolean;
+  // 쿠팡 취소/반품 사유 (#246) — returnRequests v6 API 응답 매핑
+  cancel_reason_code?: string | null;
+  cancel_reason_text?: string | null;
+  cancel_reason_category1?: string | null;
+  cancel_reason_category2?: string | null;
+  cancel_fault_by?: string | null;   // CUSTOMER/VENDOR/COUPANG/WMS/GENERAL
+  cancel_receipt_id?: number | null;
+  cancel_release_status?: string | null;       // Y/N/S/A
+  cancel_release_stop_status?: string | null;
+  cancel_requested_at?: string | null;
 }
 
 export interface MessageLog {
@@ -340,6 +350,15 @@ export const orderApi = {
       `${SAMBA_PREFIX}/orders/sync-from-markets`, { method: "POST", body: JSON.stringify({ days, account_id: accountId || undefined }) }),
   approveCancel: (id: string) =>
     request<{ ok: boolean; message: string }>(`${SAMBA_PREFIX}/orders/${id}/approve-cancel`, { method: "POST" }),
+  // 쿠팡 이미출고(release_status='A') 케이스 — 운영자가 택배사·송장번호 입력 (#246)
+  approveCancelWithShipment: (id: string, deliveryCompanyCode: string, invoiceNumber: string) =>
+    request<{ ok: boolean; message: string }>(`${SAMBA_PREFIX}/orders/${id}/approve-cancel-with-shipment`, {
+      method: "POST",
+      body: JSON.stringify({ delivery_company_code: deliveryCompanyCode, invoice_number: invoiceNumber }),
+    }),
+  // 취소 거부 — 쿠팡은 거부 API 없어 내부 cancel_reject_pending만 표시 (#246)
+  rejectCancel: (id: string) =>
+    request<{ ok: boolean; message: string; manual_required?: boolean }>(`${SAMBA_PREFIX}/orders/${id}/reject-cancel`, { method: "POST" }),
   sellerCancel: (id: string, reasonCode: string, reasonText?: string) =>
     request<{ ok: boolean; message: string; detail?: string }>(`${SAMBA_PREFIX}/orders/${id}/seller-cancel`, {
       method: "POST", body: JSON.stringify({ reason_code: reasonCode, reason_text: reasonText || "" }),

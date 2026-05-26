@@ -140,8 +140,26 @@ export default function OrdersTable(props: OrdersTableProps) {
             const activeActionTags = parseActionTags(activeActions[o.id] ?? o.action_tag ?? null)
             const customerAddress = splitCustomerAddress(o.customer_address, o.customer_address_detail)
 
+            const isCancelRequested = o.status === 'cancel_requested'
+            const isReturnRequested = o.status === 'return_requested'
+            const isRejectPending = o.status === 'cancel_reject_pending'
+            const rowStyle: React.CSSProperties = {
+              borderBottom: '1px solid #1C2333',
+              verticalAlign: 'top',
+            }
+            if (isCancelRequested) {
+              rowStyle.borderLeft = '4px solid #DC2626'
+              rowStyle.background = 'rgba(220,38,38,0.05)'
+            } else if (isReturnRequested) {
+              rowStyle.borderLeft = '4px solid #F59E0B'
+              rowStyle.background = 'rgba(245,158,11,0.05)'
+            } else if (isRejectPending) {
+              rowStyle.borderLeft = '4px solid #8B5CF6'
+              rowStyle.background = 'rgba(139,92,246,0.05)'
+            }
+
             return (
-              <tr key={o.id} style={{ borderBottom: '1px solid #1C2333', verticalAlign: 'top' }}>
+              <tr key={o.id} style={rowStyle}>
                 {/* 체크박스 */}
                 <td style={{ padding: '0.75rem 0.5rem', textAlign: 'center', borderRight: '1px solid #1C2333' }}>
                   <div style={{ fontSize: '0.65rem', color: '#FFFFFF', fontWeight: 'bold', marginBottom: '2px' }}>{(currentPage - 1) * pageSize + index + 1}</div>
@@ -175,6 +193,92 @@ export default function OrdersTable(props: OrdersTableProps) {
                 />
                 {/* 금액 */}
                 <td style={{ padding: '0.75rem', borderRight: '1px solid #1C2333', fontSize: '0.8rem' }}>
+                  {/* 취소요청 사유 + 승인/거부 (#246) */}
+                  {(isCancelRequested || isReturnRequested) && (() => {
+                    const faultBy = (o.cancel_fault_by || '').toUpperCase()
+                    const faultColor = faultBy === 'CUSTOMER'
+                      ? '#10B981'
+                      : (faultBy === 'VENDOR' || faultBy === 'COUPANG' ? '#F59E0B' : '#888')
+                    const faultLabel = faultBy === 'CUSTOMER' ? '구매자 귀책 (승인 권장)'
+                      : faultBy === 'VENDOR' ? '판매자 귀책 (재검토)'
+                      : faultBy === 'COUPANG' ? '쿠팡 귀책 (재검토)'
+                      : faultBy === 'WMS' ? 'WMS 귀책'
+                      : faultBy === 'GENERAL' ? '일반' : ''
+                    const cat = [o.cancel_reason_category1, o.cancel_reason_category2].filter(Boolean).join(' / ')
+                    const isAlreadyShipped = (o.cancel_release_status || '').toUpperCase() === 'A'
+                    const isStopped = (o.cancel_release_status || '').toUpperCase() === 'S'
+                    return (
+                      <div style={{
+                        marginBottom: '0.5rem', padding: '0.4rem',
+                        background: 'rgba(220,38,38,0.08)',
+                        border: '1px solid rgba(220,38,38,0.3)',
+                        borderRadius: '4px', fontSize: '0.7rem',
+                      }}>
+                        <div style={{ color: '#DC2626', fontWeight: 600, marginBottom: '0.25rem' }}>
+                          {isCancelRequested ? '취소요청' : '반품요청'}
+                          {isStopped && <span style={{ marginLeft: 6, padding: '1px 6px', background: '#10B981', color: '#fff', borderRadius: 3, fontSize: '0.6rem' }}>출고중지 완료</span>}
+                          {isAlreadyShipped && <span style={{ marginLeft: 6, padding: '1px 6px', background: '#F59E0B', color: '#fff', borderRadius: 3, fontSize: '0.6rem' }}>이미출고</span>}
+                        </div>
+                        {cat && <div style={{ color: '#ccc' }}>{cat}</div>}
+                        {o.cancel_reason_text && <div style={{ color: '#aaa', fontSize: '0.65rem' }}>{o.cancel_reason_text}</div>}
+                        {faultLabel && <div style={{ color: faultColor, fontWeight: 600, marginTop: '0.2rem' }}>{faultLabel}</div>}
+                        <div style={{ display: 'flex', gap: '4px', marginTop: '0.4rem' }}>
+                          <button
+                            onClick={async () => {
+                              if (isAlreadyShipped) {
+                                const company = window.prompt('이미출고 — 택배사 코드 입력 (예: CJGLS, HANJIN, LOTTE)')
+                                if (!company) return
+                                const invoice = window.prompt('송장번호 입력')
+                                if (!invoice) return
+                                const yes = await showConfirm('이미출고 취소승인 — 왕복 배송비 판매자 부담. 진행하시겠습니까?')
+                                if (!yes) return
+                                try {
+                                  const res = await orderApi.approveCancelWithShipment(o.id, company, invoice)
+                                  showAlert(res.message || '취소승인 완료', 'success')
+                                  loadOrders()
+                                } catch (err) {
+                                  showAlert(err instanceof Error ? err.message : '취소승인 실패', 'error')
+                                }
+                              } else {
+                                const yes = await showConfirm('취소승인 — 출고중지 처리하시겠습니까?')
+                                if (!yes) return
+                                try {
+                                  const res = await orderApi.approveCancel(o.id)
+                                  showAlert(res.message || '취소승인 완료', 'success')
+                                  loadOrders()
+                                } catch (err) {
+                                  showAlert(err instanceof Error ? err.message : '취소승인 실패', 'error')
+                                }
+                              }
+                            }}
+                            style={{
+                              flex: 1, fontSize: '0.65rem', padding: '0.2rem 0',
+                              background: '#10B981', color: '#fff',
+                              border: 'none', borderRadius: 3, cursor: 'pointer', fontWeight: 600,
+                            }}
+                          >취소 승인</button>
+                          <button
+                            onClick={async () => {
+                              const yes = await showConfirm('취소 거부 — Wing 화면에서 수동 처리 필요. 진행하시겠습니까?')
+                              if (!yes) return
+                              try {
+                                const res = await orderApi.rejectCancel(o.id)
+                                showAlert(res.message || '거부 처리 완료', res.manual_required ? 'info' : 'success')
+                                loadOrders()
+                              } catch (err) {
+                                showAlert(err instanceof Error ? err.message : '거부 실패', 'error')
+                              }
+                            }}
+                            style={{
+                              flex: 1, fontSize: '0.65rem', padding: '0.2rem 0',
+                              background: 'transparent', color: '#DC2626',
+                              border: '1px solid #DC2626', borderRadius: 3, cursor: 'pointer', fontWeight: 600,
+                            }}
+                          >취소 거부</button>
+                        </div>
+                      </div>
+                    )
+                  })()}
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#888' }}>결제</span><span>{fmtNum(o.total_payment_amount ?? o.sale_price)}</span></div>
                     <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#888' }}>정산</span><span>{fmtNum(Math.round(o.revenue))}</span></div>
