@@ -163,13 +163,13 @@ export function StoreSettingsPanel(props: Props) {
                             showAlert(res.message || '배송정보를 불러올 수 없습니다.', 'error')
                             return
                           }
-                          const places = (res.places || []).map((p: { placeNo: number; placeNm: string; placeType?: number }) => ({
+                          const places = (res.places || []).map((p: { placeNo: number; placeName?: string; placeNm?: string; placeType?: number; imposeType?: number }) => ({
                             value: String(p.placeNo),
-                            label: `[${p.placeType === 2 ? '반품지' : '출고지'}] ${p.placeNm} (${p.placeNo})`,
+                            label: `[${(p.placeType ?? p.imposeType) === 2 ? '반품지' : '출고지'}] ${p.placeName ?? p.placeNm} (${p.placeNo})`,
                           }))
-                          const dispatches = (res.dispatchPolicies || []).map((d: { dispatchPolicyNo: number; policyNm: string }) => ({
+                          const dispatches = (res.dispatchPolicies || []).map((d: { dispatchPolicyNo: number; dispatchPolicyName?: string; policyNm?: string }) => ({
                             value: String(d.dispatchPolicyNo),
-                            label: `${d.policyNm} (${d.dispatchPolicyNo})`,
+                            label: `${d.dispatchPolicyName ?? d.policyNm} (${d.dispatchPolicyNo})`,
                           }))
                           setEsmPlaceOptions(prev => ({ ...prev, [market.key]: places }))
                           setEsmDispatchOptions(prev => ({ ...prev, [market.key]: dispatches }))

@@ -259,8 +259,9 @@ async def reply_cs_inquiry(
         else ""
     )
 
-    # 마켓 전송 시도 (market_inquiry_no가 있는 경우)
-    if inquiry.market_inquiry_no:
+    # 마켓 전송 시도 (market_inquiry_no가 있거나 external_id 기반 마켓인 경우)
+    _ext_id_markets = {"SSG", "롯데홈쇼핑"}
+    if inquiry.market_inquiry_no or (inquiry.market in _ext_id_markets and inquiry.external_id):
         try:
             if inquiry.market == "스마트스토어":
                 client = None
@@ -522,13 +523,94 @@ async def reply_cs_inquiry(
                         else:
                             market_msg = "eBay 인증정보 없음"
 
+            elif inquiry.market == "롯데홈쇼핑":
+                from backend.api.v1.routers.samba.proxy._helpers import _get_lotte_client
+                from backend.domain.samba.account.model import SambaMarketAccount
+
+                lh_acc = None
+                if inquiry.account_id:
+                    _lh_result = await session.execute(
+                        select(SambaMarketAccount).where(
+                            SambaMarketAccount.id == inquiry.account_id
+                        )
+                    )
+                    lh_acc = _lh_result.scalar_one_or_none()
+
+                if lh_acc:
+                    import json as _json
+                    from backend.domain.samba.proxy.lottehome import LotteHomeClient
+                    _lh_af = lh_acc.additional_fields or {}
+                    if isinstance(_lh_af, str):
+                        _lh_af = _json.loads(_lh_af)
+                    lh_client = LotteHomeClient(
+                        user_id=_lh_af.get("userId", "") or lh_acc.seller_id or "",
+                        password=_lh_af.get("password", "") or lh_acc.api_secret or "",
+                        agnc_no=_lh_af.get("agncNo", ""),
+                        env=_lh_af.get("env", "prod"),
+                    )
+                else:
+                    lh_client = await _get_lotte_client(session)
+
+                await svc.reply_inquiry(inquiry_id, body.reply, mark_replied=False)
+                ok = await svc.send_reply_to_lottehome(inquiry_id, lh_client)
+                if ok:
+                    market_sent = True
+                    market_msg = "롯데홈쇼핑 CS 답변 전송 완료"
+                else:
+                    market_msg = "롯데홈쇼핑 답변 전송 실패"
+
+            elif inquiry.market == "SSG":
+                from backend.domain.samba.account.model import SambaMarketAccount
+                from backend.domain.samba.proxy.ssg import SSGClient
+
+                ssg_acc = None
+                if inquiry.account_id:
+                    _ssg_result = await session.execute(
+                        select(SambaMarketAccount).where(
+                            SambaMarketAccount.id == inquiry.account_id
+                        )
+                    )
+                    ssg_acc = _ssg_result.scalar_one_or_none()
+                if ssg_acc is None:
+                    _ssg_result2 = await session.execute(
+                        select(SambaMarketAccount).where(
+                            SambaMarketAccount.market_type == "ssg",
+                            SambaMarketAccount.is_active == True,  # noqa: E712
+                        )
+                    )
+                    ssg_acc = _ssg_result2.scalars().first()
+
+                if ssg_acc:
+                    _ssg_af = ssg_acc.additional_fields or {}
+                    ssg_api_key = _ssg_af.get("apiKey", "") or ssg_acc.api_key or ""
+                    if ssg_api_key:
+                        ssg_client = SSGClient(ssg_api_key)
+                        try:
+                            await svc.reply_inquiry(inquiry_id, body.reply, mark_replied=False)
+                            ok = await svc.send_reply_to_market(inquiry_id, ssg_client)
+                            if ok:
+                                market_sent = True
+                                market_msg = "SSG CS 답변 전송 완료"
+                            else:
+                                market_msg = "SSG 답변 전송 실패"
+                        finally:
+                            await ssg_client.close()
+                    else:
+                        market_msg = "SSG API 키 미설정"
+                else:
+                    market_msg = "SSG 계정 없음"
+
         except Exception as e:
             logger.warning(f"[CS답변] 마켓 전송 실패 (DB 저장은 진행): {e}")
             market_msg = f"마켓 전송 실패: {e}"
 
     # DB 저장: 마켓 전송 성공 시에만 replied로 마킹, 실패 시 답변 내용만 저장
     # market_inquiry_no 없는 문의(플레이오토 등)는 항상 replied로 마킹
-    mark_replied = market_sent or not inquiry.market_inquiry_no
+    # SSG/롯데홈쇼핑은 external_id 기반이므로 market_sent 결과에만 의존
+    _external_id_markets = {"SSG", "롯데홈쇼핑"}
+    mark_replied = market_sent or (
+        not inquiry.market_inquiry_no and inquiry.market not in _external_id_markets
+    )
     updated = await svc.reply_inquiry(inquiry_id, body.reply, mark_replied=mark_replied)
     if answer_no and answer_no != (inquiry.market_answer_no or ""):
         from backend.domain.samba.cs_inquiry.repository import SambaCSInquiryRepository
@@ -2702,6 +2784,67 @@ async def _do_sync_cs_from_markets(
                 errors.append(f"{esm_market_label}({esm_label}): {e}")
     except Exception as e:
         logger.warning(f"[CS동기화][ESM] 계정 조회 실패: {e}")
+
+    # ── 롯데홈쇼핑 CS 동기화 ──
+    if not market_name or market_name == "롯데홈쇼핑":
+        try:
+            from backend.domain.samba.account.model import SambaMarketAccount
+            from backend.api.v1.routers.samba.proxy._helpers import _get_lotte_client
+
+            lh_accts_result = await session.execute(
+                select(SambaMarketAccount).where(
+                    SambaMarketAccount.market_type == "lottehome",
+                    SambaMarketAccount.is_active == True,  # noqa: E712
+                )
+            )
+            lh_accts = lh_accts_result.scalars().all()
+            if not lh_accts:
+                # SambaMarketAccount 없으면 lottehome_credentials 설정으로 폴백
+                lh_client = await _get_lotte_client(session)
+                lh_collect = await svc.collect_from_lottehome(
+                    lh_client,
+                    days_back=7,
+                    account_id=None,
+                    account_label="롯데홈쇼핑",
+                )
+                synced += lh_collect.get("collected", 0)
+                logger.info(f"[CS동기화] 롯데홈쇼핑 CS: {lh_collect}")
+            else:
+                for lh_acc in lh_accts:
+                    if account_id and lh_acc.id != account_id:
+                        continue
+                    try:
+                        import json as _json
+                        lh_af = lh_acc.additional_fields or {}
+                        if isinstance(lh_af, str):
+                            lh_af = _json.loads(lh_af)
+                        from backend.domain.samba.proxy.lottehome import LotteHomeClient
+                        lh_client = LotteHomeClient(
+                            user_id=lh_af.get("userId", "") or lh_acc.seller_id or "",
+                            password=lh_af.get("password", "") or lh_acc.api_secret or "",
+                            agnc_no=lh_af.get("agncNo", ""),
+                            env=lh_af.get("env", "prod"),
+                        )
+                        lh_label = (
+                            lh_acc.account_label
+                            or lh_acc.business_name
+                            or lh_acc.seller_id
+                            or "롯데홈쇼핑"
+                        )
+                        lh_collect = await svc.collect_from_lottehome(
+                            lh_client,
+                            days_back=7,
+                            account_id=lh_acc.id,
+                            account_label=lh_label,
+                        )
+                        synced += lh_collect.get("collected", 0)
+                        logger.info(f"[CS동기화] 롯데홈쇼핑({lh_label}) CS: {lh_collect}")
+                    except Exception as e:
+                        lh_label = lh_acc.account_label or lh_acc.seller_id or "롯데홈쇼핑"
+                        logger.error(f"[CS동기화] 롯데홈쇼핑({lh_label}) 실패: {e}")
+                        errors.append(f"롯데홈쇼핑({lh_label}): {e}")
+        except Exception as e:
+            logger.warning(f"[CS동기화] 롯데홈쇼핑 계정 조회 실패: {e}")
 
     results: list[dict[str, Any]] = []
     try:
