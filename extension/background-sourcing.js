@@ -1249,6 +1249,8 @@ async function handleCancelOrderJob(job) {
   try {
     if (site === 'MUSINSA') {
       result = await _cancelMusinsa(ordNo, sourcingAccountId)
+    } else if (site === 'LOTTEON') {
+      result = await _cancelLotteon(ordNo, sourcingAccountId)
     } else {
       result.reason = `확장앱 cancel 미구현(site=${site})`
     }
@@ -1685,6 +1687,182 @@ async function _cancelMusinsa(ordNo, expectedAccountId) {
     details: results,
   }
 }
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LOTTEON 발주취소 — 데몬 자동로그인 봇 차단(2026-05-26 실측)으로 확장앱 라우팅.
+//
+// 무신사와 다른 점: LOTTEON 은 사용자 chrome 세션 필수 + native JS confirm dialog
+// 자동 accept 필요. ServiceWorker fetch 만으로는 불가(Vue v-select 등 페이지 JS 필요).
+// 해결: chrome.tabs.create({active:false}) 백그라운드 탭 + chrome.debugger.attach
+// → Page.handleJavaScriptDialog 자동 accept → cancel_js evaluate → 결과 회수 → 탭 close.
+//
+// 사용자 시야: active:false 라 활성 탭 변경 X. 탭 리스트에 잠깐 표시되나 즉시 닫힘(~10초).
+// ─────────────────────────────────────────────────────────────────────────────
+async function _cancelLotteon(ordNo, expectedAccountId) {
+  if (!ordNo) return { success: false, cancelled: false, error: 'ordNo empty' }
+
+  const cancelUrl = `https://www.lotteon.com/p/order/claim/cancellation/orderCancellationAccept?odNo=${ordNo}&odSeq=1&procSeq=1`
+  let tab = null
+  let attached = false
+  try {
+    // 1. 백그라운드 탭 생성
+    tab = await chrome.tabs.create({url: cancelUrl, active: false})
+    // 페이지 로드 대기
+    await new Promise(resolve => {
+      const start = Date.now()
+      const check = () => {
+        chrome.tabs.get(tab.id, (t) => {
+          if (chrome.runtime.lastError) return resolve()
+          if (t.status === 'complete' || Date.now() - start > 15000) return resolve()
+          setTimeout(check, 300)
+        })
+      }
+      check()
+    })
+    await new Promise(r => setTimeout(r, 2000))
+
+    // 2. debugger attach + Page.javascriptDialogOpening 자동 accept
+    await new Promise((resolve, reject) => {
+      chrome.debugger.attach({tabId: tab.id}, '1.3', () => {
+        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message))
+        resolve()
+      })
+    })
+    attached = true
+    await new Promise((resolve, reject) => {
+      chrome.debugger.sendCommand({tabId: tab.id}, 'Page.enable', {}, () => {
+        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message))
+        resolve()
+      })
+    })
+    const dialogHandler = (source, method, params) => {
+      if (source.tabId !== tab.id) return
+      if (method === 'Page.javascriptDialogOpening') {
+        chrome.debugger.sendCommand({tabId: tab.id}, 'Page.handleJavaScriptDialog', {accept: true}, () => {
+          void chrome.runtime.lastError
+        })
+      }
+    }
+    chrome.debugger.onEvent.addListener(dialogHandler)
+
+    try {
+      // 3. cancel_js evaluate
+      const cancelJs = _LOTTEON_CANCEL_JS_FOR_EXT
+      const result = await new Promise((resolve, reject) => {
+        chrome.debugger.sendCommand(
+          {tabId: tab.id}, 'Runtime.evaluate',
+          {expression: cancelJs, returnByValue: true, awaitPromise: true, timeout: 60000},
+          (res) => {
+            if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message))
+            resolve(res)
+          }
+        )
+      })
+      const val = result?.result?.value
+      const data = typeof val === 'string' ? JSON.parse(val) : (val || {})
+      chrome.debugger.onEvent.removeListener(dialogHandler)
+      return {
+        success: !!data.success,
+        cancelled: !!(data.cancelled || data.success),
+        alreadyShipped: !!data.alreadyShipped,
+        reason: data.reason || '',
+        details: data,
+      }
+    } finally {
+      chrome.debugger.onEvent.removeListener(dialogHandler)
+    }
+  } catch (err) {
+    return { success: false, cancelled: false, error: `LOTTEON cancel 예외: ${err.message || err}` }
+  } finally {
+    if (attached && tab) {
+      try { chrome.debugger.detach({tabId: tab.id}, () => void chrome.runtime.lastError) } catch (_) {}
+    }
+    if (tab) {
+      try { await chrome.tabs.remove(tab.id) } catch (_) {}
+    }
+  }
+}
+
+
+// LOTTEON cancel_js — daemon.py LOTTEON_CANCEL_JS 와 동일 흐름 (Vue v-select mousedown + 사유 + 동의 + 최종 클릭).
+// dialog 자동 accept 는 chrome.debugger Page.handleJavaScriptDialog 가 담당.
+const _LOTTEON_CANCEL_JS_FOR_EXT = `
+(async () => {
+  try { window.confirm = () => true; window.alert = () => {}; } catch(_) {}
+  let vs = null
+  for (let i = 0; i < 50; i++) {
+    vs = document.querySelector('div.v-select')
+    if (vs) break
+    await new Promise(r => setTimeout(r, 200))
+  }
+  if (!vs) return JSON.stringify({success: false, error: 'v-select 사유 dropdown 미발견'})
+  const opener = vs.querySelector('.vs__selected-options') || vs
+  opener.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, button: 0}))
+  opener.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, button: 0}))
+  opener.click()
+  await new Promise(r => setTimeout(r, 800))
+  let selected = false
+  for (const el of document.querySelectorAll('ul.vs__dropdown-menu li[role=option], .vs__dropdown-option')) {
+    const t = (el.innerText || el.textContent || '').trim()
+    if (t === '구매 의사 없어짐' || t === '구매의사 없어짐') {
+      el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, button: 0}))
+      el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, button: 0}))
+      el.click()
+      selected = true
+      break
+    }
+  }
+  if (!selected) return JSON.stringify({success: false, error: '사유 옵션(구매 의사 없어짐) 미발견'})
+  await new Promise(r => setTimeout(r, 500))
+  const agreeIds = ['claimAgree','paymentAgree','checkbox_fnclTx','checkbox_indivisualInfoCollection','checkbox_indivisualInfoConsignment']
+  for (const id of agreeIds) {
+    const el = document.getElementById(id)
+    if (el && !el.checked) el.click()
+  }
+  await new Promise(r => setTimeout(r, 500))
+  let cancelResp = null
+  const origFetch = window.fetch.bind(window)
+  window.fetch = async function(input, init) {
+    const url = typeof input === 'string' ? input : (input && input.url) || ''
+    const res = await origFetch(input, init)
+    if (/processOrderCancellation/.test(url)) {
+      try { const cl = res.clone(); cancelResp = JSON.parse(await cl.text()) } catch(_) {}
+    }
+    return res
+  }
+  const _xo = XMLHttpRequest.prototype.open
+  const _xs = XMLHttpRequest.prototype.send
+  XMLHttpRequest.prototype.open = function(m, u) { this.__sambaU = u; return _xo.apply(this, arguments) }
+  XMLHttpRequest.prototype.send = function(b) {
+    this.addEventListener('load', () => {
+      try { if (/processOrderCancellation/.test(this.__sambaU || '')) cancelResp = JSON.parse(this.responseText) } catch(_) {}
+    })
+    return _xs.apply(this, arguments)
+  }
+  let clicked = false
+  for (const el of document.querySelectorAll('button')) {
+    const t = (el.innerText || '').trim()
+    if (t === '취소요청' && !el.disabled) { el.click(); clicked = true; break }
+  }
+  if (!clicked) return JSON.stringify({success: false, error: '취소요청 버튼 미발견'})
+  const start = Date.now()
+  while (Date.now() - start < 25000) {
+    if (cancelResp !== null) break
+    await new Promise(r => setTimeout(r, 300))
+  }
+  if (!cancelResp) return JSON.stringify({success: false, error: 'processOrderCancellation 응답 timeout'})
+  const code = (cancelResp.returnCode || cancelResp.code || '').toString()
+  const msg = cancelResp.message || cancelResp.msg || ''
+  const ok = code === '200' || /SUCCESS/i.test(msg)
+  return JSON.stringify({
+    success: ok, cancelled: ok,
+    alreadyShipped: /이미\\s*발송|이미\\s*취소|배송\\s*시작/.test(msg),
+    reason: ok ? 'LOTTEON 발주취소 완료' : (msg || 'returnCode=' + code),
+    response: cancelResp,
+  })
+})()
+`
 
 // content script 가 페이지에서 추출 결과를 background로 보낼 때 매칭
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {

@@ -366,7 +366,6 @@ export default function WarroomPage() {
 
   // LOTTEON 데몬 health 체크 — 60s 폴링.
   // 미감지 시 1회 자동 다운로드 트리거 + 토스트 (오토튠 이용 위해 1번 실행 필요).
-  const [autotuneDaemonAlive, setAutotuneDaemonAlive] = useState<boolean | null>(null)
   const autotuneInstallTriggeredRef = useRef(false)
   useEffect(() => {
     let cancelled = false
@@ -382,7 +381,6 @@ export default function WarroomPage() {
         const data = await r.json()
         if (cancelled) return
         const alive = Boolean(data?.alive)
-        setAutotuneDaemonAlive(alive)
         if (!alive && !autotuneInstallTriggeredRef.current) {
           // 단 한 번만 자동 다운로드 (브라우저 prof 영구). 이후 alive=false 여도
           // 빨간 배너만 노출 — 사용자가 "다시 다운로드" 버튼 클릭 시만 재트리거.
@@ -986,44 +984,6 @@ export default function WarroomPage() {
         </div>
       )}
 
-      {/* LOTTEON 데몬 미감지 안내 — 자동 다운로드 후 1번 실행 안내 */}
-      {autotuneDaemonAlive === false && (
-        <div style={{
-          padding: '0.75rem 1.25rem',
-          background: '#3D1F1F',
-          border: '1px solid #FF6B6B',
-          borderRadius: '8px',
-          color: '#FFE4E4',
-          fontSize: '0.875rem',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          gap: '1rem',
-        }}>
-          <div>
-            <strong style={{ color: '#FF8888' }}>오토튠 데몬 미감지</strong>
-            <span style={{ marginLeft: '0.5rem' }}>
-              방금 다운로드된 <code>autotune-daemon-setup*.exe</code> 를 1번만 실행해 주세요. 이후 자동으로 동작.
-            </span>
-          </div>
-          <button
-            onClick={() => { downloadDaemonInstaller(getOrCreateAutotuneDaemonDeviceId()) }}
-            style={{
-              padding: '0.4rem 0.8rem',
-              background: '#FF6B6B',
-              color: '#FFF',
-              border: 'none',
-              borderRadius: '6px',
-              fontSize: '0.8rem',
-              fontWeight: 700,
-              cursor: 'pointer',
-            }}
-          >
-            다시 다운로드
-          </button>
-        </div>
-      )}
-
       {/* A. 상단 상태바 */}
       <div
         style={{
@@ -1149,26 +1109,14 @@ export default function WarroomPage() {
                   window.postMessage({ source: 'samba-page', type: 'AUTOTUNE_SET_JOIN', joined: false }, window.location.origin)
                   setAutotuneRunning(false)
                   falseCountRef.current = 0
-                  // (2026-05-25) 정지 시 분담 비우기 — backend pick_any_owner 매칭 차단.
-                  // 본인 PC device + 데몬 device 둘 다 register([]) → 다른 PC 가 잡 발행해도 본인 PC 미매칭.
-                  try {
-                    await registerPcAllowedSites([])
-                    const daemonDev = (typeof window !== 'undefined' && window.localStorage.getItem('samba.autotune.daemon.deviceId')) || ''
-                    if (daemonDev) {
-                      await fetchWithAuth(`${apiBase}/api/v1/samba/collector/autotune/pc-allowed-sites`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ device_id: daemonDev, sites: [] }),
-                      })
-                    }
-                  } catch { /* ignore */ }
+                  // 정지 = polling 중단만. 분담 mapping 은 유지 (다음 시작 시 체크박스로 덮어씀).
+                  // 사용자 룰 (2026-05-26): "다시 시작할때 기준으로 체크박스 소싱처 처리".
+                  // backend pick 단계에서 정지 PC 매칭 차단은 autotune_running_devices set 이 담당.
                   try {
                     window.localStorage.setItem('samba.autotune.userIntent', 'stop')
-                    // 자동 재합류 24시간 잠금 — 다른 PC 실행 중이면 enabled=true 유지되어
-                    // cooldown 만료 후 autoRejoin 발동하던 사고 차단(2026-05-25 사용자 재요청).
-                    window.localStorage.setItem('samba.autotune.autoRejoinAt', String(Date.now() + 86400_000))
+                    window.localStorage.removeItem('samba.autotune.autoRejoinAt')
                   } catch { /* ignore */ }
-                  autoRejoinAtRef.current = Date.now() + 86400_000
+                  autoRejoinAtRef.current = 0
                   showAlert('이 PC 오토튠 정지 완료', 'success')
                 } else if (r.ok && data.ok === false) {
                   showAlert(`정지 실패 — ${data.error || '백엔드 거절'}`, 'error')

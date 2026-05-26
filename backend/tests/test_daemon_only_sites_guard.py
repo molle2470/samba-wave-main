@@ -108,7 +108,8 @@ def test_add_reward_job_blocks_daemon_only(site, monkeypatch, _stub_db_insert):
     asyncio.run(_run())
 
 
-@pytest.mark.parametrize("site", ["SSG", "ABCmart", "GrandStage", "LOTTEON"])
+# LOTTEON cancel_order 는 확장앱 라우팅으로 전환(2026-05-26) — 데몬 전용 가드 제외.
+@pytest.mark.parametrize("site", ["SSG", "ABCmart", "GrandStage"])
 def test_add_cancel_order_job_blocks_daemon_only(site, _stub_db_insert):
     from backend.domain.samba.proxy.sourcing_queue import SourcingQueue
 

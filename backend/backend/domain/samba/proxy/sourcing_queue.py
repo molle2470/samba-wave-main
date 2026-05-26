@@ -39,7 +39,9 @@ DAEMON_ONLY_JOB_SITES: dict[str, set[str]] = {
     "search": DAEMON_ONLY_SITES,
     "detail": DAEMON_ONLY_SITES,
     "reward": DAEMON_ONLY_SITES,
-    "cancel_order": DAEMON_ONLY_SITES,
+    # LOTTEON 발주취소는 데몬 Playwright 자동로그인 봇 차단(2026-05-26 실측)으로 확장앱 라우팅 전환.
+    # cancel_order 만 LOTTEON 제외, 나머지(detail/tracking/search/reward) 정책 유지.
+    "cancel_order": DAEMON_ONLY_SITES - {"LOTTEON"},
     "tracking": DAEMON_ONLY_SITES
     | {"MUSINSA", "GSShop", "FashionPlus", "Nike", "OliveYoung", "KREAM"},
 }

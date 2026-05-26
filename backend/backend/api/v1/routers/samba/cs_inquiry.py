@@ -261,7 +261,9 @@ async def reply_cs_inquiry(
 
     # 마켓 전송 시도 (market_inquiry_no가 있거나 external_id 기반 마켓인 경우)
     _ext_id_markets = {"SSG", "롯데홈쇼핑"}
-    if inquiry.market_inquiry_no or (inquiry.market in _ext_id_markets and inquiry.external_id):
+    if inquiry.market_inquiry_no or (
+        inquiry.market in _ext_id_markets and inquiry.external_id
+    ):
         try:
             if inquiry.market == "스마트스토어":
                 client = None
@@ -524,7 +526,9 @@ async def reply_cs_inquiry(
                             market_msg = "eBay 인증정보 없음"
 
             elif inquiry.market == "롯데홈쇼핑":
-                from backend.api.v1.routers.samba.proxy._helpers import _get_lotte_client
+                from backend.api.v1.routers.samba.proxy._helpers import (
+                    _get_lotte_client,
+                )
                 from backend.domain.samba.account.model import SambaMarketAccount
 
                 lh_acc = None
@@ -539,6 +543,7 @@ async def reply_cs_inquiry(
                 if lh_acc:
                     import json as _json
                     from backend.domain.samba.proxy.lottehome import LotteHomeClient
+
                     _lh_af = lh_acc.additional_fields or {}
                     if isinstance(_lh_af, str):
                         _lh_af = _json.loads(_lh_af)
@@ -586,7 +591,9 @@ async def reply_cs_inquiry(
                     if ssg_api_key:
                         ssg_client = SSGClient(ssg_api_key)
                         try:
-                            await svc.reply_inquiry(inquiry_id, body.reply, mark_replied=False)
+                            await svc.reply_inquiry(
+                                inquiry_id, body.reply, mark_replied=False
+                            )
                             ok = await svc.send_reply_to_market(inquiry_id, ssg_client)
                             if ok:
                                 market_sent = True
@@ -2815,13 +2822,17 @@ async def _do_sync_cs_from_markets(
                         continue
                     try:
                         import json as _json
+
                         lh_af = lh_acc.additional_fields or {}
                         if isinstance(lh_af, str):
                             lh_af = _json.loads(lh_af)
                         from backend.domain.samba.proxy.lottehome import LotteHomeClient
+
                         lh_client = LotteHomeClient(
                             user_id=lh_af.get("userId", "") or lh_acc.seller_id or "",
-                            password=lh_af.get("password", "") or lh_acc.api_secret or "",
+                            password=lh_af.get("password", "")
+                            or lh_acc.api_secret
+                            or "",
                             agnc_no=lh_af.get("agncNo", ""),
                             env=lh_af.get("env", "prod"),
                         )
@@ -2838,9 +2849,13 @@ async def _do_sync_cs_from_markets(
                             account_label=lh_label,
                         )
                         synced += lh_collect.get("collected", 0)
-                        logger.info(f"[CS동기화] 롯데홈쇼핑({lh_label}) CS: {lh_collect}")
+                        logger.info(
+                            f"[CS동기화] 롯데홈쇼핑({lh_label}) CS: {lh_collect}"
+                        )
                     except Exception as e:
-                        lh_label = lh_acc.account_label or lh_acc.seller_id or "롯데홈쇼핑"
+                        lh_label = (
+                            lh_acc.account_label or lh_acc.seller_id or "롯데홈쇼핑"
+                        )
                         logger.error(f"[CS동기화] 롯데홈쇼핑({lh_label}) 실패: {e}")
                         errors.append(f"롯데홈쇼핑({lh_label}): {e}")
         except Exception as e:

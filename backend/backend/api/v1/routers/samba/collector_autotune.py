@@ -883,20 +883,30 @@ async def _site_autotune_loop(device_id: str, site: str):
 
                     if products:
                         filtered_count = len(products)
-                        # 진행도 표시용 전체 대상 COUNT — 같은 WHERE 사용 (판매처 필터 SQL 미적용분은 분모가 약간 클 수 있음)
-                        try:
-                            _count_stmt = (
-                                select(func.count()).select_from(_CP).where(*_where)
-                            )
-                            _total_global_res = await session.execute(_count_stmt)
-                            _total_global = int(_total_global_res.scalar() or 0)
-                        except Exception:
-                            _total_global = filtered_count
                         _gkey = (device_id, site)
-                        # 한 바퀴 회전 완료(분자 ≥ 분모) 시 0부터 재시작
-                        # 분모 변동(신규 수집/삭제로 인한 total 증감)은 idx 유지하고 분모만 갱신
-                        # → 사이클 도중 신규 상품 들어와도 진행률이 [N/new_total]로 자연 갱신됨
                         _prev_idx = _autotune_global_idx.get(_gkey, 0)
+                        _cached_total = _autotune_global_total.get(_gkey, 0)
+                        # 사이클 시작 시에만 COUNT 재산정 (모수 freeze) — 사용자 룰 (2026-05-26):
+                        # "한 사이클 다 완성되기 전 모수 변경 금지".
+                        # 신규 상품/품절은 다음 사이클부터 반영. 사이클 중 batch SELECT 매번
+                        # COUNT 하면 [2,403/43,745] [2,415/43,731] 처럼 분모 흔들림 사고.
+                        _need_recount = (
+                            _prev_idx == 0
+                            or _cached_total <= 0
+                            or _prev_idx >= _cached_total
+                        )
+                        if _need_recount:
+                            try:
+                                _count_stmt = (
+                                    select(func.count()).select_from(_CP).where(*_where)
+                                )
+                                _total_global_res = await session.execute(_count_stmt)
+                                _total_global = int(_total_global_res.scalar() or 0)
+                            except Exception:
+                                _total_global = filtered_count
+                        else:
+                            _total_global = _cached_total
+                        # 한 바퀴 회전 완료(분자 ≥ 분모) 시 0부터 재시작
                         if _prev_idx >= _total_global or _total_global <= 0:
                             _autotune_global_idx[_gkey] = 0
                             _autotune_cycle_stats[_gkey] = _new_cycle_stats()
@@ -906,7 +916,6 @@ async def _site_autotune_loop(device_id: str, site: str):
                             _autotune_cycle_stats[_gkey]["started_at"] = now.isoformat()
                         # idx dict 시드 — 비어 있으면 refresher가 빈 dict로 오판해 순번이
                         # 1에 갇힌다(aa3beeb7에서 시드해주던 리셋 조건이 빠진 뒤 노출된 버그).
-                        # 키를 미리 0으로 등록해 누적 카운팅이 정상 동작하도록 보장.
                         _autotune_global_idx.setdefault(_gkey, 0)
                         _autotune_global_total[_gkey] = _total_global
                         log.info(
@@ -3845,6 +3854,29 @@ async def autotune_start(
 
     ev = _get_pc_event(dev)
     ev.set()
+    # 옛 main task 명시 cancel — 시작 = 이 PC 의 모든 옛 사이클 비우고 fresh 시작.
+    # 미cancel 시 사이클 누적 → 같은 사이트 사이클 N개 동시 진행 (모수 변동 사고).
+    _old_main = _pc_main_task.get(dev)
+    if _old_main and not _old_main.done():
+        _old_main.cancel()
+    # 옛 pending 잡 제거 (owner=dev) — 시작 = 큐 비우고 새 체크박스 기준 재발행.
+    try:
+        from backend.db.orm import get_write_session as _gws_clear
+        from sqlalchemy import delete as _sa_delete
+        from backend.domain.samba.sourcing_job.model import SambaSourcingJob
+
+        async with _gws_clear() as _csess:
+            await _csess.execute(
+                _sa_delete(SambaSourcingJob).where(
+                    SambaSourcingJob.owner_device_id == dev,
+                    SambaSourcingJob.status == "pending",
+                )
+            )
+            await _csess.commit()
+    except Exception as _e:
+        from backend.utils.logger import logger as _lg
+
+        _lg.warning(f"[autotune_start] 옛 pending 잡 제거 실패(무시): {_e}")
     _pc_main_task[dev] = asyncio.create_task(
         _autotune_loop(dev),
         name=f"autotune-main-{dev[:8]}",
