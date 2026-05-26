@@ -4186,10 +4186,13 @@ async def autotune_active_cycles():
             last_tick = _pc_site_last_ticks.get(dev, {}).get(site, "")
             hb = _pc_site_heartbeats.get(dev, {}).get(site, 0)
             hb_ago = int(now_ts - hb) if hb else None
-            # 현 사이클 시작 시각 + 경과 시간 + 건당 평균 처리 시간
+            # 현 사이클 시작 시각 + 경과 시간 + 건당 평균 처리 시간 + 누적 가격/재고/품절
             avg_sec: Optional[float] = None
             started_at_iso: Optional[str] = None
             elapsed_sec: Optional[int] = None
+            price_count = 0
+            stock_count = 0
+            soldout_count = 0
             try:
                 _cstats = _autotune_cycle_stats.get(gkey) or {}
                 _started_iso = _cstats.get("started_at")
@@ -4204,6 +4207,9 @@ async def autotune_active_cycles():
                     elapsed_sec = int(_elapsed)
                     if idx > 0 and _elapsed > 0:
                         avg_sec = round(_elapsed / idx, 2)
+                price_count = len(_cstats.get("price_pids") or set())
+                stock_count = len(_cstats.get("stock_pids") or set())
+                soldout_count = int(_cstats.get("deleted") or 0)
             except Exception:
                 pass
             cycles.append(
@@ -4218,6 +4224,9 @@ async def autotune_active_cycles():
                     "avg_sec_per_item": avg_sec,
                     "started_at": started_at_iso,
                     "elapsed_sec": elapsed_sec,
+                    "price_count": price_count,
+                    "stock_count": stock_count,
+                    "soldout_count": soldout_count,
                 }
             )
     cycles.sort(key=lambda c: (c["device_id"], c["site"]))
