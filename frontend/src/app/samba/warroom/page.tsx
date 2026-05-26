@@ -565,9 +565,8 @@ export default function WarroomPage() {
     return () => { cancelled = true; clearInterval(t) }
   }, [])
   const [stats, setStats] = useState<DashboardStats | null>(null)
-  const [events, setEvents] = useState<MonitorEvent[]>([])
-  const [siteChanges, setSiteChanges] = useState<Record<string, Record<string, Array<{ id: string; product_id: string | null; product_name: string | null; detail: Record<string, unknown> | null; created_at: string }>>>>({})
-  const [marketChanges, setMarketChanges] = useState<Record<string, Record<string, Array<{ id: string; event_id: string; created_at: string; source_site: string | null; market_product_no: string | null; site_product_id: string | null; account_id: string; account_label: string; product_id: string | null; product_name: string | null; detail: Record<string, unknown> | null }>>>>({})
+  // 이벤트 타임라인 state 제거 (2026-05-26 사용자 요구) — 활성 사이클 패널이 대체.
+  // monitorApi.recentEvents/siteChanges/marketChanges 폴링 + DB 부담 제거.
 
   const [loading, setLoading] = useState(true)
   const [, setLastFetched] = useState<Date | null>(null)
@@ -910,12 +909,7 @@ export default function WarroomPage() {
     if (_cyclesAdvanced || _staleFetch) {
       prevCyclesRef.current = cycles
       prevEventsFetchedAtRef.current = _nowMs
-      monitorApi.recentEvents(100).then(ev => setEvents(ev.map(row => ({
-        ...row,
-        source_site: normalizeWarroomSourceSite(row.source_site),
-      })))).catch(() => {})
-      monitorApi.siteChanges(5).then(c => { if (c && Object.keys(c).length > 0) setSiteChanges(normalizeWarroomSiteChanges(c)) }).catch(() => {})
-      monitorApi.marketChanges(5).then(c => { if (c && Object.keys(c).length > 0) setMarketChanges(c) }).catch(() => {})
+      // 이벤트 타임라인 fetch 제거 — 활성 사이클 패널로 대체.
     }
   }, [])
 
@@ -1030,68 +1024,7 @@ export default function WarroomPage() {
     return () => clearInterval(poll)
   }, [load])
 
-  // 이벤트 타임라인 — 30분 폴링 (load() 10초 폴링에서 분리). autotune cycle 진행 시(handleAutotuneStatus) 즉시 갱신 트리거 유지.
-  useEffect(() => {
-    const fetchEventTimeline = () => {
-      monitorApi.recentEvents(100)
-        .then(rows => {
-          setEvents(rows.map(row => ({
-            ...row,
-            source_site: normalizeWarroomSourceSite(row.source_site),
-          })))
-        })
-        .catch(() => { /* ignore */ })
-
-      monitorApi.siteChanges(5)
-        .then(c => {
-          if (!c || Object.keys(c).length === 0) return
-          setSiteChanges(normalizeWarroomSiteChanges(c))
-        })
-        .catch(() => { /* ignore */ })
-
-      monitorApi.marketChanges(5)
-        .then(c => { if (c && Object.keys(c).length > 0) setMarketChanges(c) })
-        .catch(() => { /* ignore */ })
-    }
-    fetchEventTimeline()
-    const timer = setInterval(fetchEventTimeline, 30 * 60 * 1000)
-    return () => clearInterval(timer)
-  }, [])
-
-  // 이벤트 필터링 — scheduler_cycle(1바퀴 단위) 소싱처별 최신 2건 표시
-  // scheduler_tick(200건 배치 단위)은 타임라인에서 숨김 — 디버깅용 DB 잔존
-  const filteredEvents = (() => {
-    const mapped = events
-      .filter(e => e.event_type !== 'scheduler_tick')
-      .map(e => ({
-        ...e,
-        summary: e.summary?.replace(/오토튠\(registered\)\s*—\s*/, '') ?? e.summary,
-      }))
-    // scheduler_cycle 소싱처별 최신 2건만 유지
-    const tickCountBySite: Record<string, number> = {}
-    const deduped = mapped.filter(e => {
-      if (e.event_type === 'scheduler_cycle') {
-        const siteKey = normalizeWarroomSourceSite(e.source_site) || '_none'
-        tickCountBySite[siteKey] = (tickCountBySite[siteKey] || 0) + 1
-        if (tickCountBySite[siteKey] > 2) return false
-      }
-      return true
-    })
-    return deduped
-  })()
-
-  // scheduler_cycle 이벤트를 소싱처별로 그룹핑
-  const tickEventsBySite = (() => {
-    const ticks = filteredEvents.filter(e => e.event_type === 'scheduler_cycle')
-    const groups: Record<string, typeof ticks> = {}
-    for (const e of ticks) {
-      const siteKey = e.source_site || '기타'
-      if (!groups[siteKey]) groups[siteKey] = []
-      groups[siteKey].push(e)
-    }
-    return groups
-  })()
-  const nonTickEvents = [] as typeof filteredEvents
+  // 이벤트 타임라인 폴링/state 제거 (2026-05-26 사용자 요구) — 활성 사이클 패널이 대체.
 
   if (loading || !stats) {
     return (
