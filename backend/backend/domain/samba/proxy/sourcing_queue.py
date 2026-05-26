@@ -574,52 +574,50 @@ class SourcingQueue:
         # - in-flight (pending/dispatched) 잡 존재 시 skip
         # - 최근 N분 내 실패 잡 존재 시 skip (마켓 폴러 재발행 무한루프 차단)
         from datetime import datetime as _dt, timedelta as _td, timezone as _tz
-        from sqlalchemy import and_, or_, select
 
         _COOLDOWN_MIN = 30  # 실패 후 재시도 cooldown(분)
 
+        # raw SQL — ORM JSON 비교 실패 가능성 회피 (실측 2026-05-26 SSG/MUSINSA/LOTTEON
+        # 같은 ord 잡 N건 중복 발행. SQL psql 시뮬레이션은 매칭하나 ORM 가드 우회됨).
+        from sqlalchemy import text as _text
+
         try:
             async with get_write_session() as session:
-                # in-flight
-                stmt = (
-                    select(SambaSourcingJob.request_id)
-                    .where(
-                        and_(
-                            SambaSourcingJob.job_type == "cancel_order",
-                            SambaSourcingJob.site == site,
-                            or_(
-                                SambaSourcingJob.status == "pending",
-                                SambaSourcingJob.status == "dispatched",
-                            ),
-                            SambaSourcingJob.payload["sourcingOrderNumber"].astext
-                            == ord_no,
-                        )
-                    )
-                    .limit(1)
+                # in-flight (pending/dispatched)
+                in_flight_sql = _text(
+                    "SELECT request_id FROM samba_sourcing_job "
+                    "WHERE job_type = 'cancel_order' "
+                    "  AND site = :site "
+                    "  AND status IN ('pending', 'dispatched') "
+                    "  AND payload->>'sourcingOrderNumber' = :ord_no "
+                    "LIMIT 1"
                 )
-                existing = (await session.execute(stmt)).scalar_one_or_none()
+                existing = (
+                    await session.execute(
+                        in_flight_sql, {"site": site, "ord_no": ord_no}
+                    )
+                ).scalar_one_or_none()
                 if existing is not None:
                     logger.info(
                         f"[자동취소] order={order_id} 잡 in-flight({existing}) — skip"
                     )
                     return False
-                # cooldown — 최근 실패 잡
+                # cooldown — 최근 N분 failed
                 since = _dt.now(_tz.utc) - _td(minutes=_COOLDOWN_MIN)
-                stmt2 = (
-                    select(SambaSourcingJob.request_id)
-                    .where(
-                        and_(
-                            SambaSourcingJob.job_type == "cancel_order",
-                            SambaSourcingJob.site == site,
-                            SambaSourcingJob.status == "failed",
-                            SambaSourcingJob.payload["sourcingOrderNumber"].astext
-                            == ord_no,
-                            SambaSourcingJob.completed_at >= since,
-                        )
-                    )
-                    .limit(1)
+                cd_sql = _text(
+                    "SELECT request_id FROM samba_sourcing_job "
+                    "WHERE job_type = 'cancel_order' "
+                    "  AND site = :site "
+                    "  AND status = 'failed' "
+                    "  AND payload->>'sourcingOrderNumber' = :ord_no "
+                    "  AND completed_at >= :since "
+                    "LIMIT 1"
                 )
-                recent_fail = (await session.execute(stmt2)).scalar_one_or_none()
+                recent_fail = (
+                    await session.execute(
+                        cd_sql, {"site": site, "ord_no": ord_no, "since": since}
+                    )
+                ).scalar_one_or_none()
                 if recent_fail is not None:
                     logger.info(
                         f"[자동취소] order={order_id} 최근 실패({recent_fail}) — "
