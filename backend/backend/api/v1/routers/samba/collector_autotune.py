@@ -927,11 +927,14 @@ async def _site_autotune_loop(device_id: str, site: str):
                                 _total_global = filtered_count
                         else:
                             _total_global = _cached_total
-                        # 한 바퀴 회전 완료(분자 ≥ 분모) 시 0부터 재시작
+                        # 한 바퀴 회전 완료(분자 ≥ 분모) 시 0부터 재시작 + 사이클# 증가
                         if _prev_idx >= _total_global or _total_global <= 0:
                             _autotune_global_idx[_gkey] = 0
                             _autotune_cycle_stats[_gkey] = _new_cycle_stats()
                             _autotune_cycle_stats[_gkey]["started_at"] = now.isoformat()
+                            # 사이클# = 전체 한 바퀴 완료마다 +1 (2026-05-26 사용자 룰).
+                            _scc_done = _pc_scc(device_id)
+                            _scc_done[site] = _scc_done.get(site, 0) + 1
                         elif _gkey not in _autotune_cycle_stats:
                             _autotune_cycle_stats[_gkey] = _new_cycle_stats()
                             _autotune_cycle_stats[_gkey]["started_at"] = now.isoformat()
@@ -3133,11 +3136,13 @@ async def _site_autotune_loop(device_id: str, site: str):
                         break
 
                     _pc_seh(device_id)[site] = 0  # 정상 사이클 → 카운터 리셋
-                    _scc = _pc_scc(device_id)
-                    _scc[site] = _scc.get(site, 0) + 1
                     _pc_slt(device_id)[site] = now.isoformat()
+                    # 사이클# = 한 바퀴 완료 시 증가. batch 단위 increment 폐기
+                    # (2026-05-26 사용자 요구: "전체 상품 한바퀴 = 1 사이클").
+                    # 한 바퀴 완료 increment 는 line 931 area (idx ≥ total reset) 에서 처리.
+                    _scc = _pc_scc(device_id)
                     log.info(
-                        "[오토튠][%s] 배치 완료 (누적 %d회) — 즉시 재시작",
+                        "[오토튠][%s] 배치 완료 (한바퀴 누적 %d회) — 즉시 재시작",
                         site,
                         _scc.get(site, 0),
                     )
