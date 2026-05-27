@@ -457,6 +457,8 @@ async def sync_pc_allowed_sites_from_db() -> None:
             if not dev_clean:
                 continue
             new_set = {s.strip() for s in sites if isinstance(s, str) and s.strip()}
+            # GrandStage strip — ABCmart 통합 사이트 (2026-05-27).
+            new_set.discard("GrandStage")
             _pc_allowed_sites[dev_clean] = new_set
             if dev_clean not in _pc_last_seen:
                 _pc_last_seen[dev_clean] = now
@@ -550,6 +552,10 @@ def register_pc_allowed_sites(
 
         _block = {s.upper() for s in DAEMON_ONLY_SITES}
         sites = [s for s in sites if (s or "").strip().upper() not in _block]
+    # GrandStage 는 abcmart.a-rt.com 의 GRAND STAGE 탭 — backend 수집이 두 탭 통합해
+    # source_site='ABCmart' 로 저장. 별도 GrandStage 분담 불필요. 옛 데몬/UI 잔재 stale
+    # entry 자동 정리 (2026-05-27, 사용자 정정 "ABC = ABCmart + GrandStage 통합").
+    sites = [s for s in sites if (s or "").strip() != "GrandStage"]
     new_set = frozenset(s.strip() for s in sites if s and s.strip())
     now = time.time()
     # authoritative: UI 확정 지정 — union 이력 비우고 입력값 그대로 박는다.
@@ -634,6 +640,16 @@ async def restore_pc_allowed_sites_from_db() -> int:
                     )
                     dirty = True
                     raw_set -= stripped
+            # GrandStage strip — abcmart.a-rt.com 통합 사이트 (ABCmart 가 두 탭 모두 처리).
+            # 옛 분담 DB stale entry 자동 정리 (2026-05-27).
+            if "GrandStage" in raw_set:
+                _log.warning(
+                    "[오토튠] PC 분담 복원 시 GrandStage strip "
+                    "(ABCmart 통합 사이트): dev=%s",
+                    dev_clean,
+                )
+                dirty = True
+                raw_set.discard("GrandStage")
             _pc_allowed_sites[dev_clean] = raw_set
             # last_seen은 복원 시점으로 표시 — 첫 폴링까지 stale 정리 방지
             _pc_last_seen[dev_clean] = now
