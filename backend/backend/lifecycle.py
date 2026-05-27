@@ -473,10 +473,9 @@ async def _tetris_sync_loop() -> None:
                 )
                 tenant_ids: list[str | None] = [row[0] for row in rows.all()]
 
-            # 배치가 없어도 레거시 블록(registered_accounts 기반)을 처리하기 위해
-            # tenant_id=None 항상 포함 (멀티테넌트 환경에서도 None 레코드가 존재)
-            if None not in tenant_ids:
-                tenant_ids.insert(0, None)
+            # 레거시 블록(registered_accounts 기반) 처리는 tenant_id=None 레코드가 실제 존재할 때만
+            # 강제 삽입 금지 — 멀티테넌트 환경에서 sync_all(None) 호출 시 transmit 잡이 tenant_id=None 으로
+            # 생성되어 worker.list_by_tenant(None)→WHERE tenant_id IS NULL 배치 0건 → "스킵 (전송 대상 계정 없음)" (#252)
 
             from backend.domain.samba.tetris.repository import SambaTetrisRepository
             from backend.domain.samba.tetris.service import SambaTetrisService

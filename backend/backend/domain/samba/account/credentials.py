@@ -64,9 +64,10 @@ def ssg_creds(account: Optional["SambaMarketAccount"]) -> dict[str, Any]:
     if account is None:
         return {}
     ext = _extras(account)
+    # additional_fields fallback — useStoreSettings 경로는 apiKey 를 additional_fields 에만 적재함
     return {
-        "apiKey": account.api_key or "",
-        "sellerId": account.seller_id or "",
+        "apiKey": account.api_key or ext.get("apiKey", "") or "",
+        "sellerId": account.seller_id or ext.get("sellerId", "") or "",
         "brandList": ext.get("brandList", []),
         "shippingPolicyId": ext.get("shippingPolicyId", ""),
         "outboundAddressId": ext.get("outboundAddressId", ""),
