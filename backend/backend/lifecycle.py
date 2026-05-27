@@ -416,10 +416,13 @@ async def _pc_cleanup_loop() -> None:
             # 3) cleanup — active device 만 유지 (빈 분담 허용)
             # active key 면 사용자 체크박스 비어있는 상태도 정상 → 보존.
             # 옛/revoked device 만 제거.
+            # samba-daemon-* 는 install-token 없는 자가빌드 케이스에서 extension_key 미등록
+            # 상태로도 정상 동작 가능 — cleanup 보존 (2026-05-27 사용자 PC 사고).
             cleaned = {
                 k: v
                 for k, v in current.items()
-                if k in active_set and isinstance(v, list)
+                if (k in active_set or k.startswith("samba-daemon-"))
+                and isinstance(v, list)
             }
 
             if cleaned != current:
