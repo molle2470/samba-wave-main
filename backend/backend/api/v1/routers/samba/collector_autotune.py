@@ -3348,10 +3348,13 @@ async def _autotune_loop(device_id: str):
                     clear_emergency_stop()
                     log.info("[오토튠][%s] 잔존 비상정지 해제", _dev_tag)
 
-                from backend.db.orm import get_write_session
+                from backend.db.orm import get_read_session
 
-                # 공통 사전 작업 (분류, 쿠키)
-                async with get_write_session() as session:
+                # 공통 사전 작업 (분류, 쿠키). (2026-05-27) write → read 전환:
+                # 이 블록은 _get_setting / _get_active_sites_cached 호출만 — read-only.
+                # 기존 write 세션 점유로 write pool 33s 핫스팟 (DB풀 모니터 캡처).
+                # write pool 압박 감소 + idle in transaction 누적 차단.
+                async with get_read_session() as session:
                     from backend.api.v1.routers.samba.proxy import _get_setting
 
                     # 롯데ON 쿠키 갱신
