@@ -304,6 +304,23 @@ class CoupangClient:
 
     BASE_URL = "https://api-gateway.coupang.com"
 
+    # 한글 택배사명 → 쿠팡 Wing API enum 코드 매핑
+    DELIVERY_COMPANY_MAP: dict[str, str] = {
+        "CJ대한통운": "CJGLS",
+        "한진택배": "HANJIN",
+        "롯데택배": "HYUNDAI",
+        "로젠택배": "KGB",
+        "우체국택배": "EPOST",
+        "경동택배": "KDEXP",
+        "대신택배": "DAESIN",
+        "일양로지스": "ILYANG",
+        "편의점택배": "CVSNET",
+        "합동택배": "HDEXP",
+        "천일택배": "CHUNIL",
+        "DHL": "DHL",
+        "기타": "ETC",
+    }
+
     # 카테고리별 notice 메타 캐시 (module-level, 모든 인스턴스 공유)
     # category_id → (data, timestamp)
     _notice_meta_cache: dict[str, tuple[dict, float]] = {}
@@ -1298,6 +1315,9 @@ class CoupangClient:
                 "쿠팡 송장업로드 필수 파라미터 누락 (orderId/vendorItemId)"
             )
         path = f"/v2/providers/openapi/apis/api/v4/vendors/{self.vendor_id}/orders/invoices"
+        mapped_company_code = self.DELIVERY_COMPANY_MAP.get(
+            delivery_company_code, delivery_company_code
+        )
         body = {
             "vendorId": self.vendor_id,
             "orderSheetInvoiceApplyDtos": [
@@ -1305,7 +1325,7 @@ class CoupangClient:
                     "shipmentBoxId": shipment_box_id,
                     "orderId": order_id,
                     "vendorItemId": vendor_item_id,
-                    "deliveryCompanyCode": delivery_company_code,
+                    "deliveryCompanyCode": mapped_company_code,
                     "invoiceNumber": invoice_number,
                     "splitShipping": False,
                     "preSplitShipped": False,
@@ -1475,16 +1495,19 @@ class CoupangClient:
             f"/v2/providers/openapi/apis/api/v4/vendors/{self.vendor_id}/"
             f"returnRequests/{receipt_id}/completedShipment"
         )
+        mapped_company_code = self.DELIVERY_COMPANY_MAP.get(
+            delivery_company_code, delivery_company_code
+        )
         body = {
             "vendorId": self.vendor_id,
             "receiptId": receipt_id,
-            "deliveryCompanyCode": delivery_company_code,
+            "deliveryCompanyCode": mapped_company_code,
             "invoiceNumber": invoice_number,
         }
         result = await self._call_api("PATCH", path, body=body)
         logger.info(
             f"[쿠팡] 이미출고 처리 완료: receiptId={receipt_id} "
-            f"company={delivery_company_code} invoice={invoice_number}"
+            f"company={mapped_company_code} invoice={invoice_number}"
         )
         return result
 

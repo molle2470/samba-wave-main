@@ -10,13 +10,15 @@ $running = Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
     Where-Object { $_.CommandLine -like '*local_bg_worker.py*' }
 
 if (-not $running) {
+    # WMI Win32_Process Create — 콘솔창 생성 없이 detached spawn. 자식은 부모 env 상속(PYTHONIOENCODING/UTF8)
     $env:PYTHONIOENCODING = 'utf-8'
     $env:PYTHONUTF8 = '1'
-    $logFile = Join-Path $workerDir 'bgworker.log'
-    Start-Process -WindowStyle Hidden `
-        -WorkingDirectory $workerDir `
-        -FilePath $python `
-        -ArgumentList '-u', $workerScript `
-        -RedirectStandardOutput $logFile `
-        -RedirectStandardError "$logFile.err"
+    $cmdLine = "`"$python`" -u $workerScript"
+    $si = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
+    Invoke-CimMethod -ClassName Win32_Process -MethodName Create `
+        -Arguments @{
+            CommandLine = $cmdLine
+            CurrentDirectory = $workerDir
+            ProcessStartupInformation = $si
+        } | Out-Null
 }

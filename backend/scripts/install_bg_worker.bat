@@ -101,8 +101,8 @@ if errorlevel 1 (
     echo       Registered: %TASK_NAME% (on logon)
 )
 
-REM 1분마다 워치독 — 죽으면 자동 부활 (wscript이 .vbs를 invisible 모드로 실행 → cmd창 안 뜸)
-schtasks /Create /TN "%TASK_NAME_WD%" /TR "wscript.exe \"%WD_VBS%\"" /SC MINUTE /MO 1 /RL LIMITED /F >nul
+REM 1분마다 워치독 — 죽으면 자동 부활 (powershell -WindowStyle Hidden 직접 호출, conhost 깜빡임 방지)
+schtasks /Create /TN "%TASK_NAME_WD%" /TR "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \"%WD_PS1%\"" /SC MINUTE /MO 1 /RL LIMITED /F >nul
 if errorlevel 1 (
     echo [ERROR] Watchdog task registration failed. Worker won't auto-restart.
     goto :END
@@ -116,7 +116,7 @@ if exist "%OLD_STARTUP%" del "%OLD_STARTUP%" >nul 2>nul
 REM ── [6/6] 즉시 시작 ─────────────────────────────
 echo.
 echo [6/6] Starting worker now...
-wscript.exe "%WD_VBS%"
+powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%WD_PS1%"
 echo       Worker launched (or already running).
 
 echo.
