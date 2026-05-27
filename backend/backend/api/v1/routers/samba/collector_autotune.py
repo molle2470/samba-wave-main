@@ -2452,7 +2452,14 @@ async def _site_autotune_loop(device_id: str, site: str):
                                     try:
                                         _tx_result = None
                                         _tx_exc: Exception | None = None
-                                        for _tx_attempt in range(2):
+                                        # 좀비/prepared state 에러 retry — 1회로 부족 (사용자 케이스 2026-05-27).
+                                        # 마켓 HTTP 길이 60s 초과 시 idle_in_transaction_session_timeout
+                                        # 으로 session 끊김 → "prepared state" 에러 → retry 후 새 session.
+                                        # 3회로 늘림 + 짧은→긴 backoff (0.2/0.5/1.5초).
+                                        _TX_RETRY_DELAYS = (0.2, 0.5, 1.5)
+                                        for _tx_attempt in range(
+                                            len(_TX_RETRY_DELAYS) + 1
+                                        ):
                                             try:
                                                 async with get_write_session() as _tx_s:
                                                     from backend.domain.samba.shipment.repository import (
@@ -2478,18 +2485,25 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                 break
                                             except Exception as _try_exc:
                                                 _tx_exc = _try_exc
-                                                if (
-                                                    _is_stale_conn_error(_try_exc)
-                                                    and _tx_attempt == 0
+                                                if _is_stale_conn_error(
+                                                    _try_exc
+                                                ) and _tx_attempt < len(
+                                                    _TX_RETRY_DELAYS
                                                 ):
+                                                    _delay = _TX_RETRY_DELAYS[
+                                                        _tx_attempt
+                                                    ]
                                                     log.warning(
                                                         "[오토튠][DB재시도] transmit_group "
-                                                        "pid=%s 좀비 connection 감지 → "
-                                                        "새 세션으로 재시도: %s",
+                                                        "pid=%s 좀비/prepared (시도 %d/%d, "
+                                                        "%.1fs 대기) → 새 세션 재시도: %s",
                                                         _pid,
+                                                        _tx_attempt + 1,
+                                                        len(_TX_RETRY_DELAYS) + 1,
+                                                        _delay,
                                                         str(_try_exc)[:120],
                                                     )
-                                                    await asyncio.sleep(0.2)
+                                                    await asyncio.sleep(_delay)
                                                     continue
                                                 raise
                                         if _tx_exc:
