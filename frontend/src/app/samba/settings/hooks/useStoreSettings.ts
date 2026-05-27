@@ -457,6 +457,25 @@ export function useStoreSettings(): StoreSettingsState & StoreSettingsActions {
       }).catch(() => {})
   }, [storeTab, savedStoreData, storeData, lotteonDeliveryPolicyOptions.length, lotteonWarehouseOptions.departure.length, editingAccountId])
 
+  // 지마켓/옥션: 수정 모드 진입 시 해당 계정의 출고지·발송정책 로드
+  useEffect(() => {
+    if (storeTab !== 'gmarket' && storeTab !== 'auction') return
+    if (!editingAccountId) return
+    proxyApi.esmDeliveryInfo(storeTab, editingAccountId).then(res => {
+      if (!res.success) return
+      const places = (res.places || []).map((p: { placeNo: number; placeName?: string; placeNm?: string; placeType?: number; imposeType?: number }) => ({
+        value: String(p.placeNo),
+        label: `[${(p.placeType ?? p.imposeType) === 2 ? '반품지' : '출고지'}] ${p.placeName ?? p.placeNm} (${p.placeNo})`,
+      }))
+      const dispatches = (res.dispatchPolicies || []).map((d: { dispatchPolicyNo: number; dispatchPolicyName?: string; policyNm?: string }) => ({
+        value: String(d.dispatchPolicyNo),
+        label: `${d.dispatchPolicyName ?? d.policyNm} (${d.dispatchPolicyNo})`,
+      }))
+      setEsmPlaceOptions(prev => ({ ...prev, [storeTab]: places }))
+      setEsmDispatchOptions(prev => ({ ...prev, [storeTab]: dispatches }))
+    }).catch(() => {})
+  }, [storeTab, editingAccountId])
+
   // 롯데홈쇼핑 배송비정책/출고지/반품지는 버튼 클릭 시에만 로드 (자동 로드 제거 — 동시 호출 시 롯데 API 오류 방지)
 
   // 11번가 탭 진입 시 발송마감 템플릿 자동 로드 (출고지 정보 응답에 포함)

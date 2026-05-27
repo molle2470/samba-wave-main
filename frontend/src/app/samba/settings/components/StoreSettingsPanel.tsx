@@ -327,7 +327,7 @@ export function StoreSettingsPanel(props: Props) {
                   {field.type === 'esm-place-select' ? (
                     <select
                       style={{ ...inputStyle, flex: 1 }}
-                      value={storeData[market.key]?.[field.name] || ''}
+                      value={storeData[market.key]?.[field.name] ?? (editingAccountId ? savedStoreData[market.key]?.[field.name] : undefined) ?? ''}
                       onChange={(e) => updateStoreField(market.key, field.name, e.target.value)}
                     >
                       <option value=''>불러오기 버튼으로 선택</option>
@@ -336,7 +336,7 @@ export function StoreSettingsPanel(props: Props) {
                   ) : field.type === 'esm-dispatch-select' ? (
                     <select
                       style={{ ...inputStyle, flex: 1 }}
-                      value={storeData[market.key]?.[field.name] || ''}
+                      value={storeData[market.key]?.[field.name] ?? (editingAccountId ? savedStoreData[market.key]?.[field.name] : undefined) ?? ''}
                       onChange={(e) => updateStoreField(market.key, field.name, e.target.value)}
                     >
                       <option value=''>불러오기 버튼으로 선택</option>
