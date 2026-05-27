@@ -29,6 +29,54 @@ EXTENSION_SITES = {
 }
 
 
+async def _ensure_daemon_extension_key(session, device_id: str) -> None:
+    """데몬 device 가 samba_extension_key 에 없으면 placeholder INSERT.
+
+    근본 fix (2026-05-27): install-token 없는 자가빌드 daemon.exe 는 extension_key
+    자가등록 흐름이 없어 _pc_cleanup_loop 가 active_set 외 dev 로 판정 → 분담 dict
+    에서 제거 → SSG/ABC/LOTTEON 잡 발행 실패. 데몬 폴링 도착 시 placeholder row 박아
+    cleanup_loop active_set 통과시킴. revoked_at=NULL, expires_at=NULL, is_install_token=False.
+
+    placeholder 는 인증 권한 없음 (key_hash="DAEMON_AUTOREG_PLACEHOLDER"). 데몬은
+    실제 api_key 별도 발급 흐름(bootstrap_api_key) 로 동작, 이 row 는 cleanup_loop
+    스캔용 marker 전용. exchange/auth 어디서도 매칭 안 됨.
+    """
+    try:
+        import hashlib
+        import uuid
+        from sqlalchemy import text as _text
+
+        existing = await session.execute(
+            _text(
+                "SELECT 1 FROM samba_extension_key "
+                "WHERE device_id=:d AND revoked_at IS NULL LIMIT 1"
+            ),
+            {"d": device_id},
+        )
+        if existing.first():
+            return
+        marker = f"DAEMON_AUTOREG:{device_id}"
+        await session.execute(
+            _text(
+                "INSERT INTO samba_extension_key "
+                "(id, key_hash, user_id, label, device_id, is_install_token) "
+                "VALUES (:id, :h, :u, :l, :d, false) "
+                "ON CONFLICT DO NOTHING"
+            ),
+            {
+                "id": str(uuid.uuid4())[:40],
+                "h": hashlib.sha256(marker.encode()).hexdigest(),
+                "u": "daemon-autoreg",
+                "l": f"daemon-autoreg {device_id[:20]}",
+                "d": device_id,
+            },
+        )
+    except Exception as _exc:
+        from backend.utils.logger import logger as _lg
+
+        _lg.warning(f"[데몬자가등록] {device_id} INSERT 실패(무시): {_exc}")
+
+
 def _get_sourcing_client(site: str):
     """직접 API 클라이언트 반환."""
     s = site.lower()
@@ -137,6 +185,7 @@ async def sourcing_collect_queue(request: Request) -> Any:
 
                 async with get_write_session() as _persist_sess:
                     await persist_pc_allowed_sites(_persist_sess, device_id)
+                    await _ensure_daemon_extension_key(_persist_sess, device_id)
                     await _persist_sess.commit()
         # 확장앱: 분담 자동 갱신 폐기 — UI 체크박스 저장만 분담 갱신 권한.
     except Exception:
@@ -322,6 +371,7 @@ async def autotune_daemon_concurrency(request: Request) -> dict[str, Any]:
 
                 async with get_write_session() as _persist_sess:
                     await persist_pc_allowed_sites(_persist_sess, device_id)
+                    await _ensure_daemon_extension_key(_persist_sess, device_id)
                     await _persist_sess.commit()
         _my = get_pc_allowed_sites(device_id)
         if _my:
