@@ -50,7 +50,12 @@ def _pick_owner_with_prefix(site: str, daemon_only: bool) -> str | None:
             if _site_u not in {s.upper() for s in sites}:
                 continue
             last = _pc_last_seen.get(dev, 0)
-            if now - last > 60:
+            # 데몬은 long process_job(SSG extract_pdp 50s) 동안 폴링 못 함 →
+            # 60s strict TTL 위반으로 풀에서 빠져 "데몬 미등록" 회귀.
+            # 데몬은 별도 heartbeat 15s 로 last_seen 갱신하므로 180s 까지 허용.
+            # 확장앱은 인터넷 OFF 빠르게 탐지 위해 60s 유지.
+            ttl = 180.0 if daemon_only else 60.0
+            if now - last > ttl:
                 continue
             pool.append(dev)
         pool.sort()

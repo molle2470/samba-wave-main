@@ -332,6 +332,25 @@ class SourcingQueue:
         if owner_device_id is None and (site or "").upper() in {
             s.upper() for s in _daemon_only_for_job("detail")
         }:
+            # [TEMP-DIAG v1.4.14] 데몬 풀 상태 dump — TTL/등록 어느 쪽 결손인지 식별.
+            try:
+                from backend.api.v1.routers.samba.collector_autotune import (
+                    _pc_allowed_sites as _diag_pa,
+                    _pc_last_seen as _diag_ls,
+                )
+                import time as _diag_t
+
+                _diag_now = _diag_t.time()
+                _diag_dump = {
+                    _d: (sorted(_s), int(_diag_now - _diag_ls.get(_d, 0)))
+                    for _d, _s in _diag_pa.items()
+                    if _d.startswith("samba-daemon-")
+                }
+                logger.warning(
+                    f"[데몬미등록 진단] site={site} pid={product_id} daemons={_diag_dump}"
+                )
+            except Exception:
+                pass
             logger.warning(
                 f"[소싱큐] {site} 데몬 미등록 — 잡 발행 skip (확장앱 fallback 차단): {product_id}"
             )

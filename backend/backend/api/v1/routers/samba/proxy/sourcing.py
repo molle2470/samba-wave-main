@@ -141,6 +141,12 @@ async def sourcing_collect_queue(request: Request) -> Any:
         # 확장앱: 분담 자동 갱신 폐기 — UI 체크박스 저장만 분담 갱신 권한.
     except Exception:
         pass
+
+    # X-Heartbeat: 데몬 워커-독립 heartbeat (v1.4.14+). 잡 dequeue 없이 last_seen 만 갱신.
+    # long process_job 50s 사이클 동안 폴링 공백으로 last_seen TTL 초과 → "데몬 미등록"
+    # 회귀 차단. SourcingQueue.get_next_job 의 사이트 lock 경합 + DB 부하 0.
+    if request.headers.get("X-Heartbeat"):
+        return {"hasJob": False, "heartbeat": True}
     # X-Allowed-Sites 헤더 의미:
     #   - 헤더 미부착(None) = 디폴트 '전체 처리' (단일 PC 운영)
     #   - 빈 문자열 ""     = 명시적 '아무 작업도 안 받음' (분담 외 PC)
@@ -190,10 +196,10 @@ async def sourcing_collect_queue(request: Request) -> Any:
 # ====================================================================
 
 # build/release 시 갱신. 데몬이 시작 시 비교하여 신버전이면 자기 종료(다음 시작 시 갱신).
-AUTOTUNE_DAEMON_LATEST_VERSION = "1.4.13"
+AUTOTUNE_DAEMON_LATEST_VERSION = "1.4.14"
 AUTOTUNE_DAEMON_DOWNLOAD_URL = (
     "https://github.com/sbk0674-web/samba-wave/releases/download/"
-    "samba-daemon-v1.4.13/samba.exe"
+    "samba-daemon-v1.4.14/samba.exe"
 )
 # 데몬 self-update 경로 — backend 경유로 install-token 박힌 exe 받기.
 # 인증: X-Api-Key (데몬 long-lived key). 키 검증 후 새 install-token 발급 + exe tail append.
@@ -282,7 +288,9 @@ async def autotune_daemon_health(
             continue
         if last > latest_last:
             latest_last = last
-    alive = bool(latest_last and now - latest_last < 60)
+    # 데몬 long process_job(50s) + heartbeat 15s 주기 고려 180s 까지 alive 인정.
+    # daemon_pool._pick_owner_with_prefix TTL 과 일치 (v1.4.14+).
+    alive = bool(latest_last and now - latest_last < 180)
     return {"alive": alive, "last_seen": float(latest_last)}
 
 

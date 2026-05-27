@@ -77,7 +77,7 @@ except ImportError:
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.4.13"
+DAEMON_VERSION = "1.4.14"
 
 
 # ====================================================================
@@ -2491,6 +2491,32 @@ async def run_daemon(args: argparse.Namespace) -> int:
 
             _mon_task = asyncio.create_task(_relogin_monitor(page))
 
+            # 워커-독립 heartbeat (v1.4.14) — long process_job(SSG extract_pdp 50s)
+            # 동안 fetch_job 폴링 공백으로 backend last_seen 60s 초과 → pick_daemon_owner
+            # 풀에서 빠져 "데몬 미등록 — 잡 발행 불가" SSG 5000+건 연쇄 실패 차단.
+            # 15s 주기 GET /collect-queue?X-Heartbeat=1 — 잡 dequeue 없이 last_seen 만 갱신.
+            async def _heartbeat_loop() -> None:
+                hb_url = f"{backend_url}/api/v1/samba/proxy/sourcing/collect-queue"
+                while not state.should_die():
+                    await asyncio.sleep(15)
+                    try:
+                        await http_client.get(
+                            hb_url,
+                            headers={
+                                "X-Device-Id": args.device_id,
+                                "X-Allowed-Sites": allowed_sites_header,
+                                "X-Heartbeat": "1",
+                                "X-Api-Key": api_key,
+                            },
+                            timeout=10.0,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.debug("heartbeat 실패(무시): %s", str(exc)[:80])
+
+            _hb_task = asyncio.create_task(_heartbeat_loop())
+
             async def _sync_assignment() -> dict:
                 # 백엔드에서 동시실행 + 담당 사이트 조회 → active_sites/login 반영 후
                 # _eff_conc(담당 사이트 워커 맵) 반환. _cli_sites 지정 시 배정 무시(강제).
@@ -2541,6 +2567,11 @@ async def run_daemon(args: argparse.Namespace) -> int:
                 _mon_task.cancel()
                 try:
                     await _mon_task
+                except BaseException:
+                    pass
+                _hb_task.cancel()
+                try:
+                    await _hb_task
                 except BaseException:
                     pass
                 await _despawn()
