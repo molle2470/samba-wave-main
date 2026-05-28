@@ -64,7 +64,7 @@ export default function OrdersPage() {
   const [marketStatus, setMarketStatus] = useState('')
   const [siteFilter, setSiteFilter] = useState('')
   const [accountFilter, setAccountFilter] = useState('')
-  const [registrationFilter, setRegistrationFilter] = useState('registered')
+  const [registrationFilter, setRegistrationFilter] = useState('')
   const [inputFilter, setInputFilter] = useState('')
   const [invoiceFilter, setInvoiceFilter] = useState('')
   const [statusFilter, setStatusFilter] = useState('cancel_return_excluded')
@@ -330,7 +330,7 @@ export default function OrdersPage() {
     const handler = () => {
       setStatusFilter('cancel_return_excluded')
       setMarketStatus('')
-      setRegistrationFilter('registered')
+      setRegistrationFilter('')
       setInputFilter('')
       setInvoiceFilter('')
       setAppliedSearchText('')
