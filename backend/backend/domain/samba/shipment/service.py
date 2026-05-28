@@ -1266,10 +1266,14 @@ class SambaShipmentService:
         _dispatch_account_map = {a.id: a for a in _res2.scalars().all()}
 
         # 배치 읽기 완료 — soldout refresh(최대 30초) 전 커밋으로 idle in transaction 방지
+        # commit 실패 시 rollback으로 SessionTransaction PREPARED 고착 차단(이슈#276)
         try:
             await self.session.commit()
         except Exception:
-            pass
+            try:
+                await self.session.rollback()
+            except Exception:
+                pass
 
         # 전 옵션 품절 시 소싱처 1회 최신화 시도 (30초 타임아웃)
         _all_opts = product_dict.get("options") or []
@@ -1392,10 +1396,14 @@ class SambaShipmentService:
 
         # 모든 pre-read 완료 — asyncio.gather 전 커밋으로 idle in transaction 방지
         # (policy/name_rule/account 읽기가 여기까지 모두 완료됨)
+        # commit 실패 시 rollback으로 SessionTransaction PREPARED 고착 차단(이슈#276)
         try:
             await self.session.commit()
         except Exception:
-            pass
+            try:
+                await self.session.rollback()
+            except Exception:
+                pass
 
         # 계정별 전송을 병렬 코루틴으로 실행
 
@@ -1411,6 +1419,12 @@ class SambaShipmentService:
                 "clear_nos": [],
                 "db_update_failed": False,
             }
+            # 직전 계정 처리에서 commit 실패로 SessionTransaction PREPARED 고착 가능성 사전 청소(이슈#276)
+            # rollback은 ACTIVE/DEACTIVE/PREPARED 모두에서 호출 가능, CLOSED에서는 no-op
+            try:
+                await self.session.rollback()
+            except Exception:
+                pass
             try:
                 # 전송 시작 전 취소 체크
                 if is_cancel_requested():
@@ -1542,10 +1556,14 @@ class SambaShipmentService:
                             }
 
                             # HTTP 마켓 삭제 전 커밋 — idle in transaction 방지
+                            # commit 실패 시 rollback으로 SessionTransaction PREPARED 고착 차단(이슈#276)
                             try:
                                 await self.session.commit()
                             except Exception:
-                                pass
+                                try:
+                                    await self.session.rollback()
+                                except Exception:
+                                    pass
                             del_result = await delete_from_market(
                                 self.session, market_type, _del_pd, account=account
                             )
@@ -1813,10 +1831,14 @@ class SambaShipmentService:
                             return res
 
                     # 모든 DB 읽기 완료 — HTTP 전송 전 트랜잭션 종료 (idle in transaction 방지)
+                    # commit 실패 시 rollback으로 SessionTransaction PREPARED 고착 차단(이슈#276)
                     try:
                         await self.session.commit()
                     except Exception:
-                        pass
+                        try:
+                            await self.session.rollback()
+                        except Exception:
+                            pass
                     logger.info(f"[메모리] 마켓전송 전: {_mem_mb()}MB")
                     start_time = time.time()
                     result = await dispatch_to_market(
@@ -2665,7 +2687,11 @@ class SambaShipmentService:
                 try:
                     await self.session.commit()
                 except Exception:
-                    pass
+                    # commit 실패 시 rollback으로 SessionTransaction PREPARED 고착 차단(이슈#276)
+                    try:
+                        await self.session.rollback()
+                    except Exception:
+                        pass
                 # SSG 표준카테고리(stdCtgId) 주입 — 정상 send path 와 동일 패턴
                 acct_product = dict(product_dict)
                 if account.market_type == "ssg":

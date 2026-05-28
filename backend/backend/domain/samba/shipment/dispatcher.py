@@ -25,10 +25,14 @@ async def _get_setting(session: AsyncSession, key: str) -> Any:
     repo = SambaSettingsRepository(session)
     row = await repo.find_by_async(key=key)
     val = row.value if row else None
+    # commit 실패 시 rollback으로 SessionTransaction PREPARED 고착 차단(이슈#276)
     try:
         await session.commit()
     except Exception:
-        pass
+        try:
+            await session.rollback()
+        except Exception:
+            pass
     return val
 
 
