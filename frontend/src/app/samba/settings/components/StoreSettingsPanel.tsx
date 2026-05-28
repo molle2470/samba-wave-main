@@ -587,12 +587,11 @@ export function StoreSettingsPanel(props: Props) {
                     <button
                       onClick={async () => {
                         try {
-                          // 현재 입력된 API Key로 먼저 설정 저장
                           const data = storeData['11st'] || {}
-                          if (data.apiKey) {
-                            await forbiddenApi.saveSetting('store_11st', data)
-                          }
-                          const res = await proxyApi.elevenstSellerInfo(editingAccountId ? { account_id: editingAccountId } : undefined)
+                          const res = await proxyApi.elevenstSellerInfo({
+                            ...(editingAccountId ? { account_id: editingAccountId } : {}),
+                            ...(data.apiKey ? { api_key: data.apiKey } : {}),
+                          })
                           if (res.success && res.data) {
                             const d = res.data
                             if (d.shipFromAddress) updateStoreField('11st', 'shipFromAddress', d.shipFromAddress)
