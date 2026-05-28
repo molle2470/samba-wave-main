@@ -175,10 +175,11 @@ asyncio.run(fix())
     # 최신 HEAD로 stamp — 컬럼/인덱스가 이미 DB에 존재하는 상태에서 hot 테이블 ALTER가
     # 활성 트랜잭션과 데드락 일으키는 문제 방지. 누락 컬럼이 진짜 있다면
     # alembic upgrade heads 가 IF NOT EXISTS로 추가하므로 안전.
-    echo "Stamping alembic to previous revision (coupang_cancel_columns = collected_image_mirror_map 이전)..."
-    # 신규 collected_image_mirror_map(image_mirror_map JSONB) 마이그레이션만 실행 강제.
-    # 마이그레이션 자체 idempotent (information_schema 사전체크 + ADD COLUMN — hot 테이블 데드락 회피).
-    uv run alembic stamp --purge zzzzzzzzzzz_coupang_cancel_columns 2>/dev/null || true
+    echo "Stamping alembic to current head (ai_image_transformed_column)..."
+    # 컬럼/인덱스가 이미 DB에 존재하는 상태에서 hot 테이블 ALTER 데드락 회피.
+    # head 신규 마이그레이션 추가 시 이 라인의 revision 반드시 같이 갱신.
+    # 누락하면 옛 마이그레이션 재실행으로 hot 테이블(samba_collected_product) lock_timeout 데드락 재발.
+    uv run alembic stamp --purge zzzzzzzzzzzzz_ai_image_transformed_column 2>/dev/null || true
     _MIGRATION_OK=0
     for i in 1 2 3; do
       if uv run alembic upgrade heads; then
