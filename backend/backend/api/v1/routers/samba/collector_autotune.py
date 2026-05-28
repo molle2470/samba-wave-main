@@ -612,25 +612,37 @@ async def persist_pc_allowed_sites(
             dev = device_id.strip()
             if not dev:
                 return
-            # advisory lock — 멀티 worker / 멀티 PC 동시 register 시 read-modify-write
-            # last-write-wins 으로 먼저 박힌 device row 가 사라지는 race 차단
-            # (2026-05-28: PC1 시작 시 브라우저+데몬 dev 동시 POST로 1ec58a10 row 증발 사고).
-            # 같은 트랜잭션 내 advisory lock — commit/rollback 시 자동 release.
+            # session-level advisory lock — 멀티 worker / 멀티 PC 동시 register 시
+            # read-modify-write last-write-wins race 차단.
+            # _set_setting 내부 save_setting 이 자체 session.commit() 호출하므로 (forbidden/
+            # service.py:79) xact-level lock 은 commit 즉시 release → race 그대로.
+            # session-level lock 은 명시 unlock 까지 유지 → save_setting 의 중간 commit
+            # 영향 없음. finally 에서 반드시 unlock.
+            # (2026-05-28: PC1 시작 시 브라우저+데몬 dev 동시 POST 로 1ec58a10 row 증발 사고)
             from sqlalchemy import text
 
+            _lock_key = "autotune_pc_allowed_sites"
             await session.execute(
-                text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
-                {"k": f"autotune_pc_allowed_sites:{PC_ALLOWED_SITES_DB_KEY}"},
+                text("SELECT pg_advisory_lock(hashtext(:k))"), {"k": _lock_key}
             )
-            current = await _get_setting(session, PC_ALLOWED_SITES_DB_KEY)
-            if not isinstance(current, dict):
-                current = {}
-            mem = _pc_allowed_sites.get(dev)
-            if mem is None:
-                current.pop(dev, None)
-            else:
-                current[dev] = sorted(mem)
-            await _set_setting(session, PC_ALLOWED_SITES_DB_KEY, current)
+            try:
+                current = await _get_setting(session, PC_ALLOWED_SITES_DB_KEY)
+                if not isinstance(current, dict):
+                    current = {}
+                mem = _pc_allowed_sites.get(dev)
+                if mem is None:
+                    current.pop(dev, None)
+                else:
+                    current[dev] = sorted(mem)
+                await _set_setting(session, PC_ALLOWED_SITES_DB_KEY, current)
+            finally:
+                try:
+                    await session.execute(
+                        text("SELECT pg_advisory_unlock(hashtext(:k))"),
+                        {"k": _lock_key},
+                    )
+                except Exception:
+                    pass
             return
         snapshot = {dev: sorted(sites) for dev, sites in _pc_allowed_sites.items()}
         await _set_setting(session, PC_ALLOWED_SITES_DB_KEY, snapshot)
