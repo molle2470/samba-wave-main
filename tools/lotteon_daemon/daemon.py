@@ -77,7 +77,7 @@ except ImportError:
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.4.14"
+DAEMON_VERSION = "1.4.15"
 
 
 # ====================================================================
@@ -2538,8 +2538,15 @@ async def run_daemon(args: argparse.Namespace) -> int:
             )
             try:
                 _last_version_check_at = time.time()
+                _start_ts = time.time()
                 while not state.should_die():
                     await asyncio.sleep(60)
+                    if args.max_uptime > 0 and (time.time() - _start_ts) >= args.max_uptime:
+                        logger.info(
+                            "max-uptime %ds 도달 — 메모리 초기화 재시작", args.max_uptime
+                        )
+                        state.die()
+                        break
                     # v1.4.6+ 주기적 버전 체크 — 매 5분, 신버전 감지 시 즉시 종료
                     # → supervisor 가 self-update 다운로드 + 재시작. 사용자 수동 작업 0.
                     # v1.4.5 까지는 시작 시 1회 체크만 → 무한 polling 중 업데이트 안 됨 사고.
@@ -2813,6 +2820,12 @@ def _parse_args() -> argparse.Namespace:
         action="store_false",
         default=True,
         help="headed 모드로 전환 (LOTTEON WAF 차단 시 디버깅용).",
+    )
+    p.add_argument(
+        "--max-uptime",
+        type=int,
+        default=3600,
+        help="worker 최대 가동 초. 초과 시 재시작(메모리 초기화). 0=비활성. 기본 3600(1시간)",
     )
     # parse_known_args: self-install 재실행 시 argv 에 붙는 식별자(_it-<token>/_be-<hex>/did=)는
     # argparse 가 모르는 토큰이라 parse_args 면 'unrecognized arguments' 로 크래시(rc=2)한다.
