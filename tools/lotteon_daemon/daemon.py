@@ -77,7 +77,7 @@ except ImportError:
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.4.16"
+DAEMON_VERSION = "1.4.17"
 
 
 # ====================================================================
@@ -130,14 +130,31 @@ def _register_run_key(exe_path: Path) -> None:
         logger_print(f"Run 키 등록 실패(무시): {exc}")
 
 
-_DAEMON_UPDATE_URL_LEGACY = (
-    "https://github.com/sbk0674-web/samba-wave/releases/latest/download/samba.exe"
+# 레거시 무버전 자산 — 1.4.16부터 자산명이 `samba-v{ver}.exe` 로 변경되어 404 회귀.
+# 2026-05-28: api_key.txt 없는 PC 가 legacy fallback 으로 빠질 때 무한 404 루프 발생.
+# 이제 fallback 도 backend latest-version 으로 동적 download_url 조회 → 항상 최신 자산 받음.
+_DAEMON_LATEST_VERSION_URL = (
+    "https://api.samba-wave.co.kr/api/v1/samba/proxy/autotune-daemon/latest-version"
 )
 # v1.4.2+: backend 경유 self-update — install-token 박힌 exe 자동 받음.
 # 데몬이 자동 키 갱신 가능 (옛 키 invalid 케이스도 자동 복구).
 _DAEMON_UPDATE_URL_BACKEND = (
     "https://api.samba-wave.co.kr/api/v1/samba/extension-keys/daemon-self-update"
 )
+
+
+def _fetch_latest_download_url() -> str:
+    """backend latest-version API → 버전 박힌 download_url 반환. 실패 시 ''."""
+    import json as _json
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(_DAEMON_LATEST_VERSION_URL, timeout=10) as resp:
+            data = _json.loads(resp.read().decode("utf-8") or "{}")
+            return (data.get("download_url") or "").strip()
+    except Exception as exc:
+        logger_print(f"latest-version 조회 실패: {exc}")
+        return ""
 
 
 def _perform_self_update(api_key: str = "") -> bool:
@@ -171,15 +188,23 @@ def _perform_self_update(api_key: str = "") -> bool:
                     f.write(chunk)
         except Exception as exc:
             logger_print(f"backend 경유 self-update 실패 → GitHub fallback: {exc}")
+            _dl_url = _fetch_latest_download_url()
+            if not _dl_url:
+                logger_print("GitHub fallback URL 조회 실패 — 업데이트 중단")
+                return False
             try:
-                urllib.request.urlretrieve(_DAEMON_UPDATE_URL_LEGACY, str(new_path))
+                urllib.request.urlretrieve(_dl_url, str(new_path))
             except Exception as exc2:
                 logger_print(f"GitHub fallback 도 실패(무시): {exc2}")
                 return False
     else:
+        _dl_url = _fetch_latest_download_url()
+        if not _dl_url:
+            logger_print("자동 업데이트 download_url 조회 실패 — 중단")
+            return False
         try:
-            logger_print(f"자동 업데이트: 새 exe 다운로드 {_DAEMON_UPDATE_URL_LEGACY}")
-            urllib.request.urlretrieve(_DAEMON_UPDATE_URL_LEGACY, str(new_path))
+            logger_print(f"자동 업데이트: 새 exe 다운로드 {_dl_url}")
+            urllib.request.urlretrieve(_dl_url, str(new_path))
         except Exception as exc:
             logger_print(f"자동 업데이트 다운로드 실패(무시): {exc}")
             return False
@@ -1702,9 +1727,7 @@ async def extract_pdp(
     if _need_retry_partial or _need_retry_full:
         await page.wait_for_timeout(3_000)
         data2 = await page.evaluate(handler.extract_js)
-        if isinstance(data2, dict) and (
-            data2.get(retry_field) or data2.get("success")
-        ):
+        if isinstance(data2, dict) and (data2.get(retry_field) or data2.get("success")):
             data = data2
     return (
         data
@@ -2549,9 +2572,13 @@ async def run_daemon(args: argparse.Namespace) -> int:
                 _start_ts = time.time()
                 while not state.should_die():
                     await asyncio.sleep(60)
-                    if args.max_uptime > 0 and (time.time() - _start_ts) >= args.max_uptime:
+                    if (
+                        args.max_uptime > 0
+                        and (time.time() - _start_ts) >= args.max_uptime
+                    ):
                         logger.info(
-                            "max-uptime %ds 도달 — 메모리 초기화 재시작", args.max_uptime
+                            "max-uptime %ds 도달 — 메모리 초기화 재시작",
+                            args.max_uptime,
                         )
                         state.die()
                         break

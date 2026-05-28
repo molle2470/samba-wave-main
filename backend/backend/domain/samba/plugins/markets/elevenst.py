@@ -287,9 +287,38 @@ class ElevenstPlugin(MarketPlugin):
                         "message": f"11번가 유령 매핑 자동정리 (사유: {_err_msg})",
                         "ghost_cleanup": True,
                     }
-                logger.warning(
-                    f"[11번가] 경량 업데이트 실패, 전체 수정으로 폴백: {existing_no} — {e}"
-                )
+                # 발송마감 템플릿 오류 — 템플릿 제거 후 즉시 재시도 (전체 폴백도 동일 에러)
+                if "발송마감 템플릿" in _err_msg:
+                    import re as _re_tmpl
+
+                    _xml_no_tmpl = _re_tmpl.sub(
+                        r"<dlvSendCloseTmpltNo>[^<]*</dlvSendCloseTmpltNo>",
+                        "",
+                        xml_data,
+                    )
+                    logger.warning(
+                        f"[11번가] 발송마감 템플릿 미존재 — 템플릿 없이 재시도: {existing_no}"
+                    )
+                    try:
+                        _r2 = await client.update_product(existing_no, _xml_no_tmpl)
+                        _p2 = [f"가격({new_price:,}원)"]
+                        if options:
+                            _p2.append(f"옵션({len(options)}건)")
+                        return {
+                            "success": True,
+                            "product_no": existing_no,
+                            "message": f"11번가 경량 업데이트 (발송마감 템플릿 제외): {', '.join(_p2)}",
+                            "data": _r2,
+                        }
+                    except Exception as _e2:
+                        logger.warning(
+                            f"[11번가] 템플릿 제거 재시도도 실패, 전체 수정으로 폴백: {_e2}"
+                        )
+                        # 폴백: 아래 전체 로직으로 계속 진행
+                else:
+                    logger.warning(
+                        f"[11번가] 경량 업데이트 실패, 전체 수정으로 폴백: {existing_no} — {e}"
+                    )
                 # 폴백: 아래 전체 로직으로 계속 진행
 
         account_settings = (account.additional_fields or {}) if account else {}
@@ -403,7 +432,24 @@ class ElevenstPlugin(MarketPlugin):
                 xml_data_for_put = _re.sub(
                     r"<dispCtgrNo>[^<]*</dispCtgrNo>", "", xml_data, count=1
                 )
-                result = await client.update_product(existing_no, xml_data_for_put)
+                try:
+                    result = await client.update_product(existing_no, xml_data_for_put)
+                except Exception as _put_e:
+                    # 발송마감 템플릿 오류 — 템플릿 태그 제거 후 재시도
+                    if "발송마감 템플릿" in str(_put_e):
+                        logger.warning(
+                            f"[11번가] 전체 수정 발송마감 템플릿 미존재 — 템플릿 없이 재시도: {existing_no}"
+                        )
+                        xml_data_for_put = _re.sub(
+                            r"<dlvSendCloseTmpltNo>[^<]*</dlvSendCloseTmpltNo>",
+                            "",
+                            xml_data_for_put,
+                        )
+                        result = await client.update_product(
+                            existing_no, xml_data_for_put
+                        )
+                    else:
+                        raise
                 logger.info(f"[11번가] 폴백 응답: {result}")
                 return {
                     "success": True,

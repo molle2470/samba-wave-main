@@ -27,24 +27,32 @@ if (-not (Test-Path $src)) {
 }
 
 # 업로드용 이름 — 파일명에 버전 포함 (samba-v{Version}.exe). 지침: 데몬 설치파일명 버전 노출 필수.
+# 추가: 무버전 alias `samba.exe` 도 같이 업로드 — releases/latest/download/samba.exe 레거시 URL 호환.
+# 2026-05-28 사고: 1.4.15→1.4.16 자산명만 바뀌고 `samba.exe` alias 빠져 legacy fallback 404 무한 루프.
 $assetDir = Join-Path $here 'dist\release'
 New-Item -ItemType Directory -Path $assetDir -Force | Out-Null
 $assetName = "samba-v$Version.exe"
 $assetPath = Join-Path $assetDir $assetName
 Copy-Item -Path $src -Destination $assetPath -Force
+$legacyAlias = Join-Path $assetDir 'samba.exe'
+Copy-Item -Path $src -Destination $legacyAlias -Force
 
 $tag = "samba-daemon-v$Version"
-Write-Host "GitHub Release 생성/갱신: $tag (asset=$assetName)"
+Write-Host "GitHub Release 생성/갱신: $tag (asset=$assetName + samba.exe legacy alias)"
 
 # 기존 릴리스 있으면 자산 교체, 없으면 새로 생성
 $existing = & gh release view $tag 2>$null
 if ($LASTEXITCODE -eq 0) {
   Write-Host "기존 릴리스 발견 → asset 교체"
-  & gh release upload $tag $assetPath --clobber
+  & gh release upload $tag $assetPath $legacyAlias --clobber
 } else {
   Write-Host "신규 릴리스 생성"
-  & gh release create $tag $assetPath --title "Samba Daemon $Version" --notes "삼바 헤드리스 데몬 $Version ($assetName, 멀티PC 지원)"
+  & gh release create $tag $assetPath $legacyAlias --title "Samba Daemon $Version" --notes "삼바 헤드리스 데몬 $Version ($assetName + samba.exe legacy alias, 멀티PC 지원)"
 }
+
+# Latest release 로 마킹 — releases/latest/download/samba.exe 가 항상 이 자산으로 resolve 되도록.
+Write-Host "Latest release 마킹"
+& gh release edit $tag --latest
 
 Write-Host ""
 Write-Host "완료." -ForegroundColor Green
