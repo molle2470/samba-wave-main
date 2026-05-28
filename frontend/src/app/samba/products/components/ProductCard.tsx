@@ -20,7 +20,7 @@ import OptionPanel from './OptionPanel'
 export const MARKETS = [
   // 국내 오픈마켓
   { id: 'smartstore', name: '스마트스토어', url: 'https://sell.smartstore.naver.com', searchUrl: 'https://search.shopping.naver.com/search/all?query=' },
-  { id: 'gmarket', name: '지마켓', url: 'https://www.esmplus.com', searchUrl: 'https://browse.gmarket.co.kr/search?keyword=' },
+  { id: 'gmarket', name: 'G마켓', url: 'https://www.esmplus.com', searchUrl: 'https://browse.gmarket.co.kr/search?keyword=' },
   { id: 'auction', name: '옥션', url: 'https://www.esmplus.com', searchUrl: 'https://browse.auction.co.kr/search?keyword=' },
   { id: 'coupang', name: '쿠팡', url: 'https://wing.coupang.com', searchUrl: 'https://www.coupang.com/np/search?q=' },
   { id: 'lotteon', name: '롯데ON', url: 'https://partner.lotteon.com', searchUrl: 'https://www.lotteon.com/csearch/search/search?render=search&platform=pc&mallId=2&q=' },
@@ -53,7 +53,7 @@ export const MARKETS = [
 const MARKET_NAME_LIMITS: Record<string, number> = {
   '스마트스토어': 49,
   '쿠팡': 100,
-  '지마켓': 100,
+  'G마켓': 100,
   '옥션': 100,
 }
 

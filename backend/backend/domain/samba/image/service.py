@@ -1219,9 +1219,13 @@ class ImageTransformService:
                         (enforce_max_dim or not strict_pixel) and max(w, h) > max_dim
                     )
                     over_bytes = len(image_bytes) > max_bytes
+                    # 핫링크 차단 도메인 — 크기/용량 무관하게 R2 강제 미러
+                    is_hotlink = any(
+                        blocked in host for blocked in self._HOTLINK_BLOCKED_HOSTS
+                    )
 
-                    # 픽셀/용량 모두 통과면 원본 유지
-                    if not need_upscale and not need_downscale and not over_bytes:
+                    # 픽셀/용량 모두 통과하고 차단 도메인도 아니면 원본 유지
+                    if not need_upscale and not need_downscale and not over_bytes and not is_hotlink:
                         result.append(url)
                         continue
 

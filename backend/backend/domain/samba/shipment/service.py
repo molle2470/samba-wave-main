@@ -24,7 +24,7 @@ MARKET_TYPE_TO_POLICY_KEY: dict[str, str] = {
     "ssg": "신세계몰(전시)",
     "smartstore": "스마트스토어",
     "11st": "11번가",
-    "gmarket": "지마켓",
+    "gmarket": "G마켓",
     "auction": "옥션",
     "gsshop": "GS샵",
     "lotteon": "롯데ON",
@@ -507,7 +507,7 @@ class SambaShipmentService:
             "ssg": "신세계몰(전시)",
             "smartstore": "스마트스토어",
             "11st": "11번가",
-            "gmarket": "지마켓",
+            "gmarket": "G마켓",
             "auction": "옥션",
             "gsshop": "GS샵",
             "lotteon": "롯데ON",
@@ -729,10 +729,10 @@ class SambaShipmentService:
                     skip_policy_account_filter,
                     on_account_done=on_account_done,
                 ),
-                timeout=180,  # 상품 1건당 최대 180초 (최신화+이미지업로드 포함)
+                timeout=300,  # 상품 1건당 최대 300초 (ESM 이미지 propagation 재시도 포함)
             )
         except asyncio.TimeoutError:
-            logger.warning(f"[전송] 상품 {product_id} 전송 180초 타임아웃 — 스킵")
+            logger.warning(f"[전송] 상품 {product_id} 전송 300초 타임아웃 — 스킵")
             shipment = await self.repo.create_async(
                 product_id=product_id,
                 target_account_ids=target_account_ids,
@@ -740,7 +740,7 @@ class SambaShipmentService:
                 status="failed",
                 update_result={},
                 transmit_result={},
-                transmit_error={"_all": "전송 180초 타임아웃"},
+                transmit_error={"_all": "전송 300초 타임아웃"},
             )
             return shipment
         finally:
@@ -1133,7 +1133,7 @@ class SambaShipmentService:
             "ssg": "신세계몰(전시)",
             "smartstore": "스마트스토어",
             "11st": "11번가",
-            "gmarket": "지마켓",
+            "gmarket": "G마켓",
             "auction": "옥션",
             "gsshop": "GS샵",
             "lotteon": "롯데ON",
@@ -1253,9 +1253,14 @@ class SambaShipmentService:
 
         transmit_result: dict[str, str] = {}
         transmit_error: dict[str, str] = {}
+        plugin_messages: dict[str, str] = {}
         update_mode_accounts: set[str] = (
             set()
         )  # PATCH 모드였던 계정 (실패해도 등록정보 보존)
+        logger.info(
+            f"[전송] 상품 {product_id} 전송 대상 계정: {target_account_ids} / "
+            f"매핑된 마켓: {list(mapped_categories.keys())}"
+        )
 
         # 전송 대상 계정 배치 조회 (N+1 → 1회)
         from sqlmodel import select as _sel2
@@ -1413,6 +1418,7 @@ class SambaShipmentService:
                 "account_id": account_id,
                 "status": "failed",
                 "error": "",
+                "plugin_message": "",
                 "product_nos": {},
                 "sent_snapshot": None,
                 "is_update": False,
@@ -1434,6 +1440,9 @@ class SambaShipmentService:
 
                 account = _dispatch_account_map.get(account_id)
                 if not account:
+                    logger.warning(
+                        f"[전송] 계정 {account_id} DB에 없음 (dispatch_account_map 키: {list(_dispatch_account_map.keys())})"
+                    )
                     # 삭제된 마켓 계정 — 해당 상품 registered_accounts 에서 자동 제거
                     # (legacy 루프가 동일 잡 무한 재생성하는 사고 방지)
                     res["error"] = f"계정을 찾을 수 없습니다 (삭제됨): {account_id}"
@@ -1461,6 +1470,7 @@ class SambaShipmentService:
                     return res
 
                 market_type = account.market_type
+                logger.info(f"[전송] {market_type}({account_id}) 시작 — category_id_in_map={mapped_categories.get(market_type, '없음')}")
 
                 # 0순위: 수동등록 상품의 계정별 명시 카테고리
                 # manual_market_categories는 {account_id: category_id} 구조
@@ -1485,6 +1495,15 @@ class SambaShipmentService:
                             logger.info(
                                 f"[ESM 크로스매핑] {other}({other_id}) → {market_type}({category_id})"
                             )
+                        else:
+                            logger.warning(
+                                f"[ESM 크로스매핑] {other}({other_id}) → {market_type} 변환 실패 (JSON 매핑 없음)"
+                            )
+                    else:
+                        logger.warning(
+                            f"[ESM 크로스매핑] {market_type}: {other} 매핑 없거나 비숫자 "
+                            f"(other_id={other_id!r}, mapped={list(mapped_categories.keys())})"
+                        )
 
                 # 카페24/롯데홈쇼핑은 플러그인 내부에서 자체 카테고리(소싱처/정책 disp_no)를 사용하므로 매핑 없어도 허용
                 if not category_id and market_type not in (
@@ -1985,8 +2004,11 @@ class SambaShipmentService:
                     }
 
                     action = "수정" if existing_product_no else "등록"
+                    _plugin_msg = result.get("message", "")
+                    res["plugin_message"] = _plugin_msg
                     logger.info(
                         f"[전송] {market_type} {action} 성공 - 상품: {product_id}, 계정: {account_id}"
+                        + (f" - {_plugin_msg}" if _plugin_msg else "")
                     )
                 else:
                     # _skip_retry: 플레이오토 미등록 상품코드 — 재시도/신규등록 차단
@@ -2043,6 +2065,8 @@ class SambaShipmentService:
             transmit_result[aid] = ar["status"]
             if ar["error"]:
                 transmit_error[aid] = ar["error"]
+            if ar.get("plugin_message"):
+                plugin_messages[aid] = ar["plugin_message"]
             if ar["is_update"]:
                 update_mode_accounts.add(aid)
             # 404 초기화 — B칸과 A칸에서 동시 제거
@@ -2155,8 +2179,13 @@ class SambaShipmentService:
             "transmit_error": transmit_error if transmit_error else None,
             "completed_at": datetime.now(UTC),
         }
+        _update_result: dict[str, Any] = {}
         if refresh_status:
-            final_update["update_result"] = {"refresh": refresh_status}
+            _update_result["refresh"] = refresh_status
+        if plugin_messages:
+            _update_result["plugin_messages"] = plugin_messages
+        if _update_result:
+            final_update["update_result"] = _update_result
         updated = await self.repo.update_async(shipment.id, **final_update)
 
         # 6. 상품 상태 업데이트 (등록된 계정 목록)

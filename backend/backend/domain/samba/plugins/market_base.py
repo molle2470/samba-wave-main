@@ -64,12 +64,13 @@ class MarketPlugin(ABC):
         if account:
             extras = account.additional_fields or {}
             creds = {k: v for k, v in extras.items() if v}
-            # additional_fields 비어있어도 api_key/api_secret 체크
-            if not creds:
-                if account.api_key:
-                    creds["apiKey"] = account.api_key
-                if account.api_secret:
-                    creds["apiSecret"] = account.api_secret
+            # additional_fields 내용과 무관하게 컬럼값 보충 (없는 키만 추가)
+            if account.api_key and "apiKey" not in creds:
+                creds["apiKey"] = account.api_key
+            if account.api_secret and "apiSecret" not in creds:
+                creds["apiSecret"] = account.api_secret
+            if account.seller_id and "sellerId" not in creds:
+                creds["sellerId"] = account.seller_id
             # account 지정됐으나 credentials 없으면 폴백 없이 None 반환
             return creds or None
         # account가 None인 경우에만 SambaSettings 폴백 (레거시 단일계정)

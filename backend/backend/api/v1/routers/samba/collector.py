@@ -1384,10 +1384,28 @@ async def products_init_data(
         )
 
         if not mappings:
-            from backend.domain.samba.category.model import SambaCategoryMapping
+            from sqlalchemy import text as _text_cat
 
-            map_r = await session.execute(select(SambaCategoryMapping).limit(2000))
-            mappings = [to_dict(r) for r in map_r.scalars().all()]
+            map_r = await session.execute(
+                _text_cat(
+                    "SELECT id, tenant_id, source_site, source_category, "
+                    "target_mappings, applied_policy_id "
+                    "FROM samba_category_mapping "
+                    "ORDER BY source_site, source_category "
+                    "LIMIT 2000"
+                )
+            )
+            mappings = [
+                {
+                    "id": r[0],
+                    "tenant_id": r[1],
+                    "source_site": r[2],
+                    "source_category": r[3],
+                    "target_mappings": r[4],
+                    "applied_policy_id": r[5],
+                }
+                for r in map_r.fetchall()
+            ]
             await cache.set("init_data:category_mappings", mappings, ttl=300)
 
         policies = [to_dict(r) for r in pol_r.scalars().all()]

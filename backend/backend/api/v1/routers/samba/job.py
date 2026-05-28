@@ -13,6 +13,7 @@ from backend.domain.samba.job.progress_tracker import get_recent_sec_per_item
 from backend.domain.samba.job.repository import SambaJobRepository
 from backend.domain.samba.job.service import SambaJobService
 from backend.domain.samba.tenant.middleware import get_optional_tenant_id
+from backend.utils.logger import logger
 
 router = APIRouter(prefix="/jobs", tags=["samba-jobs"])
 
@@ -133,6 +134,18 @@ async def create_job(
             _text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
             {"k": _lock_key},
         )
+
+        # 이전 cancel-transmit 으로 __all__ 플래그가 남아있으면 해제.
+        # 새 전송 잡 제출 = 사용자가 전송 재개 의사 표명 → 자동 해제.
+        # 비상정지(emergency) 중에는 해제하지 않음 — emergency-clear 로만 해제 가능.
+        from backend.domain.samba.emergency import is_emergency_stopped as _is_ems
+        from backend.domain.samba.shipment.service import (
+            clear_cancel_transmit as _clear_ctx,
+            is_cancel_requested as _is_cancel,
+        )
+        if _is_cancel("__all__") and not _is_ems():
+            _clear_ctx()
+            logger.info("[전송잡 생성] 전역 취소 플래그(__all__) 자동 해제")
 
         # 1) PENDING/RUNNING 잡과 중복 → 기존 잡 그대로 반환
         active_jobs = (

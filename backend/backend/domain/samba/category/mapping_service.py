@@ -134,9 +134,10 @@ class CategoryMappingMixin:
     async def list_mappings(
         self, skip: int = 0, limit: int = 10000
     ) -> List[SambaCategoryMapping]:
-        return await self.mapping_repo.list_async(
-            skip=skip, limit=limit, order_by="-created_at"
-        )
+        # list_async() 대신 list_all() 사용 — tenant_id=NULL 레거시 row 포함
+        rows = await self.mapping_repo.list_all()
+        rows.sort(key=lambda r: r.created_at or "", reverse=True)
+        return rows[skip : skip + limit]
 
     async def _rebuild_exported_rules(self) -> None:
         """기존 호출 호환을 위한 wrapper — 실제 로직은 모듈 레벨 함수에서 별도 세션으로 처리.
@@ -217,18 +218,74 @@ class CategoryMappingMixin:
         return sanitized
 
     async def create_mapping(self, data: Dict[str, Any]) -> SambaCategoryMapping:
-        if "target_mappings" in data:
-            data = dict(data)
-            data["target_mappings"] = await self._sanitize_target_mappings(
-                data.get("target_mappings"),
-                source_site=str(data.get("source_site") or ""),
-                source_category=str(data.get("source_category") or ""),
-            )
-        result = await self.mapping_repo.create_async(**data)
         import asyncio
+        from datetime import datetime, timezone
+        from sqlalchemy import text
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        from backend.domain.samba.category.model import generate_category_mapping_id
+        from backend.core.tenant_context import current_tenant_id
 
+        data = dict(data)
+        source_site = str(data.get("source_site") or "")
+        source_category = str(data.get("source_category") or "")
+        tid = current_tenant_id.get()
+
+        new_target_mappings = data.get("target_mappings")
+        if "target_mappings" in data:
+            new_target_mappings = await self._sanitize_target_mappings(
+                new_target_mappings,
+                source_site=source_site,
+                source_category=source_category,
+            )
+
+        session = self.mapping_repo.session
+        now = datetime.now(tz=timezone.utc)
+
+        # raw SQL SELECT — tenant 필터 우회 (NULL tenant_id 레거시 row 포함)
+        raw = await session.execute(
+            text("SELECT id, target_mappings FROM samba_category_mapping WHERE source_site = :ss AND source_category = :sc LIMIT 1"),
+            {"ss": source_site, "sc": source_category},
+        )
+        existing_row = raw.fetchone()
+
+        # Python에서 미리 병합 (json 타입 컬럼은 || 연산자 불가)
+        if existing_row is not None:
+            existing_targets = existing_row[1] or {}
+            final_targets = {**existing_targets, **(new_target_mappings or {})}
+            final_id = existing_row[0]
+        else:
+            final_targets = new_target_mappings
+            final_id = data.get("id") or generate_category_mapping_id()
+
+        # pg_insert — ORM 모델이 JSON 직렬화 처리, RETURNING 없이 단순 upsert
+        stmt = pg_insert(SambaCategoryMapping).values(
+            id=final_id,
+            tenant_id=tid,
+            source_site=source_site,
+            source_category=source_category,
+            target_mappings=final_targets,
+            applied_policy_id=data.get("applied_policy_id"),
+            created_at=now,
+            updated_at=now,
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["source_site", "source_category"],
+            set_={
+                "target_mappings": stmt.excluded.target_mappings,
+                "updated_at": stmt.excluded.updated_at,
+            },
+        )
+        await session.execute(stmt)
+        await session.commit()
         asyncio.create_task(self._rebuild_exported_rules())
-        return result
+
+        return SambaCategoryMapping(
+            id=final_id, tenant_id=tid,
+            source_site=source_site, source_category=source_category,
+            target_mappings=final_targets,
+            applied_policy_id=data.get("applied_policy_id"),
+            created_at=now, updated_at=now,
+        )
 
     async def update_mapping(
         self, mapping_id: str, data: Dict[str, Any]

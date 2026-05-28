@@ -594,6 +594,11 @@ class JobWorker:
                 # 일시정지 중이면 transmit 클레임 스킵 — PENDING 잡 대기 유지
                 _excl_types: set[str] = {"bg_remove"}
                 if is_cancel_requested("__all__"):
+                    if self._poll_count % 12 == 0:  # 60초(5s × 12)마다 1회 경고
+                        logger.warning(
+                            "[잡워커] 전역 취소 플래그(__all__) 활성 → transmit 클레임 차단 중. "
+                            "새 전송을 시작하면 자동 해제됩니다."
+                        )
                     _excl_types.add("transmit")
                 job = await repo.claim_pending_job(
                     exclude_sources=_excl_sources or None,
@@ -1339,9 +1344,15 @@ class JobWorker:
                             any_success = True
                             _s += 1
                             label = "품절삭제" if acc_status == "completed" else "전송"
+                            _pm = (
+                                (ur.get("plugin_messages") or {}).get(acc_id, "")
+                                if isinstance(ur, dict)
+                                else ""
+                            )
+                            _pm_suffix = f" {_pm}" if _pm else ""
                             _add_job_log(
                                 job.id,
-                                f"[{i + 1}/{total:,}] {prod_name} → {acc_label}: {label}{rl}",
+                                f"[{i + 1}/{total:,}] {prod_name} → {acc_label}: {label}{rl}{_pm_suffix}",
                             )
                         elif acc_status == "skipped":
                             _sk += 1

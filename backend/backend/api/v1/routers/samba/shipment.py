@@ -483,7 +483,7 @@ async def ghost_summary(
         ORDER BY created_at DESC
         """
     )
-    rows = (await session.execute(sql, {"h": hours})).mappings().all()
+    rows = (await session.execute(sql, {"h": str(hours)})).mappings().all()
 
     by_market: dict[str, dict] = {}
     for r in rows:

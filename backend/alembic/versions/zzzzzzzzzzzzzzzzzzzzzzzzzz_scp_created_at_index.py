@@ -20,15 +20,11 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # CONCURRENTLY 는 트랜잭션 밖에서만 실행 가능 — autocommit 블록 사용.
-    # IF NOT EXISTS 로 idempotent.
-    with op.get_context().autocommit_block():
-        op.execute(
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
-            "ix_scp_created_at ON samba_collected_product (created_at)"
-        )
+    op.execute(
+        "CREATE INDEX IF NOT EXISTS "
+        "ix_scp_created_at ON samba_collected_product (created_at)"
+    )
 
 
 def downgrade() -> None:
-    with op.get_context().autocommit_block():
-        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_scp_created_at")
+    op.execute("DROP INDEX IF EXISTS ix_scp_created_at")

@@ -2235,11 +2235,11 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                             "[오토튠] %s → SSG 반려 감지(sellStatCd=05), 재신청",
                                                             product.id,
                                                         )
-                                                        if not _acc_items:
-                                                            _acc_items.append("price")
-                                                            _acc_action_parts.append(
-                                                                f"SSG 반려 → 재신청 → {acc_label}"
-                                                            )
+                                                        # 어드민 저장과 동일한 항목으로 전송해야 재심사 트리거됨
+                                                        _acc_items[:] = ["price", "stock", "image", "description"]
+                                                        _acc_action_parts[:] = [
+                                                            f"SSG 반려 → 재신청 → {acc_label}"
+                                                        ]
                                             except Exception as _ssg_qa_e:
                                                 log.warning(
                                                     "[오토튠] %s SSG 판매상태 확인 실패: %s",
