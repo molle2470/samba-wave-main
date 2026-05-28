@@ -2236,7 +2236,12 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                             product.id,
                                                         )
                                                         # 어드민 저장과 동일한 항목으로 전송해야 재심사 트리거됨
-                                                        _acc_items[:] = ["price", "stock", "image", "description"]
+                                                        _acc_items[:] = [
+                                                            "price",
+                                                            "stock",
+                                                            "image",
+                                                            "description",
+                                                        ]
                                                         _acc_action_parts[:] = [
                                                             f"SSG 반려 → 재신청 → {acc_label}"
                                                         ]

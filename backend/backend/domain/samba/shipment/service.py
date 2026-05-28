@@ -1470,7 +1470,9 @@ class SambaShipmentService:
                     return res
 
                 market_type = account.market_type
-                logger.info(f"[전송] {market_type}({account_id}) 시작 — category_id_in_map={mapped_categories.get(market_type, '없음')}")
+                logger.info(
+                    f"[전송] {market_type}({account_id}) 시작 — category_id_in_map={mapped_categories.get(market_type, '없음')}"
+                )
 
                 # 0순위: 수동등록 상품의 계정별 명시 카테고리
                 # manual_market_categories는 {account_id: category_id} 구조

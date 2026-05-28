@@ -143,6 +143,7 @@ async def create_job(
             clear_cancel_transmit as _clear_ctx,
             is_cancel_requested as _is_cancel,
         )
+
         if _is_cancel("__all__") and not _is_ems():
             _clear_ctx()
             logger.info("[전송잡 생성] 전역 취소 플래그(__all__) 자동 해제")

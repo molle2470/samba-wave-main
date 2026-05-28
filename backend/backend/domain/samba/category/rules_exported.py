@@ -7,5 +7,4 @@
 """
 
 # (source_site, target_market) → {source_category: target_category}
-EXPORTED_RULES: dict[tuple[str, str], dict[str, str]] = {
-}
+EXPORTED_RULES: dict[tuple[str, str], dict[str, str]] = {}

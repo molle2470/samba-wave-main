@@ -243,7 +243,9 @@ class CategoryMappingMixin:
 
         # raw SQL SELECT — tenant 필터 우회 (NULL tenant_id 레거시 row 포함)
         raw = await session.execute(
-            text("SELECT id, target_mappings FROM samba_category_mapping WHERE source_site = :ss AND source_category = :sc LIMIT 1"),
+            text(
+                "SELECT id, target_mappings FROM samba_category_mapping WHERE source_site = :ss AND source_category = :sc LIMIT 1"
+            ),
             {"ss": source_site, "sc": source_category},
         )
         existing_row = raw.fetchone()
@@ -280,11 +282,14 @@ class CategoryMappingMixin:
         asyncio.create_task(self._rebuild_exported_rules())
 
         return SambaCategoryMapping(
-            id=final_id, tenant_id=tid,
-            source_site=source_site, source_category=source_category,
+            id=final_id,
+            tenant_id=tid,
+            source_site=source_site,
+            source_category=source_category,
             target_mappings=final_targets,
             applied_policy_id=data.get("applied_policy_id"),
-            created_at=now, updated_at=now,
+            created_at=now,
+            updated_at=now,
         )
 
     async def update_mapping(

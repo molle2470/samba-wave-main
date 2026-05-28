@@ -4460,7 +4460,9 @@ async def sync_orders_from_markets(
         try:
             orders_data: list[dict[str, Any]] = []
             unconfirmed_ids: list[str] = []
-            _lh_replaced_old_keys: list[str] = []  # deliver_list가 교체한 index-format order_numbers
+            _lh_replaced_old_keys: list[
+                str
+            ] = []  # deliver_list가 교체한 index-format order_numbers
 
             if market_type == "smartstore":
                 from backend.domain.samba.proxy.smartstore import SmartStoreClient
@@ -6378,8 +6380,12 @@ async def sync_orders_from_markets(
                                             or _pitem.get("OrdDtlSn")
                                             or ""
                                         )
-                                        if _dsn and _dsn not in _lh_dlvsn_map.get(_ono, []):
-                                            _lh_dlvsn_map.setdefault(_ono, []).append(_dsn)
+                                        if _dsn and _dsn not in _lh_dlvsn_map.get(
+                                            _ono, []
+                                        ):
+                                            _lh_dlvsn_map.setdefault(_ono, []).append(
+                                                _dsn
+                                            )
                             elif isinstance(_pi, dict):
                                 _dsn = str(
                                     _pi.get("DlvUnitSn") or _pi.get("OrdDtlSn") or ""
@@ -6410,7 +6416,9 @@ async def sync_orders_from_markets(
                             _dlvsn_list = _lh_dlvsn_map.get(_no_key, [])
                             for _i, _prod in enumerate(_prod_info_raw):
                                 _flat = dict(ro)
-                                _flat["ProdInfo"] = _prod if isinstance(_prod, dict) else {}
+                                _flat["ProdInfo"] = (
+                                    _prod if isinstance(_prod, dict) else {}
+                                )
                                 if _dlvsn_list and _i < len(_dlvsn_list):
                                     _flat["_lh_prod_idx"] = _dlvsn_list[_i]
                                     # DlvUnitSn 키로 교체 시 이전 index-format 레코드 삭제 대상 등록
@@ -6421,7 +6429,9 @@ async def sync_orders_from_markets(
                                     _flat, account["id"], label, _fs, _fss
                                 )
                                 _p["shipping_status"] = _fss
-                                _dedup_key = _p.get("ext_order_number") or _p.get("order_number", "")
+                                _dedup_key = _p.get("ext_order_number") or _p.get(
+                                    "order_number", ""
+                                )
                                 if _dedup_key and _dedup_key not in _lh_seen:
                                     _lh_seen.add(_dedup_key)
                                     orders_data.append(_p)
@@ -6450,12 +6460,9 @@ async def sync_orders_from_markets(
                         if _dlv_ord_no and _dlv_ord_no in _lh_seen_ordno:
                             if _dlv_ord_no not in _lh_dlv_replaced:
                                 for _o in orders_data:
-                                    if (
-                                        _o.get("source") == "lottehome"
-                                        and str(_o.get("order_number", "")).startswith(
-                                            f"{_dlv_ord_no}:"
-                                        )
-                                    ):
+                                    if _o.get("source") == "lottehome" and str(
+                                        _o.get("order_number", "")
+                                    ).startswith(f"{_dlv_ord_no}:"):
                                         _o["status"] = _fs
                                         _o["shipping_status"] = _fss
                                 _lh_dlv_replaced.add(_dlv_ord_no)
@@ -6466,7 +6473,9 @@ async def sync_orders_from_markets(
                                 ro, account["id"], label, _fs
                             ):
                                 _p["shipping_status"] = _fss
-                                _dedup_key = _p.get("ext_order_number") or _p.get("order_number", "")
+                                _dedup_key = _p.get("ext_order_number") or _p.get(
+                                    "order_number", ""
+                                )
                                 if _dedup_key and _dedup_key not in _lh_seen:
                                     _lh_seen.add(_dedup_key)
                                     orders_data.append(_p)
@@ -7535,7 +7544,9 @@ async def sync_orders_from_markets(
                     await session.commit()
                 except Exception as _orp_e:
                     await session.rollback()
-                    logger.warning(f"[주문동기화] 롯데홈쇼핑 교체 레코드 삭제 실패(무시): {_orp_e}")
+                    logger.warning(
+                        f"[주문동기화] 롯데홈쇼핑 교체 레코드 삭제 실패(무시): {_orp_e}"
+                    )
 
             total_synced += synced
             if market_type == "smartstore":

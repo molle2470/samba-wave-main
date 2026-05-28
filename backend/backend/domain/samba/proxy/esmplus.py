@@ -1770,9 +1770,13 @@ async def _build_combination(
             continue
         group, pool = await _resolve_esm_group(client, cat_code, name)
         if not group:
-            logger.warning(f"[ESM] 조합형 축 스킵(그룹없음): samba='{name}' cat={cat_code}")
+            logger.warning(
+                f"[ESM] 조합형 축 스킵(그룹없음): samba='{name}' cat={cat_code}"
+            )
             continue
-        matched_count = sum(1 for v in samba_vals if ESMPlusClient.match_option_value(v["text"], pool))
+        matched_count = sum(
+            1 for v in samba_vals if ESMPlusClient.match_option_value(v["text"], pool)
+        )
         logger.info(
             f"[ESM] 조합형 축 확정: '{name}' → optNo={group['recommendedOptNo']} "
             f"vals={len(samba_vals)}개 매칭={matched_count}개"
@@ -1862,7 +1866,9 @@ async def _build_combination(
         for ai in range(len(axes)):
             val_no = d.get(f"recommendedOptValueNo{ai + 1}", 0)
             if val_no == 0:
-                free_text = d.get(f"recommendedOptValue{ai + 1}", {}).get("koreanText", "")
+                free_text = d.get(f"recommendedOptValue{ai + 1}", {}).get(
+                    "koreanText", ""
+                )
                 key_parts.append(f"0:{free_text}")
             else:
                 key_parts.append(str(val_no))
@@ -2109,7 +2115,9 @@ async def register_esm_options(
             }
             ok2, err2 = await _try_set_options(fb_payload)
             if ok2:
-                opt_name = fallback_opt.get("name") or fallback_opt.get("option_name", "")
+                opt_name = fallback_opt.get("name") or fallback_opt.get(
+                    "option_name", ""
+                )
                 logger.info(
                     f"[ESM] type=1 fallback 성공: opt='{opt_name}' goods={goods_no}"
                 )
@@ -2121,7 +2129,9 @@ async def register_esm_options(
                     "group": None,
                     "note": f"type={opt_type} 실패 후 type=1 fallback",
                 }
-            logger.warning(f"[ESM] type=1 fallback 실패: opt='{fallback_opt.get('name')}' err={err2}")
+            logger.warning(
+                f"[ESM] type=1 fallback 실패: opt='{fallback_opt.get('name')}' err={err2}"
+            )
 
     return {
         "success": False,

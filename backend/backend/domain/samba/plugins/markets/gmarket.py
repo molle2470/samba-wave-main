@@ -28,7 +28,10 @@ def _to_grouped_options(options: list[dict], group_names: list[str]) -> list[dic
     """
     if not options:
         return []
-    if options[0].get("values") is not None or options[0].get("option_values") is not None:
+    if (
+        options[0].get("values") is not None
+        or options[0].get("option_values") is not None
+    ):
         return options
     if len(group_names) <= 1:
         group_name = group_names[0] if group_names else "사이즈"
@@ -36,7 +39,9 @@ def _to_grouped_options(options: list[dict], group_names: list[str]) -> list[dic
     return _split_multi_group_options(options, group_names)
 
 
-def _split_multi_group_options(options: list[dict], group_names: list[str]) -> list[dict]:
+def _split_multi_group_options(
+    options: list[dict], group_names: list[str]
+) -> list[dict]:
     """'색상/사이즈' flat 조합 → 축별 그룹 + _combo_stock_map 변환.
 
     _combo_stock_map은 _build_combination이 per-combination 재고로 활용한다.
@@ -273,7 +278,9 @@ class GMarketMarketPlugin(MarketPlugin):
                         f"[지마켓] 추가 이미지 설정 실패 ({_img_wait}s 후 재시도): {img_e}"
                     )
             else:
-                logger.warning(f"[지마켓] 추가 이미지 설정 최종 실패: goodsNo={goods_no}")
+                logger.warning(
+                    f"[지마켓] 추가 이미지 설정 최종 실패: goodsNo={goods_no}"
+                )
 
         # 추천옵션 등록 — samba options 있고 cat_code 있을 때만.
         # register_esm_options 가 이미지 propagation polling (0/30/60s, 최대 90s) 자체 처리.
@@ -283,7 +290,9 @@ class GMarketMarketPlugin(MarketPlugin):
                 from backend.domain.samba.proxy.esmplus import register_esm_options
 
                 opt_result = await _asyncio.wait_for(
-                    register_esm_options(client, goods_no, cat_code, samba_options, site="gmarket"),
+                    register_esm_options(
+                        client, goods_no, cat_code, samba_options, site="gmarket"
+                    ),
                     timeout=120,
                 )
                 if opt_result.get("success"):

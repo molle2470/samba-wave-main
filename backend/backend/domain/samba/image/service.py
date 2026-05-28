@@ -1225,7 +1225,12 @@ class ImageTransformService:
                     )
 
                     # 픽셀/용량 모두 통과하고 차단 도메인도 아니면 원본 유지
-                    if not need_upscale and not need_downscale and not over_bytes and not is_hotlink:
+                    if (
+                        not need_upscale
+                        and not need_downscale
+                        and not over_bytes
+                        and not is_hotlink
+                    ):
                         result.append(url)
                         continue
 
