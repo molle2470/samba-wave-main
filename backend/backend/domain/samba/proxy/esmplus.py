@@ -1872,6 +1872,11 @@ async def register_esm_options(
     if not samba_options:
         return {"success": False, "message": "samba_options 비어있음"}
 
+    # flat list(값 나열) → 단일 그룹 구조 변환
+    # collected_product.options: [{"name":"S","stock":2}, ...] 형태는 "values" 키 없음
+    if not any(o.get("values") for o in samba_options):
+        samba_options = [{"name": "옵션", "values": samba_options}]
+
     site_key = ESMPlusClient.SITE_CONFIG[site]["siteKey"]
     opt_count = min(len(samba_options), 3)
 

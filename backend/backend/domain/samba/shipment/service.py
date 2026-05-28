@@ -1914,6 +1914,24 @@ class SambaShipmentService:
                                 nos[f"{account_id}_pid"] = _cpid
                             if _cvid:
                                 nos[f"{account_id}_vid"] = _cvid
+                        if market_type in ("gmarket", "auction"):
+                            # result.data.data 에서 siteGoodsNo(구매페이지 URL용) / sellerProductId(수정·삭제 API용) 분리 저장
+                            _esm_d: dict = {}
+                            _rd = result.get("data", {})
+                            if isinstance(_rd, dict):
+                                _esm_d = _rd.get("data", _rd)
+                            if not isinstance(_esm_d, dict):
+                                _esm_d = {}
+                            _site_goods_no = str(_esm_d.get("siteGoodsNo", "") or "")
+                            _seller_pid = str(_esm_d.get("sellerProductId", "") or "")
+                            if _site_goods_no:
+                                nos[account_id] = _site_goods_no
+                            if _seller_pid:
+                                nos[f"{account_id}_origin"] = _seller_pid
+                            if _site_goods_no or _seller_pid:
+                                logger.info(
+                                    f"[전송] {market_type} 상품번호 — siteGoodsNo={_site_goods_no}, sellerProductId={_seller_pid}"
+                                )
                         res["product_nos"] = nos
                         logger.info(f"[전송] {market_type} 상품번호: {product_no}")
 
@@ -2739,12 +2757,6 @@ class SambaShipmentService:
         results: list[dict[str, Any]] = []
 
         for product_id in product_ids:
-            # 강제 중단 체크
-            if is_cancel_requested():
-                logger.info(
-                    f"[마켓삭제] 강제 중단 — {len(results)}건 완료, {len(product_ids) - len(results)}건 취소"
-                )
-                break
             product_row = await product_repo.get_async(product_id)
             if not product_row:
                 results.append(

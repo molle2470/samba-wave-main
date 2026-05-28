@@ -788,6 +788,9 @@ export default function ProductsPage() {
               logsRef.push(`[${ts()}] [${fmt(i + 1)}/${fmt(targetProducts.length)}] ${productName}${mktNoStr} -> ${label}: ${logMsg}`)
             }
             if (successAccIds.length) successMap.set(product.id, successAccIds)
+          } else if (res?.processed === 0) {
+            totalFail++
+            logsRef.push(`[${ts()}] [${fmt(i + 1)}/${fmt(targetProducts.length)}] ${productName} -> 0건 처리됨 (비상정지 상태 확인 필요)`)
           } else {
             totalOk++
             logsRef.push(`[${ts()}] [${fmt(i + 1)}/${fmt(targetProducts.length)}] ${productName} -> 성공`)
@@ -862,6 +865,8 @@ export default function ProductsPage() {
           const remaining = (pp.registered_accounts ?? []).filter(id => !successAccIds.includes(id))
           return { ...pp, registered_accounts: remaining, status: remaining.length === 0 ? 'collected' : pp.status } as SambaCollectedProduct
         }))
+      } else if (!res?.results?.length || res?.processed === 0) {
+        setAiJobLogs([`[${ts()}] ${productName} → 0건 처리됨 (비상정지 상태 확인 필요)`])
       } else {
         setAiJobLogs([`[${ts()}] ${productName} → ✓`])
       }

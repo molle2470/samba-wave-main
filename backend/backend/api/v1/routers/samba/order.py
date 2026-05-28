@@ -1173,17 +1173,21 @@ async def list_orders_by_date_range_paged(
         search_text=search_text,
         search_category=search_category,
     )
+    if status_filter == "cancel_alert":
+        date_extra: list[Any] = []
+    else:
+        date_extra = [
+            SambaOrder.paid_at != None,  # noqa: E711
+            SambaOrder.paid_at >= start_dt,
+            SambaOrder.paid_at <= end_dt,
+        ]
     return await _run_paginated_order_query(
         session,
         filters,
         skip=skip,
         limit=limit,
         sort_by=sort_by,
-        extra_filters=[
-            SambaOrder.paid_at != None,  # noqa: E711
-            SambaOrder.paid_at >= start_dt,
-            SambaOrder.paid_at <= end_dt,
-        ],
+        extra_filters=date_extra,
     )
 
 

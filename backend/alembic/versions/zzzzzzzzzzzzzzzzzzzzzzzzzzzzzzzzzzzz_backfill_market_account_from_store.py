@@ -119,7 +119,10 @@ def _build_insert_sql(
         SELECT 1 FROM samba_market_account ma
         WHERE COALESCE(ma.tenant_id, '') = COALESCE({tenant_expr}, '')
           AND ma.market_type = '{market_type}'
-          AND ma.is_default = true
+          AND (
+            ma.is_default = true
+            OR COALESCE(ma.api_key, '') = COALESCE({api_key_expr}, '')
+          )
       )
     """
 
