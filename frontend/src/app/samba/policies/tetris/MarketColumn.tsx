@@ -135,7 +135,7 @@ export default function MarketColumn({
               ? scaledCapacityHeight
               : account.total_collected > 0
                 ? Math.max(1, Math.round(account.total_collected * pixelsPerUnit))
-                : Math.max(1, Math.round(globalMax * pixelsPerUnit * 0.15))
+                : 60
 
             return (
               <div key={account.account_id}>

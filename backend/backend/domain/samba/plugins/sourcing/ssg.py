@@ -255,17 +255,19 @@ class SSGPlugin(SourcingPlugin):
                     _ext_obj = _ext_result.get("resultItemObj", {})
                     _item_nm = _ext_obj.get("itemNm", "")
                     if _item_nm and _html:
-                        _opts = client._parse_layered_select_options(_html)
-                        _sold = (
-                            all(o.get("isSoldOut", False) for o in _opts)
-                            if _opts
-                            else False
-                        )
                         # sellprc = 정상가, bestAmt = 최적가, domSalePrice = DOM 실제 판매가
                         _sell = (
                             _dom_sale
                             or int(_ext_obj.get("bestAmt", 0) or 0)
                             or int(_ext_obj.get("sellprc", 0) or 0)
+                        )
+                        _opts = client._parse_layered_select_options(
+                            _html, base_price=_sell
+                        )
+                        _sold = (
+                            all(o.get("isSoldOut", False) for o in _opts)
+                            if _opts
+                            else False
                         )
                         _best_amt = int(_ext_obj.get("bestAmt", 0) or 0)
                         _dom_card_fb = int(_ext_result.get("domCardPrice", 0) or 0)
@@ -442,6 +444,25 @@ class SSGPlugin(SourcingPlugin):
                     }
                     for opt in raw_options
                 ]
+
+            # 옵션별 원가 계산 (카드할인율 × 옵션가격)
+            if new_options and new_sale_price and best_benefit_price:
+                _card_ratio = best_benefit_price / new_sale_price
+                for _opt in new_options:
+                    _opt_price = _opt.get("price", 0)
+                    if _opt_price > 0:
+                        _opt["cost"] = round(_opt_price * _card_ratio)
+                # 제품 레벨 원가 = 가장 비싼 판매 가능 옵션 기준 (보수적 마진 보호)
+                _max_price = max(
+                    (
+                        o.get("price", 0)
+                        for o in new_options
+                        if not o.get("isSoldOut", False)
+                    ),
+                    default=0,
+                )
+                if _max_price > 0:
+                    best_benefit_price = round(_max_price * _card_ratio)
 
             # 변동/재고변동 정확 판정 — 옵션별 0 경계 전환을 stock_changed로 인정
             from backend.domain.samba.collector.refresher import (
