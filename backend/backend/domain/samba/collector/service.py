@@ -376,6 +376,13 @@ class SambaCollectorService:
             # 정책 복사
             if ref.applied_policy_id:
                 data["applied_policy_id"] = ref.applied_policy_id
+        # 기존 상품에서 정책 못 가져왔으면 SearchFilter 자체에서 fallback(이슈#277)
+        # — 같은 필터 첫 수집(기존 상품 0건)이면 filter_refs=[]라 위 블록 skip되어
+        #   applied_policy_id=NULL 저장 → 이후 수집도 NULL ref 받아 도미노 전파
+        if not data.get("applied_policy_id"):
+            sf = await self.filter_repo.get_async(fid)
+            if sf and sf.applied_policy_id:
+                data["applied_policy_id"] = sf.applied_policy_id
         if group_refs:
             gref = group_refs[0]
             # 마켓 가격 복사 (동일 모델 SKU 패밀리 내에서만)
