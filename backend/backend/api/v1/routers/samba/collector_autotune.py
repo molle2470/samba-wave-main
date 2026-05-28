@@ -604,7 +604,6 @@ async def persist_pc_allowed_sites(
     _log = logging.getLogger("autotune")
     try:
         from backend.api.v1.routers.samba.proxy._helpers import (
-            _get_setting,
             _set_setting,
         )
 
@@ -612,37 +611,56 @@ async def persist_pc_allowed_sites(
             dev = device_id.strip()
             if not dev:
                 return
-            # session-level advisory lock — 멀티 worker / 멀티 PC 동시 register 시
-            # read-modify-write last-write-wins race 차단.
-            # _set_setting 내부 save_setting 이 자체 session.commit() 호출하므로 (forbidden/
-            # service.py:79) xact-level lock 은 commit 즉시 release → race 그대로.
-            # session-level lock 은 명시 unlock 까지 유지 → save_setting 의 중간 commit
-            # 영향 없음. finally 에서 반드시 unlock.
-            # (2026-05-28: PC1 시작 시 브라우저+데몬 dev 동시 POST 로 1ec58a10 row 증발 사고)
-            from sqlalchemy import text
+            # atomic JSONB merge UPSERT — 멀티 worker / 멀티 PC 동시 register race 차단.
+            # 옛 read-modify-write (_get_setting → dict 갱신 → _set_setting) 는
+            # save_setting (forbidden/service.py:79) 의 자체 commit 으로 트랜잭션 분리되어
+            # last-write-wins. advisory_lock 도 connection pool 영향으로 위험.
+            # 단일 SQL UPSERT 가 진짜 atomic — race 원천 차단.
+            # samba_settings.value 컬럼 타입 = json (jsonb 아님). jsonb 연산 결과를
+            # ::json 캐스트로 컬럼 타입 일치 (DatatypeMismatchError 차단).
+            # (2026-05-28: PC1 시작 시 1ec58a10 row 증발 + _add_running_device 의 ::text
+            # 캐스트 DatatypeMismatchError 사고 둘 다 같은 패턴으로 fix)
+            from sqlalchemy import text as _sa_text
 
-            _lock_key = "autotune_pc_allowed_sites"
-            await session.execute(
-                text("SELECT pg_advisory_lock(hashtext(:k))"), {"k": _lock_key}
-            )
-            try:
-                current = await _get_setting(session, PC_ALLOWED_SITES_DB_KEY)
-                if not isinstance(current, dict):
-                    current = {}
-                mem = _pc_allowed_sites.get(dev)
-                if mem is None:
-                    current.pop(dev, None)
-                else:
-                    current[dev] = sorted(mem)
-                await _set_setting(session, PC_ALLOWED_SITES_DB_KEY, current)
-            finally:
-                try:
-                    await session.execute(
-                        text("SELECT pg_advisory_unlock(hashtext(:k))"),
-                        {"k": _lock_key},
-                    )
-                except Exception:
-                    pass
+            mem = _pc_allowed_sites.get(dev)
+            if mem is None:
+                # row 제거 — value 에서 dev 키만 삭제
+                await session.execute(
+                    _sa_text(
+                        """
+                        UPDATE samba_settings
+                        SET value = (COALESCE(value::jsonb, '{}'::jsonb) - :dev)::json,
+                            updated_at = NOW()
+                        WHERE key = :k
+                        """
+                    ),
+                    {"k": PC_ALLOWED_SITES_DB_KEY, "dev": dev},
+                )
+            else:
+                sites_list = sorted(mem)
+                await session.execute(
+                    _sa_text(
+                        """
+                        INSERT INTO samba_settings (key, value, updated_at)
+                        VALUES (
+                            :k,
+                            jsonb_build_object(:dev::text, to_jsonb(:sites::text[]))::json,
+                            NOW()
+                        )
+                        ON CONFLICT (key) DO UPDATE SET
+                            value = (
+                                COALESCE(samba_settings.value::jsonb, '{}'::jsonb)
+                                || jsonb_build_object(:dev::text, to_jsonb(:sites::text[]))
+                            )::json,
+                            updated_at = NOW()
+                        """
+                    ),
+                    {
+                        "k": PC_ALLOWED_SITES_DB_KEY,
+                        "dev": dev,
+                        "sites": sites_list,
+                    },
+                )
             return
         snapshot = {dev: sorted(sites) for dev, sites in _pc_allowed_sites.items()}
         await _set_setting(session, PC_ALLOWED_SITES_DB_KEY, snapshot)
@@ -3651,12 +3669,12 @@ async def _add_running_device(dev: str) -> None:
                     INSERT INTO samba_settings (key, value, updated_at)
                     VALUES (
                         'autotune_running_devices',
-                        to_jsonb(ARRAY[:dev]::text[])::text,
+                        to_jsonb(ARRAY[:dev]::text[])::json,
                         NOW()
                     )
                     ON CONFLICT (key) DO UPDATE SET
                         value = (
-                            SELECT to_jsonb(array_agg(DISTINCT x ORDER BY x))::text
+                            SELECT to_jsonb(array_agg(DISTINCT x ORDER BY x))::json
                             FROM (
                                 SELECT jsonb_array_elements_text(
                                     CASE WHEN samba_settings.value::text ~ '^\\[' THEN samba_settings.value::jsonb
@@ -3694,12 +3712,12 @@ async def _remove_running_device(dev: str) -> None:
                     """
                     UPDATE samba_settings SET
                         value = COALESCE((
-                            SELECT to_jsonb(array_agg(x ORDER BY x))::text
+                            SELECT to_jsonb(array_agg(x ORDER BY x))::json
                             FROM jsonb_array_elements_text(
                                 CASE WHEN value::text ~ '^\\[' THEN value::jsonb ELSE '[]'::jsonb END
                             ) AS x
                             WHERE x != :dev AND x IS NOT NULL AND x != ''
-                        ), '[]'),
+                        ), '[]'::json),
                         updated_at = NOW()
                     WHERE key = 'autotune_running_devices'
                     """
