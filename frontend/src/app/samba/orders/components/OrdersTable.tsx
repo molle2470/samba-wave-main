@@ -296,7 +296,7 @@ export default function OrdersTable(props: OrdersTableProps) {
                         const yes = await showConfirm(confirmMsg)
                         if (!yes) return
                         try {
-                          const res = await orderApi.sellerCancel(o.id, 'SOLD_OUT')
+                          const res = await orderApi.sellerCancel(o.id, 'INTENT_CHANGED')
                           showAlert(res.message || '처리 완료', 'success')
                           loadOrders()
                         } catch (err) {
