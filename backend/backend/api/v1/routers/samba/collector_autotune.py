@@ -629,7 +629,7 @@ async def persist_pc_allowed_sites(
                     _sa_text(
                         """
                         UPDATE samba_settings
-                        SET value = (COALESCE(value::jsonb, '{}'::jsonb) - :dev)::json,
+                        SET value = (COALESCE(value::jsonb, '{}'::jsonb) - CAST(:dev AS text))::json,
                             updated_at = NOW()
                         WHERE key = :k
                         """
@@ -638,19 +638,29 @@ async def persist_pc_allowed_sites(
                 )
             else:
                 sites_list = sorted(mem)
+                # SQLAlchemy text + asyncpg: ':name::type' 패턴은 placeholder parser 와
+                # PostgreSQL cast 연산자 ':: '충돌로 PostgresSyntaxError. CAST(:name AS type)
+                # 형식 강제. (2026-05-28: 옛 :dev::text 패턴이 syntax error 로 silent fail
+                # 하던 사고 — try-except 로 잡혀 "DB 저장 실패(무시)" 만 출력)
                 await session.execute(
                     _sa_text(
                         """
                         INSERT INTO samba_settings (key, value, updated_at)
                         VALUES (
                             :k,
-                            jsonb_build_object(:dev::text, to_jsonb(:sites::text[]))::json,
+                            jsonb_build_object(
+                                CAST(:dev AS text),
+                                to_jsonb(CAST(:sites AS text[]))
+                            )::json,
                             NOW()
                         )
                         ON CONFLICT (key) DO UPDATE SET
                             value = (
                                 COALESCE(samba_settings.value::jsonb, '{}'::jsonb)
-                                || jsonb_build_object(:dev::text, to_jsonb(:sites::text[]))
+                                || jsonb_build_object(
+                                    CAST(:dev AS text),
+                                    to_jsonb(CAST(:sites AS text[]))
+                                )
                             )::json,
                             updated_at = NOW()
                         """
