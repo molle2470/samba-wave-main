@@ -14,7 +14,17 @@ export default function ExtensionLinkPage() {
     try {
       // 확장앱 deviceId 동봉 — 백엔드가 키.device_id 컬럼에 저장해
       // 오토튠 status "본인 PC 매칭"에 사용 (누락 시 device_id=None 으로 매칭 불가).
-      const deviceId = getDeviceId()
+      // race condition fix (2026-05-28): content script postMessage가 sessionStorage에
+      // 도착하기 전에 issueKey가 발사되면 deviceId 빈 값으로 발급되어 device_id=NULL
+      // row만 쌓임 → 오토튠 본인 PC 매칭 실패. 최대 3초 polling 후 발급.
+      let deviceId = getDeviceId()
+      if (!deviceId) {
+        for (let i = 0; i < 30; i++) {
+          await new Promise(r => setTimeout(r, 100))
+          deviceId = getDeviceId()
+          if (deviceId) break
+        }
+      }
       const headers: Record<string, string> = { 'Content-Type': 'application/json' }
       if (deviceId) headers['X-Device-Id'] = deviceId
       const res = await fetchWithAuth(`${SAMBA_PREFIX}/extension-keys`, {
