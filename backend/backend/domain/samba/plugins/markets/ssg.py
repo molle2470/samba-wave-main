@@ -154,6 +154,7 @@ class SSGPlugin(MarketPlugin):
             "ssgNoticeAsContact": "_ssg_notice_as_contact",
             "ssgNoticeManufacturer": "_ssg_notice_manufacturer",
             "ssgNoticeOrigin": "_ssg_notice_origin",
+            "ssgNoticeDropProps": "_ssg_notice_drop_props",
         }
         for cred_key, prod_key in _notice_field_map.items():
             val = creds.get(cred_key)
@@ -339,6 +340,68 @@ class SSGPlugin(MarketPlugin):
                         )
         else:
             result = await client.register_product(data)
+
+        # itemMngPropId 카테고리 거부 자동 재시도 (insertItem 한정, 1회)
+        # 같은 wear 그룹이라도 카테고리에 따라 일부 itemMngPropId 가 거부되는 경우 대응.
+        # 에러 메시지에서 거부된 ID 추출 → _ssg_notice_drop_props 에 누적 → 재변환·재전송.
+        if not data.get("itemId"):
+            _retry_data = result.get("data", {}) if isinstance(result, dict) else {}
+            _retry_res = (
+                _retry_data.get("result", {}) if isinstance(_retry_data, dict) else {}
+            )
+            if isinstance(_retry_res, dict):
+                _retry_code = str(_retry_res.get("resultCode", "") or "")
+                if _retry_code and _retry_code not in ("00", "SUCCESS"):
+                    _retry_msg = (
+                        _retry_res.get("resultDesc", "")
+                        or _retry_res.get("resultMessage", "")
+                        or ""
+                    )
+                    if "itemMngPropId" in _retry_msg:
+                        import re as _re_ssg
+
+                        _rejected_ids = _re_ssg.findall(
+                            r"itemMngPropId\s*:\s*(\d+)", _retry_msg
+                        )
+                        if _rejected_ids:
+                            _existing_drop = product.get("_ssg_notice_drop_props") or []
+                            if isinstance(_existing_drop, str):
+                                _existing_drop = [
+                                    s.strip()
+                                    for s in _existing_drop.replace(" ", ",").split(",")
+                                    if s.strip()
+                                ]
+                            _merged_drop = sorted(
+                                {str(x) for x in _existing_drop} | set(_rejected_ids)
+                            )
+                            logger.warning(
+                                f"[SSG] itemMngPropId 거부 감지({_rejected_ids}) → drop 누적 후 1회 재시도: drop={_merged_drop}"
+                            )
+                            product = {
+                                **product,
+                                "_ssg_notice_drop_props": _merged_drop,
+                            }
+                            try:
+                                data = client.transform_product(
+                                    product,
+                                    category_id,
+                                    std_category_id=std_category_id,
+                                    main_category_id=main_category_id,
+                                    infra=infra,
+                                    margin_rate=margin_rate,
+                                    shpp_rqrm_dcnt=shpp_rqrm_dcnt,
+                                    day_max_qty=day_max_qty,
+                                    once_min_qty=once_min_qty,
+                                    once_max_qty=once_max_qty,
+                                    brand_mappings=brand_mappings,
+                                )
+                                result = await client.register_product(data)
+                            except Exception as e:
+                                import traceback as _tb
+
+                                logger.error(
+                                    f"[SSG] itemMngPropId 재시도 실패: {e}\n{_tb.format_exc()}"
+                                )
 
         # SSG API 응답 검증
         result_data = result.get("data", {})

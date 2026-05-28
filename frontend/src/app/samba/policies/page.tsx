@@ -90,6 +90,7 @@ interface MarketPolicyForm {
   ssgNoticeAsContact?: string
   ssgNoticeManufacturer?: string
   ssgNoticeOrigin?: string
+  ssgNoticeDropProps?: string
   // 스마트스토어 전용
   discountRate: number  // 즉시할인율 (%)
   maxStock: number      // 최대 재고수량 (0=무제한)
@@ -1465,7 +1466,17 @@ export default function PoliciesPage() {
                         style={{ flex: 1, padding: '0.3rem 0.4rem', fontSize: '0.8rem', background: '#1A1A1A', border: '1px solid #2D2D2D', borderRadius: '4px', color: '#E5E5E5', outline: 'none' }}
                       />
                     </div>
-                    <span style={{ fontSize: '0.72rem', color: '#444' }}>나머지 항목(소재·색상·치수·수입여부 등)은 소싱 데이터 자동 입력</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      <span style={{ color: '#888', fontSize: '0.8125rem', minWidth: '120px', flexShrink: 0 }}>고시항목 제외</span>
+                      <input
+                        type="text"
+                        value={mp.ssgNoticeDropProps || ''}
+                        onChange={e => { setCurrentMarketPolicy({ ...mp, ssgNoticeDropProps: e.target.value }); triggerAutoSave() }}
+                        placeholder="예: 0000000001,0000000003"
+                        style={{ flex: 1, padding: '0.3rem 0.4rem', fontSize: '0.8rem', background: '#1A1A1A', border: '1px solid #2D2D2D', borderRadius: '4px', color: '#E5E5E5', outline: 'none' }}
+                      />
+                    </div>
+                    <span style={{ fontSize: '0.72rem', color: '#444' }}>나머지 항목(소재·색상·치수·수입여부 등)은 소싱 데이터 자동 입력. 카테고리에서 거부하는 itemMngPropId 는 콤마로 구분 입력(예: 0000000001 거부 시 등록 실패 시 자동 재시도 됨).</span>
                   </div>
                   </div>
                 </div>

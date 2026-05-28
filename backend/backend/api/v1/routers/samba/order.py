@@ -8901,6 +8901,15 @@ def _parse_lottehome_order(
         prod_info.get("prodOption") or prod_info.get("GoodsDesc") or ""
     )
     product_id = str(prod_info.get("ProdCode") or prod_info.get("GoodsNo") or "")
+    # product_id 빈 lottehome 주문 — 미등록 주문 발생 원인 진단용 raw 키 로그
+    # 신규/배송/취소/반품 4개 엔드포인트 중 어디서 빈 케이스 오는지 파악 후 별도 PR 에서 폴백 키 확장.
+    if not product_id:
+        logger.warning(
+            f"[주문동기화] lottehome product_id 누락 — "
+            f"OrdNo={order_no}, SubOrdNo={sub_ord_no}, "
+            f"ProdInfo keys={sorted(prod_info.keys())}, "
+            f"item keys={sorted(item.keys())}"
+        )
     sale_price = int(float(prod_info.get("ordPrice") or prod_info.get("SalePrc") or 0))
     buy_real_price = int(float(prod_info.get("buyRealPrice", 0) or 0))
     qty = int(prod_info.get("ordQty") or prod_info.get("OrdQty") or 1)

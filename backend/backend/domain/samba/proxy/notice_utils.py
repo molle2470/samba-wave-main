@@ -1272,4 +1272,17 @@ def build_ssg_notice(
             {"itemMngPropId": "0000000012", "itemMngCntt": as_info},
         ]
 
+    # 카테고리에서 거부하는 itemMngPropId 제외 — 정책 토글 + 자동 재시도 경로 공용
+    # 입력 형식: list[str] (예: ["0000000001", "0000000003"]) 또는 콤마 문자열
+    _drop_raw = product.get("_ssg_notice_drop_props")
+    if _drop_raw:
+        if isinstance(_drop_raw, str):
+            _drop_ids = {
+                s.strip() for s in _drop_raw.replace(" ", ",").split(",") if s.strip()
+            }
+        else:
+            _drop_ids = {str(x).strip() for x in _drop_raw if str(x).strip()}
+        if _drop_ids:
+            attrs = [a for a in attrs if a.get("itemMngPropId") not in _drop_ids]
+
     return cls_id, attrs
