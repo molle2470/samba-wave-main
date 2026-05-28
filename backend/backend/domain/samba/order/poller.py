@@ -129,25 +129,28 @@ async def _fetch_new_order_numbers(
                 lh_start = lh_end - timedelta(days=1)
                 lh_start_str = lh_start.strftime("%Y%m%d")
                 lh_end_str = lh_end.strftime("%Y%m%d")
-                for sel_option in ["01", "02", "03"]:
-                    lh_orders = await lh_client.search_new_orders(
-                        lh_start_str, lh_end_str, sel_option=sel_option
-                    )
-                    for ro in lh_orders:
-                        prod = (
-                            ro.get("ProdInfo", {})
-                            if isinstance(ro.get("ProdInfo"), dict)
-                            else {}
+                try:
+                    for sel_option in ["01", "02", "03"]:
+                        lh_orders = await lh_client.search_new_orders(
+                            lh_start_str, lh_end_str, sel_option=sel_option
                         )
-                        oid = str(
-                            ro.get("SubOrdNo")
-                            or prod.get("DlvUnitSn")
-                            or prod.get("OrdDtlSn")
-                            or ro.get("OrdNo", "")
-                            or ""
-                        )
-                        if oid:
-                            raw_order_numbers.append(oid)
+                        for ro in lh_orders:
+                            prod = (
+                                ro.get("ProdInfo", {})
+                                if isinstance(ro.get("ProdInfo"), dict)
+                                else {}
+                            )
+                            oid = str(
+                                ro.get("SubOrdNo")
+                                or prod.get("DlvUnitSn")
+                                or prod.get("OrdDtlSn")
+                                or ro.get("OrdNo", "")
+                                or ""
+                            )
+                            if oid:
+                                raw_order_numbers.append(oid)
+                finally:
+                    await lh_client.close()
 
             else:
                 continue
