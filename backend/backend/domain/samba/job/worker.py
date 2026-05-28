@@ -2123,6 +2123,7 @@ class JobWorker:
                         "extra_charge": pr.get("extraCharge", 0),
                         "use_range_margin": pr.get("useRangeMargin", False),
                         "range_margins": pr.get("rangeMargins", []),
+                        "min_margin_amount": pr.get("minMarginAmount", 0),
                         "source_site_margins": pr.get("sourceSiteMargins", {}),
                     }
                 count = await svc.apply_policy_to_filter_products(
@@ -5771,6 +5772,7 @@ class JobWorker:
                         "extra_charge": pr.get("extraCharge", 0),
                         "use_range_margin": pr.get("useRangeMargin", False),
                         "range_margins": pr.get("rangeMargins", []),
+                        "min_margin_amount": pr.get("minMarginAmount", 0),
                         "source_site_margins": pr.get("sourceSiteMargins", {}),
                     }
                 count = await svc.apply_policy_to_filter_products(

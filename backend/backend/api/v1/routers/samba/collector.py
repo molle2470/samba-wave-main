@@ -528,6 +528,9 @@ async def update_filter(
                             "margin_rate": pr.get("marginRate", 15),
                             "shipping_cost": pr.get("shippingCost", 0),
                             "extra_charge": pr.get("extraCharge", 0),
+                            "use_range_margin": pr.get("useRangeMargin", False),
+                            "range_margins": pr.get("rangeMargins", []),
+                            "min_margin_amount": pr.get("minMarginAmount", 0),
                             "source_site_margins": pr.get("sourceSiteMargins", {}),
                         }
                     bg_svc = _get_services(bg_session)
@@ -590,6 +593,9 @@ async def bulk_apply_policy(
                         "margin_rate": pr.get("marginRate", 15),
                         "shipping_cost": pr.get("shippingCost", 0),
                         "extra_charge": pr.get("extraCharge", 0),
+                        "use_range_margin": pr.get("useRangeMargin", False),
+                        "range_margins": pr.get("rangeMargins", []),
+                        "min_margin_amount": pr.get("minMarginAmount", 0),
                         "source_site_margins": pr.get("sourceSiteMargins", {}),
                     }
                 bg_svc = _get_services(bg_session)

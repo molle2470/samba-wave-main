@@ -804,6 +804,11 @@ class SambaCollectorService:
         updated = 0
         failed_ids: list[str] = []
 
+        # 이슈 #261 (2026-05-27) — minMarginAmount 강제 누락 fix.
+        # market_prices.default 는 마켓별 fee 분할 전 "참고 default" 이므로
+        # 최소한 base 기준 margin 적용 후 minMargin 강제만이라도 보장.
+        min_margin = int(policy_data.get("min_margin_amount") or 0)
+
         async for p in self.product_repo.iter_by_filter(filter_id):
             try:
                 base = p.sale_price or p.original_price or 0
@@ -830,9 +835,12 @@ class SambaCollectorService:
                             source_margin += round(base * _ss_rate / 100)
                         if _ss_amount > 0:
                             source_margin += _ss_amount
-                calculated = int(
-                    base * (1 + margin_rate / 100) + source_margin + shipping + extra
-                )
+                # 기본 마진 (markup)
+                margin_amt = round(base * margin_rate / 100)
+                # minMarginAmount 강제 (이슈 #261)
+                if min_margin > 0 and margin_amt < min_margin:
+                    margin_amt = min_margin
+                calculated = int(base + margin_amt + source_margin + shipping + extra)
                 await self.product_repo.update_async(
                     p.id,
                     applied_policy_id=policy_id,
