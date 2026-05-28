@@ -6,7 +6,15 @@
 
 // 키 발급용 연결 페이지 — 저장 시 키가 없으면 자동으로 이 페이지를 열어
 // 로그인 세션 기반으로 키를 발급받고 탭이 자동으로 닫힌다.
-const EXTENSION_LINK = 'https://samba-wave.vercel.app/samba/extension-link'
+// 포크 환경 대응(이슈 #257): 저장된 백엔드 URL 에서 frontend 도메인을
+// 동적으로 유도. api.* → 루트로 치환. proxyUrl 미설정 시만 본진 fallback.
+const DEFAULT_EXTENSION_LINK = 'https://samba-wave.vercel.app/samba/extension-link'
+
+function deriveExtensionLinkUrl(proxyUrl) {
+  if (!proxyUrl) return DEFAULT_EXTENSION_LINK
+  const frontendBase = proxyUrl.replace(/^https?:\/\/api\./i, (m) => m.replace('api.', ''))
+  return `${frontendBase}/samba/extension-link`
+}
 
 function $(id) { return document.getElementById(id) }
 
@@ -81,7 +89,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     await chrome.storage.local.remove('apiKey')
     setStatus(status, '✅ 저장됨 — 자동 연결 중...', 'ok')
     updateConn(false)
-    chrome.tabs.create({ url: EXTENSION_LINK, active: true })
+    chrome.tabs.create({ url: deriveExtensionLinkUrl(url), active: true })
   })
 
   // ============================================================
