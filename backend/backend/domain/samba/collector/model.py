@@ -359,6 +359,11 @@ class SambaCollectedProduct(SQLModel, table=True):
         default=0, sa_column=Column(Integer, nullable=False, server_default="0")
     )
 
+    # AI 이미지 변환 완료 여부 — tags의 __ai_image__ 태그와 독립. race wipe 영구 차단용
+    ai_image_transformed: bool = Field(
+        default=False, sa_column=Column(Boolean, nullable=False, server_default="false")
+    )
+
     # 마켓별 마지막 전송 스냅샷 (스킵 판단용)
     # { "계정ID": { "sale_price": 24469, "cost": 20000, "options": [...], "sent_at": "..." } }
     last_sent_data: Optional[Any] = Field(

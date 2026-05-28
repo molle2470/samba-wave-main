@@ -396,14 +396,13 @@ async def transform_images(
     # 주의: __ai_image__는 상품 단위 태그(thumbnail/additional/detail scope 구분 없음).
     #       썸네일만 처리된 상품도 제외되므로 상세 재처리 용도엔 부적합.
     if scope.get("skip_processed") and product_ids:
-        from sqlalchemy import select as sa_select, text as _text_jsonb
+        from sqlalchemy import select as sa_select
 
         from backend.domain.samba.collector.model import SambaCollectedProduct
 
-        _ai_img = _text_jsonb("'[\"__ai_image__\"]'::jsonb")
         _done_stmt = sa_select(SambaCollectedProduct.id).where(
             SambaCollectedProduct.id.in_(product_ids),
-            SambaCollectedProduct.tags.op("@>")(_ai_img),
+            SambaCollectedProduct.ai_image_transformed.is_(True),
         )
         _done_res = await session.execute(_done_stmt)
         _done_ids = {r[0] for r in _done_res.all()}
@@ -667,6 +666,7 @@ async def bg_jobs_complete(
             if new_detail is not None:
                 product.detail_images = new_detail
             product.tags = new_tags
+            product.ai_image_transformed = True
             session.add(product)
             success_count += 1
         else:
@@ -764,6 +764,7 @@ async def bg_jobs_progress(
                 product.tags = list(
                     set((product.tags or []) + ["__ai_image__", "__img_edited__"])
                 )
+                product.ai_image_transformed = True
                 session.add(product)
                 res["total_transformed"] = int(res.get("total_transformed", 0)) + 1
             else:

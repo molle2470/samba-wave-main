@@ -1751,7 +1751,7 @@ class ImageTransformService:
                             product_result["failed"] += 1
                     update_data["detail_images"] = new_details
 
-            # DB 업데이트 — __ai_image__ + __img_edited__ 태그 추가
+            # DB 업데이트 — __ai_image__ + __img_edited__ 태그 추가 + 컬럼 SET
             if update_data and product_result["transformed"] > 0:
                 existing_tags = list(product.tags or [])
                 if "__ai_image__" not in existing_tags:
@@ -1759,6 +1759,7 @@ class ImageTransformService:
                 if "__img_edited__" not in existing_tags:
                     existing_tags.append("__img_edited__")
                 update_data["tags"] = existing_tags
+                update_data["ai_image_transformed"] = True
             if update_data:
                 try:
                     await repo.update_async(pid, **update_data)

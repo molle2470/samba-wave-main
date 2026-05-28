@@ -813,7 +813,7 @@ class SambaShipmentService:
             _src_norm in _AI_REQUIRED_SOURCE_SITES
             and _brand_norm in _AI_REQUIRED_BRANDS
         ):
-            if "__ai_image__" not in (product_row.tags or []):
+            if not product_row.ai_image_transformed:
                 _msg = (
                     f"{product_row.source_site} 나이키 상품은 "
                     f"AI 이미지 변환 후에만 등록 가능합니다."
