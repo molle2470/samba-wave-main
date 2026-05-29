@@ -77,7 +77,7 @@ except ImportError:
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.4.17"
+DAEMON_VERSION = "1.4.18"
 
 
 # ====================================================================
@@ -2399,56 +2399,86 @@ async def run_daemon(args: argparse.Namespace) -> int:
             # (SSG 등)가 굶는다. 워룸 동시실행 설정(인풋박스)만큼 사이트별 페이지를 띄워
             # 각 사이트를 독립 병렬 처리한다. 60초마다 재조회해 인풋박스 변경을 탄력 반영.
             _MAX_TOTAL_PAGES = int(os.environ.get("DAEMON_MAX_PAGES", "16"))
+            # 같은 page 를 수천 번 navigate 하면 렌더러에 DOM/JS 가 쌓여 메모리가 GB 단위로
+            # 부푼다(실측 1.9GB/탭, 합 5.6GB). _PAGE_RECYCLE 개 잡마다 page 를 닫고 새로 열어
+            # 렌더러 메모리를 리셋한다. max-uptime(1시간) 재시작 전에 누수를 끊는 1차 방어선.
+            _PAGE_RECYCLE = int(os.environ.get("DAEMON_PAGE_RECYCLE", "50"))
 
             async def _site_worker(site: str, wid: str, wpage: Page) -> None:
                 _idle_at = 0.0
-                while not state.should_die():
-                    try:
-                        # 등록(allowed_sites)=전체 활성 사이트 → pick_daemon_owner 가
-                        # 모든 사이트의 owner 후보로 이 데몬 인식. 잡 dequeue 스코프
-                        # (poll_site)=이 워커 사이트 하나. 분리 안 하면 등록값이 단일
-                        # 사이트로 덮어써져 owner 매칭 깨짐(LOTTEON 60s 타임아웃 원인).
-                        job = await fetch_job(
-                            http_client,
-                            backend_url,
-                            args.device_id,
-                            api_key,
-                            allowed_sites=allowed_sites_header,
-                            poll_site=site,
-                        )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        logger.debug("[%s] fetch_job 예외: %s", wid, str(exc)[:80])
-                        await asyncio.sleep(args.poll_interval)
-                        continue
-                    if not job:
-                        _now = time.time()
-                        if _now - _idle_at > 60:
-                            logger.info(
-                                "[%s] 대기 중 (processed=%d ok=%d fail=%d)",
-                                wid,
-                                state.processed,
-                                state.succeeded,
-                                state.failed,
+                _done = 0  # 처리한 잡 수 — _PAGE_RECYCLE 마다 page 재생성(메모리 리셋)
+                try:
+                    while not state.should_die():
+                        try:
+                            # 등록(allowed_sites)=전체 활성 사이트 → pick_daemon_owner 가
+                            # 모든 사이트의 owner 후보로 이 데몬 인식. 잡 dequeue 스코프
+                            # (poll_site)=이 워커 사이트 하나. 분리 안 하면 등록값이 단일
+                            # 사이트로 덮어써져 owner 매칭 깨짐(LOTTEON 60s 타임아웃 원인).
+                            job = await fetch_job(
+                                http_client,
+                                backend_url,
+                                args.device_id,
+                                api_key,
+                                allowed_sites=allowed_sites_header,
+                                poll_site=site,
                             )
-                            _idle_at = _now
-                        await asyncio.sleep(args.poll_interval)
-                        continue
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            logger.debug("[%s] fetch_job 예외: %s", wid, str(exc)[:80])
+                            await asyncio.sleep(args.poll_interval)
+                            continue
+                        if not job:
+                            _now = time.time()
+                            if _now - _idle_at > 60:
+                                logger.info(
+                                    "[%s] 대기 중 (processed=%d ok=%d fail=%d)",
+                                    wid,
+                                    state.processed,
+                                    state.succeeded,
+                                    state.failed,
+                                )
+                                _idle_at = _now
+                            await asyncio.sleep(args.poll_interval)
+                            continue
+                        try:
+                            await process_job(
+                                wpage,
+                                http_client,
+                                backend_url,
+                                job,
+                                state,
+                                api_key,
+                                args.device_id,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            logger.warning(
+                                "[%s] process_job 예외: %s", wid, str(exc)[:120]
+                            )
+                        # 잡 처리 후 페이지 재활용 카운트 — 같은 page 를 계속 navigate 하면
+                        # 렌더러 메모리가 GB 단위로 누적된다. _PAGE_RECYCLE 마다 page 를 닫고
+                        # 새로 열어 메모리를 리셋(이미지 차단 route 는 context 단위라 자동 상속).
+                        _done += 1
+                        if _done % _PAGE_RECYCLE == 0:
+                            try:
+                                await wpage.close()
+                            except Exception:
+                                pass
+                            wpage = await context.new_page()
+                            logger.info(
+                                "[%s] 페이지 재생성 (누적 %d개 처리 — 렌더러 메모리 리셋)",
+                                wid,
+                                _done,
+                            )
+                finally:
+                    # 워커 종료(취소 포함) 시 현재 page 정리 — _pages 목록엔 초기 page 만 있어
+                    # 재생성된 page 는 여기서 닫지 않으면 _despawn 이 못 닫아 누수된다.
                     try:
-                        await process_job(
-                            wpage,
-                            http_client,
-                            backend_url,
-                            job,
-                            state,
-                            api_key,
-                            args.device_id,
-                        )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        logger.warning("[%s] process_job 예외: %s", wid, str(exc)[:120])
+                        await wpage.close()
+                    except Exception:
+                        pass
 
             async def _relogin_monitor(rl_page: Page) -> None:
                 while not state.should_die():
