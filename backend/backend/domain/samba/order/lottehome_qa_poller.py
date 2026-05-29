@@ -85,6 +85,8 @@ async def _run_lottehome_qa_sync() -> tuple[int, int]:
                 if isinstance(result_data, dict)
                 else result_data
             )
+            if not isinstance(goods_info, dict):
+                continue
             sale_stat = str(goods_info.get("SaleStatCd", "") or "")
             qa_result = str(goods_info.get("QaRsltCd", "") or "")
             if sale_stat == "10" or qa_result in ("10", "15", "30"):

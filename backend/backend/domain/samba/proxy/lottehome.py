@@ -257,6 +257,11 @@ class LotteHomeClient:
                 code="NOT_XML",
                 message=f"비XML 응답({len(xml_str):,}자) 앞부분: {_stripped[:500]!r}",
             )
+        # 미이스케이프 & 보정 — 롯데 API 서버 버그 대응
+        # (searchStockList 33MB 응답 중 <CorpItemNo>Pink & lavender</CorpItemNo> 등
+        # 텍스트 노드 내 & 미이스케이프로 "not well-formed (invalid token)" 발생)
+        # 기존 엔터티 레퍼런스(&amp; &lt; &gt; &quot; &apos; &#..;)는 유지
+        xml_str = re.sub(r"&(?!amp;|lt;|gt;|quot;|apos;|#\w+;)", "&amp;", xml_str)
         try:
             root_el = ET.fromstring(xml_str)
         except ET.ParseError as _e:
@@ -351,7 +356,7 @@ class LotteHomeClient:
             # EUC-KR 응답을 UTF-8로 변환
             raw_bytes = resp.content
             try:
-                xml_str = raw_bytes.decode("euc-kr")
+                xml_str = raw_bytes.decode("euc-kr", errors="replace")
             except (UnicodeDecodeError, LookupError):
                 xml_str = raw_bytes.decode("utf-8", errors="replace")
 
