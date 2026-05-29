@@ -118,9 +118,7 @@ class NikePlugin(SourcingPlugin):
             try:
                 availability = await client._fetch_availability(site_product_id)
             except Exception as e:
-                logger.warning(
-                    f"[Nike] availability 조회 실패 {site_product_id}: {e}"
-                )
+                logger.warning(f"[Nike] availability 조회 실패 {site_product_id}: {e}")
                 availability = {}
             if availability:
                 matched = 0

@@ -1,8 +1,10 @@
 """SambaWave Analytics service - cross-domain statistics (ported from js/modules/analytics.js)."""
 
 from collections import defaultdict
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+
+_KST = timezone(timedelta(hours=9))
 
 from backend.domain.samba.channel.repository import SambaChannelRepository
 from backend.domain.samba.order.repository import SambaOrderRepository
@@ -116,31 +118,32 @@ class SambaAnalyticsService:
     async def get_daily_trend(
         self, days: int = 30, tenant_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """일별 매출 트렌드."""
+        """일별 매출 트렌드 (paid_at KST 기준)."""
         all_orders = self._filter_by_tenant(
             await self.order_repo.list_async(), tenant_id
         )
-        now = datetime.now(UTC)
-        cutoff = now - timedelta(days=days)
+        now_kst = datetime.now(_KST)
+        cutoff_kst = now_kst - timedelta(days=days)
 
         daily: Dict[str, Dict[str, Any]] = {}
 
         # 빈 날짜 초기화
         for i in range(days):
-            date = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+            date = (now_kst - timedelta(days=i)).strftime("%Y-%m-%d")
             daily[date] = {"date": date, "sales": 0.0, "orders": 0, "profit": 0.0}
 
         for order in all_orders:
-            if order.created_at < cutoff:
+            paid_at = order.paid_at
+            if not paid_at:
                 continue
-            date_str = order.created_at.strftime("%Y-%m-%d")
+            if paid_at.tzinfo is None:
+                paid_at = paid_at.replace(tzinfo=UTC)
+            paid_kst = paid_at.astimezone(_KST)
+            if paid_kst < cutoff_kst:
+                continue
+            date_str = paid_kst.strftime("%Y-%m-%d")
             if date_str not in daily:
-                daily[date_str] = {
-                    "date": date_str,
-                    "sales": 0.0,
-                    "orders": 0,
-                    "profit": 0.0,
-                }
+                continue
 
             daily[date_str]["sales"] += order.sale_price * order.quantity
             daily[date_str]["orders"] += 1

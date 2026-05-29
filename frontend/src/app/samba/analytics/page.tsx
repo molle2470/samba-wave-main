@@ -199,7 +199,13 @@ export default function AnalyticsPage() {
 
     return (
       <div style={{ ...card, padding: '1.25rem', marginBottom: '1.5rem' }}>
-        <h3 style={{ fontSize: '0.9375rem', fontWeight: 600, color: '#FF8C00', marginBottom: '1rem' }}>{title}</h3>
+        <h3 style={{
+          fontSize: '0.9375rem', fontWeight: 600, color: '#FF8C00', marginBottom: '1rem',
+          position: 'sticky', top: '64px', zIndex: 10,
+          background: 'rgba(26,26,26,0.97)', backdropFilter: 'blur(4px)',
+          padding: '0.5rem 0', margin: '-0.25rem 0 1rem 0',
+          borderBottom: '1px solid #2D2D2D',
+        }}>{title}</h3>
         <div style={{ overflowX: 'auto' }}>
           <table style={{ borderCollapse: 'collapse', width: '100%', minWidth: `${(columns.length + 2) * 120}px` }}>
             <thead>
@@ -403,7 +409,13 @@ export default function AnalyticsPage() {
       <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '1.5rem', marginTop: '1.5rem' }}>
         {/* 매출 추이 라인차트 */}
         <div style={{ ...card, padding: '1.25rem' }}>
-          <div style={{ fontSize: '0.9375rem', fontWeight: 700, marginBottom: '0.75rem' }}>최근 30일 매출 추이</div>
+          <div style={{
+            fontSize: '0.9375rem', fontWeight: 700, marginBottom: '0.75rem',
+            position: 'sticky', top: '64px', zIndex: 10,
+            background: 'rgba(26,26,26,0.97)', backdropFilter: 'blur(4px)',
+            padding: '0.5rem 0', margin: '-0.25rem 0 0.75rem 0',
+            borderBottom: '1px solid #2D2D2D',
+          }}>최근 30일 매출 추이</div>
           <RevenueTrendLine data={dailyData} />
         </div>
       </div>
@@ -412,11 +424,23 @@ export default function AnalyticsPage() {
       {brandData.length > 0 && (
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem', marginTop: '1.5rem' }}>
           <div style={{ ...card, padding: '1.25rem' }}>
-            <div style={{ fontSize: '0.9375rem', fontWeight: 700, marginBottom: '0.75rem' }}>브랜드별 매출 TOP 10</div>
+            <div style={{
+              fontSize: '0.9375rem', fontWeight: 700, marginBottom: '0.75rem',
+              position: 'sticky', top: '64px', zIndex: 10,
+              background: 'rgba(26,26,26,0.97)', backdropFilter: 'blur(4px)',
+              padding: '0.5rem 0', margin: '-0.25rem 0 0.75rem 0',
+              borderBottom: '1px solid #2D2D2D',
+            }}>브랜드별 매출 TOP 10</div>
             <SalesBarChart data={brandData} nameKey="brand" valueKey="sales" />
           </div>
           <div style={{ ...card, padding: '1.25rem' }}>
-            <div style={{ fontSize: '0.9375rem', fontWeight: 700, marginBottom: '0.75rem' }}>브랜드별 상세</div>
+            <div style={{
+              fontSize: '0.9375rem', fontWeight: 700, marginBottom: '0.75rem',
+              position: 'sticky', top: '64px', zIndex: 10,
+              background: 'rgba(26,26,26,0.97)', backdropFilter: 'blur(4px)',
+              padding: '0.5rem 0', margin: '-0.25rem 0 0.75rem 0',
+              borderBottom: '1px solid #2D2D2D',
+            }}>브랜드별 상세</div>
             <div style={{ overflowX: 'auto' }}>
               <table style={{ width: '100%', fontSize: '0.8125rem', borderCollapse: 'collapse' }}>
                 <thead>
@@ -448,7 +472,13 @@ export default function AnalyticsPage() {
       {/* 소싱처 ROI */}
       {sourcingRoi.length > 0 && (
         <div style={{ ...card, padding: '1.25rem', marginTop: '1.5rem' }}>
-          <div style={{ fontSize: '0.9375rem', fontWeight: 700, marginBottom: '0.75rem' }}>소싱처별 ROI 분석</div>
+          <div style={{
+            fontSize: '0.9375rem', fontWeight: 700, marginBottom: '0.75rem',
+            position: 'sticky', top: '64px', zIndex: 10,
+            background: 'rgba(26,26,26,0.97)', backdropFilter: 'blur(4px)',
+            padding: '0.5rem 0', margin: '-0.25rem 0 0.75rem 0',
+            borderBottom: '1px solid #2D2D2D',
+          }}>소싱처별 ROI 분석</div>
           <div style={{ overflowX: 'auto' }}>
             <table style={{ width: '100%', fontSize: '0.8125rem', borderCollapse: 'collapse' }}>
               <thead>
@@ -485,7 +515,13 @@ export default function AnalyticsPage() {
       {/* 베스트셀러 */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '1.5rem', marginTop: '1.5rem' }}>
         <div style={{ ...card, padding: '1.25rem' }}>
-          <div style={{ fontSize: '0.9375rem', fontWeight: 700, marginBottom: '0.75rem', color: '#FF8C00' }}>베스트셀러 TOP 10 (30일)</div>
+          <div style={{
+            fontSize: '0.9375rem', fontWeight: 700, color: '#FF8C00', marginBottom: '0.75rem',
+            position: 'sticky', top: '64px', zIndex: 10,
+            background: 'rgba(26,26,26,0.97)', backdropFilter: 'blur(4px)',
+            padding: '0.5rem 0', margin: '-0.25rem 0 0.75rem 0',
+            borderBottom: '1px solid #2D2D2D',
+          }}>베스트셀러 TOP 10 (30일)</div>
           {bestSellers.length > 0 ? (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
               {bestSellers.map((p, i) => (

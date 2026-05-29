@@ -61,9 +61,7 @@ def _patch_get_detail(monkeypatch, detail: dict) -> None:
     async def _fake(self, style_color, pdp_url=None, base_info=None):  # noqa: ANN001
         return detail
 
-    monkeypatch.setattr(
-        nike_proxy.NikeClient, "get_detail", _fake, raising=True
-    )
+    monkeypatch.setattr(nike_proxy.NikeClient, "get_detail", _fake, raising=True)
 
 
 def _patch_fetch_availability(monkeypatch, result_or_exc) -> None:
@@ -170,9 +168,7 @@ class TestNikeAvailabilityReconcile:
             "XL": 99,
         }
 
-    def test_empty_availability_response_keeps_parser_result(
-        self, monkeypatch
-    ) -> None:
+    def test_empty_availability_response_keeps_parser_result(self, monkeypatch) -> None:
         # env on + 빈 응답({}) → no-op, 기존 결과 그대로
         monkeypatch.setenv("NIKE_AVAILABILITY_ENABLED", "1")
         _patch_get_detail(monkeypatch, _make_fresh_detail())
