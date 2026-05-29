@@ -8158,9 +8158,12 @@ def _parse_coupang_order(
     ):
         option_name = "FREE"
     sales_price = int(first_item.get("salesPrice", 0) or 0)
-    quantity = int(first_item.get("orderQuantity", 1) or 1)
+    # 쿠팡 수량 필드는 shippingCount (orderQuantity 키는 응답에 없음)
+    quantity = int(first_item.get("shippingCount", 1) or 1)
     shipping_price = int(order.get("shippingPrice", 0) or 0)
-    sale_price = sales_price + shipping_price
+    # orderPrice = 라인 총액(단가×수량). 멀티수량 결제총액 정상화 폴백 salesPrice×quantity
+    line_total = int(first_item.get("orderPrice", 0) or 0) or (sales_price * quantity)
+    sale_price = line_total + shipping_price
 
     # 쿠팡 정률 수수료 10.5% + VAT 10% = 실효 11.55%
     fee_rate = 11.55
