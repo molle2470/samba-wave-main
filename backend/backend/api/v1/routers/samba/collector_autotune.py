@@ -732,8 +732,7 @@ async def restore_pc_allowed_sites_from_db() -> int:
                 dirty = True
                 raw_set.discard("GrandStage")
             _pc_allowed_sites[dev_clean] = raw_set
-            # last_seen은 복원 시점으로 표시 — 첫 폴링까지 stale 정리 방지
-            _pc_last_seen[dev_clean] = now
+            # last_seen 복원 안 함 — 실제 폴링 전 "살아있음" 오판 방지
             count += 1
         if count:
             _log.info(

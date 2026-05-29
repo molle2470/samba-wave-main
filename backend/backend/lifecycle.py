@@ -356,6 +356,7 @@ _reward_auto_task: asyncio.Task | None = None
 _reward_auto_last_run: float = 0.0
 _pc_sync_task: asyncio.Task | None = None
 _pc_cleanup_task: asyncio.Task | None = None
+_daemon_poll_watch_task: asyncio.Task | None = None
 
 
 async def _pc_sync_loop() -> None:
@@ -471,6 +472,72 @@ async def _pc_cleanup_loop() -> None:
             # unused 방지
             _ = json  # noqa: F841
         await asyncio.sleep(60)
+
+
+async def _daemon_poll_watch_loop() -> None:
+    """매 5분 — 데몬 폴링 끊김 감지 + 워룸 경고 이벤트 발행.
+
+    samba-daemon- prefix dev 중 분담 있는데 10분(600s) 이상 폴링 없으면 알림.
+    폴링 재개 시 알림 상태 해제.
+    """
+    import time
+
+    from backend.api.v1.routers.samba.collector_autotune import (
+        _pc_allowed_sites,
+        _pc_last_seen,
+    )
+
+    _lg = logging.getLogger("backend.daemon-watch")
+    _alerted: set[str] = set()
+
+    while True:
+        await asyncio.sleep(300)
+        try:
+            now = time.time()
+            for dev, sites in list(_pc_allowed_sites.items()):
+                if not dev.startswith("samba-daemon-"):
+                    continue
+                if not sites:
+                    continue
+                last = _pc_last_seen.get(dev, 0)
+                elapsed = int(now - last) if last else None
+                if (last == 0 or now - last > 600) and dev not in _alerted:
+                    _alerted.add(dev)
+                    _lg.warning(
+                        "[daemon-watch] 폴링 끊김: dev=%s sites=%s last_seen_ago=%s",
+                        dev,
+                        sorted(sites),
+                        elapsed,
+                    )
+                    try:
+                        from backend.domain.samba.warroom.service import (
+                            SambaMonitorService,
+                        )
+                        from backend.db.orm import get_write_session
+
+                        async with get_write_session() as ws:
+                            await SambaMonitorService(ws).emit(
+                                "daemon_poll_stopped",
+                                "warning",
+                                summary=(
+                                    f"데몬 폴링 끊김 — {dev[:12]}"
+                                    f" ({', '.join(sorted(sites))}). 데몬 재가동 필요."
+                                ),
+                                detail={
+                                    "device_id": dev,
+                                    "sites": sorted(sites),
+                                    "last_seen_ago": elapsed,
+                                },
+                            )
+                            await ws.commit()
+                    except Exception as _e:
+                        _lg.warning(
+                            "[daemon-watch] 워룸 이벤트 발행 실패(무시): %s", _e
+                        )
+                elif last and now - last <= 600 and dev in _alerted:
+                    _alerted.discard(dev)
+        except Exception as exc:
+            _lg.warning("[daemon-watch] 감지 실패(무시): %s", exc)
 
 
 async def _tetris_sync_loop() -> None:
@@ -693,13 +760,14 @@ async def _warmup_tetris_board_cache(logger: logging.Logger) -> None:
 
 
 async def _start_tetris_sync_scheduler() -> None:
-    global _tetris_sync_task, _pc_sync_task, _pc_cleanup_task
+    global _tetris_sync_task, _pc_sync_task, _pc_cleanup_task, _daemon_poll_watch_task
 
     _tetris_sync_task = asyncio.create_task(_tetris_sync_loop())
     _pc_sync_task = asyncio.create_task(_pc_sync_loop())
     _pc_cleanup_task = asyncio.create_task(_pc_cleanup_loop())
+    _daemon_poll_watch_task = asyncio.create_task(_daemon_poll_watch_loop())
     logging.getLogger("backend.lifecycle").info(
-        "[lifecycle] 테트리스 sync + PC 분담 sync + cleanup 스케줄러 시작"
+        "[lifecycle] 테트리스 sync + PC 분담 sync + cleanup + 데몬 폴링 감시 스케줄러 시작"
     )
 
 
