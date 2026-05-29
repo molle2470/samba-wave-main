@@ -175,11 +175,16 @@ asyncio.run(fix())
     # 최신 HEAD로 stamp — 컬럼/인덱스가 이미 DB에 존재하는 상태에서 hot 테이블 ALTER가
     # 활성 트랜잭션과 데드락 일으키는 문제 방지. 누락 컬럼이 진짜 있다면
     # alembic upgrade heads 가 IF NOT EXISTS로 추가하므로 안전.
-    echo "Stamping alembic to current head (ai_image_transformed_column)..."
+    echo "Stamping alembic to current heads..."
+    # multi-head 환경: 모든 head revision을 동적으로 조회해서 stamp.
+    # 단일 revision으로만 stamp하면 upgrade heads 시 missing parent deadlock 발생.
     # 컬럼/인덱스가 이미 DB에 존재하는 상태에서 hot 테이블 ALTER 데드락 회피.
-    # head 신규 마이그레이션 추가 시 이 라인의 revision 반드시 같이 갱신.
-    # 누락하면 옛 마이그레이션 재실행으로 hot 테이블(samba_collected_product) lock_timeout 데드락 재발.
-    uv run alembic stamp --purge zzzzzzzzzzzzz_ai_image_transformed_column 2>/dev/null || true
+    _HEADS=$(uv run alembic heads -q 2>/dev/null | head -1)
+    if [ -z "$_HEADS" ]; then
+      echo "Warning: alembic heads 조회 실패, zzzzzzzzzzzzz_ai_image_transformed_column으로 fallback"
+      _HEADS="zzzzzzzzzzzzz_ai_image_transformed_column"
+    fi
+    uv run alembic stamp --purge $_HEADS 2>/dev/null || true
     _MIGRATION_OK=0
     for i in 1 2 3; do
       if uv run alembic upgrade heads; then

@@ -947,10 +947,18 @@ class ARTSourcingClient:
                     result["manufacture_date"] = value
 
             # 취급주의 (precaution 배열 첫 번째 항목)
+            # [공통][면][패딩] 형태로 오는 경우 [공통] 섹션만 추출
             precaution_list = data.get("precaution") or []
             if precaution_list:
                 care = (precaution_list[0].get("prdtAddInfo") or "").strip()
                 if care:
+                    # [공통] 섹션 추출
+                    if "[공통]" in care:
+                        import re as _re
+
+                        match = _re.search(r"\[공통\](.*?)(?:\[|$)", care)
+                        if match:
+                            care = match.group(1).strip()
                     result["care_instructions"] = care
 
             # 품질보증 (authority 배열 — notice에서 못 찾은 경우 보완)

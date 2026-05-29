@@ -1143,6 +1143,29 @@ def _is_domestic_origin(origin: str) -> bool:
     return stripped in _DOMESTIC_ORIGIN_KEYWORDS or stripped in _UNKNOWN_ORIGIN_KEYWORDS
 
 
+def _is_vague(value: str) -> bool:
+    """소재/색상이 모호한 값인지 판별한다.
+
+    '상세페이지 참조', '상품정보 별도표시' 같은 값은 SSG 심사에서 반려되므로
+    이런 값들은 무효로 처리.
+    """
+    if not value:
+        return False
+    stripped = value.strip().lower()
+    vague_keywords = {
+        "상세페이지",
+        "상품정보 별도표시",
+        "별도표시",
+        "상세설명",
+        "참조",
+        "상세",
+        "미표기",
+        "미기재",
+        "없음",
+    }
+    return any(keyword in stripped for keyword in vague_keywords)
+
+
 def build_ssg_notice(
     product: dict[str, Any],
 ) -> tuple[str, list[dict[str, str]]]:
@@ -1156,17 +1179,29 @@ def build_ssg_notice(
     _pol_material = product.get("_ssg_notice_material", "") or ""
     _pol_color = product.get("_ssg_notice_color", "") or ""
 
-    material = product.get("material", "") or _pol_material or fallback
-    color = product.get("color", "") or _pol_color or fallback
-    origin = product.get("origin", "") or ""
-
-    # 치수 및 굽높이 — 정책 주입값 우선, 없으면 소싱 데이터(ABCmart sizeNotice/heelHeight), 최종 fallback(이슈#279)
-    size_heel = (
-        product.get("_ssg_notice_size", "")
-        or product.get("sizeNotice", "")
-        or product.get("heelHeight", "")
+    # 소재/색상 모호값 필터링 — _is_vague로 검사
+    _raw_material = product.get("material", "") or ""
+    _raw_color = product.get("color", "") or ""
+    material = (
+        _pol_material
+        or (_raw_material if not _is_vague(_raw_material) else "")
         or fallback
     )
+    color = _pol_color or (_raw_color if not _is_vague(_raw_color) else "") or fallback
+    origin = product.get("origin", "") or ""
+
+    # 치수 및 굽높이 — 정책 주입값 우선, 없으면 소싱 데이터(ABCmart sizeNotice/heelHeight)
+    # 둘 다 있으면 "치수: X / 굽높이: Y" 형식으로 구분
+    _size_notice = product.get("size_notice") or product.get("sizeNotice") or ""
+    _heel_height = product.get("heel_height") or product.get("heelHeight") or ""
+    if _size_notice and _heel_height:
+        size_heel = f"치수: {_size_notice} / 굽높이: {_heel_height}"
+    elif _size_notice:
+        size_heel = _size_notice
+    elif _heel_height:
+        size_heel = f"굽높이: {_heel_height}"
+    else:
+        size_heel = product.get("_ssg_notice_size", "") or fallback
 
     # 수입여부 — 정책값 우선, 없으면 원산지로 자동 판별
     if "_ssg_import_yn" in product:
@@ -1219,15 +1254,18 @@ def build_ssg_notice(
         attrs: list[dict[str, str]] = [
             {"itemMngPropId": "0000000001", "itemMngCntt": material},
             {"itemMngPropId": "0000000002", "itemMngCntt": color},
-            {"itemMngPropId": "0000000003", "itemMngCntt": fallback},
-            {"itemMngPropId": "0000000008", "itemMngCntt": import_yn},
-            {"itemMngPropId": "0000000009", "itemMngCntt": importer},
-            {"itemMngPropId": "0000000005", "itemMngCntt": fallback},
-            {"itemMngPropId": "0000000004", "itemMngCntt": fallback},
+            {"itemMngPropId": "0000000003", "itemMngCntt": size_heel},
+            {
+                "itemMngPropId": "0000000004",
+                "itemMngCntt": product.get("manufacture_date") or fallback,
+            },
+            {"itemMngPropId": "0000000005", "itemMngCntt": caution},
             {
                 "itemMngPropId": "0000000006",
                 "itemMngCntt": "관련 법 및 소비자 분쟁해결 규정에 따름",
             },
+            {"itemMngPropId": "0000000008", "itemMngCntt": import_yn},
+            {"itemMngPropId": "0000000009", "itemMngCntt": importer},
             {
                 "itemMngPropId": "0000000011",
                 "itemMngCntt": product.get("_ssg_origin_code") or fallback,

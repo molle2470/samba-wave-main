@@ -347,6 +347,16 @@ class SambaCollectedProduct(SQLModel, table=True):
     quality_guarantee: Optional[str] = Field(
         default=None, sa_column=Column(Text, nullable=True)
     )
+    # ABCmart 고시정보
+    size_notice: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    heel_height: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    manufacture_date: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
 
     # 배송 정보: 무료배송 / 당일발송 / 소싱 배송비
     free_shipping: bool = Field(
