@@ -234,13 +234,13 @@ export default function AnalyticsPage() {
 
     return (
       <div style={{ marginBottom: '1.5rem' }}>
-        <h3 style={{
+        <div style={{
           fontSize: '0.9375rem', fontWeight: 600, color: '#FF8C00',
-          position: 'sticky', top: '64px', zIndex: 10,
+          position: 'sticky', top: 'var(--header-h, 68px)', zIndex: 10,
           background: 'rgba(15,15,15,0.97)', backdropFilter: 'blur(4px)',
-          padding: '0.5rem 1.25rem', marginBottom: 0,
+          padding: '0.5rem 1.25rem',
           borderBottom: '1px solid #2D2D2D',
-        }}>{title}</h3>
+        }}>{title}</div>
         <div style={{ ...card, padding: '1.25rem', borderTopLeftRadius: 0, borderTopRightRadius: 0 }}>
         <div style={{ overflowX: 'auto' }}>
           <table style={{ borderCollapse: 'collapse', width: '100%', minWidth: `${(columns.length + 2) * 120}px` }}>
@@ -448,7 +448,7 @@ export default function AnalyticsPage() {
         <div>
           <div style={{
             fontSize: '0.9375rem', fontWeight: 700,
-            position: 'sticky', top: '64px', zIndex: 10,
+            position: 'sticky', top: 'var(--header-h, 68px)', zIndex: 10,
             background: 'rgba(15,15,15,0.97)', backdropFilter: 'blur(4px)',
             padding: '0.5rem 1.25rem',
             borderBottom: '1px solid #2D2D2D',
@@ -467,7 +467,7 @@ export default function AnalyticsPage() {
           <div>
             <div style={{
               fontSize: '0.9375rem', fontWeight: 700,
-              position: 'sticky', top: '64px', zIndex: 10,
+              position: 'sticky', top: 'var(--header-h, 68px)', zIndex: 10,
               background: 'rgba(15,15,15,0.97)', backdropFilter: 'blur(4px)',
               padding: '0.5rem 1.25rem',
               borderRadius: '12px 12px 0 0', border: '1px solid #2D2D2D',
@@ -479,7 +479,7 @@ export default function AnalyticsPage() {
           <div>
             <div style={{
               fontSize: '0.9375rem', fontWeight: 700,
-              position: 'sticky', top: '64px', zIndex: 10,
+              position: 'sticky', top: 'var(--header-h, 68px)', zIndex: 10,
               background: 'rgba(15,15,15,0.97)', backdropFilter: 'blur(4px)',
               padding: '0.5rem 1.25rem',
               borderRadius: '12px 12px 0 0', border: '1px solid #2D2D2D',
@@ -519,7 +519,7 @@ export default function AnalyticsPage() {
         <div style={{ marginTop: '1.5rem' }}>
           <div style={{
             fontSize: '0.9375rem', fontWeight: 700,
-            position: 'sticky', top: '64px', zIndex: 10,
+            position: 'sticky', top: 'var(--header-h, 68px)', zIndex: 10,
             background: 'rgba(15,15,15,0.97)', backdropFilter: 'blur(4px)',
             padding: '0.5rem 1.25rem',
             borderRadius: '12px 12px 0 0', border: '1px solid #2D2D2D',
@@ -564,7 +564,7 @@ export default function AnalyticsPage() {
         <div>
           <div style={{
             fontSize: '0.9375rem', fontWeight: 700, color: '#FF8C00',
-            position: 'sticky', top: '64px', zIndex: 10,
+            position: 'sticky', top: 'var(--header-h, 68px)', zIndex: 10,
             background: 'rgba(15,15,15,0.97)', backdropFilter: 'blur(4px)',
             padding: '0.5rem 1.25rem',
             borderRadius: '12px 12px 0 0', border: '1px solid #2D2D2D',

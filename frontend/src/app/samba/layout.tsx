@@ -250,6 +250,12 @@ export default function SambaLayout({
       {/* Header */}
       <header
         className="sticky top-0 z-30"
+        ref={(el) => {
+          if (el) {
+            const h = el.getBoundingClientRect().height
+            document.documentElement.style.setProperty('--header-h', `${h}px`)
+          }
+        }}
         style={{
           background: "rgba(15,15,15,0.9)",
           borderBottom: "1px solid #2D2D2D",
