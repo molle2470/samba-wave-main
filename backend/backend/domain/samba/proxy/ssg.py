@@ -1691,7 +1691,11 @@ class SSGClient:
                 f"orordNo={first.get('orordNo')}, "
                 f"shppNo={first.get('shppNo')}, ordItemSeq={first.get('ordItemSeq')}, "
                 f"itemNm={first.get('itemNm')}, siteNo={first.get('siteNo')}, "
-                f"rlordAmt={first.get('rlordAmt')}"
+                f"rlordAmt={first.get('rlordAmt')}, "
+                f"shpplocZpCd={first.get('shpplocZpCd')}, "
+                f"rcptpeZpCd={first.get('rcptpeZpCd')}, "
+                f"shpplocZipCd={first.get('shpplocZipCd')}, "
+                f"shpplocZpNo={first.get('shpplocZpNo')}"
             )
             # 전체 주문 번호 목록 로그 (중복 진단용)
             for _i, _o in enumerate(unwrapped):
@@ -2069,6 +2073,19 @@ class SSGClient:
         customer_address = str(
             (f"{bsc} {dtl}".strip() if bsc else "") or raw.get("shpplocAddr", "") or ""
         )
+        # 우편번호 — SSG 필드명 후보 fallback chain
+        _zip = str(
+            raw.get("shpplocZpCd", "")
+            or raw.get("rcptpeZpCd", "")
+            or raw.get("shpplocZipCd", "")
+            or raw.get("shpplocZpNo", "")
+            or ""
+        ).strip()
+        if not _zip:
+            logger.info(
+                f"[SSG 주문] 우편번호 필드 미발견 — ordNo={raw.get('ordNo')}, "
+                f"zip후보키={[k for k in raw if 'zp' in k.lower() or 'zip' in k.lower()]}"
+            )
 
         item_id_str = str(raw.get("itemId", "") or "")
         # 미등록 주문에 부정확한 사진이 매칭되던 문제로 product_image 자동 합성 제거.
@@ -2130,10 +2147,15 @@ class SSGClient:
                 f"date_keys={[k for k in raw.keys() if 'Dt' in str(k) or 'dt' in str(k)]}"
             )
 
+        # 고객메모 앞 [태그] 제거 (예: "[고객배송메모]부재 시..." → "부재 시...")
+        _raw_note = str(raw.get("ordMemoCntt", "") or "")
+        customer_note = re.sub(r"^\[.*?\]", "", _raw_note).strip()
+
         return {
             "order_number": ord_no,
             "shipment_id": shipment_id,
-            "customer_note": str(raw.get("ordMemoCntt", "") or ""),
+            "customer_note": customer_note,
+            "customer_postal_code": _zip or None,
             "channel_id": account_id,
             "channel_name": label,
             "product_id": item_id_str,
