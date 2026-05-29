@@ -101,20 +101,30 @@ export function useAnalyticsData({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // 마켓 기본값: aggregate에서 채널명 추출 — localStorage 저장값 없을 때만 1회
+  // 마켓 기본값: aggregate에서 채널명 추출
+  // - 저장값 없으면 전체 초기화
+  // - 저장값 있어도 aggregate에 새 마켓이 있으면 자동 추가 (신규 마켓 누락 방지)
   const initialMarketSet = useRef(false)
   useEffect(() => {
-    if (!initialMarketSet.current && aggregate.length > 0 && !hasStoredMarkets) {
+    if (!initialMarketSet.current && aggregate.length > 0) {
       initialMarketSet.current = true
       const orderMarkets = new Set<string>()
       for (const r of aggregate) {
         if (r.channel_name) {
           const name = r.channel_name
           const idx = name.indexOf('(')
-          orderMarkets.add(idx > 0 ? name.substring(0, idx) : name)
+          const market = (idx > 0 ? name.substring(0, idx) : name).trim()
+          if (market) orderMarkets.add(market)
         }
       }
-      if (orderMarkets.size > 0) setSelectedMarkets([...orderMarkets])
+      if (orderMarkets.size === 0) return
+      if (!hasStoredMarkets) {
+        setSelectedMarkets([...orderMarkets])
+      } else {
+        // 기존 선택에 없는 신규 마켓 자동 추가
+        const toAdd = [...orderMarkets].filter(m => !selectedMarkets.includes(m))
+        if (toAdd.length > 0) setSelectedMarkets([...selectedMarkets, ...toAdd])
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [aggregate])

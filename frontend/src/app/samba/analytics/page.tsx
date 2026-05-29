@@ -58,7 +58,7 @@ export default function AnalyticsPage() {
   const channelToMarket = (name: string | undefined): string => {
     if (!name) return '기타'
     const idx = name.indexOf('(')
-    return idx > 0 ? name.substring(0, idx) : name
+    return (idx > 0 ? name.substring(0, idx) : name).trim()
   }
 
   // 기간 + 마켓 + 소싱처 + 주문상태 필터링 (paid_at KST 기준)

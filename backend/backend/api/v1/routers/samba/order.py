@@ -1447,8 +1447,10 @@ async def analytics_aggregate(
 
     start_dt, end_dt = kst_date_range_to_utc(start, end)
 
-    # paid_at(timestamptz) → KST 변환 후 일자만 추출
-    kst_date = sa_func.date(sa_func.timezone("Asia/Seoul", SambaOrder.paid_at))
+    # paid_at이 있으면 paid_at 기준, 없으면 created_at 기준으로 집계
+    # (쿠팡/롯데홈쇼핑 등 paid_at 미설정 주문 누락 방지)
+    effective_at = sa_func.coalesce(SambaOrder.paid_at, SambaOrder.created_at)
+    kst_date = sa_func.date(sa_func.timezone("Asia/Seoul", effective_at))
 
     # 마켓 그룹키 — samba_market_account.market_name(G마켓/옥션/11번가/...) 우선,
     # 매칭 안 되면 channel_name 사용. channel_name(=계정 닉네임 "가디(...)")으로
@@ -1473,9 +1475,8 @@ async def analytics_aggregate(
         .select_from(SambaOrder)
         .outerjoin(SambaMarketAccount, SambaMarketAccount.id == SambaOrder.channel_id)
         .where(
-            SambaOrder.paid_at != None,  # noqa: E711
-            SambaOrder.paid_at >= start_dt,
-            SambaOrder.paid_at <= end_dt,
+            effective_at >= start_dt,
+            effective_at <= end_dt,
         )
         .group_by(
             kst_date,
