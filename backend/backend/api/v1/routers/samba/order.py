@@ -9264,8 +9264,13 @@ def _parse_lottehome_order(
         "sale_price": sale_price,
         "total_payment_amount": sale_price * qty,
         "cost": 0,
-        "fee_rate": 0,
-        "revenue": buy_real_price,
+        # buy_real_price는 단가 기준 정산금액 → quantity 곱해 라인 총액으로 저장
+        "fee_rate": (
+            round((1 - buy_real_price / sale_price) * 100, 2)
+            if (sale_price > 0 and buy_real_price > 0)
+            else 0
+        ),
+        "revenue": buy_real_price * qty if buy_real_price > 0 else 0,
         "status": status,
         "shipping_status": shipping_status,
         "shipping_company": shipping_company,
