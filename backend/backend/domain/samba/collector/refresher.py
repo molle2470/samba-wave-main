@@ -1441,8 +1441,18 @@ async def _parse_fashionplus(product: Any) -> RefreshResult:
 
     new_sale = detail.get("sale_price", 0) or 0
     new_orig = detail.get("original_price", 0) or new_sale
-    shipping_fee = detail.get("shipping_fee", 0) or 0
-    new_cost = new_sale + shipping_fee
+    shipping_fee = detail.get("shipping_fee", 3000) or 3000
+    # 가격 추출 실패 시 cost=None — 배송비(3000)만 박는 폴백 금지.
+    # 마진 정책의 minMarginAmount(5000)와 합쳐져 8400 같은 가짜 가격이 마켓에 전송되는 회귀 방지.
+    if new_sale <= 0:
+        new_cost = None
+        price_uncertain = True
+        logger.warning(
+            f"[FashionPlus][가격불확실] sale_price 추출 실패: {pid} → cost 갱신 및 전송 보류"
+        )
+    else:
+        new_cost = new_sale + shipping_fee
+        price_uncertain = False
 
     old_sale = getattr(product, "sale_price", 0) or 0
     old_cost = getattr(product, "cost", 0) or 0
@@ -1473,6 +1483,7 @@ async def _parse_fashionplus(product: Any) -> RefreshResult:
             new_options
             and _has_stock_diff(getattr(product, "options", None), new_options)
         ),
+        price_uncertain=price_uncertain,
     )
 
 
