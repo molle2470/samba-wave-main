@@ -242,7 +242,7 @@ export default function AnalyticsPage() {
           borderBottom: '1px solid #2D2D2D',
         }}>{title}</div>
         <div style={{ ...card, padding: '1.25rem', borderTopLeftRadius: 0, borderTopRightRadius: 0 }}>
-        <div style={{ overflowX: 'auto' }}>
+        <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: 'calc(100vh - 220px)' }}>
           <table style={{ borderCollapse: 'collapse', width: '100%', minWidth: `${(columns.length + 2) * 120}px` }}>
             <thead>
               <tr>
@@ -485,15 +485,15 @@ export default function AnalyticsPage() {
               borderRadius: '12px 12px 0 0', border: '1px solid #2D2D2D',
             }}>브랜드별 상세</div>
             <div style={{ ...card, padding: '1.25rem', borderTopLeftRadius: 0, borderTopRightRadius: 0, borderTop: 'none' }}>
-              <div style={{ overflowX: 'auto' }}>
+              <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: 'calc(100vh - 220px)' }}>
                 <table style={{ width: '100%', fontSize: '0.8125rem', borderCollapse: 'collapse' }}>
                   <thead>
                     <tr style={{ borderBottom: '1px solid #2D2D2D' }}>
-                      <th style={{ padding: '0.5rem', textAlign: 'left', color: '#999' }}>브랜드</th>
-                      <th style={{ padding: '0.5rem', textAlign: 'right', color: '#999' }}>매출</th>
-                      <th style={{ padding: '0.5rem', textAlign: 'right', color: '#999' }}>이익</th>
-                      <th style={{ padding: '0.5rem', textAlign: 'right', color: '#999' }}>건수</th>
-                      <th style={{ padding: '0.5rem', textAlign: 'right', color: '#999' }}>이윤율</th>
+                      <th style={{ padding: '0.5rem', textAlign: 'left', color: '#999', position: 'sticky', top: 0, background: '#1A1A1A', zIndex: 2 }}>브랜드</th>
+                      <th style={{ padding: '0.5rem', textAlign: 'right', color: '#999', position: 'sticky', top: 0, background: '#1A1A1A', zIndex: 2 }}>매출</th>
+                      <th style={{ padding: '0.5rem', textAlign: 'right', color: '#999', position: 'sticky', top: 0, background: '#1A1A1A', zIndex: 2 }}>이익</th>
+                      <th style={{ padding: '0.5rem', textAlign: 'right', color: '#999', position: 'sticky', top: 0, background: '#1A1A1A', zIndex: 2 }}>건수</th>
+                      <th style={{ padding: '0.5rem', textAlign: 'right', color: '#999', position: 'sticky', top: 0, background: '#1A1A1A', zIndex: 2 }}>이윤율</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -525,18 +525,13 @@ export default function AnalyticsPage() {
             borderRadius: '12px 12px 0 0', border: '1px solid #2D2D2D',
           }}>소싱처별 ROI 분석</div>
           <div style={{ ...card, padding: '1.25rem', borderTopLeftRadius: 0, borderTopRightRadius: 0, borderTop: 'none' }}>
-            <div style={{ overflowX: 'auto' }}>
+            <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: 'calc(100vh - 220px)' }}>
               <table style={{ width: '100%', fontSize: '0.8125rem', borderCollapse: 'collapse' }}>
                 <thead>
                   <tr style={{ borderBottom: '1px solid #2D2D2D' }}>
-                    <th style={{ padding: '0.5rem', textAlign: 'left', color: '#999' }}>소싱처</th>
-                    <th style={{ padding: '0.5rem', textAlign: 'right', color: '#999' }}>매출</th>
-                    <th style={{ padding: '0.5rem', textAlign: 'right', color: '#999' }}>원가</th>
-                    <th style={{ padding: '0.5rem', textAlign: 'right', color: '#999' }}>이익</th>
-                    <th style={{ padding: '0.5rem', textAlign: 'right', color: '#999' }}>건수</th>
-                    <th style={{ padding: '0.5rem', textAlign: 'right', color: '#999' }}>건당이익</th>
-                    <th style={{ padding: '0.5rem', textAlign: 'right', color: '#999' }}>이윤율</th>
-                    <th style={{ padding: '0.5rem', textAlign: 'right', color: '#999' }}>ROI</th>
+                    {['소싱처', '매출', '원가', '이익', '건수', '건당이익', '이윤율', 'ROI'].map((h, i) => (
+                      <th key={h} style={{ padding: '0.5rem', textAlign: i === 0 ? 'left' : 'right', color: '#999', position: 'sticky', top: 0, background: '#1A1A1A', zIndex: 2, whiteSpace: 'nowrap' }}>{h}</th>
+                    ))}
                   </tr>
                 </thead>
                 <tbody>
