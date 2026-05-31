@@ -4584,6 +4584,7 @@ async def autotune_cancel_cycle(body: CancelCycleRequest):
 
             async with get_write_session() as _ws:
                 await persist_pc_allowed_sites(_ws, dev)
+                await _ws.commit()
         except Exception as _exc:
             logging.getLogger("autotune").warning(
                 f"[cancel-cycle] persist 실패 (무시): {_exc}"
