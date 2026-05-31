@@ -2851,6 +2851,12 @@ class SambaShipmentService:
                     {"product_id": product_id, "status": "failed", "error": "상품 없음"}
                 )
                 continue
+            # 삭제잠금 가드 — 자동 경로(autotune/refresh)와 동일하게 수동 마켓삭제도 차단 (#301)
+            if getattr(product_row, "lock_delete", False):
+                results.append(
+                    {"product_id": product_id, "status": "skipped", "error": "삭제잠금"}
+                )
+                continue
 
             # OOM 방지: 삭제에 불필요한 대용량 필드 제외
             product_dict = product_row.model_dump(

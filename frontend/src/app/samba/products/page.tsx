@@ -827,6 +827,11 @@ export default function ProductsPage() {
   const handleMarketDelete = async (productId: string) => {
     const product = allProducts.find(x => x.id === productId)
     if (!product) return
+    // 삭제잠금 가드 — 자동 경로(autotune/refresh)와 동일하게 수동 마켓삭제도 차단 (#301)
+    if (product.lock_delete) {
+      showAlert('삭제잠금이 설정된 상품입니다. 잠금을 해제한 후 마켓삭제하세요.')
+      return
+    }
     if (!(product.registered_accounts?.length ?? 0)) {
       showAlert('마켓에 등록된 계정이 없습니다.')
       return
@@ -2733,7 +2738,9 @@ export default function ProductsPage() {
                   marketPool = await fetchProductsByIds([...selectedIds])
                 } catch { /* 폴백: 현재 페이지만 */ }
               }
-              const targets = marketPool.filter(p => (p.registered_accounts?.length ?? 0) > 0)
+              const lockedMkt = marketPool.filter(p => p.lock_delete && (p.registered_accounts?.length ?? 0) > 0)
+              const targets = marketPool.filter(p => !p.lock_delete && (p.registered_accounts?.length ?? 0) > 0)
+              if (lockedMkt.length) showAlert(`삭제잠금 ${fmt(lockedMkt.length)}개 제외됩니다.`, 'info')
               if (!targets.length) { showAlert('마켓에 등록된 상품이 없습니다.'); return }
               openMarketDeleteModal(targets, 'bulk')
               return
