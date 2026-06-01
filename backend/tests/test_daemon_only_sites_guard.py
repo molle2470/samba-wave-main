@@ -62,6 +62,8 @@ def test_add_detail_job_blocks_daemon_only(site, _stub_db_insert):
     asyncio.run(_run())
 
 
+# 송장 데몬 전용은 SSG/ABCmart/GrandStage/LOTTEON 4개만 — 살아있는 데몬 없으면 RuntimeError.
+# 무신사/GSShop 등은 확장앱 처리(owner='' 로 발행, raise 안 함) → 이 테스트 대상 아님.
 @pytest.mark.parametrize(
     "site",
     [
@@ -69,12 +71,6 @@ def test_add_detail_job_blocks_daemon_only(site, _stub_db_insert):
         "ABCmart",
         "GrandStage",
         "LOTTEON",
-        "MUSINSA",
-        "GSShop",
-        "FashionPlus",
-        "Nike",
-        "OliveYoung",
-        "KREAM",
     ],
 )
 def test_add_tracking_job_blocks_daemon_only(site, _stub_db_insert):

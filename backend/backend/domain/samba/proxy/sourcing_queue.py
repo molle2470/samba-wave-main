@@ -445,13 +445,13 @@ class SourcingQueue:
                     raise RuntimeError(f"{site} 살아있는 데몬 없음 — 송장 잡 발행 불가")
                 owner_device_id = ""  # 빈값 → dequeue 가 데몬 아무나 매칭
             else:
-                owner_device_id = _resolve_job_owner(site, "tracking")
-                if owner_device_id is None:
-                    logger.warning(
-                        f"[소싱큐] {site} 송장 데몬 미등록 — 잡 발행 skip: "
-                        f"ord={sourcing_order_number}"
-                    )
-                    raise RuntimeError(f"{site} 데몬 미등록 — 송장 잡 발행 불가")
+                # 비데몬 tracking 사이트(무신사/GSShop 등): owner='' 로 두고 활성 확장앱
+                # 아무나 dequeue 하게 한다. 특정 device 로 고정(pick_any_owner)하면 그 PC
+                # 확장앱이 마침 미가동일 때 잡이 영영 PENDING 으로 막힌다(2026-06-01 실측:
+                # owner=특정확장앱 고정 → 그 확장앱 비활성 → 176초+ PENDING).
+                # dequeue 가드가 비데몬을 DAEMON_ONLY_SITES(4개)에서만 차단하므로 무신사
+                # 송장은 확장앱이 정상 claim. 송장 잡 자체는 무조건 발행(모달 노출 보장).
+                owner_device_id = ""
 
         job: dict[str, Any] = {
             "requestId": request_id,
