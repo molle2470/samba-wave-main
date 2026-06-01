@@ -285,11 +285,11 @@ class AbcMartPlugin(SourcingPlugin):
                         new_original_price = _dom_orig
             except asyncio.TimeoutError:
                 logger.warning(
-                    f"[ABCmart] 확장앱 미응답(110s) → 갱신 차단: {site_product_id}"
+                    f"[ABCmart] 데몬 미응답(110s, DOM위임) → 갱신 차단: {site_product_id}"
                 )
                 return RefreshResult(
                     product_id=product_id,
-                    error="ABCmart 확장앱 미응답 (110s 타임아웃) — 갱신 차단",
+                    error="ABCmart 데몬 미응답 (110s 타임아웃, DOM위임) — 갱신 차단",
                 )
             except Exception as _dom_err:
                 # 데몬 미등록 시 add_detail_job 이 RuntimeError raise → 여기로 잡힘.

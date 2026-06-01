@@ -403,7 +403,7 @@ class SSGPlugin(SourcingPlugin):
                 return RefreshResult(
                     product_id=product_id,
                     error=_ext_msg
-                    or f"SSG 상세 조회 실패 (확장앱 미응답 또는 파싱 실패): {site_product_id}",
+                    or f"SSG 상세 조회 실패 (데몬/DOM위임 미응답 또는 파싱 실패): {site_product_id}",
                 )
 
             new_sale_price = detail.get("salePrice", 0)

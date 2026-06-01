@@ -597,11 +597,11 @@ class LotteonSourcingPlugin(SourcingPlugin):
                 dom_ext = None
         except asyncio.TimeoutError:
             logger.warning(
-                f"[LOTTEON] 확장앱 미응답(60s) → 갱신 차단: {site_product_id}"
+                f"[LOTTEON] 데몬 미응답(60s, DOM위임) → 갱신 차단: {site_product_id}"
             )
             return RefreshResult(
                 product_id=product_id,
-                error="LOTTEON 확장앱 미응답 (60s 타임아웃) — 갱신 차단",
+                error="LOTTEON 데몬 미응답 (60s 타임아웃, DOM위임) — 갱신 차단",
             )
         except Exception as _dom_err:
             # dom_ext 는 None 유지 → 하단 else 분기에서 price_uncertain=True 처리됨.
