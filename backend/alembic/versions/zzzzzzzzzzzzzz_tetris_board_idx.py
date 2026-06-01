@@ -22,8 +22,12 @@ idempotent / hot 테이블 안전:
     entrypoint stamp 재배포 시 반복 실행 대비).
 
 Revision ID: zzzzzzzzzzzzzz_tetris_board_idx
-Revises: zzzzzzzzzzzzz_ai_image_transformed_column
+Revises: zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_add_abcmart_notice_cols
 Create Date: 2026-05-29 17:00:00.000000
+
+머지 시점 분기 해소: 작성 당시 head(ai_image_transformed_column) 뒤로 다른 마이그레이션이
+추가되어 multiple heads 발생 → 현재 최신 head(add_abcmart_notice_cols) 뒤로 재연결.
+인덱스 생성만 하므로 순서 의존성 없음.
 """
 
 from typing import Sequence, Union
@@ -33,7 +37,7 @@ from alembic import op
 
 revision: str = "zzzzzzzzzzzzzz_tetris_board_idx"
 down_revision: Union[str, Sequence[str], None] = (
-    "zzzzzzzzzzzzz_ai_image_transformed_column"
+    "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz_add_abcmart_notice_cols"
 )
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -57,6 +61,4 @@ def upgrade() -> None:
 def downgrade() -> None:
     conn = op.get_bind()
     conn.exec_driver_sql("COMMIT")
-    conn.exec_driver_sql(
-        "DROP INDEX CONCURRENTLY IF EXISTS ix_scp_tetris_board"
-    )
+    conn.exec_driver_sql("DROP INDEX CONCURRENTLY IF EXISTS ix_scp_tetris_board")
