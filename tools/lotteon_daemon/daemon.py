@@ -78,7 +78,7 @@ except ImportError:
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.4.22"
+DAEMON_VERSION = "1.4.23"
 
 
 # ── 가격수집 도메인 화이트리스트 ───────────────────────────────────────────
@@ -343,7 +343,12 @@ def _self_install_and_relaunch() -> None:
 
 
 def _log_file_path() -> Path:
-    return _install_dir() / "daemon.log"
+    # 프로세스별 로그파일 분리 — supervisor(daemon.log)/worker(daemon-worker.log)가
+    # 같은 파일을 RotatingFileHandler 로 동시에 잡으면 rollover 시 WinError 32
+    # (다른 프로세스 점유)로 rename 실패 → rotate 영영 안 됨 → 로그 무한 증식 +
+    # 그 예외가 _site_worker 를 죽여 매시간 크래시. 파일을 나눠 충돌 원천 제거.
+    suffix = "-worker" if "--worker" in sys.argv else ""
+    return _install_dir() / f"daemon{suffix}.log"
 
 
 def logger_print(msg: str) -> None:
@@ -2754,8 +2759,33 @@ async def run_daemon(args: argparse.Namespace) -> int:
             return 1
 
 
+class SafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """rollover 가 WinError 32(다른 프로세스 점유) 등으로 실패해도 예외를 던지지 않고
+    현재 파일을 truncate(비우기) 폴백.
+
+    Windows 멀티프로세스에서 rename 기반 rollover 는 본질적으로 불안정 — rename 실패
+    예외가 호출 스택(_site_worker)까지 전파되면 워커가 죽었다. 여기서 삼켜서:
+      1) 로그 무한 증식 차단 (rename 실패해도 truncate 로 크기 리셋)
+      2) 워커 크래시 방지 (예외 비전파)
+    """
+
+    def doRollover(self) -> None:  # noqa: D102
+        try:
+            super().doRollover()
+        except Exception:
+            # rename 실패 — 현재 스트림을 비워 무한 증식만이라도 차단
+            try:
+                if self.stream:
+                    self.stream.close()
+                with open(self.baseFilename, "w", encoding=self.encoding or "utf-8"):
+                    pass
+                self.stream = self._open()
+            except Exception:
+                pass
+
+
 def _setup_logging() -> None:
-    """파일 로깅 (RotatingFileHandler) — --noconsole 빌드에서 stderr 사라져도 로그 영구 보존."""
+    """파일 로깅 (SafeRotatingFileHandler) — --noconsole 빌드에서 stderr 사라져도 로그 영구 보존."""
     fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
     formatter = logging.Formatter(fmt)
     root = logging.getLogger()
@@ -2766,7 +2796,7 @@ def _setup_logging() -> None:
     try:
         log_path = _log_file_path()
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        fh = logging.handlers.RotatingFileHandler(
+        fh = SafeRotatingFileHandler(
             str(log_path),
             maxBytes=5 * 1024 * 1024,
             backupCount=3,
