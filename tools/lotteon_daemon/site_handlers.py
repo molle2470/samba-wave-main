@@ -403,10 +403,13 @@ ABCMART_LOGOUT_URL = "https://abcmart.a-rt.com/member/logout"
 SSG_TRACKING_LOGIN_URL = "https://member.ssg.com/member/login.ssg"
 SSG_HOME_URL = "https://www.ssg.com/"
 SSG_LOGOUT_URL = "https://www.ssg.com/comm/login/logout.ssg"
+# [2026-06-01 실측] SSG 로그인 페이지에 id="loginBtn" 가 div + button 2개 존재.
+# querySelector('#loginBtn') 는 첫 번째 div(장식용)를 잡아 click() 해도 로그인 미발화 →
+# 에러 없이 조용히 실패(8일 824건 FAILED). 반드시 button#loginBtn 로 진짜 버튼 지정.
 SSG_LOGIN_SELECTORS = {
     "id": ["#mem_id", 'input[name="mbrLoginId"]'],
     "pw": ["#mem_pw", 'input[name="password"]'],
-    "btn": ["#loginBtn", 'button[type="submit"].cmem_btn'],
+    "btn": ["button#loginBtn", 'button[type="submit"].cmem_btn'],
 }
 SSG_LOGIN_CHECK_JS = r"""
 (() => {
