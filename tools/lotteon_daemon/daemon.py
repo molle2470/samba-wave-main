@@ -78,7 +78,7 @@ except ImportError:
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.4.25"
+DAEMON_VERSION = "1.4.26"
 
 
 # ── 가격수집 도메인 화이트리스트 ───────────────────────────────────────────
@@ -1522,38 +1522,33 @@ async def extract_tracking(
                 "error": (click_res or {}).get("error", "배송조회 클릭 실패"),
                 "cancelled": bool((click_res or {}).get("cancelled")),
             }
-        # 클릭 후 trace 페이지 도착 대기 (pushState/풀네비 모두 wait_for_url 로 커버)
-        try:
-            await page.wait_for_url(handler.tracking_trace_url_glob, timeout=20_000)
-        except Exception:
-            # 배송조회는 trace 가 별도 SSO 도메인(member.one) 인증을 요구해 login?entryToken=
-            # 으로 튕기는 경우가 있다(2026-06-01 실측). 그 페이지에서 in-place 재로그인하면
-            # entryToken 핸드셰이크가 완료되어 trace 로 리다이렉트된다.
+        # 클릭 후 trace 페이지 도착을 page.url 폴링으로 감지.
+        # wait_for_url 은 클릭 시 컨텍스트 파괴 후 네비가 이미 완료된 경우 "다음 네비"를
+        # 기다리다 타임아웃하는 race 가 있다(2026-06-01 실측: page.url 은 trace 인데 미진입 오판).
+        # 폴링은 현재 URL 을 즉시 확인 → race 회피. member.one SSO 튕기면 in-place 재로그인 1회.
+        _TRACE_NEEDLE = "order-service/my/delivery/trace"
+        _relogged = False
+        _reached = False
+        for _ in range(50):  # 50 * 500ms = 25s
             _cur = page.url
-            if "member.one.musinsa.com/login" in _cur and credential:
+            if _TRACE_NEEDLE in _cur:
+                _reached = True
+                break
+            if (
+                not _relogged
+                and "member.one.musinsa.com/login" in _cur
+                and credential
+            ):
                 logger.info(
-                    "%s 배송조회 → member.one SSO 튕김 — 재로그인 후 trace 재대기", handler.site
+                    "%s 배송조회 → member.one SSO 튕김 — in-place 재로그인", handler.site
                 )
-                if await _relogin_in_place(page, handler, credential):
-                    try:
-                        await page.wait_for_url(
-                            handler.tracking_trace_url_glob, timeout=20_000
-                        )
-                    except Exception:
-                        return {
-                            "success": False,
-                            "error": f"SSO 재로그인 후에도 trace 미진입 (현재 {page.url})",
-                        }
-                else:
-                    return {
-                        "success": False,
-                        "error": f"member.one SSO 재로그인 실패 (현재 {page.url})",
-                    }
-            else:
-                return {
-                    "success": False,
-                    "error": f"trace 페이지 미진입 (현재 {_cur})",
-                }
+                _relogged = await _relogin_in_place(page, handler, credential)
+            await page.wait_for_timeout(500)
+        if not _reached:
+            return {
+                "success": False,
+                "error": f"trace 페이지 미진입 (현재 {page.url})",
+            }
         try:
             data = await page.evaluate(handler.tracking_js)
         except Exception as exc:

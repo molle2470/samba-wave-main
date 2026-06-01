@@ -491,13 +491,18 @@ _MUSINSA_TRACKING_TRACE_JS = r"""
 (async () => {
   if((document.title||'').toLowerCase().includes('보안 인증')) return {success:false, error:'captcha'};
   if(/정상적인\s*접근이\s*아닙니다/.test((document.body?.innerText||'').slice(0,2000))) return {success:false, error:'abnormal_access'};
-  const t0=Date.now(); let ce=null;
-  while(Date.now()-t0<20000){ ce=document.querySelector('p.company-name'); if(ce&&(ce.textContent||'').trim())break; await new Promise(r=>setTimeout(r,300)); }
-  if(!ce) return {success:false, error:'no_tracking: 택배사 DOM 미로드 (미발송)'};
-  const courierName=ce.textContent.trim();
-  const te=document.querySelector('button.tracking-number');
-  const trackingNumber=(te?.textContent||'').trim();
-  if(!trackingNumber) return {success:false, error:'no_tracking: 송장번호 없음', courierName};
+  // 송장번호(button.tracking-number)를 핵심 신호로 폴링 — 택배사(p.company-name)는
+  // 늦게/안 뜰 수 있어(2026-06-01 CDP 실측: courier 비어도 송장 존재) 선택값으로 처리.
+  const t0=Date.now(); let trackingNumber='', courierName='';
+  while(Date.now()-t0<20000){
+    const te=document.querySelector('button.tracking-number');
+    trackingNumber=(te?.textContent||'').trim();
+    const ce=document.querySelector('p.company-name');
+    courierName=(ce?.textContent||'').trim();
+    if(trackingNumber) break;
+    await new Promise(r=>setTimeout(r,300));
+  }
+  if(!trackingNumber) return {success:false, error:'no_tracking: 송장번호 미표시 (미발송)', courierName};
   return {success:true, courierName, trackingNumber};
 })()
 """
