@@ -78,7 +78,7 @@ except ImportError:
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.4.23"
+DAEMON_VERSION = "1.4.24"
 
 
 # ── 가격수집 도메인 화이트리스트 ───────────────────────────────────────────
@@ -1443,10 +1443,24 @@ async def extract_tracking(
 
     # ── 2단계(two-hop) 흐름 — MUSINSA: 배송조회 클릭 → trace 페이지 네비 → 스크랩 ──
     if handler.tracking_two_hop:
+        # 클릭 JS 가 배송조회 버튼을 누르면 무신사 SPA 는 즉시 trace 페이지로 네비게이션한다.
+        # 이때 evaluate 가 반환값을 보내기 전에 실행 컨텍스트가 파괴되어
+        # "Execution context was destroyed ... navigation" 예외가 난다.
+        # 이 예외 = "클릭 성공 + 네비 시작" 신호이므로 실패가 아니라 성공으로 간주하고
+        # 아래 wait_for_url 로 trace 도착을 확인한다.
+        # (미발송/취소/버튼없음은 클릭 전에 return → 네비 없이 정상 dict 응답 → 이 분기 안 탐)
+        click_res: Any = None
         try:
             click_res = await page.evaluate(handler.tracking_click_js)
         except Exception as exc:
-            return {"success": False, "error": f"tracking click 예외: {str(exc)[:120]}"}
+            _emsg = str(exc)
+            if "context was destroyed" in _emsg or "Execution context" in _emsg:
+                click_res = {"clicked": True, "_navigated": True}
+            else:
+                return {
+                    "success": False,
+                    "error": f"tracking click 예외: {_emsg[:120]}",
+                }
         if not isinstance(click_res, dict) or not click_res.get("clicked"):
             return {
                 "success": False,
