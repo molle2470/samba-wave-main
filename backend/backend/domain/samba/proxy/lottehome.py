@@ -161,12 +161,14 @@ class LotteHomeClient:
         hp_no: str = "",
         cert_key: str = "",
         cert_expires_at_iso: str = "",
+        proxy_url: Optional[str] = None,
     ) -> None:
         self.user_id = user_id
         self.password = password
         self.agnc_no = agnc_no
         self.env = env
         self.hp_no = hp_no
+        self.proxy_url = proxy_url
 
         # 인증 캐시 (메모리)
         self._cert_key: str = ""
@@ -343,7 +345,10 @@ class LotteHomeClient:
         }
 
         timeout = httpx.Timeout(settings.http_timeout_default, connect=10.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        client_kwargs: dict[str, Any] = {"timeout": timeout}
+        if self.proxy_url:
+            client_kwargs["proxy"] = self.proxy_url
+        async with httpx.AsyncClient(**client_kwargs) as client:
             if method == "GET":
                 qs = self._build_query(params)
                 if qs:

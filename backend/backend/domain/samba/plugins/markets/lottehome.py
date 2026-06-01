@@ -13,6 +13,9 @@ from backend.domain.samba.plugins.market_base import MarketPlugin
 from backend.utils import add_lazy_loading
 from backend.utils.logger import logger
 
+# goods_no → {opt_name: item_no} 캐시 (프로세스 내 영구 유지, 재시작 시 1회만 API 조회)
+_item_no_cache: dict[str, dict[str, str]] = {}
+
 
 def _sanitize_image_url(url: str) -> str:
     """롯데홈쇼핑 등록용 이미지 URL 정규화.
@@ -557,37 +560,42 @@ class LotteHomePlugin(MarketPlugin):
             source_options = product.get("options") or []
             if source_options:
                 try:
-                    # 롯데 현재 등록된 아이템 목록 조회
-                    stock_result = await client.search_stock(existing_no)
-                    stock_data = stock_result.get("data", {})
-                    result_data = stock_data.get("Result", stock_data)
-                    all_items = result_data.get(
-                        "GoodsInfoList",
-                        result_data.get("ItemInfo", result_data.get("items", [])),
-                    )
-                    if isinstance(all_items, dict):
-                        all_items = [all_items]
+                    # 캐시 우선 — 없을 때만 searchStockList API 호출 (API 폭격 방지)
+                    item_no_map: dict[str, str] = _item_no_cache.get(existing_no, {})
+                    if not item_no_map:
+                        stock_result = await client.search_stock(existing_no)
+                        stock_data = stock_result.get("data", {})
+                        result_data = stock_data.get("Result", stock_data)
+                        all_items = result_data.get(
+                            "GoodsInfoList",
+                            result_data.get("ItemInfo", result_data.get("items", [])),
+                        )
+                        if isinstance(all_items, dict):
+                            all_items = [all_items]
 
-                    # 해당 goods_no 아이템만 필터링
-                    lotte_items = [
-                        it
-                        for it in (all_items if isinstance(all_items, list) else [])
-                        if str(it.get("GoodNo", "")) == str(existing_no)
-                    ]
+                        lotte_items = [
+                            it
+                            for it in (all_items if isinstance(all_items, list) else [])
+                            if str(it.get("GoodNo", "")) == str(existing_no)
+                        ]
 
-                    # OptDesc → 옵션명 추출 ("옵션:A/L" → "A/L")
-                    item_no_map: dict[str, str] = {}
-                    lotte_opt_names: set[str] = set()
-                    for it in lotte_items:
-                        raw = str(it.get("OptDesc", it.get("ItemNm", ""))).strip()
-                        opt_name = raw.split(":")[-1].strip() if ":" in raw else raw
-                        item_no = str(it.get("ItemNo", ""))
-                        item_no_map[opt_name] = item_no
-                        lotte_opt_names.add(opt_name)
+                        lotte_opt_names: set[str] = set()
+                        for it in lotte_items:
+                            raw = str(it.get("OptDesc", it.get("ItemNm", ""))).strip()
+                            opt_name = raw.split(":")[-1].strip() if ":" in raw else raw
+                            item_no = str(it.get("ItemNo", ""))
+                            item_no_map[opt_name] = item_no
+                            lotte_opt_names.add(opt_name)
 
-                    logger.info(
-                        f"[롯데홈쇼핑] 롯데 등록 옵션: {lotte_opt_names}, item_no_map: {item_no_map}"
-                    )
+                        if item_no_map:
+                            _item_no_cache[existing_no] = item_no_map
+                            logger.info(
+                                f"[롯데홈쇼핑] item_no_map 캐시 저장: {existing_no} → {lotte_opt_names}"
+                            )
+                    else:
+                        logger.debug(
+                            f"[롯데홈쇼핑] item_no_map 캐시 히트: {existing_no} ({len(item_no_map)}개 옵션)"
+                        )
 
                     if not item_no_map:
                         logger.warning(
