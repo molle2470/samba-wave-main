@@ -42,8 +42,10 @@ DAEMON_ONLY_JOB_SITES: dict[str, set[str]] = {
     # LOTTEON 발주취소는 데몬 Playwright 자동로그인 봇 차단(2026-05-26 실측)으로 확장앱 라우팅 전환.
     # cancel_order 만 LOTTEON 제외, 나머지(detail/tracking/search/reward) 정책 유지.
     "cancel_order": DAEMON_ONLY_SITES - {"LOTTEON"},
-    "tracking": DAEMON_ONLY_SITES
-    | {"MUSINSA", "GSShop", "FashionPlus", "Nike", "OliveYoung", "KREAM"},
+    # 송장(tracking): 데몬은 SSG/ABC/GrandStage/LOTTEON 만. 무신사/GSShop 등은 확장앱 처리.
+    # (무신사 trace 는 member.one SSO + app_atk/mss_mac/cf_clearance 토큰 요구 → 헤드리스
+    #  데몬 로그인으론 못 뚫음, 2026-06-01 실측. 실제 브라우저=확장앱 세션만 통과.)
+    "tracking": DAEMON_ONLY_SITES,
 }
 
 # 송장 전용 별칭 — 하위호환. 신규 코드는 DAEMON_ONLY_JOB_SITES["tracking"] 사용 권장.
@@ -781,18 +783,6 @@ class SourcingQueue:
                 )
                 for i, s in enumerate(_sites):
                     params[f"dsite_{i}"] = s.upper()
-                # 송장 전용 데몬 사이트(무신사/GSShop 등)의 tracking 잡은 확장앱(비데몬)
-                # dequeue 차단 — 헤드리스 데몬 전담. 데몬은 get_next_job 의 tracking
-                # site-분담 예외로 기존 워커(ABCmart 등)가 그대로 처리하므로 데몬에 해당
-                # 사이트를 active_sites 로 등록할 필요 없음(등록 시 가격수집 워커 중복 스폰 사고).
-                _tds = sorted(TRACKING_ONLY_DAEMON_SITES)
-                if _tds:
-                    _tph = ", ".join(f":tdsite_{i}" for i in range(len(_tds)))
-                    conditions.append(
-                        f"NOT (job_type = 'tracking' AND UPPER(site) IN ({_tph}))"
-                    )
-                    for i, s in enumerate(_tds):
-                        params[f"tdsite_{i}"] = s.upper()
 
             # site 필터 — 케이싱 무관 매칭.
             # detail 잡 site='ABCmart'(혼합)인데 tracking 잡 site='ABCMART'(대문자)라

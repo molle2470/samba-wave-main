@@ -159,13 +159,13 @@ def test_register_preserves_daemon_only_for_daemon_dev():
     )
 
 
-# ── 송장-전용-데몬 사이트(무신사 등) 잡타입별 owner 분기 ──────────────────────
-# 무신사 송장 = 데몬 헤드리스, 무신사 가격수집(detail) = 확장앱.
-# 데몬이 detail 미지원이라 detail/search/cancel 은 데몬에 있어도 확장앱으로 가야 함.
+# ── 무신사 등은 데몬 미라우팅 — 모든 잡타입(송장 포함) 확장앱/일반 owner ──────────
+# 무신사 trace 는 member.one SSO + 앱토큰 요구 → 헤드리스 데몬으론 못 뚫음(2026-06-01).
+# 따라서 무신사 송장도 확장앱 처리. detail/search/cancel 은 _resolve guard 로 확장앱 강제.
 
 
-def test_resolve_job_owner_musinsa_detail_uses_extension(monkeypatch):
-    """무신사 detail 은 데몬이 풀에 있어도 확장앱으로 — 가격수집 보호."""
+def test_resolve_job_owner_musinsa_uses_extension_not_daemon(monkeypatch):
+    """무신사는 데몬 미라우팅 — 송장은 pick_any_owner, detail 등은 확장앱 강제."""
     import backend.domain.samba.proxy.daemon_pool as dp
 
     monkeypatch.setattr(
@@ -176,9 +176,9 @@ def test_resolve_job_owner_musinsa_detail_uses_extension(monkeypatch):
 
     from backend.domain.samba.proxy.sourcing_queue import _resolve_job_owner
 
-    # 송장(tracking) → 데몬
-    assert _resolve_job_owner("MUSINSA", "tracking") == "samba-daemon-x"
-    # detail/search/cancel → 확장앱 (데몬 우회)
+    # 송장(tracking) → 데몬 전용 아님 → pick_any_owner (데몬 우선이나 확장앱 폴백)
+    assert _resolve_job_owner("MUSINSA", "tracking") == "ANY-dev"
+    # detail/search/cancel → 확장앱 강제 (가격수집 보호 guard)
     assert _resolve_job_owner("MUSINSA", "detail") == "ext-dev"
     assert _resolve_job_owner("MUSINSA", "search") == "ext-dev"
     assert _resolve_job_owner("MUSINSA", "cancel_order") == "ext-dev"
