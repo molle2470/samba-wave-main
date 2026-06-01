@@ -424,14 +424,32 @@ class SourcingQueue:
         loop = asyncio.get_event_loop()
         future: asyncio.Future[Any] = loop.create_future()
         if owner_device_id is None:
-            owner_device_id = _resolve_job_owner(site, "tracking")
-        if owner_device_id is None and (site or "").upper() in {
-            s.upper() for s in _daemon_only_for_job("tracking")
-        }:
-            logger.warning(
-                f"[소싱큐] {site} 송장 데몬 미등록 — 잡 발행 skip: ord={sourcing_order_number}"
-            )
-            raise RuntimeError(f"{site} 데몬 미등록 — 송장 잡 발행 불가")
+            site_u = (site or "").upper()
+            if site_u in {s.upper() for s in _daemon_only_for_job("tracking")}:
+                # 송장(tracking)은 오토튠 담당(_pc_allowed_sites)과 무관해야 한다.
+                # owner 를 pick_daemon_owner(=오토튠 SSG 체크 PC)로 박으면, SSG 오토튠
+                # 담당 PC가 0대이거나 그 PC 데몬이 죽으면 송장이 영영 막힌다(2026-06-01
+                # 버그: SSG 오토튠을 다른 PC가 돌리는 중이라 송장이 그 PC에만 라우팅 →
+                # 그 PC 구버전 데몬이 매번 로그인 실패, 다른 PC는 처리 못 함).
+                # owner="" 로 두고 dequeue 가드(get_next_job: tracking 은 site 분담 예외
+                # + 비데몬 차단)가 살아있는 데몬 아무나 매칭하게 한다.
+                from backend.domain.samba.proxy.daemon_pool import has_alive_daemon
+
+                if not has_alive_daemon():
+                    logger.warning(
+                        f"[소싱큐] {site} 송장 — 살아있는 데몬 없음, 잡 발행 skip: "
+                        f"ord={sourcing_order_number}"
+                    )
+                    raise RuntimeError(f"{site} 살아있는 데몬 없음 — 송장 잡 발행 불가")
+                owner_device_id = ""  # 빈값 → dequeue 가 데몬 아무나 매칭
+            else:
+                owner_device_id = _resolve_job_owner(site, "tracking")
+                if owner_device_id is None:
+                    logger.warning(
+                        f"[소싱큐] {site} 송장 데몬 미등록 — 잡 발행 skip: "
+                        f"ord={sourcing_order_number}"
+                    )
+                    raise RuntimeError(f"{site} 데몬 미등록 — 송장 잡 발행 불가")
 
         job: dict[str, Any] = {
             "requestId": request_id,
@@ -774,8 +792,14 @@ class SourcingQueue:
             if allowed_sites is not None:
                 site_list = [s.strip() for s in allowed_sites if s.strip()]
                 placeholders = ", ".join(f":site_{i}" for i in range(len(site_list)))
+                # cancel_order + tracking 은 site 분담(X-Poll-Site) 무시.
+                # 송장(tracking)은 오토튠 사이트 담당과 무관하게 살아있는 데몬 아무나
+                # 처리해야 한다(2026-06-01). 데몬은 모든 사이트 active 라 담당 외 사이트
+                # 송장도 즉석 로그인+스크랩 가능. 비데몬(확장앱)은 위 DAEMON_ONLY 가드
+                # (job_type='cancel_order' OR site NOT IN daemon_only)가 여전히 차단.
                 conditions.append(
-                    f"(job_type = 'cancel_order' OR UPPER(site) IN ({placeholders}))"
+                    f"(job_type IN ('cancel_order', 'tracking') "
+                    f"OR UPPER(site) IN ({placeholders}))"
                 )
                 for i, s in enumerate(site_list):
                     params[f"site_{i}"] = s.upper()

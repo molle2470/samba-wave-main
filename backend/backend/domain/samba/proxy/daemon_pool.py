@@ -70,3 +70,27 @@ def _pick_owner_with_prefix(site: str, daemon_only: bool) -> str | None:
         idx = _rr_counters.get(key, 0) % len(pool)
         _rr_counters[key] = idx + 1
     return pool[idx]
+
+
+def has_alive_daemon() -> bool:
+    """살아있는 데몬(heartbeat 180s 이내) 1대라도 있나 — 오토튠 담당(_pc_allowed_sites) 무관.
+
+    송장(tracking)은 가격수집(detail)과 달리 오토튠 사이트 분담과 무관해야 한다.
+    데몬은 시작 시 모든 사이트를 active 로 올려 SSG/ABC/LOTTEON 로그인+송장조회가
+    가능하므로, "이 사이트를 오토튠 담당으로 체크한 PC"가 아니라 "살아있는 데몬 아무나"가
+    송장을 처리할 수 있어야 한다. pick_daemon_owner(=_pc_allowed_sites 기반)로 송장
+    owner 를 박으면, SSG 오토튠 담당 PC가 0대이거나 그 PC 데몬이 죽으면 송장이 영영
+    발행/처리 안 되는 버그가 생긴다(2026-06-01 확인). 이 함수는 그 발행 가드용.
+    """
+    try:
+        import time
+
+        from backend.api.v1.routers.samba.collector_autotune import _pc_last_seen
+
+        now = time.time()
+        for dev, last in _pc_last_seen.items():
+            if dev.startswith("samba-daemon-") and now - last <= 180.0:
+                return True
+    except Exception:
+        pass
+    return False
