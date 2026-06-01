@@ -781,6 +781,18 @@ class SourcingQueue:
                 )
                 for i, s in enumerate(_sites):
                     params[f"dsite_{i}"] = s.upper()
+                # 송장 전용 데몬 사이트(무신사/GSShop 등)의 tracking 잡은 확장앱(비데몬)
+                # dequeue 차단 — 헤드리스 데몬 전담. 데몬은 get_next_job 의 tracking
+                # site-분담 예외로 기존 워커(ABCmart 등)가 그대로 처리하므로 데몬에 해당
+                # 사이트를 active_sites 로 등록할 필요 없음(등록 시 가격수집 워커 중복 스폰 사고).
+                _tds = sorted(TRACKING_ONLY_DAEMON_SITES)
+                if _tds:
+                    _tph = ", ".join(f":tdsite_{i}" for i in range(len(_tds)))
+                    conditions.append(
+                        f"NOT (job_type = 'tracking' AND UPPER(site) IN ({_tph}))"
+                    )
+                    for i, s in enumerate(_tds):
+                        params[f"tdsite_{i}"] = s.upper()
 
             # site 필터 — 케이싱 무관 매칭.
             # detail 잡 site='ABCmart'(혼합)인데 tracking 잡 site='ABCMART'(대문자)라

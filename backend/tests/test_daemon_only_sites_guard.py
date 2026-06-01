@@ -82,7 +82,9 @@ def test_add_tracking_job_blocks_daemon_only(site, _stub_db_insert):
     from backend.domain.samba.proxy.sourcing_queue import SourcingQueue
 
     async def _run():
-        with pytest.raises(RuntimeError, match="데몬 미등록"):
+        # 데몬 매칭 실패 시 RuntimeError — 메시지는 "데몬 미등록"(개별 owner) 또는
+        # "살아있는 데몬 없음"(tracking owner='' 경로, 2026-06-01) 둘 다 가능.
+        with pytest.raises(RuntimeError, match="데몬"):
             await SourcingQueue.add_tracking_job(
                 site, "https://example.com", "order-1", "ord-num-1"
             )
