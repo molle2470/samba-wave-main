@@ -831,13 +831,16 @@ export default function WarroomPage() {
       const dev = getDeviceId()
       if (!dev) return
       const { API_BASE_URL: apiBase } = await import('@/config/api')
-      // 사이트별 dev 분리 (2026-05-25 사용자 룰):
-      //  - 데몬 전용(SSG/ABCmart/GrandStage/LOTTEON) → 데몬 dev 에만 분담
-      //  - 브라우저 전용(무신사/GSShop) → 브라우저 dev 에만 분담
-      // 4개 사이트는 확장앱 절대 관여 X — 데몬에만 박는다.
+      // 사이트별 dev 분리 (2026-05-25 사용자 룰 + 2026-06-01 무신사 송장 데몬 전환):
+      //  - 데몬 전용(SSG/ABCmart/GrandStage/LOTTEON) → 데몬 dev 에만 (가격수집+송장 둘 다 데몬)
+      //  - 송장만 데몬(무신사) → 브라우저 dev(가격수집 detail) + 데몬 dev(송장 tracking) 둘 다 등록.
+      //    무신사 송장은 데몬 헤드리스(창 X)로 처리, 가격수집은 데몬 미지원이라 확장앱 유지.
+      //    백엔드 _resolve_job_owner 가 무신사 detail 은 확장앱, tracking 은 데몬으로 분기.
       const daemonDev = (typeof window !== 'undefined' &&
         window.localStorage.getItem('samba.autotune.daemon.deviceId')) || ''
       const _DAEMON_ONLY = new Set(['SSG', 'ABCmart', 'GrandStage', 'LOTTEON'])
+      // 송장만 데몬으로 보내는 사이트 — 브라우저(detail)에도 남기고 데몬(tracking)에도 등록.
+      const _TRACKING_DAEMON = new Set(['MUSINSA'])
       // ABCmart 체크 = ABCmart + GrandStage 자동 expand (같은 a-rt.com 도메인)
       const _SITE_EXPAND: Record<string, string[]> = {
         ABCmart: ['ABCmart', 'GrandStage'],
@@ -845,13 +848,13 @@ export default function WarroomPage() {
       const expanded = sites === null
         ? null
         : sites.flatMap(s => _SITE_EXPAND[s] || [s])
-      // 사이트 분리
+      // 사이트 분리 (무신사는 브라우저+데몬 양쪽에 포함)
       const browserSites = expanded === null
         ? null
         : expanded.filter(s => !_DAEMON_ONLY.has(s))
       const daemonSites = expanded === null
         ? null
-        : expanded.filter(s => _DAEMON_ONLY.has(s))
+        : expanded.filter(s => _DAEMON_ONLY.has(s) || _TRACKING_DAEMON.has(s))
       // race fix (2026-05-28): Promise.all 동시 POST 시 백엔드 persist 가 read-modify-write
       // 라 last-write-wins 으로 먼저 박힌 device row 가 덮어써짐 → 브라우저 dev 분담이 DB
       // 에서 사라지고 lifecycle sync 가 _pc_allowed_sites.pop → 무신사/GS 사이클 cancel.

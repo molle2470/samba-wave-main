@@ -155,3 +155,43 @@ def test_register_preserves_daemon_only_for_daemon_dev():
     assert sites == {"SSG", "ABCmart", "LOTTEON"}, (
         f"데몬 dev 분담이 strip 됨(잘못): {sites}"
     )
+
+
+# ── 송장-전용-데몬 사이트(무신사 등) 잡타입별 owner 분기 ──────────────────────
+# 무신사 송장 = 데몬 헤드리스, 무신사 가격수집(detail) = 확장앱.
+# 데몬이 detail 미지원이라 detail/search/cancel 은 데몬에 있어도 확장앱으로 가야 함.
+
+
+def test_resolve_job_owner_musinsa_detail_uses_extension(monkeypatch):
+    """무신사 detail 은 데몬이 풀에 있어도 확장앱으로 — 가격수집 보호."""
+    import backend.domain.samba.proxy.daemon_pool as dp
+
+    monkeypatch.setattr(
+        dp, "pick_daemon_owner", lambda site, settings_obj=None: "samba-daemon-x"
+    )
+    monkeypatch.setattr(dp, "pick_extension_owner", lambda site: "ext-dev")
+    monkeypatch.setattr(dp, "pick_any_owner", lambda site: "ANY-dev")
+
+    from backend.domain.samba.proxy.sourcing_queue import _resolve_job_owner
+
+    # 송장(tracking) → 데몬
+    assert _resolve_job_owner("MUSINSA", "tracking") == "samba-daemon-x"
+    # detail/search/cancel → 확장앱 (데몬 우회)
+    assert _resolve_job_owner("MUSINSA", "detail") == "ext-dev"
+    assert _resolve_job_owner("MUSINSA", "search") == "ext-dev"
+    assert _resolve_job_owner("MUSINSA", "cancel_order") == "ext-dev"
+
+
+def test_resolve_job_owner_daemon_only_site_unaffected(monkeypatch):
+    """SSG(완전 데몬 전용)는 모든 잡타입에서 데몬 — 가드 영향 없음."""
+    import backend.domain.samba.proxy.daemon_pool as dp
+
+    monkeypatch.setattr(
+        dp, "pick_daemon_owner", lambda site, settings_obj=None: "samba-daemon-ssg"
+    )
+    monkeypatch.setattr(dp, "pick_extension_owner", lambda site: "ext-dev")
+
+    from backend.domain.samba.proxy.sourcing_queue import _resolve_job_owner
+
+    assert _resolve_job_owner("SSG", "detail") == "samba-daemon-ssg"
+    assert _resolve_job_owner("SSG", "tracking") == "samba-daemon-ssg"

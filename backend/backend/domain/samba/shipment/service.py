@@ -2021,6 +2021,45 @@ class SambaShipmentService:
                         "sent_at": datetime.now(UTC).isoformat(),
                     }
 
+                    # _already_exists: SSG 동일상품 존재로 itemId 미확인 — "__exists__" 마커 저장
+                    if result.get("_already_exists"):
+                        res["product_nos"] = {account_id: "__exists__"}
+                        logger.warning(
+                            f"[전송] {market_type} 이미 등록됨(itemId 미확인) — __exists__ 마커 저장: "
+                            f"상품={product_id}, 계정={account_id}"
+                        )
+
+                    # 등록 성공 직후 즉시 DB 저장 (transmitting stuck 방지):
+                    # 프로세스가 최종 업데이트 전에 종료돼도 registered_accounts + product_no 보존.
+                    _imm_nos = res.get("product_nos") or {}
+                    if _imm_nos:
+                        try:
+                            _pr_now = await product_repo.get_async(product_id)
+                            if _pr_now:
+                                _imm_reg = list(
+                                    set(
+                                        (_pr_now.registered_accounts or [])
+                                        + [account_id]
+                                    )
+                                )
+                                _imm_mpn = dict(_pr_now.market_product_nos or {})
+                                _imm_mpn.update(_imm_nos)
+                                await product_repo.update_async(
+                                    product_id,
+                                    registered_accounts=_imm_reg,
+                                    market_product_nos=_imm_mpn,
+                                    status="registered",
+                                )
+                                await self.session.commit()
+                        except Exception as _ie:
+                            logger.warning(
+                                f"[전송] {market_type} 즉시저장 실패 (무시): {_ie}"
+                            )
+                            try:
+                                await self.session.rollback()
+                            except Exception:
+                                pass
+
                     action = "수정" if existing_product_no else "등록"
                     _plugin_msg = result.get("message", "")
                     res["plugin_message"] = _plugin_msg
@@ -2097,7 +2136,7 @@ class SambaShipmentService:
             merged_nos.update(_new_nos)
             if (
                 ar.get("status") == "success"
-                and _new_nos.get(aid)
+                and (_new_nos.get(aid) or ar.get("_already_exists"))
                 and aid not in merged_reg
             ):
                 merged_reg.append(aid)

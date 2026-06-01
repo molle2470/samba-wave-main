@@ -49,6 +49,19 @@ DAEMON_ONLY_JOB_SITES: dict[str, set[str]] = {
 # 송장 전용 별칭 — 하위호환. 신규 코드는 DAEMON_ONLY_JOB_SITES["tracking"] 사용 권장.
 DAEMON_ONLY_TRACKING_SITES: set[str] = DAEMON_ONLY_JOB_SITES["tracking"]
 
+# 송장(tracking)만 데몬 헤드리스, 그 외 잡(detail/search/reward/cancel)은 확장앱 전용 사이트.
+# 데몬은 이 사이트들의 가격수집(detail)을 미지원(site_handlers.py detail_supported=False) —
+# 데몬에 owner 를 주면 detail 잡이 더미 실패해 가격수집이 깨진다. 비-tracking 잡은 확장앱으로 강제.
+# (이 사이트들이 데몬 active_sites 에 등록돼 있어도 detail/search/reward/cancel 은 데몬 우회)
+TRACKING_ONLY_DAEMON_SITES: set[str] = {
+    "MUSINSA",
+    "GSShop",
+    "FashionPlus",
+    "Nike",
+    "OliveYoung",
+    "KREAM",
+}
+
 
 def _daemon_only_for_job(job_type: str) -> set[str]:
     """잡 타입별 데몬 강제 사이트 집합. 미정의 타입은 기본 DAEMON_ONLY_SITES."""
@@ -67,10 +80,19 @@ def _resolve_job_owner(site: str, job_type: str) -> str | None:
     from backend.domain.samba.proxy.daemon_pool import (
         pick_any_owner,
         pick_daemon_owner,
+        pick_extension_owner,
     )
 
-    if (site or "").upper() in {s.upper() for s in _daemon_only_for_job(job_type)}:
+    site_u = (site or "").upper()
+    if site_u in {s.upper() for s in _daemon_only_for_job(job_type)}:
         return pick_daemon_owner(site)
+    # 송장 전용 데몬 사이트(MUSINSA 등)의 비-송장 잡은 확장앱 전용.
+    # 데몬이 detail 미지원이라, 데몬이 이 사이트를 active_sites 에 올려도(송장 처리용)
+    # detail/search/reward/cancel 은 데몬으로 가면 안 됨 — 확장앱으로 강제해 가격수집 보호.
+    if job_type != "tracking" and site_u in {
+        s.upper() for s in TRACKING_ONLY_DAEMON_SITES
+    }:
+        return pick_extension_owner(site)
     return pick_any_owner(site)
 
 

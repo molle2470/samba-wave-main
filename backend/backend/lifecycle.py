@@ -213,6 +213,21 @@ async def _recover_running_jobs(logger: logging.Logger) -> None:
                     ),
                     timeout=8,
                 )
+                # transmitting 상태로 10분 이상 멈춘 shipment → failed 처리
+                # (전송 성공 후 프로세스 종료로 registered_accounts 미업데이트 상태 방지)
+                shipment_stuck = await asyncio.wait_for(
+                    session.execute(
+                        text(
+                            "UPDATE samba_shipment "
+                            "SET status = 'failed', "
+                            "    transmit_error = COALESCE(transmit_error, '{}')::jsonb "
+                            '    || \'{"_stuck_recovery": "transmitting > 10min at restart"}\'::jsonb '
+                            "WHERE status = 'transmitting' "
+                            "AND updated_at < now() - interval '10 minutes'"
+                        )
+                    ),
+                    timeout=8,
+                )
                 await session.commit()
 
             if resumed.rowcount:
@@ -222,6 +237,11 @@ async def _recover_running_jobs(logger: logging.Logger) -> None:
             if reset.rowcount:
                 logger.info(
                     "[startup] reset stale non-transmit jobs=%s", reset.rowcount
+                )
+            if shipment_stuck.rowcount:
+                logger.warning(
+                    "[startup] transmitting stuck shipments → failed: %s건",
+                    shipment_stuck.rowcount,
                 )
             return
         except Exception as exc:

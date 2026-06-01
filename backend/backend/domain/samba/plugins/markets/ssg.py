@@ -48,6 +48,15 @@ class SSGPlugin(MarketPlugin):
         if not api_key:
             return {"success": False, "message": "SSG 인증키가 비어있습니다."}
 
+        # transmitting stuck으로 인해 itemId가 "__exists__"로 저장된 상품:
+        # SSG에는 이미 등록됐지만 실제 itemId를 모름 → 재등록/수정 차단 + 경고
+        if existing_no == "__exists__":
+            return {
+                "success": False,
+                "message": "SSG itemId 미확인 (신세계몰 셀러센터에서 상품번호 확인 후 수동 입력 필요)",
+                "_skip_retry": True,
+            }
+
         # 전시카테고리 미매핑 시 등록 불가 — 명확한 에러 반환
         if not category_id:
             product_name = product.get("name", "")
@@ -516,6 +525,19 @@ class SSGPlugin(MarketPlugin):
                         or res.get("resultMessage", "")
                         or f"resultCode={code}"
                     )
+                    # 동일 상품 이미 존재 — 첫 전송 성공 후 transmitting stuck으로 itemId 미저장된 경우.
+                    # registered_accounts 복구 + "__exists__" 마커로 중복 재등록 차단.
+                    if "동일한 상품이 이미 존재" in msg and not existing_no:
+                        logger.warning(
+                            f"[SSG] 동일상품 존재 오류 → 이미 등록된 것으로 처리 (itemId 수동 확인 필요): "
+                            f"product={product.get('id')}"
+                        )
+                        return {
+                            "success": True,
+                            "message": "SSG 이미 등록된 상품 (itemId 미확인 — 셀러센터에서 확인 필요)",
+                            "_already_exists": True,
+                            "data": result_data,
+                        }
                     return {
                         "success": False,
                         "message": f"SSG 등록 실패: {msg}",
