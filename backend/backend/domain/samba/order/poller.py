@@ -125,16 +125,16 @@ async def _fetch_new_order_numbers(
                     continue
 
                 from backend.domain.samba.collector.refresher import (
-                    get_transmit_proxy_url,
+                    get_collect_proxy_url,
                 )
 
-                _lh_proxy = get_transmit_proxy_url()
+                _lh_proxy = get_collect_proxy_url()
                 lh_client = LotteHomeClient(
                     lh_user_id, lh_password, lh_agnc_no, lh_env, proxy_url=_lh_proxy
                 )
                 if _lh_proxy:
                     logger.info(
-                        f"[주문폴러] 롯데홈쇼핑 transmit 프록시 적용: {_lh_proxy.split('@')[-1] if '@' in _lh_proxy else 'on'}"
+                        f"[주문폴러] 롯데홈쇼핑 collect 프록시 적용: {_lh_proxy.split('@')[-1] if '@' in _lh_proxy else 'on'}"
                     )
                 lh_end = datetime.now(UTC)
                 lh_start = lh_end - timedelta(days=1)
@@ -161,7 +161,7 @@ async def _fetch_new_order_numbers(
                             if oid:
                                 raw_order_numbers.append(oid)
                 finally:
-                    await lh_client.close()
+                    pass  # LotteHomeClient는 per-request httpx — close 불필요
 
             else:
                 continue
