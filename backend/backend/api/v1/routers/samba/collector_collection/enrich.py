@@ -207,9 +207,16 @@ async def _retransmit_if_changed(
             _reg_ids,
             skip_unchanged=False,
             skip_refresh=True,
+            skip_policy_account_filter=True,  # 이미 등록된 계정 재전송 — 정책 필터 불필요
+        )
+        _success_cnt = sum(
+            1
+            for pr in (ship_result.get("results") or [])
+            for aid, status in (pr.get("transmit_result") or {}).items()
+            if status == "success"
         )
         result["retransmitted"] = True
-        result["retransmit_accounts"] = len(_reg_ids)
+        result["retransmit_accounts"] = _success_cnt or len(_reg_ids)
 
         # 마켓별 결과 로깅
         for pr in ship_result.get("results") or []:

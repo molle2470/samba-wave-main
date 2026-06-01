@@ -2594,6 +2594,7 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                         _accs_list,
                                                         skip_unchanged=False,
                                                         skip_refresh=True,
+                                                        skip_policy_account_filter=True,
                                                         on_account_done=_on_account_done,
                                                     )
                                                     # HTTP 끝났으면 즉시 commit — 세션이 idle

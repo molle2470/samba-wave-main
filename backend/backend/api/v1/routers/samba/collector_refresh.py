@@ -472,7 +472,11 @@ async def refresh_products(
             acc_ids = acc_key.split(",")
             try:
                 await ship_svc.start_update(
-                    pids, ["price"], acc_ids, skip_unchanged=False
+                    pids,
+                    ["price"],
+                    acc_ids,
+                    skip_unchanged=False,
+                    skip_policy_account_filter=True,
                 )
                 retransmitted += len(pids)
                 _pid_set = set(pids)
@@ -493,7 +497,11 @@ async def refresh_products(
             acc_ids = acc_key.split(",")
             try:
                 await ship_svc.start_update(
-                    pids, ["stock"], acc_ids, skip_unchanged=False
+                    pids,
+                    ["stock"],
+                    acc_ids,
+                    skip_unchanged=False,
+                    skip_policy_account_filter=True,
                 )
                 retransmitted += len(pids)
                 _pid_set = set(pids)
@@ -747,7 +755,11 @@ async def refresh_products(
                     _acc_ids = _acc_key.split(",")
                     try:
                         await _ship_svc.start_update(
-                            _pids, ["price"], _acc_ids, skip_unchanged=False
+                            _pids,
+                            ["price"],
+                            _acc_ids,
+                            skip_unchanged=False,
+                            skip_policy_account_filter=True,
                         )
                         retransmitted += len(_pids)
                     except Exception as e:
