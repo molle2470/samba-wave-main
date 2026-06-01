@@ -2148,6 +2148,42 @@ class LotteonClient:
             )
             return False
 
+    async def approve_cancel(self, od_no: str, clm_no: str, items: list[dict]) -> bool:
+        """취소요청 승인 처리 (cnclRequestApproval).
+
+        고객이 마켓에 취소요청한 건을 판매자가 승인. 판매자직접취소(slrDirectCnclProc)와
+        다른 API — 직접취소는 취소요청이 없을 때 판매자가 먼저 취소하는 용도다.
+
+        Args:
+          od_no: 주문번호
+          clm_no: 클레임번호 (취소클레임 동기화 시 캡처)
+          items: itemList — 각 항목에 odSeq, procSeq, orglProcSeq, slrRsnCd 필수
+                 slrRsnCd 승인 사유코드: 106=구매의사 없어짐(고객변심), 103=옵션/사이즈,
+                 111=판매자 취소 등
+
+        Returns:
+          True (승인 성공). 실패 시 Exception.
+        """
+        payload = {
+            "odNo": od_no,
+            "clmNo": clm_no,
+            "itemList": items,
+        }
+        logger.info(
+            f"[롯데ON][취소승인] odNo={od_no} clmNo={clm_no} items={len(items)}건"
+        )
+        resp = await self._call_api(
+            "POST",
+            "/v1/openapi/claim/v1/cancellationOpenApi/cnclRequestApproval",
+            body=payload,
+        )
+        rc = str(resp.get("returnCode", ""))
+        if rc != "0000":
+            msg = resp.get("message", f"returnCode={rc}")
+            raise Exception(f"롯데ON 취소 승인 오류: {msg}")
+        logger.info(f"[롯데ON][취소승인] 성공: odNo={od_no} clmNo={clm_no}")
+        return True
+
     async def approve_return(self, od_no: str, clm_no: str, items: list[dict]) -> bool:
         """반품 승인 처리 (returnRequestApproval).
 

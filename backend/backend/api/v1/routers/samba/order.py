@@ -2655,6 +2655,34 @@ async def approve_cancel(
         )
         return {"ok": True, "message": "쿠팡 취소승인 완료 (출고중지)"}
 
+    elif account.market_type == "lotteon":
+        # 롯데ON 취소요청 승인 — 라이브 취소클레임 조회로 승인 대상 판별 후 cnclRequestApproval.
+        # 클레임 없으면 판매자직접취소. 자동취소와 동일 로직(_lotteon_approve_or_direct_cancel).
+        from backend.api.v1.routers.samba.proxy.sourcing import (
+            _lotteon_approve_or_direct_cancel,
+        )
+        from backend.domain.samba.proxy.lotteon import LotteonClient
+
+        extras = account.additional_fields or {}
+        api_key = extras.get("apiKey", "") or account.api_key or ""
+        if not api_key:
+            raise HTTPException(status_code=400, detail="롯데ON API Key 없음")
+
+        client = LotteonClient(api_key)
+        try:
+            ok, message = await _lotteon_approve_or_direct_cancel(client, order)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"롯데ON 취소승인 실패: {e}")
+        if not ok:
+            raise HTTPException(status_code=500, detail=f"롯데ON 취소 실패: {message}")
+
+        await svc.update_order(
+            order_id,
+            {"shipping_status": "취소완료", "status": "cancelled"},
+        )
+        logger.info(f"[취소승인][롯데ON] {order.order_number} {message}")
+        return {"ok": True, "message": f"롯데ON {message}"}
+
     else:
         raise HTTPException(
             status_code=400, detail=f"{account.market_type} 취소승인 미지원"
@@ -4941,21 +4969,26 @@ async def sync_orders_from_markets(
                     logger.warning(f"[롯데ON] 교환 클레임 조회 실패: {ex_err}")
 
                 # 취소 클레임 조회 → samba_order.status 갱신
-                # step_cd: 11=취소요청, 12=취소처리중, 13=취소완료
+                # odPrgsStepCd 실측(2026-06-01 getCancellationRequestAndComplateList):
+                #   02=요청 / 21=취소완료 / 22=철회.
+                # (구 매핑 11/12/13 은 실제값과 안 맞아 한 번도 매칭 안 되던 죽은 코드였음.
+                #  claim 기반 status 갱신이 전혀 안 돼 cancel_requested 는 메인목록 ordPrdStat
+                #  파싱만 세팅해 왔음.)
+                # 22 철회(고객이 취소요청 회수)는 취소 진행 아님 → 매핑 안 함, status 유지.
+                # 21 취소완료는 의도적으로 매핑 안 함 — 종결(cancelled) 상태는 메인 주문목록
+                #   파싱이 권위 소스. claim-sync 로 21 을 일괄 flip 하면 배송완료/구매확정 주문이
+                #   cancelled 로 뒤집히고 profit/cost 가 0으로 정리 안 돼 정산 불일치 발생.
+                #   여기선 actionable 한 02 요청만 반영(auto-cancel 트리거).
                 try:
                     cancel_claims = await lotteon_client.get_cancel_orders(
                         days=body.days
                     )
                     logger.info(f"[롯데ON] 취소 클레임 조회: {len(cancel_claims)}건")
                     cancel_step_map = {
-                        "11": ("취소요청", "cancel_requested"),
-                        "12": ("취소처리중", "cancel_requested"),
-                        "13": ("취소완료", "cancelled"),
+                        "02": ("취소요청", "cancel_requested"),
                     }
                     cancel_priority = {
                         "취소요청": 1,
-                        "취소처리중": 2,
-                        "취소완료": 3,
                     }
                     # 배송 진행 단계 보호 — 송장출력 이후로 진행한 주문은 좀비/지연
                     # cancel claim 으로 '취소요청'으로 되돌리지 않음 ('취소처리중'/'취소완료'
@@ -4972,6 +5005,19 @@ async def sync_orders_from_markets(
                         step_cd_c = str(claim.get("odPrgsStepCd", "") or "")
                         mapped = cancel_step_map.get(step_cd_c)
                         if not mapped or not cn_od_no:
+                            continue
+                        # 부분취소(잔여수량>0)는 전체취소 아님 → status 전이 스킵.
+                        # 수량 처리는 메인 주문목록 파싱(ordPrdStat/quantity)에 위임.
+                        # 안 막으면 21 취소완료 클레임이 부분취소 주문을 전체 cancelled 로 오염.
+                        try:
+                            _cn_rmdr = int(claim.get("rmdrQty", 0) or 0)
+                        except (TypeError, ValueError):
+                            _cn_rmdr = 0
+                        if _cn_rmdr > 0:
+                            logger.info(
+                                f"[롯데ON][취소클레임] 부분취소 스킵: {cn_od_no} "
+                                f"잔여수량={_cn_rmdr}"
+                            )
                             continue
                         cn_ship_status, cn_status = mapped
                         found_in_data_c = False

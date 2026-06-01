@@ -455,6 +455,82 @@ async def sourcing_tracking_result(body: dict[str, Any]) -> dict[str, Any]:
     return res
 
 
+# 롯데ON 취소클레임 진행단계 — '완료' 로 간주하는 코드(멱등 성공 처리용).
+# 그 외 모든 단계는 승인 대상으로 보고 cnclRequestApproval 시도한다.
+# 실측(2026-06-01 getCancellationRequestAndComplateList): odPrgsStepCd = 02 요청 / 21 취소완료
+#   / 22 철회 (문서값 일치, 기존 status sync 의 11/12/13 매핑은 실제로 매칭 안 됨 = 죽은 코드).
+# 21=완료만 done 처리 → 02 요청은 승인 대상. 22 철회는 done 에 안 넣음(승인 시도→실패 시 운영자
+# 수동, false-success 절대 안 만든다). 13 은 혹시 모를 구버전 대비 방어적으로 유지.
+_LOTTEON_CANCEL_DONE_STEPS = {"13", "21"}
+
+
+async def _lotteon_approve_or_direct_cancel(client, ord_row) -> tuple[bool, str]:
+    """롯데ON 취소 마무리 — 라이브 취소클레임 조회로 승인 대상 판별.
+
+    분기:
+      - od_no 매칭 클레임 없음 → 마켓 측 취소요청 자체가 없음 → 판매자직접취소(slrDirectCnclProc)
+      - 승인 대상(요청) 클레임 있음 → cnclRequestApproval (취소요청 승인)
+      - 완료 클레임만 있음 → 이미 승인됨(멱등) → 성공
+
+    클레임이 존재하는데 직접취소로 fallback 하지 않는 이유: 직접취소는 취소요청 대기 건에
+    3006 반환 + seller_cancel_order 가 3006 을 성공으로 처리 → '미승인인데 완료' false-success.
+    """
+    od_no = ord_row.od_no or ord_row.order_number
+    try:
+        claims = await client.get_cancel_orders(days=14)
+    except Exception as e:
+        # 조회 실패 시 직접취소로 내려가면 false-success 위험 → 실패 처리(운영자 수동)
+        return False, f"취소클레임 조회 실패: {e}"
+
+    matched = [c for c in claims if str(c.get("odNo", "") or "") == str(od_no)]
+    if ord_row.od_seq:
+        by_seq = [
+            c for c in matched if str(c.get("odSeq", "") or "") == str(ord_row.od_seq)
+        ]
+        if by_seq:
+            matched = by_seq
+
+    if not matched:
+        # 마켓 측 고객 취소요청 없음 → 판매자가 직접 취소
+        success, message = await client.seller_cancel_order(
+            od_no=od_no,
+            reason_code="CC11",  # 고객변심
+            reason_text="고객 취소요청",
+            od_seq=int(ord_row.od_seq or 1),
+            proc_seq=int(ord_row.proc_seq or 1),
+        )
+        return success, (message if not success else "판매자직접취소 완료")
+
+    pending = [
+        c
+        for c in matched
+        if str(c.get("odPrgsStepCd", "") or "") not in _LOTTEON_CANCEL_DONE_STEPS
+    ]
+    if not pending:
+        # 완료 클레임만 존재 → 이미 승인 처리됨(멱등)
+        return True, "이미 취소 처리된 클레임"
+
+    claim = pending[0]
+    try:
+        await client.approve_cancel(
+            od_no=od_no,
+            clm_no=str(claim.get("clmNo", "") or ""),
+            items=[
+                {
+                    "odSeq": int(claim.get("odSeq", 1) or 1),
+                    "procSeq": int(claim.get("procSeq", 1) or 1),
+                    "orglProcSeq": int(claim.get("orglProcSeq", 1) or 1),
+                    # 승인 사유코드 = 클레임사유코드(clmRsnCd) 그대로, 없으면 106(고객변심)
+                    "slrRsnCd": str(claim.get("clmRsnCd", "") or "106"),
+                    "slrRsnCnts": "고객 취소요청",
+                }
+            ],
+        )
+    except Exception as e:
+        return False, f"취소요청 승인 실패: {e}"
+    return True, "취소요청 승인 완료"
+
+
 async def _maybe_approve_market_cancel(
     sess, ord_row, now_kst_tag: str, sourcing_site: str, sourcing_ord_no: str
 ) -> None:
@@ -610,15 +686,12 @@ async def _maybe_approve_market_cancel(
             except Exception as e:
                 await _record_failure("롯데ON", f"인증 실패: {e}")
                 return
-            success, message = await client.seller_cancel_order(
-                od_no=(ord_row.od_no or ord_row.order_number),
-                reason_code="CC11",  # 고객변심
-                reason_text="고객 취소요청",
-                od_seq=int(ord_row.od_seq or 1),
-                proc_seq=int(ord_row.proc_seq or 1),
-            )
-            if not success:
-                await _record_failure("롯데ON", f"판매자취소 실패: {message}")
+            # 마켓 측 고객 취소요청 건은 취소요청 승인(cnclRequestApproval)으로 닫아야 한다.
+            # 판매자직접취소(slrDirectCnclProc)는 취소요청 대기 건에 쏘면 3006(주문 상태 확인)
+            # 반환되며 고객 취소요청은 미승인 잔존한다. 승인 대상 클레임은 라이브 조회로 찾는다.
+            ok, msg = await _lotteon_approve_or_direct_cancel(client, ord_row)
+            if not ok:
+                await _record_failure("롯데ON", msg)
                 return
             # 같은 od_no 동반 cancel — 기존 패턴 (order.py:2440)
             from sqlalchemy import select as _select
