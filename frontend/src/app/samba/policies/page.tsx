@@ -99,6 +99,7 @@ interface MarketPolicyForm {
   streetPriceRate: number // 시중가 비율 (%)
   ssgBrandMappings?: { brandId: string; brandNm: string }[]
   ssgExtraFeeRate?: number
+  extraFeeRate?: number
 }
 
 
@@ -167,8 +168,9 @@ interface LottePolicy {
   itemQuality: string
   itemQualityNote: string
   itemAs: string
+  extraFeeRate: string
 }
-const defaultLottePolicy: LottePolicy = { mdGsgrNo: '', mdGsgrNm: '', dispNo: '', dispNm: '', stdCatNo: '', stdCatNm: '', brandMappings: [], manufacturer: '', taxType: '', ageLimit: '', purchaseType: '', marginRate: '', saleType: '', saleMethod: '', priceCompareDisplay: '', purchaseQtyLimit: '', optionModify: '', optionStockMgmt: '사용함', imageResize: '', dlvPolcNo: '', dlvPolcNm: '', corpRlsPlSn: '', corpRlsPlNm: '', corpDlvpSn: '', corpDlvpNm: '', addDlvPolcNo: '', addDlvPolcNm: '', ecGoodsArtcCd: '', ecGoodsArtcNm: '', itemMaterial: '', itemColor: '', itemSize: '', itemImport: '', itemImportNote: '', itemWashing: '', itemMfgDate: '', itemQuality: '', itemQualityNote: '', itemAs: '' }
+const defaultLottePolicy: LottePolicy = { mdGsgrNo: '', mdGsgrNm: '', dispNo: '', dispNm: '', stdCatNo: '', stdCatNm: '', brandMappings: [], manufacturer: '', taxType: '', ageLimit: '', purchaseType: '', marginRate: '', extraFeeRate: '', saleType: '', saleMethod: '', priceCompareDisplay: '', purchaseQtyLimit: '', optionModify: '', optionStockMgmt: '사용함', imageResize: '', dlvPolcNo: '', dlvPolcNm: '', corpRlsPlSn: '', corpRlsPlNm: '', corpDlvpSn: '', corpDlvpNm: '', addDlvPolcNo: '', addDlvPolcNm: '', ecGoodsArtcCd: '', ecGoodsArtcNm: '', itemMaterial: '', itemColor: '', itemSize: '', itemImport: '', itemImportNote: '', itemWashing: '', itemMfgDate: '', itemQuality: '', itemQualityNote: '', itemAs: '' }
 
 function extractLotteList<T>(data: unknown, ...keys: string[]): T[] {
   if (!data || typeof data !== 'object') return []
@@ -1236,6 +1238,19 @@ export default function PoliciesPage() {
                           placeholder="30"
                           value={lottePolicy.marginRate}
                           onChange={e => { setLottePolicy(p => ({ ...p, marginRate: e.target.value })); setCurrentMarketPolicy({ ...mp, feeRate: Number(e.target.value) || 0 }); triggerAutoSave() }}
+                        />
+                        <span style={{ padding: '0.3rem 0.5rem', fontSize: '0.8rem', background: '#252525', border: '1px solid #2D2D2D', borderLeft: 'none', borderRadius: '0 4px 4px 0', color: '#888' }}>%</span>
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.375rem' }}>
+                      <span style={{ color: '#888', fontSize: '0.8125rem', minWidth: '72px', flexShrink: 0 }}>추가수수료율</span>
+                      <div style={{ display: 'flex', alignItems: 'center' }}>
+                        <input
+                          type="text"
+                          style={{ width: '60px', padding: '0.3rem 0.4rem', fontSize: '0.8rem', background: '#1A1A1A', border: '1px solid #2D2D2D', borderRadius: '4px 0 0 4px', color: '#E5E5E5' }}
+                          placeholder="0"
+                          value={lottePolicy.extraFeeRate}
+                          onChange={e => { setLottePolicy(p => ({ ...p, extraFeeRate: e.target.value })); setCurrentMarketPolicy({ ...mp, extraFeeRate: Number(e.target.value) || 0 }); triggerAutoSave() }}
                         />
                         <span style={{ padding: '0.3rem 0.5rem', fontSize: '0.8rem', background: '#252525', border: '1px solid #2D2D2D', borderLeft: 'none', borderRadius: '0 4px 4px 0', color: '#888' }}>%</span>
                       </div>
