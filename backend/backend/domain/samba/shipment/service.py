@@ -804,6 +804,11 @@ class SambaShipmentService:
             transmit_result={},
             transmit_error={},
         )
+        # greenlet 방지: shipment.id 를 plain 값으로 스냅샷. 전송 루프 내부의
+        # connection-refresh rollback(_dispatch_one 시작부) 이 shipment ORM 을 expire
+        # 시킨 뒤 루프 이후(merge 단계 update_async(shipment.id) 등)에서 shipment.id
+        # 접근 시 reload→MissingGreenlet 발생(잔여 전송실패 원인). 불변 PK 라 스냅샷 안전.
+        _shipment_id = shipment.id
 
         # 2. 상품 데이터 조회
         product_repo = SambaCollectedProductRepository(self.session)
@@ -2363,7 +2368,7 @@ class SambaShipmentService:
             _update_result["plugin_messages"] = plugin_messages
         if _update_result:
             final_update["update_result"] = _update_result
-        updated = await self.repo.update_async(shipment.id, **final_update)
+        updated = await self.repo.update_async(_shipment_id, **final_update)
 
         # 6. 상품 상태 업데이트 (등록된 계정 목록)
         # 성공한 계정은 추가, 실패한 계정은 제거
@@ -2408,12 +2413,12 @@ class SambaShipmentService:
             await product_repo.update_async(product_id, **update_data)
 
         logger.info(
-            f"Shipment {shipment.id} 완료 status={final_status} "
+            f"Shipment {_shipment_id} 완료 status={final_status} "
             f"product={product_id} 성공={sum(1 for v in values if v == 'success')}/{len(values)}"
         )
         if not updated:
-            logger.warning(f"Shipment {shipment.id} 업데이트 실패, DB 재조회")
-            updated = await self.repo.get_async(shipment.id)
+            logger.warning(f"Shipment {_shipment_id} 업데이트 실패, DB 재조회")
+            updated = await self.repo.get_async(_shipment_id)
         return updated or shipment
 
     # ==================== 상품명 조합 ====================
