@@ -17,6 +17,7 @@ from backend.utils.logger import logger
 
 import math
 
+
 # 마켓타입(영문 코드) → 정책키(한글 표시명) 매핑
 # 마켓 계정의 market_type 필드 값을 정책 설정의 per_market 키로 변환할 때 사용
 MARKET_TYPE_TO_POLICY_KEY: dict[str, str] = {
@@ -2050,28 +2051,46 @@ class SambaShipmentService:
                     _imm_snap = res.get("sent_snapshot")
                     if _imm_nos or _imm_snap:
                         try:
-                            _pr_now = await product_repo.get_async(product_id)
-                            if _pr_now:
-                                _imm_reg = list(
-                                    set(
-                                        (_pr_now.registered_accounts or [])
-                                        + [account_id]
+                            if _imm_nos:
+                                # 신규 등록: registered_accounts + market_product_nos 갱신
+                                _pr_now = await product_repo.get_async(product_id)
+                                if _pr_now:
+                                    _imm_reg = list(
+                                        set(
+                                            (_pr_now.registered_accounts or [])
+                                            + [account_id]
+                                        )
                                     )
-                                )
-                                _imm_mpn = dict(_pr_now.market_product_nos or {})
-                                _imm_mpn.update(_imm_nos)
-                                # last_sent_data: sent_snapshot 저장 + failed_at 제거
-                                _imm_lsd = dict(_pr_now.last_sent_data or {})
-                                if _imm_snap:
-                                    _imm_lsd[account_id] = _imm_snap
-                                elif isinstance(_imm_lsd.get(account_id), dict):
-                                    _imm_lsd[account_id].pop("failed_at", None)
-                                await product_repo.update_async(
-                                    product_id,
-                                    registered_accounts=_imm_reg,
-                                    market_product_nos=_imm_mpn,
-                                    status="registered",
-                                    last_sent_data=_imm_lsd or None,
+                                    _imm_mpn = dict(_pr_now.market_product_nos or {})
+                                    _imm_mpn.update(_imm_nos)
+                                    await product_repo.update_async(
+                                        product_id,
+                                        registered_accounts=_imm_reg,
+                                        market_product_nos=_imm_mpn,
+                                        status="registered",
+                                    )
+                                    # update_async 내부에서 commit 완료
+                            if _imm_snap:
+                                # last_sent_data: 계정 하나만 atomic merge
+                                # (전체 덮어쓰기 시 다른 그룹 동시 전송과 race condition 발생)
+                                import json as _imm_j  # noqa: F811
+                                from sqlalchemy import text as _imm_sa_text  # noqa: F811
+
+                                await self.session.execute(
+                                    _imm_sa_text(
+                                        "UPDATE samba_collected_product"
+                                        " SET last_sent_data = ("
+                                        "  COALESCE(CAST(last_sent_data AS jsonb), '{}'::jsonb)"
+                                        "  || CAST(:updates AS jsonb))::json,"
+                                        " updated_at = NOW()"
+                                        " WHERE id = :pid"
+                                    ),
+                                    {
+                                        "updates": _imm_j.dumps(
+                                            {account_id: _imm_snap}
+                                        ),
+                                        "pid": product_id,
+                                    },
                                 )
                                 await self.session.commit()
                         except Exception as _ie:
@@ -2131,13 +2150,16 @@ class SambaShipmentService:
 
         # 결과 병합 + DB 일괄 업데이트
         merged_nos = dict(product_row.market_product_nos or {})
-        merged_sent = dict(product_row.last_sent_data or {})
         # A칸(registered_accounts) 동기화: 정상 전송 성공 경로에서도 함께 갱신
         # — 기존엔 스마트스토어 group 등록·삭제·재시도 경로만 A칸을 갱신해서
         #   11번가/쿠팡/롯데홈 등 일반 마켓은 B칸만 채워지고 A칸은 backfill 루프가
         #   채워줄 때까지(때로는 1시간+) 비어있어, 테트리스 sync가 같은 상품을
         #   '미등록'으로 오판해 헛걸음 잡을 반복 생성했음 → 'skipped(이미 등록됨, 변동 없음)' 로그 발생.
         merged_reg = list(product_row.registered_accounts or [])
+        # lsd_updates: 이번 그룹에서 처리한 계정들의 last_sent_data 변경분만 수집
+        # (전체 snapshot 덮어쓰기 → 동시 실행 그룹 간 race condition 발생하므로 계정별 atomic merge로 변경)
+        _prev_lsd = product_row.last_sent_data or {}
+        lsd_updates: dict[str, Any] = {}
         for ar in account_results:
             if isinstance(ar, Exception):
                 continue
@@ -2163,35 +2185,31 @@ class SambaShipmentService:
                 and aid not in merged_reg
             ):
                 merged_reg.append(aid)
-            # 스냅샷 병합
+            # last_sent_data 변경분 수집 (atomic merge용)
             if ar.get("sent_snapshot"):
-                # 전송 성공 — sent_snapshot으로 덮어써서 기존 failed_at 마킹 자동 제거
-                merged_sent[aid] = ar["sent_snapshot"]
+                # 전송 성공 — sent_snapshot(sent_at 포함, failed_at 없음)으로 교체
+                lsd_updates[aid] = ar["sent_snapshot"]
             elif ar.get("status") == "failed":
-                # 전송 실패 — 기존 last_sent 보존 + failed_at 마킹 (오토튠이 다음 cycle에서
-                # 무조건 재시도 트리거. last_sent.sale_price는 안 갱신해 expected==last
-                # 비교는 그대로 동작하지만 failed_at 존재 여부로 강제 전송)
-                _existing = dict(merged_sent.get(aid, {}) or {})
+                # 전송 실패 — 기존 last_sent 보존 + failed_at 마킹
+                _existing = dict(_prev_lsd.get(aid, {}) or {})
                 _existing["failed_at"] = datetime.now(UTC).isoformat()
                 # 안전망: 동일 (cp, account) 전송 실패 누적 — 3회 도달 시 테트리스 sync에서 제외
-                # (스마트스토어 등 plugin 응답 추출 실패로 A칸 동기화 못 해 무한 재등록 가는 사고 방지)
                 _existing["failure_count"] = (
                     int(_existing.get("failure_count") or 0) + 1
                 )
-                merged_sent[aid] = _existing
-            elif ar.get("_clear_failed_at") and aid in merged_sent:
-                # _skip_retry 케이스 (플레이오토 미등록 상품코드): 기존 failed_at 제거 → 재시도 루프 차단
-                _existing = dict(merged_sent[aid] or {})
+                lsd_updates[aid] = _existing
+            elif ar.get("_clear_failed_at") and aid in _prev_lsd:
+                # _skip_retry 케이스 (플레이오토 미등록 상품코드): failed_at 제거
+                _existing = dict(_prev_lsd[aid] or {})
                 _existing.pop("failed_at", None)
-                merged_sent[aid] = _existing
+                lsd_updates[aid] = _existing
 
-        # DB 1회 업데이트
+        # DB 업데이트 ①: market_product_nos + registered_accounts
         try:
             await product_repo.update_async(
                 product_id,
                 market_product_nos=merged_nos or None,
                 registered_accounts=merged_reg or None,
-                last_sent_data=merged_sent or None,
             )
         except Exception as _db_e:
             logger.warning(f"[전송] DB 업데이트 실패: {_db_e}")
@@ -2199,6 +2217,32 @@ class SambaShipmentService:
                 await self.session.rollback()
             except Exception:
                 pass
+
+        # DB 업데이트 ②: last_sent_data — 계정별 atomic JSONB merge (race condition 방지)
+        # json 컬럼이므로 CAST AS jsonb 후 :: 연산자 적용, 결과를 ::json으로 저장
+        if lsd_updates:
+            try:
+                import json as _lsd_j  # noqa: F811
+                from sqlalchemy import text as _lsd_sa_text  # noqa: F811
+
+                await self.session.execute(
+                    _lsd_sa_text(
+                        "UPDATE samba_collected_product"
+                        " SET last_sent_data = ("
+                        "  COALESCE(CAST(last_sent_data AS jsonb), '{}'::jsonb)"
+                        "  || CAST(:updates AS jsonb))::json,"
+                        " updated_at = NOW()"
+                        " WHERE id = :pid"
+                    ),
+                    {"updates": _lsd_j.dumps(lsd_updates), "pid": product_id},
+                )
+                await self.session.commit()
+            except Exception as _lsd_e:
+                logger.warning(f"[전송] last_sent_data atomic merge 실패: {_lsd_e}")
+                try:
+                    await self.session.rollback()
+                except Exception:
+                    pass
 
         # 마켓삭제 성공 + DB 업데이트 실패 계정 → 새 세션으로 registered_accounts 재시도
         _failed_db_accs = [

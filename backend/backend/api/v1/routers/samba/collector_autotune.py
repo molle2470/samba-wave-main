@@ -1292,6 +1292,58 @@ async def _site_autotune_loop(device_id: str, site: str):
                             if _last_exc:
                                 raise _last_exc
 
+                        async def _atomic_merge_lsd(pid: str, updates: dict):
+                            """last_sent_data 특정 계정들만 atomic JSONB merge.
+
+                            전체 snapshot 덮어쓰기 대신 계정별 부분 갱신으로
+                            동시 실행 그룹 간 race condition 방지.
+                            json 컬럼이므로 CAST AS jsonb 후 || 연산자 적용 → ::json 저장.
+                            """
+                            import json as _alm_j  # noqa: F811
+                            from sqlalchemy import text as _alm_text  # noqa: F811
+                            from backend.db.orm import (
+                                get_write_session as _get_alm_session,
+                            )
+
+                            _stmt = _alm_text(
+                                "UPDATE samba_collected_product"
+                                " SET last_sent_data = ("
+                                "  COALESCE(CAST(last_sent_data AS jsonb), '{}'::jsonb)"
+                                "  || CAST(:updates AS jsonb))::json,"
+                                " updated_at = NOW()"
+                                " WHERE id = :pid"
+                            )
+                            _last_exc_alm: Exception | None = None
+                            for _alm_attempt in range(2):
+                                try:
+                                    async with _get_alm_session() as _alm_s:
+                                        await _alm_s.execute(
+                                            _stmt,
+                                            {
+                                                "updates": _alm_j.dumps(updates),
+                                                "pid": pid,
+                                            },
+                                        )
+                                        await _alm_s.commit()
+                                    return
+                                except Exception as _alm_ex:
+                                    _last_exc_alm = _alm_ex
+                                    if (
+                                        _is_stale_conn_error(_alm_ex)
+                                        and _alm_attempt == 0
+                                    ):
+                                        log.warning(
+                                            "[오토튠][DB재시도] atomic_merge_lsd %s"
+                                            " 좀비 connection → 재시도: %s",
+                                            pid,
+                                            str(_alm_ex)[:120],
+                                        )
+                                        await asyncio.sleep(0.1)
+                                        continue
+                                    raise
+                            if _last_exc_alm:
+                                raise _last_exc_alm
+
                         async def _on_result(product, r, idx=0, total=0):
                             """리프레시 직후 호출 — DB 업데이트 + 즉시 마켓 전송."""
                             nonlocal \
@@ -2444,14 +2496,27 @@ async def _site_autotune_loop(device_id: str, site: str):
                             # → service.start_update 내부 asyncio.gather가 계정별 동시 전송 (account 단위 세마포어로 안전)
 
                             # preemptive failed_at DB 박기 — transmit task cancel/누락 대비.
-                            # 메모리 last_sent[acc_id]["failed_at"] 를 _transmit_queue.append 직후
-                            # 마킹했으므로 여기서 DB 반영. transmit 성공 시 sent_snapshot 덮어쓰기로 자동 제거.
+                            # 전체 snapshot 덮어쓰기 대신 큐 계정들만 atomic merge
+                            # (전체 덮어쓰기 시 이전 사이클 background transmit의 sent_snapshot을 stale 값으로 되돌리는 race 발생)
                             if _transmit_queue:
                                 try:
-                                    await _partial_update(
-                                        r.product_id,
-                                        {"last_sent_data": dict(last_sent)},
-                                    )
+                                    _pre_updates = {}
+                                    for (
+                                        _pre_pid,
+                                        _pre_items,
+                                        _pre_acc,
+                                        _pre_label,
+                                        _pre_action,
+                                    ) in _transmit_queue:
+                                        _pre_data = dict(last_sent.get(_pre_acc) or {})
+                                        _pre_data["failed_at"] = datetime.now(
+                                            timezone.utc
+                                        ).isoformat()
+                                        _pre_updates[_pre_acc] = _pre_data
+                                    if _pre_updates:
+                                        await _atomic_merge_lsd(
+                                            r.product_id, _pre_updates
+                                        )
                                 except Exception as _pe:
                                     log.warning(
                                         "[오토튠][preemptive] %s last_sent_data 갱신 실패: %s",
