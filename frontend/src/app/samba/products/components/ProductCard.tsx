@@ -510,6 +510,22 @@ const ProductCard = React.memo(function ProductCard({
           displayCalcStr = `${curSym}${fmt(displayPrice)} = ${r.calcStr.split(' = ')[1]} + 300원올림 +${fmt(diff)}`
         }
       }
+      // 롯데홈쇼핑: 추가수수료율 역산 + 10원 단위 올림
+      if (marketName === '롯데홈쇼핑') {
+        const lhExtraFeeRate = Number((v as Record<string, unknown>).extraFeeRate || 0)
+        if (lhExtraFeeRate > 0 && lhExtraFeeRate < 100) {
+          const before = displayPrice
+          displayPrice = Math.ceil(before / (1 - lhExtraFeeRate / 100))
+          const extraAmt = displayPrice - before
+          const baseCalc = displayCalcStr.split(' = ').slice(1).join(' = ')
+          displayCalcStr = `${curSym}${fmt(displayPrice)} = ${baseCalc} + 추가수수료 ${fmt(extraAmt)}(${lhExtraFeeRate}%)`
+        }
+        const rounded = Math.ceil(displayPrice / 10) * 10
+        if (rounded !== displayPrice) {
+          displayCalcStr = displayCalcStr.replace(/^[₩$][\d,]+/, `${curSym}${fmt(rounded)}`)
+          displayPrice = rounded
+        }
+      }
       // SSG: 추가수수료율 역산 + 100원 단위 올림
       if (marketName === '신세계몰(전시)') {
         if (acctExtraFeeRate > 0) {
