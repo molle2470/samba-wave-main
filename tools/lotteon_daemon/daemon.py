@@ -78,7 +78,7 @@ except ImportError:
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.4.26"
+DAEMON_VERSION = "1.4.27"
 
 
 # ── 가격수집 도메인 화이트리스트 ───────────────────────────────────────────
@@ -1366,6 +1366,12 @@ async def ensure_logged_in(
 # 큐가 sourcingAccountId 순으로 잡을 주므로 같은 계정 연속 → 스왑 횟수 = 계정 수.
 _last_tracking_account: dict[str, str] = {}
 
+# (site|account_id) → 로그인 auth 실패 시각. 비번 틀린 계정에 잡마다 재로그인 시도하면
+# 사이트가 5회+ 실패로 계정을 차단한다(2026-06-01 SSG 사고). 실패 1회 후 쿨다운 동안
+# 그 계정 재시도 스킵 → 로그인 시도 1회로 캡 → 차단 방지. 비번 수정 후 쿨다운 지나면 재시도.
+_failed_login_accounts: dict[str, float] = {}
+_FAILED_LOGIN_COOLDOWN_SEC = 1800  # 30분
+
 
 async def logout_site(page: Page, handler: SiteHandler) -> None:
     """계정 전환용 정식 로그아웃 — 서버 세션 expire + Set-Cookie 쿠키 정리."""
@@ -1396,6 +1402,22 @@ async def ensure_logged_in_as_account(
     account_id 없으면 site 기본 계정으로 로그인(레거시 폴백).
     """
     site = handler.site
+    _fkey = f"{site}|{account_id or '_default'}"
+
+    # auth 실패 쿨다운 — 직전 로그인 실패한 계정은 재시도 스킵(사이트 계정 차단 방지).
+    _ft = _failed_login_accounts.get(_fkey, 0.0)
+    if _ft:
+        _elapsed = time.time() - _ft
+        if _elapsed < _FAILED_LOGIN_COOLDOWN_SEC:
+            logger.warning(
+                "%s 계정 %s 로그인 실패 쿨다운 — 재시도 스킵(차단 방지, %d초 남음). 비번 확인 필요.",
+                site,
+                account_id or "기본",
+                int(_FAILED_LOGIN_COOLDOWN_SEC - _elapsed),
+            )
+            return False
+        _failed_login_accounts.pop(_fkey, None)  # 쿨다운 만료 → 1회 재시도 허용
+
     last = _last_tracking_account.get(site, "")
 
     # 같은 계정 연속 + 세션 살아있으면 스왑 스킵 (빠른 경로)
@@ -1418,6 +1440,16 @@ async def ensure_logged_in_as_account(
     ok = await auto_login_site(page, handler, cred)
     if ok:
         _last_tracking_account[site] = account_id or "_default"
+        _failed_login_accounts.pop(_fkey, None)  # 성공 → 쿨다운 해제
+    else:
+        # auth 실패 → 쿨다운 시작 (잡마다 재로그인 폭주로 인한 계정 차단 차단)
+        _failed_login_accounts[_fkey] = time.time()
+        logger.warning(
+            "%s 계정 %s 로그인 실패 — %d분 쿨다운(재시도 차단). 비번 확인 필요.",
+            site,
+            account_id or "기본",
+            _FAILED_LOGIN_COOLDOWN_SEC // 60,
+        )
     return ok
 
 
