@@ -773,9 +773,9 @@ class SambaShipmentService:
 
         logger.info(f"[메모리] 전송시작: {_mem_mb()}MB")
 
-        # commit 후 ORM 객체가 expired → _dispatch_one 내 lazy load 시도 → greenlet_spawn
-        # expire_on_commit=False로 이 세션에서 읽은 객체들이 commit 후에도 유효하게 유지
-        self.session.sync_session.expire_on_commit = False
+        # greenlet_spawn 방지: account 객체를 아래 expunge로 세션에서 분리하는 것이 진짜 픽스.
+        # expire_on_commit=False는 sessionmaker(orm.py:195) 에서 이미 전역 설정되어 있어 여기선 no-op.
+        # (삭제하지 않고 명시적으로 남겨 의도를 표시)
 
         from backend.domain.samba.account.model import SambaMarketAccount
         from backend.domain.samba.account.repository import SambaMarketAccountRepository
@@ -1284,8 +1284,8 @@ class SambaShipmentService:
         for _acc_obj in _dispatch_account_map.values():
             try:
                 self.session.expunge(_acc_obj)
-            except Exception:
-                pass
+            except Exception as _exp_e:
+                logger.debug(f"[전송] account expunge 실패 (계속 진행): {_exp_e}")
 
         # 배치 읽기 완료 — soldout refresh(최대 30초) 전 커밋으로 idle in transaction 방지
         # commit 실패 시 rollback으로 SessionTransaction PREPARED 고착 차단(이슈#276)
@@ -1442,10 +1442,15 @@ class SambaShipmentService:
                 "clear_nos": [],
                 "db_update_failed": False,
             }
-            # 기존 rollback 2개 제거:
-            # - "직전 계정 청소" rollback: 계정별 개별 세션으로 변경됐으므로 불필요
-            # - "SELECT 1 + rollback" connection refresh: 역시 불필요
-            # 두 rollback 모두 ORM 객체를 expired 시켜 greenlet_spawn 에러 유발.
+            # connection refresh: pool_recycle 후 만료된 연결 사전 교체.
+            # account 객체는 expunge로 분리, product_row 필드는 _row_* 스냅샷으로 보존됨.
+            try:
+                from sqlalchemy import text as _gc_text
+
+                await self.session.execute(_gc_text("SELECT 1"))
+                await self.session.rollback()
+            except Exception:
+                pass
             try:
                 # 전송 시작 전 취소 체크
                 if is_cancel_requested():
@@ -2092,6 +2097,8 @@ class SambaShipmentService:
                                                 status="registered",
                                             )
                                         )
+                                # _imm_nos 먼저 커밋 — _imm_snap 실패해도 등록번호/registered_accounts 보존
+                                await _imm_s.commit()
                                 if _imm_snap:
                                     await _imm_s.execute(
                                         _imm_sa_text(
@@ -2109,7 +2116,7 @@ class SambaShipmentService:
                                             "pid": product_id,
                                         },
                                     )
-                                await _imm_s.commit()
+                                    await _imm_s.commit()  # _imm_snap 별도 커밋
                         except Exception as _ie:
                             logger.warning(
                                 f"[전송] {market_type} 즉시저장 실패 (무시): {_ie}"
@@ -2146,6 +2153,12 @@ class SambaShipmentService:
                     pass
             return res
 
+        # product_row 필드 스냅샷 — _dispatch_one 내 connection refresh rollback 후에도
+        # ORM lazy load 없이 안전하게 참조할 수 있도록 순수 Python 타입으로 추출
+        _row_mpn = dict(product_row.market_product_nos or {})
+        _row_reg = list(product_row.registered_accounts or [])
+        _row_lsd = dict(product_row.last_sent_data or {})
+
         # 계정별 순차 전송 — 동일 세션 병렬 사용 시 asyncpg 연결 오염 방지
         # 한 계정 끝나는 즉시 on_account_done 콜백을 발사해 호출자가 진행 로그를
         # 실시간으로 흘릴 수 있도록 한다(오토튠 워룸 로그 패널이 활용).
@@ -2162,16 +2175,16 @@ class SambaShipmentService:
                     )
 
         # 결과 병합 + DB 일괄 업데이트
-        merged_nos = dict(product_row.market_product_nos or {})
+        merged_nos = dict(_row_mpn)
         # A칸(registered_accounts) 동기화: 정상 전송 성공 경로에서도 함께 갱신
         # — 기존엔 스마트스토어 group 등록·삭제·재시도 경로만 A칸을 갱신해서
         #   11번가/쿠팡/롯데홈 등 일반 마켓은 B칸만 채워지고 A칸은 backfill 루프가
         #   채워줄 때까지(때로는 1시간+) 비어있어, 테트리스 sync가 같은 상품을
         #   '미등록'으로 오판해 헛걸음 잡을 반복 생성했음 → 'skipped(이미 등록됨, 변동 없음)' 로그 발생.
-        merged_reg = list(product_row.registered_accounts or [])
+        merged_reg = list(_row_reg)
         # lsd_updates: 이번 그룹에서 처리한 계정들의 last_sent_data 변경분만 수집
         # (전체 snapshot 덮어쓰기 → 동시 실행 그룹 간 race condition 발생하므로 계정별 atomic merge로 변경)
-        _prev_lsd = product_row.last_sent_data or {}
+        _prev_lsd = _row_lsd
         lsd_updates: dict[str, Any] = {}
         for ar in account_results:
             if isinstance(ar, Exception):
@@ -2339,18 +2352,9 @@ class SambaShipmentService:
         ]
         # DB에서 최신 상태 다시 읽기 (전송 중 market_product_nos가 업데이트되었을 수 있음)
         refreshed = await product_repo.get_async(product_id)
-        existing = (
-            refreshed.registered_accounts
-            if refreshed
-            else product_row.registered_accounts
-        ) or []
+        existing = (refreshed.registered_accounts if refreshed else _row_reg) or []
         existing_nos = dict(
-            (
-                refreshed.market_product_nos
-                if refreshed
-                else product_row.market_product_nos
-            )
-            or {}
+            (refreshed.market_product_nos if refreshed else _row_mpn) or {}
         )
         # 성공 추가 + 신규등록 실패만 제거
         new_accounts = list(
