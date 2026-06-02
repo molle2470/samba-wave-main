@@ -437,7 +437,7 @@ class SambaShipmentService:
                 )
                 processed += 1
             except Exception as exc:
-                logger.error(f"상품 {product_id} 전송 실패: {exc}")
+                logger.error(f"상품 {product_id} 전송 실패: {exc}", exc_info=True)
                 results.append(
                     {
                         "product_id": product_id,
