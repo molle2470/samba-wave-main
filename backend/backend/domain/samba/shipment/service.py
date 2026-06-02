@@ -337,6 +337,12 @@ class SambaShipmentService:
         name_rule = result.first()
         if not name_rule:
             return
+        # greenlet 방지: name_rule 을 세션에서 분리(expunge).
+        # 이 객체는 product_dict["_name_rule"] 로 per-account 전송 루프 깊은 곳(_dispatch_one
+        # 1680 .market_name_compositions)까지 운반되는데, 그 사이 rollback() 이 ORM 을 expire
+        # 시키면 expired 컬럼 reload(SELECT)가 sync getattr 컨텍스트에서 발생 → MissingGreenlet.
+        # 방금 SELECT 로 모든 컬럼이 로드된 상태이므로 detached 로도 접근 안전.
+        self.session.expunge(name_rule)
         if product_dict.get("options"):
             product_dict["options"] = self._apply_option_name_rules(
                 product_dict["options"], name_rule
@@ -1177,6 +1183,15 @@ class SambaShipmentService:
         policy = await policy_repo.get_async(product_row.applied_policy_id)
         if policy and policy.market_policies:
             policy_market_data = policy.market_policies
+        # greenlet 방지: policy 도 세션에서 분리(expunge).
+        # _dispatch_one 내부(1705 policy.extras / 1720 policy.pricing 등)에서 접근되는데
+        # connection refresh rollback 이후면 expired reload → MissingGreenlet.
+        # get_async 는 defer 없이 전 컬럼 로드 → detached 접근 안전.
+        if policy is not None:
+            try:
+                self.session.expunge(policy)
+            except Exception as _exp_pol:
+                logger.debug(f"[전송] policy expunge 실패 (계속 진행): {_exp_pol}")
 
         # 글로벌 삭제어 조회 (compose 전에 미리 로드)
         from backend.domain.samba.forbidden.repository import (
@@ -1198,6 +1213,9 @@ class SambaShipmentService:
                 result = await self.session.exec(stmt)
                 name_rule = result.first()
                 if name_rule:
+                    # greenlet 방지: 세션 분리 — 이후 _dispatch_one 1680
+                    # .market_name_compositions 접근 시 expired reload 차단 (위 _apply_name_rule_effects 동일 사유)
+                    self.session.expunge(name_rule)
                     product_dict["name"] = self._compose_product_name(
                         product_dict, name_rule, deletion_words=deletion_words
                     )
@@ -2158,6 +2176,15 @@ class SambaShipmentService:
         _row_mpn = dict(product_row.market_product_nos or {})
         _row_reg = list(product_row.registered_accounts or [])
         _row_lsd = dict(product_row.last_sent_data or {})
+        # greenlet 방지: product_row 도 세션에서 분리(expunge).
+        # _dispatch_one 시작부 connection refresh(SELECT 1 + rollback)가 세션 내 모든
+        # ORM 을 expire 시키는데, product_row.name/source_site/tenant_id/market_product_nos 등을
+        # 그 이후(1586/1721/1784/1805/1910 등) 직접 접근하면 expired reload → MissingGreenlet.
+        # get_async 는 defer 없이 전 컬럼 로드하므로 detached 상태로도 접근 안전.
+        try:
+            self.session.expunge(product_row)
+        except Exception as _exp_pr:
+            logger.debug(f"[전송] product_row expunge 실패 (계속 진행): {_exp_pr}")
 
         # 계정별 순차 전송 — 동일 세션 병렬 사용 시 asyncpg 연결 오염 방지
         # 한 계정 끝나는 즉시 on_account_done 콜백을 발사해 호출자가 진행 로그를

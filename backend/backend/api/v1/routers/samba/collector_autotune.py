@@ -2594,6 +2594,17 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                         Exception(str(_eerr))
                                                     ):
                                                         _stale_in_result = True
+                                                    # product-level 에러(start_update 가 예외를
+                                                    # 잡아 transmit_error 없이 error 만 채운 경우 —
+                                                    # greenlet 등)도 stale 판정 → 새 세션 재시도.
+                                                    _row_err = _rr.get("error")
+                                                    if (
+                                                        _row_err
+                                                        and _is_stale_conn_error(
+                                                            Exception(str(_row_err))
+                                                        )
+                                                    ):
+                                                        _stale_in_result = True
                                                     break
                                                 if (
                                                     _stale_in_result
@@ -2676,10 +2687,26 @@ async def _site_autotune_loop(device_id: str, site: str):
                                         _row_status = (
                                             _tx_row.get("status") if _tx_row else None
                                         )
-                                        _acc_ok = not _acc_err and (
-                                            _acc_status
-                                            in (None, "success", "completed")
-                                            or _row_status in ("success", "completed")
+                                        # product-level 에러(예: start_update 가 예외를 잡아
+                                        # {status:"failed", error:...} 만 반환 — transmit_result/
+                                        # transmit_error 비어있음) 도 실패로 인정.
+                                        # 이 가드 없으면 _acc_status=None 이 성공으로 오판돼
+                                        # 실제 전송 실패가 "전송완료" 로 거짓 로깅됨(greenlet 사고).
+                                        _row_error = (
+                                            _tx_row.get("error") if _tx_row else None
+                                        )
+                                        # _tx_row 자체가 없으면(결과 0건) 성공 근거 없음 → 실패.
+                                        _acc_ok = (
+                                            _tx_row is not None
+                                            and not _acc_err
+                                            and not _row_error
+                                            and _row_status != "failed"
+                                            and (
+                                                _acc_status
+                                                in (None, "success", "completed")
+                                                or _row_status
+                                                in ("success", "completed")
+                                            )
                                         )
                                         _acc_was_deleted = False
                                         if _tx_row:
@@ -2716,11 +2743,9 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                     f"{_idx_pfx}{_label}: {_action_text} 전송완료{_t}",
                                                 )
                                         else:
-                                            _fail_msg = (
-                                                str(_acc_err)[:200]
-                                                if _acc_err
-                                                else "결과없음"
-                                            )
+                                            _fail_msg = str(
+                                                _acc_err or _row_error or "결과없음"
+                                            )[:200]
                                             _log_line(
                                                 _site,
                                                 _pid,
