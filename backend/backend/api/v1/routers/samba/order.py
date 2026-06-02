@@ -2602,6 +2602,52 @@ async def approve_cancel(
         # - release_status='Y'/'S'/None  → 처리 불가/이미 처리됨 → 400
         from backend.domain.samba.proxy.coupang import CoupangApiError, CoupangClient
 
+        extras = account.additional_fields or {}
+        access_key = extras.get("accessKey", "") or account.api_key or ""
+        secret_key = extras.get("secretKey", "") or account.api_secret or ""
+        vendor_id = extras.get("vendorId", "") or account.seller_id or ""
+        if not all([access_key, secret_key, vendor_id]):
+            raise HTTPException(
+                status_code=400,
+                detail="쿠팡 인증정보 없음 (accessKey/secretKey/vendorId)",
+            )
+
+        client = CoupangClient(access_key, secret_key, vendor_id)
+
+        # 0) 결제완료 단계 즉시취소 분기 — 쿠팡이 자동 취소하므로 승인 호출 불필요.
+        #    발주서 단건 재조회로 쿠팡 현재 상태(진실의 원천)를 확인해 이미 CANCEL이면
+        #    상태만 '취소완료'로 동기화하고 종료. (receiptId 없는 즉시취소 케이스 구제)
+        live_status = ""
+        if order.status != "cancelled":
+            _box_id = None
+            try:
+                # 쿠팡 order_number = shipmentBoxId (parse 규칙)
+                _box_id = int(order.order_number)
+            except (TypeError, ValueError):
+                _box_id = None
+            if _box_id:
+                try:
+                    _sheet = await client.get_ordersheet_by_box_id(_box_id)
+                    _data = _sheet.get("data") if isinstance(_sheet, dict) else None
+                    if isinstance(_data, list):
+                        _data = _data[0] if _data else None
+                    if isinstance(_data, dict):
+                        live_status = (_data.get("status") or "").upper()
+                except Exception as _le:
+                    logger.warning(f"[취소승인] 쿠팡 단건 조회 실패(무시): {_le}")
+
+        if order.status == "cancelled" or live_status == "CANCEL":
+            await svc.update_order(
+                order_id,
+                {"shipping_status": "취소완료", "status": "cancelled"},
+            )
+            logger.info(
+                f"[취소승인] 쿠팡 {order.order_number} 즉시취소 완료 — 상태 동기화 "
+                f"(live_status={live_status or 'DB cancelled'})"
+            )
+            return {"ok": True, "message": "쿠팡 즉시취소 완료 (상태 동기화)"}
+
+        # 1) 상품준비중 단계 출고중지 승인 경로 — receiptId 필수
         if not order.cancel_receipt_id:
             raise HTTPException(
                 status_code=400,
@@ -2623,17 +2669,6 @@ async def approve_cancel(
                 detail=f"쿠팡 release_status={rls} — 처리 불가 또는 이미 처리됨",
             )
 
-        extras = account.additional_fields or {}
-        access_key = extras.get("accessKey", "") or account.api_key or ""
-        secret_key = extras.get("secretKey", "") or account.api_secret or ""
-        vendor_id = extras.get("vendorId", "") or account.seller_id or ""
-        if not all([access_key, secret_key, vendor_id]):
-            raise HTTPException(
-                status_code=400,
-                detail="쿠팡 인증정보 없음 (accessKey/secretKey/vendorId)",
-            )
-
-        client = CoupangClient(access_key, secret_key, vendor_id)
         cancel_count = int(order.quantity or 1)
         try:
             await client.stopped_shipment(
@@ -7665,6 +7700,24 @@ async def sync_orders_from_markets(
                             if rev > 0
                             else "0.00"
                         )
+                    # 취소·반품 클레임 필드 백필 — 기존주문이 나중에 취소요청/반품요청으로
+                    # 전환될 때 receiptId·release_status·사유가 update_fields에서 누락돼
+                    # 영영 저장 안 되던 버그 수정 (쿠팡 취소승인 시 receiptId 미수집 차단).
+                    # parse가 채워준 값만, 기존값과 다를 때만 반영 (NULL 덮어쓰기 금지).
+                    for _cf in (
+                        "cancel_receipt_id",
+                        "cancel_release_status",
+                        "cancel_release_stop_status",
+                        "cancel_reason_code",
+                        "cancel_reason_text",
+                        "cancel_reason_category1",
+                        "cancel_reason_category2",
+                        "cancel_fault_by",
+                        "cancel_requested_at",
+                    ):
+                        _cv = order_data.get(_cf)
+                        if _cv is not None and _cv != getattr(existing, _cf, None):
+                            update_fields[_cf] = _cv
                     if update_fields:
                         await svc.update_order(existing.id, update_fields)
                     continue
