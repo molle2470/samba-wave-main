@@ -1,4 +1,4 @@
-﻿"""소싱 관련 엔드포인트 (sourcing_queue_router 포함)."""
+"""소싱 관련 엔드포인트 (sourcing_queue_router 포함)."""
 
 import asyncio
 from typing import Any
