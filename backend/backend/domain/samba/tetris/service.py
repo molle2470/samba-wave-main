@@ -25,6 +25,12 @@ _BOARD_CACHE_TTL = 300.0
 _board_cache: dict = {}
 _board_cache_lock = asyncio.Lock()
 
+# sync_all 동시 실행 직렬화 락 — 인터벌 루프와 수동 /sync(또는 더블클릭)가 겹쳐
+# 같은 (소싱처, 브랜드, 계정) 전송잡을 양쪽이 INSERT 하는 race 차단.
+# atomic 가드(_exists_pending_transmit)는 DB '읽기'라 commit 전 두 런이
+# 동시에 통과해 중복 생성됨(2026-06-03 16건 실측, gap 0.001~0.8초 = 동일 이벤트루프).
+_sync_all_lock = asyncio.Lock()
+
 
 def clear_board_cache() -> None:
     """테트리스 보드 캐시 전체 무효화 (AI 태그 변경 시 호출)."""
@@ -1300,7 +1306,6 @@ class SambaTetrisService:
         토글 OFF (tetris_sync_interval_hours <= 0) 인 경우 어떤 잡도 만들지 않고 즉시 반환.
         """
         from backend.api.v1.routers.samba.proxy._helpers import _get_setting
-        from backend.domain.samba.job.repository import SambaJobRepository
 
         # 토글 가드 — 루프/엔드포인트 어디서 호출돼도 OFF면 신규 잡 생성 차단
         toggle_val = await _get_setting(self._session, "tetris_sync_interval_hours")
@@ -1327,6 +1332,24 @@ class SambaTetrisService:
                 "triggered": 0,
                 "paused": True,
             }
+
+        # 이미 다른 sync_all 이 실행 중이면 스킵 (중복 잡 race 차단)
+        # 비차단 — 락 대기 시 /sync 요청이 gunicorn --timeout 120 초과로 worker kill 위험.
+        # 실행 중인 런이 어차피 현재 배치 기준 잡을 생성하므로 중복 호출은 스킵해도 무손실.
+        if _sync_all_lock.locked():
+            logger.info("[테트리스 sync] 이미 실행 중 — 중복 호출 스킵")
+            return {
+                "assignments": 0,
+                "jobs": 0,
+                "triggered": 0,
+                "skipped_running": True,
+            }
+        async with _sync_all_lock:
+            return await self._sync_all_impl(tenant_id)
+
+    async def _sync_all_impl(self, tenant_id: Optional[str]) -> dict[str, Any]:
+        """sync_all 실제 본문 — _sync_all_lock 보유 상태로만 호출."""
+        from backend.domain.samba.job.repository import SambaJobRepository
 
         assignments = await self._repo.list_by_tenant(tenant_id)
 
