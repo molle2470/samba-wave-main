@@ -90,9 +90,14 @@ export default function OrderInfoCell(props: Props) {
   // (2) 별칭 배지: 플레이오토 1 channel × 다 site_id 구조의 실제 판매처 별칭
   //     우선순위 o.sales_channel_alias(신규) → o.source_site 안의 괄호 형식(레거시 호환)
   const sourcingSite = String(sourceFromUrl || actualSourceSite || '').trim()
-  const sourceBadgeLabel = sourcingSite
-    ? (formatSourceSiteLabel(sourcingSite, siteAliasMap) || sourcingSite)
+  // GrandStage 는 ABCmart 의 a-rt.com 하부 도메인 — 배지 표기는 ABCmart 로 통일.
+  // (원주문링크 라우팅용 내부값 sourceFromUrl/sourceSiteCode 는 GrandStage 유지 — grandstage.a-rt.com 도메인 필요)
+  const badgeSite = sourcingSite.toLowerCase() === 'grandstage' ? 'ABCmart' : sourcingSite
+  const sourceBadgeLabel = badgeSite
+    ? (formatSourceSiteLabel(badgeSite, siteAliasMap) || badgeSite)
     : ''
+  // 타마켓주문링크 표시값 — http(s) URL 형식만 노출(내부 주문번호 오염값 차단)
+  const extOrderDisplay = o.ext_order_number && /^https?:\/\//i.test(o.ext_order_number) ? o.ext_order_number : ''
   const aliasBadgeRaw = (() => {
     const fromNew = String(o.sales_channel_alias || '').trim()
     if (fromNew) return fromNew
@@ -381,16 +386,18 @@ export default function OrderInfoCell(props: Props) {
             {o.customer_note?.trim() || '-'}
           </span>
         </div>
-      {o.source !== 'lottehome' && (
       <div style={{ display: 'flex', alignItems: 'center', gap: '0.25rem', fontSize: '0.8rem' }}>
         <span style={{ color: '#666', whiteSpace: 'nowrap' }}>타마켓주문링크</span>
         <input
           type="text"
           placeholder="타마켓 주문링크 URL"
-          defaultValue={o.ext_order_number || ''}
+          // 153d7f04 회귀 방지 — 롯데홈쇼핑 등에서 내부 주문번호가 잘못 들어간 오염값은
+          // 입력란에 표시하지 않는다(URL 형식만 노출). DB값은 유지, 사용자가 입력 시에만 덮어씀.
+          defaultValue={extOrderDisplay}
           onBlur={async (e) => {
             const val = e.target.value.trim()
-            if (val === (o.ext_order_number ?? '')) return
+            // 표시값(URL만) 기준 비교 — 클릭만 하고 나가도 DB 오염값이 지워지지 않음
+            if (val === extOrderDisplay) return
             try {
               await orderApi.update(o.id, { ext_order_number: val || undefined })
               loadOrders()
@@ -400,7 +407,6 @@ export default function OrderInfoCell(props: Props) {
           style={{ flex: 1, fontSize: '0.75rem', padding: '0.125rem 0.375rem', background: '#1A1A1A', border: '1px solid #444', color: '#E5E5E5', borderRadius: '4px', fontFamily: 'monospace', minWidth: 0 }}
         />
       </div>
-      )}
     </td>
   )
 }

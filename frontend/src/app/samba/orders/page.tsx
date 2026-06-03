@@ -1114,6 +1114,13 @@ export default function OrdersPage() {
                   return map[code] || null
                 }
                 const sourcingUrl = buildSourcingOrderUrl(j.site, j.sourcingOrderNumber || '', j.actionTag || '')
+                // 소싱처 표기 통합 — GrandStage 는 ABCmart(a-rt.com 동일 로그인)로 합쳐 표시.
+                // 단 송장조회 URL(buildSourcingOrderUrl)은 j.site 원본(GRANDSTAGE) 그대로 써서
+                // grandstage.a-rt.com 으로 정확히 라우팅됨. 표기만 ABC마트로.
+                const siteDisplayLabel = (() => {
+                  const c = (j.site || '').toUpperCase()
+                  return c === 'GRANDSTAGE' || c === 'ABCMART' ? 'ABC마트' : j.site
+                })()
                 return (
                   <div key={j.id} style={{
                     display: 'grid', gridTemplateColumns: '36px 88px 110px 150px 160px 200px 80px 140px 90px 90px 120px 266px',
@@ -1132,7 +1139,7 @@ export default function OrdersPage() {
                     <div style={{ fontFamily: 'monospace', fontSize: 11 }}>{j.orderNumber || j.orderId}</div>
                     <div>{j.customerName || '-'}</div>
                     <div>{j.channelName || '-'}</div>
-                    <div>{j.site}</div>
+                    <div>{siteDisplayLabel}</div>
                     <div style={{ fontFamily: 'monospace', fontSize: 11 }}>{j.sourcingOrderNumber || '-'}</div>
                     <div>{j.sourcingAccountLabel || '-'}</div>
                     <div>{j.courier || '-'}</div>
