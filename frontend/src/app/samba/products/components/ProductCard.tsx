@@ -295,12 +295,18 @@ function simultaneousReplace(
 }
 
 // 상품명 조합 적용 (name_composition 태그 기반)
+// market_type이 지정되고 market_name_compositions에 해당 마켓 설정이 있으면 마켓별 조합 사용 (백엔드 _compose_product_name와 동일)
 function composeProductName(
   product: SambaCollectedProduct,
   nameRule: SambaNameRule | undefined,
   deletionWords?: string[],
+  marketType?: string,
 ): string {
-  if (!nameRule?.name_composition?.length) return product.name
+  // 마켓별 조합 우선, 없으면 일반 조합 폴백
+  const composition =
+    (marketType && nameRule?.market_name_compositions?.[marketType]) ||
+    nameRule?.name_composition
+  if (!composition?.length) return product.name
   const seoKws = product.seo_keywords || []
   const tagMap: Record<string, string> = {
     '{상품명}': product.name || '',
@@ -311,12 +317,12 @@ function composeProductName(
     '{검색키워드}': seoKws.slice(0, 3).join(' '),
   }
   // 조합 태그 순서대로 값 치환
-  let composed = nameRule.name_composition
+  let composed = composition
     .map(tag => tagMap[tag] ?? tag)
     .filter(v => v.trim() !== '')
     .join(' ')
   // 치환어 적용 (동시치환/순차치환 분기)
-  if (nameRule.replacements?.length) {
+  if (nameRule?.replacements?.length) {
     if (nameRule.replace_mode === 'sequential') {
       // 순차치환: 위에서 아래로 순서대로 치환
       for (const r of nameRule.replacements) {
@@ -337,7 +343,7 @@ function composeProductName(
     }
   }
   // 중복 제거 — 구두점 안에 묶인 부분단어까지 감지
-  if (nameRule.dedup_enabled) {
+  if (nameRule?.dedup_enabled) {
     const seen = new Set<string>()
     // 2자 이상 한글/영문 + 하이픈 연결 숫자(품번) + 3자 이상 순수 숫자
     composed = composed.replace(/\p{L}{2,}|\d+(?:-\d+)+|\d{3,}/gu, (match) => {
@@ -349,8 +355,8 @@ function composeProductName(
     composed = composed.replace(/\s+/g, ' ').trim()
   }
   // prefix/suffix 적용
-  if (nameRule.prefix) composed = `${nameRule.prefix} ${composed}`
-  if (nameRule.suffix) composed = `${composed} ${nameRule.suffix}`
+  if (nameRule?.prefix) composed = `${nameRule.prefix} ${composed}`
+  if (nameRule?.suffix) composed = `${composed} ${nameRule.suffix}`
   return composed.trim()
 }
 
@@ -1511,16 +1517,38 @@ const ProductCard = React.memo(function ProductCard({
                   <span style={{ color: '#FFFFFF', fontWeight: 500 }}>{p.name}</span>
                 </td>
               </tr>
-              {/* 등록 상품명 (상품명 조합 + 삭제어 취소선 적용) */}
+              {/* 등록 상품명 (상품명 조합 + 삭제어 취소선 적용). 마켓별 조합이 있으면 마켓별로 함께 표시 */}
               <tr style={{ borderBottom: '1px solid #1E1E1E' }}>
                 <td style={tdLabel}>등록 상품명</td>
                 <td style={tdVal}>
-                  <span style={{ color: '#FFFFFF', fontSize: '0.8rem' }}>{
-                    renderRegisteredName(
-                      composeProductName(p, nameRules.find(r => r.id === (policy?.extras as Record<string, string> | undefined)?.name_rule_id)),
-                      deletionWords ?? []
+                  {(() => {
+                    const nameRule = nameRules.find(r => r.id === (policy?.extras as Record<string, string> | undefined)?.name_rule_id)
+                    // 마켓별 조합이 지정된 마켓 목록 (일반 조합과 다른 이름이 전송되는 마켓들)
+                    const marketComps = Object.keys(nameRule?.market_name_compositions || {})
+                      .filter(mkt => (nameRule?.market_name_compositions?.[mkt]?.length ?? 0) > 0)
+                    return (
+                      <>
+                        <span style={{ color: '#FFFFFF', fontSize: '0.8rem' }}>
+                          {marketComps.length > 0 && <span style={{ color: '#666', marginRight: '4px' }}>기본</span>}
+                          {renderRegisteredName(
+                            composeProductName(p, nameRule, undefined, undefined),
+                            deletionWords ?? []
+                          )}
+                        </span>
+                        {marketComps.map(mkt => (
+                          <div key={mkt} style={{ marginTop: '3px', fontSize: '0.78rem', color: '#FFFFFF' }}>
+                            <span style={{ color: '#FF8C00', marginRight: '4px' }}>
+                              {MARKETS.find(m => m.id === mkt)?.name || mkt}
+                            </span>
+                            {renderRegisteredName(
+                              composeProductName(p, nameRule, undefined, mkt),
+                              deletionWords ?? []
+                            )}
+                          </div>
+                        ))}
+                      </>
                     )
-                  }</span>
+                  })()}
                 </td>
               </tr>
               {/* SEO 검색키워드 */}
