@@ -740,7 +740,14 @@ class SourcingQueue:
 
         try:
             conditions = [
-                "status = 'pending'",
+                # [2026-06-03] dispatched 채 180s+ 무응답인 tracking 잡 재취득 허용 —
+                # hung 데몬이 잡을 claim 후 멈춰(워커 행/크래시) 잡이 expire 까지 영영
+                # 블랙홀되던 문제(SSG 실주문 3.5분 dispatched 무응답 실측) 차단.
+                # 건강한 데몬이 재처리. tracking 만 스코프(price collection 은 기존 동작 유지).
+                # 정상 tracking 처리(로그인 15s + 추출 90s + 여유)는 180s 안에 끝나 false 재취득 없음.
+                "(status = 'pending' OR (status = 'dispatched' "
+                "AND job_type = 'tracking' "
+                "AND dispatched_at < now() - interval '180 seconds'))",
                 "expires_at > now()",
             ]
             params: dict[str, Any] = {}
