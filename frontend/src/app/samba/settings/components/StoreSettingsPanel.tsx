@@ -470,7 +470,7 @@ export function StoreSettingsPanel(props: Props) {
                   ) : field.type === 'elevenst-dispatch-select' ? (
                     <select
                       style={{ ...inputStyle, flex: 1 }}
-                      value={storeData[market.key]?.[field.name] || ''}
+                      value={storeData[market.key]?.[field.name] ?? savedStoreData[market.key]?.[field.name] ?? ''}
                       onChange={(e) => updateStoreField(market.key, field.name, e.target.value)}
                     >
                       <option value=''>-- 출고지정보 가져오기로 자동 로드 --</option>
