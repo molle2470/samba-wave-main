@@ -1353,15 +1353,29 @@ class LotteonPlugin(MarketPlugin):
                             keys.add(s.rsplit("/", 1)[-1].strip())
                         return keys
 
-                    # 옵션명 → (stock, isSoldOut) 매핑 — 양방향 키 등록
+                    # 옵션명 → (stock, isSoldOut) 매핑 + 옵션명 → 소싱처가격 매핑 — 양방향 키 등록
+                    # 옵션별 추가금(#324): 등록 경로(transform_product)와 동일하게
+                    # slPrc = new_price + max(opt.price - _diff_base, 0) 로 차등 반영.
                     opt_info_map: dict[str, tuple[int, bool]] = {}
+                    opt_price_map: dict[str, int] = {}
+                    _active_opt_prices: list[int] = []
                     for o in new_options:
                         info = (
                             o.get("stock", 0) or 0,
                             bool(o.get("isSoldOut", False)),
                         )
+                        _op = int(o.get("price") or 0)
+                        # 추가금 base 후보 = 활성·비품절·재고>0 옵션 가격만 (등록 경로 _diff_base 정책 동일)
+                        if (
+                            _op > 0
+                            and not bool(o.get("isSoldOut", False))
+                            and (o.get("stock") or 0) > 0
+                        ):
+                            _active_opt_prices.append(_op)
                         for k in _make_match_keys(o.get("name") or ""):
                             opt_info_map[k] = info
+                            opt_price_map[k] = _op
+                    _diff_base = min(_active_opt_prices) if _active_opt_prices else 0
 
                     # 가격 변경 요청
                     # LOTTEON update_price 스펙: sitmNo + spdNo + slPrc 필수
@@ -1372,21 +1386,32 @@ class LotteonPlugin(MarketPlugin):
                         itm_no = itm.get("itmNo") or itm.get("sitmNo")
                         if not itm_no:
                             continue
-                        # 가격 업데이트
-                        if new_price > 0:
-                            itm_prc_lst.append(
-                                {
-                                    "sitmNo": str(itm.get("sitmNo") or itm_no),
-                                    "spdNo": existing_no,
-                                    "slPrc": new_price,
-                                }
-                            )
-                        # 재고 업데이트 (양방향 키 매칭) — 라벨 후보 선택은 헬퍼 참조
+                        # 옵션 매칭 (가격/재고 공용) — 라벨 후보 선택은 헬퍼 참조
                         itm_label = _pick_lotteon_itm_label(itm)
                         _itm_keys = _make_match_keys(itm_label)
                         _matched_key = next(
                             (k for k in _itm_keys if k in opt_info_map), None
                         )
+                        # 가격 업데이트 — 매칭 옵션의 추가금 가산
+                        if new_price > 0:
+                            _op_p = (
+                                opt_price_map.get(_matched_key, 0)
+                                if _matched_key
+                                else 0
+                            )
+                            _pdiff = (
+                                max(_op_p - _diff_base, 0)
+                                if (_op_p > 0 and _diff_base > 0)
+                                else 0
+                            )
+                            itm_prc_lst.append(
+                                {
+                                    "sitmNo": str(itm.get("sitmNo") or itm_no),
+                                    "spdNo": existing_no,
+                                    "slPrc": int(new_price) + _pdiff,
+                                }
+                            )
+                        # 재고 업데이트 (양방향 키 매칭)
                         if _matched_key:
                             raw_s, sold = opt_info_map[_matched_key]
                             stk = _apply_stock_cap(raw_s, sold)

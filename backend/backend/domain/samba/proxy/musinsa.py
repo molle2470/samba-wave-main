@@ -504,6 +504,24 @@ class MusinsaClient:
             )
 
             brand_info = d.get("brandInfo") or {}
+
+            # 판매예정(preorder) → 품절 등가 취급 (#325)
+            # 발매 전이라 실구매 불가인데 isOutOfStock=False 면 마켓에 판매중 발행/유지됨.
+            # preorder 를 품절로 매핑 → 마켓 자동품절 유지, 발매(in_stock 전환) 시 오토튠 자동 판매재개.
+            # saleStatus 분기(아래)의 preorder 판정 조건과 동일하게 구성.
+            _is_preorder = bool(
+                bool(gp.get("saleReserveYmdt") or d.get("saleReserveYmdt"))
+                or bool(
+                    options
+                    and any(
+                        str(opt.get("deliveryType", "")).upper()
+                        in ("RESERVATION", "PREORDER", "RESERVE", "SCHEDULED")
+                        for opt in options
+                    )
+                )
+                or _is_future_sell_start(d)
+            )
+
             _result = {
                 "id": f"col_musinsa_{goods_no}_{int(datetime.now(tz=timezone.utc).timestamp() * 1000)}",
                 "sourceSite": "MUSINSA",
@@ -590,6 +608,8 @@ class MusinsaClient:
                         bool(options)
                         and all(opt.get("isSoldOut", False) for opt in options)
                     )
+                    # 판매예정(preorder) 품절 등가 취급 (#325) — 발매 전 구매 차단
+                    or _is_preorder
                 ),
                 "isSale": gp.get("isSale", False),
                 # 판매 상태: sold_out(품절) → preorder(판매예정) → in_stock 순서로 판단

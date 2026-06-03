@@ -1096,6 +1096,12 @@ def _check_owner_device(request: Request) -> None:
     tenant_id = getattr(request.state, "tenant_id", None)
     device_id = (request.headers.get("X-Device-Id") or "").strip()
 
+    # 데몬 자동 허용 — 데몬 device_id 는 키 발급 흐름이 별개 (#320)
+    # tenant 차단보다 먼저 통과시켜야 함. 글로벌 키 fallback 데몬도 여기서 허용.
+    # (이전엔 tenant None 차단이 앞에 있어 docstring 의도와 달리 도달 불가했음)
+    if device_id.startswith("samba-daemon-"):
+        return
+
     # 글로벌 키 (tenant 미바인딩) — 자격증명 조회 불가
     if tenant_id is None:
         logger.warning(
@@ -1107,10 +1113,6 @@ def _check_owner_device(request: Request) -> None:
             "글로벌 키로는 민감 엔드포인트 접근 불가. "
             "/samba/extension-link 에서 테넌트 키 발급 필요.",
         )
-
-    # 데몬 자동 허용 — 데몬 device_id 는 키 발급 흐름이 별개
-    if device_id.startswith("samba-daemon-"):
-        return
 
     if not device_id:
         raise HTTPException(403, "X-Device-Id 헤더 필수")
@@ -1246,6 +1248,36 @@ async def get_login_credential(
     # 속하지 않으므로 "첫 활성 default 계정"을 반환하면 남의 테넌트 비번이 유출됨.
     # 테넌트 키(로그인 후 /samba/extension-link 발급)로만 조회 가능.
     _tenant_id = getattr(request.state, "tenant_id", None)
+
+    # ⚠️ 단일테넌트 운영 가정 — 데몬(글로벌 키 fallback)이 site default 계정의 tenant 자동 채택 (#320)
+    # 데몬은 install-token 교환으로 tenant-scoped 키를 받아야 하나, fallback 으로 글로벌 키를
+    # 쓰는 경로가 있어 자동로그인이 영구 차단됐음. site_name 의 is_login_default 계정 tenant 를 매핑.
+    # 멀티테넌트 전환 시 타 tenant 자격증명 유출 위험 → 데몬 키에 tenant 강제 박는 방식으로 교체 필요.
+    _dev_hdr = (request.headers.get("X-Device-Id") or "").strip()
+    if _tenant_id is None and _dev_hdr.startswith("samba-daemon-") and site_name:
+        _norm = _normalize_sourcing_site_name(site_name)
+        _cands = [
+            c
+            for c in dict.fromkeys(
+                [site_name, _norm, site_name.upper(), site_name.lower()]
+            )
+            if c
+        ]
+        _map_stmt = (
+            sa_select(SambaSourcingAccount)
+            .where(SambaSourcingAccount.site_name.in_(_cands))
+            .where(SambaSourcingAccount.is_active.is_(True))
+            .where(SambaSourcingAccount.is_login_default.is_(True))
+            .limit(1)
+        )
+        _map_acc = (await session.execute(_map_stmt)).scalars().first()
+        if _map_acc and _map_acc.tenant_id:
+            _tenant_id = _map_acc.tenant_id
+            logger.info(
+                f"[owner-guard] 데몬 글로벌 키 → site_name={site_name} "
+                f"default 계정 tenant 자동매핑 device={_dev_hdr[:16]}"
+            )
+
     if _tenant_id is None:
         raise HTTPException(
             403,

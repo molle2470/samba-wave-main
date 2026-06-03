@@ -589,7 +589,8 @@ class LotteonClient:
             "trGrpCd": self.tr_grp_cd,
             "trNo": self.tr_no,
             "pageNo": page,
-            "pageSize": size,
+            # 롯데ON product/list 정식 페이지크기 param 은 rowsPerPage (pageSize 는 spec 위반 → 500 returnCode 9000)
+            "rowsPerPage": size,
             "regStrtDttm": reg_strt_dttm,
             "regEndDttm": reg_end_dttm,
         }
