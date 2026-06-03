@@ -2418,6 +2418,36 @@ async def sync_returns_from_markets(
             logger.error(f"[반품동기화] {label} 실패: {e}")
             results.append({"account": label, "status": "error", "message": str(e)})
 
+    # 취소완료 주문의 stale 활성 samba_return auto-close (issue #335 Part B)
+    # 주문이 마켓에서 취소(status='cancelled')되면 그 주문에 매달린 활성 반품/교환
+    # 레코드는 더 이상 유효하지 않다. 닫지 않으면 아래 일괄 SQL의 seed 로 남아
+    # 매 cycle 취소완료 주문 shipping_status 를 반품요청/교환요청으로 덮어쓴다.
+    # completion_detail='취소' 도 함께 박아 프론트 표시(취소완료)와 정합 유지.
+    # 멱등 벌크 UPDATE — placeholder/cast 없음(silent fail 방지).
+    try:
+        from sqlalchemy import text as _sa_text
+
+        _ac = await session.execute(
+            _sa_text("""
+            UPDATE samba_return r
+            SET status = 'cancelled',
+                completion_detail = '취소'
+            FROM samba_order o
+            WHERE r.order_id = o.id
+              AND o.status = 'cancelled'
+              AND r.status NOT IN ('completed', 'cancelled', 'rejected')
+        """)
+        )
+        await session.commit()
+        if _ac.rowcount:
+            logger.info(
+                f"[반품동기화] 취소완료 주문 stale samba_return {_ac.rowcount}건 auto-close"
+            )
+    except Exception as _ac_err:
+        logger.warning(
+            f"[반품동기화] 취소완료 stale return auto-close 실패(무시): {_ac_err}"
+        )
+
     # DB 기반 원주문 shipping_status 일괄 동기화
     # samba_return 레코드가 있고 아직 진행 중인 주문의 shipping_status를 강제 업데이트
     try:
@@ -2436,7 +2466,13 @@ async def sync_returns_from_markets(
               AND r.status NOT IN ('completed', 'cancelled', 'rejected')
               AND o.shipping_status NOT IN (
                   '교환요청', '교환회수완료', '교환재배송', '교환완료',
-                  '반품요청', '반품완료', '반품거부'
+                  '반품요청', '반품완료', '반품거부',
+                  -- 취소 라벨 보호: 취소완료 주문에 stale 활성 samba_return 이 남아도
+                  -- 반품/교환요청으로 덮지 않음 (issue #335, order.py:8132 와 동일 목록)
+                  '취소요청', '취소처리중', '취소완료',
+                  -- 송장/배송 진행 라벨도 좀비 return 으로 되돌리지 않음
+                  '주문접수', '배송대기중', '송장전송완료', '국내배송중',
+                  '배송완료', '구매확정'
               )
         """)
         )
