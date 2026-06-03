@@ -72,17 +72,18 @@ class SambaJobRepository(BaseRepository[SambaJob]):
             else_=0,
         )
 
-        # PlayAuto 마켓 계정이 포함된 transmit 잡은 최우선 픽 — 5개 슬롯 안에 항상 진입.
-        # 동일 PlayAuto 계정 동시실행 차단(_db_account_lock)은 그대로 유지되어 순차 보장.
+        # 최우선 마켓(PlayAuto/SSG/롯데홈쇼핑) 계정이 포함된 transmit 잡은 최우선 픽
+        # — 슬롯 안에 항상 먼저 진입. 동일 계정 동시실행 차단(_db_account_lock)은
+        # 그대로 유지되어 순차 보장.
         _job_accounts_for_priority = self._payload_account_array_sql("samba_jobs")
-        _playauto_priority_key = case(
+        _priority_market_key = case(
             (
                 and_(
                     SambaJob.job_type == "transmit",
                     _sa_text(
                         "EXISTS (SELECT 1 FROM samba_market_account ma "
                         f"WHERE ma.id::text = ANY({_job_accounts_for_priority}) "
-                        "AND ma.market_type = 'playauto')"
+                        "AND ma.market_type IN ('playauto', 'ssg', 'lottehome'))"
                     ),
                 ),
                 0,
@@ -94,7 +95,7 @@ class SambaJobRepository(BaseRepository[SambaJob]):
             select(SambaJob)
             .where(SambaJob.status == JobStatus.PENDING)
             .order_by(
-                _playauto_priority_key.asc(),
+                _priority_market_key.asc(),
                 _transmit_size_key.asc(),
                 SambaJob.created_at.asc(),
             )

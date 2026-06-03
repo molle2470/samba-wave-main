@@ -387,10 +387,11 @@ class JobWorker:
         # 동일 계정 delete_market 잡 직렬화 — transmit 락과 독립 (전송/삭제 별개 실행)
         self._delete_account_locks: dict[str, asyncio.Lock] = {}
         # transmit 글로벌 동시 실행 한도 — write pool 여유 확보 (오토튠 점유분 고려)
-        # 기본 5 유지. 풀 한도 50 고려 — VM .env에서 8~10 선 점진 상향 + pg_stat_activity 모니터링.
-        self._transmit_semaphore = asyncio.Semaphore(
-            int(os.environ.get("JOB_TRANSMIT_MAX_CONCURRENCY", "5"))
+        # 기본 8. 풀 한도 50 + 오토튠 상시 ~10 고려, pg_stat_activity 모니터링.
+        self._transmit_max_concurrency = int(
+            os.environ.get("JOB_TRANSMIT_MAX_CONCURRENCY", "8")
         )
+        self._transmit_semaphore = asyncio.Semaphore(self._transmit_max_concurrency)
         # delete_market 전용 세마포어 — transmit 세마포어와 분리하여 전송 포화 시에도 즉시 실행
         self._delete_semaphore = asyncio.Semaphore(
             int(os.environ.get("JOB_DELETE_MAX_CONCURRENCY", "2"))
@@ -571,11 +572,11 @@ class JobWorker:
         from backend.domain.samba.job.repository import SambaJobRepository
         from backend.domain.samba.shipment.service import is_cancel_requested
 
-        # transmit 빈 슬롯 계산 (글로벌 세마포어 한도 5 기준)
+        # transmit 빈 슬롯 계산 (글로벌 세마포어 한도 기준)
         transmit_running = sum(
             1 for jid in self._active_tasks if jid in self._active_transmit_accounts
         )
-        transmit_slots = max(0, 5 - transmit_running)
+        transmit_slots = max(0, self._transmit_max_concurrency - transmit_running)
         # 한 폴링 사이클 최대 픽업 개수 = transmit 슬롯 + 비-transmit 여유분(2)
         # 비-transmit(collect/delete/기타)이 들어와도 큐 진행이 막히지 않도록 여유 둠
         max_picks = transmit_slots + 2
