@@ -15,13 +15,22 @@ import {
 import { ReturnDetailModal } from './components/ReturnDetailModal'
 
 // 완료내역(completion_detail) 옵션 + 색상 (다크테마: 옅은 배경 + 글자색)
-const COMPLETION_DEFAULT = '대기중'
-const COMPLETION_OPTIONS = ['대기중', '취소완료', '반품완료', '교환완료']
+// value = 백엔드 저장 어휘(진행중/취소/반품/교환/거부), label = 화면 표시(완료형)
+// 백엔드 정식값과 일치시켜야 필터/표시가 동작 (issue #334)
+const COMPLETION_DEFAULT = '진행중'
+const COMPLETION_OPTIONS: { value: string; label: string }[] = [
+  { value: '진행중', label: '대기중' },
+  { value: '취소', label: '취소완료' },
+  { value: '반품', label: '반품완료' },
+  { value: '교환', label: '교환완료' },
+  { value: '거부', label: '거부' },
+]
 const COMPLETION_COLORS: Record<string, { bg: string; fg: string }> = {
-  '대기중': { bg: 'rgba(255,217,61,0.12)', fg: '#FFD93D' },   // 노랑
-  '취소완료': { bg: 'rgba(255,107,107,0.12)', fg: '#FF6B6B' }, // 빨강
-  '반품완료': { bg: 'rgba(247,131,172,0.14)', fg: '#F783AC' }, // 핑크
-  '교환완료': { bg: 'rgba(76,154,255,0.12)', fg: '#4C9AFF' },  // 파랑
+  '진행중': { bg: 'rgba(255,217,61,0.12)', fg: '#FFD93D' },   // 노랑(대기중)
+  '취소': { bg: 'rgba(255,107,107,0.12)', fg: '#FF6B6B' },    // 빨강(취소완료)
+  '반품': { bg: 'rgba(247,131,172,0.14)', fg: '#F783AC' },    // 핑크(반품완료)
+  '교환': { bg: 'rgba(76,154,255,0.12)', fg: '#4C9AFF' },     // 파랑(교환완료)
+  '거부': { bg: 'rgba(150,150,150,0.14)', fg: '#AAAAAA' },    // 회색(거부)
 }
 
 export default function ReturnsPage() {
@@ -241,8 +250,8 @@ export default function ReturnsPage() {
   // completion_detail 기준 통계
   const completionCounts = {
     total: returns.length,
-    requested: returns.filter(r => (r.completion_detail || COMPLETION_DEFAULT) === '대기중').length,
-    completed: returns.filter(r => ['취소완료', '반품완료', '교환완료'].includes(r.completion_detail || '')).length,
+    requested: returns.filter(r => (r.completion_detail || COMPLETION_DEFAULT) === '진행중').length,
+    completed: returns.filter(r => ['취소', '반품', '교환'].includes(r.completion_detail || '')).length,
     rejected: returns.filter(r => (r.completion_detail || '') === '거부').length,
   }
 
@@ -376,7 +385,7 @@ export default function ReturnsPage() {
               ])
             })()}
           </select>
-          <select style={{ ...inputStyle, width: '110px', padding: '0.22rem 0.4rem', fontSize: '0.75rem' }} value={siteFilter} onChange={e => setSiteFilter(e.target.value)}><option value="">전체내역</option>{COMPLETION_OPTIONS.map(s => <option key={s} value={s}>{s}</option>)}</select>
+          <select style={{ ...inputStyle, width: '110px', padding: '0.22rem 0.4rem', fontSize: '0.75rem' }} value={siteFilter} onChange={e => setSiteFilter(e.target.value)}><option value="">전체내역</option>{COMPLETION_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}</select>
           <select style={{ ...inputStyle, width: '92px', padding: '0.22rem 0.4rem', fontSize: '0.75rem' }} value={pageSize} onChange={e => setPageSize(Number(e.target.value))}>
             <option value={50}>50개 보기</option><option value={100}>100개 보기</option><option value={200}>200개 보기</option><option value={500}>500개 보기</option>
           </select>
@@ -558,7 +567,7 @@ export default function ReturnsPage() {
                           }}
                           style={{ padding: '0.2rem 0.3rem', background: cc?.bg || '#1A1A1A', border: '1px solid #2D2D2D', borderRadius: '4px', color: cc?.fg || '#E5E5E5', fontSize: '0.75rem', fontWeight: 600, cursor: 'pointer', outline: 'none' }}
                         >
-                          {COMPLETION_OPTIONS.map(o => <option key={o} value={o}>{o}</option>)}
+                          {COMPLETION_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                         </select>
                           )
                         })()}
