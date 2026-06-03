@@ -63,6 +63,24 @@ def _normalize_sourcing_site_name(site_name: str | None) -> str:
     return alias_map.get(compact, raw)
 
 
+# a-rt.com 계열은 ABCmart / GrandStage 가 같은 로그인(a-rt.com SSO)을 공유한다.
+# 송장수집 site 가 GRANDSTAGE 로 갈리더라도 자격증명은 ABCmart 계정에만 등록돼 있으므로,
+# 자격증명 조회 후보에 항상 "ABCmart" 를 포함시켜 계정을 빌려 쓰게 한다.
+# (주의) 자격증명 조회 경로 전용 — 계정 목록/필터/CRUD 에서 GrandStage 를 ABCmart 로
+# 뭉개면 안 되므로 일반 _normalize_sourcing_site_name 은 건드리지 않는다.
+_ART_FAMILY = {"GRANDSTAGE", "GRAND_STAGE", "ABCMART", "ABC마트", "ABCMARTS"}
+
+
+def _expand_credential_site_candidates(site_name: str | None) -> list[str]:
+    """자격증명 조회용 site_name 후보 목록. a-rt 계열이면 "ABCmart" 를 보강."""
+    raw = (site_name or "").strip()
+    candidates = [raw, _normalize_sourcing_site_name(raw), raw.upper(), raw.lower()]
+    compact = raw.replace(" ", "").replace("_", "").replace("-", "").upper()
+    if compact in _ART_FAMILY:
+        candidates.append("ABCmart")
+    return [c for c in dict.fromkeys(candidates) if c]
+
+
 def _read_service(session: AsyncSession):
     from backend.domain.samba.sourcing_account.repository import (
         SambaSourcingAccountRepository,
@@ -1255,14 +1273,7 @@ async def get_login_credential(
     # 멀티테넌트 전환 시 타 tenant 자격증명 유출 위험 → 데몬 키에 tenant 강제 박는 방식으로 교체 필요.
     _dev_hdr = (request.headers.get("X-Device-Id") or "").strip()
     if _tenant_id is None and _dev_hdr.startswith("samba-daemon-") and site_name:
-        _norm = _normalize_sourcing_site_name(site_name)
-        _cands = [
-            c
-            for c in dict.fromkeys(
-                [site_name, _norm, site_name.upper(), site_name.lower()]
-            )
-            if c
-        ]
+        _cands = _expand_credential_site_candidates(site_name)
         _map_stmt = (
             sa_select(SambaSourcingAccount)
             .where(SambaSourcingAccount.site_name.in_(_cands))
@@ -1308,18 +1319,7 @@ async def get_login_credential(
         raise HTTPException(400, "site_name 또는 account_id 중 하나는 필수입니다")
 
     normalized_site_name = _normalize_sourcing_site_name(site_name)
-    site_candidates = [
-        candidate
-        for candidate in dict.fromkeys(
-            [
-                site_name,
-                normalized_site_name,
-                site_name.upper(),
-                site_name.lower(),
-            ]
-        )
-        if candidate
-    ]
+    site_candidates = _expand_credential_site_candidates(site_name)
 
     stmt = (
         sa_select(SambaSourcingAccount)

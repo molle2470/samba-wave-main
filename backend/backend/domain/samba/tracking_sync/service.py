@@ -328,6 +328,12 @@ async def enqueue_for_order(order_id: str, *, force: bool = False) -> dict[str, 
         except ValueError as exc:
             return {"success": False, "error": str(exc)}
 
+        # sourcing_account_id 정규화 — "etc"(미매핑 sentinel)/빈값은 None 처리.
+        # "etc"를 그대로 데몬에 넘기면 account_id 단건조회가 404 나고 site_name 폴백을
+        # 못 타 로그인 실패(2026-06-02 GrandStage 사고). None 이면 데몬이 site_name 기본계정 사용.
+        _said = (order.sourcing_account_id or "").strip()
+        _said = None if _said in ("", "etc") else _said
+
         try:
             request_id, _future = await SourcingQueue.add_tracking_job(
                 site=actual_site,
@@ -335,7 +341,7 @@ async def enqueue_for_order(order_id: str, *, force: bool = False) -> dict[str, 
                 order_id=order.id,
                 sourcing_order_number=order.sourcing_order_number,
                 owner_device_id=None,
-                sourcing_account_id=order.sourcing_account_id or None,
+                sourcing_account_id=_said,
             )
         except RuntimeError as exc:
             # DAEMON_ONLY_TRACKING_SITES + 데몬 미등록 → 잡 발행 skip
@@ -356,7 +362,7 @@ async def enqueue_for_order(order_id: str, *, force: bool = False) -> dict[str, 
             order_id=order.id,
             sourcing_site=actual_site,
             sourcing_order_number=order.sourcing_order_number,
-            sourcing_account_id=order.sourcing_account_id,
+            sourcing_account_id=_said,
             owner_device_id=None,
             request_id=request_id,
             status=STATUS_PENDING,
