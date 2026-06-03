@@ -81,10 +81,9 @@ async def _apply_startup_schema_fixes(logger: logging.Logger) -> None:
             "ALTER TABLE samba_search_filter "
             "ADD COLUMN IF NOT EXISTS source_brand_name TEXT",
         ),
-        (
-            "drop_market_account_sort_order",
-            "ALTER TABLE samba_market_account DROP COLUMN IF EXISTS sort_order",
-        ),
+        # (제거됨) drop_market_account_sort_order — 컬럼 이미 드롭 완료(프로덕션 ABSENT 확인,
+        # 2026-06-03 #331). no-op DROP도 매 startup ACCESS EXCLUSIVE 락을 잡아 고부하 시
+        # 계정 테이블 읽기 큐를 최대 lock_timeout(5s)만큼 막으므로 statements에서 제거.
         (
             "create_login_history",
             """

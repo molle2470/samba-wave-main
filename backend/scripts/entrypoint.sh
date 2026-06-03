@@ -104,7 +104,7 @@ async def fix():
                            ')'
                            ' AND pg_terminate_backend(pid)'),
         ('alter_search_filter', 'ALTER TABLE samba_search_filter ADD COLUMN IF NOT EXISTS source_brand_name TEXT'),
-        ('drop_market_account_sort_order', 'ALTER TABLE samba_market_account DROP COLUMN IF EXISTS sort_order'),
+        # (제거됨) drop_market_account_sort_order — 컬럼 이미 드롭 완료(#331, no-op DROP도 ACCESS EXCLUSIVE 락 잡음)
         ('alter_return_clm_req_seq', 'ALTER TABLE samba_return ADD COLUMN IF NOT EXISTS clm_req_seq TEXT'),
         ('alter_return_ord_prd_seq', 'ALTER TABLE samba_return ADD COLUMN IF NOT EXISTS ord_prd_seq TEXT'),
         ('alter_return_exch_retrieval_status', 'ALTER TABLE samba_return ADD COLUMN IF NOT EXISTS exchange_retrieval_status TEXT'),
