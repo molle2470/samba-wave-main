@@ -1071,6 +1071,31 @@ class MusinsaClient:
     # Private helpers
     # ------------------------------------------------------------------
 
+    async def _fetch_goods_base_price(
+        self, client: httpx.AsyncClient, goods_no: str
+    ) -> int:
+        """상품 할인가(base_price) 조회 — 혼합배송 brandDelivery 옵션 원가용 (#332).
+
+        _fetch_options 의 base_price 와 동일 공식:
+          immediateDiscountedPrice or salePrice or normalPrice − extraDiscountAmount
+        상세 API의 goodsPrice만 읽으므로 쿠폰/혜택가 파이프라인 미실행 (가벼움).
+        """
+        resp = await client.get(
+            f"{self.BASE_DETAIL}/{goods_no}", headers=self._headers()
+        )
+        if resp.status_code != 200:
+            return 0
+        gp = ((resp.json() or {}).get("data") or {}).get("goodsPrice") or {}
+        bp = (
+            gp.get("immediateDiscountedPrice")
+            or gp.get("salePrice")
+            or gp.get("normalPrice", 0)
+        )
+        extra = gp.get("extraDiscountAmount", 0) or 0
+        if bp > 0 and extra > 0:
+            bp = max(0, bp - extra)
+        return int(bp or 0)
+
     async def _fetch_options(
         self,
         client: httpx.AsyncClient,
@@ -1154,10 +1179,18 @@ class MusinsaClient:
                                 opt_item_no = inv.get("productVariantId")
                                 if opt_item_no:
                                     _dd = inv.get("domesticDelivery") or {}
+                                    # 혼합배송(브랜드배송 redirect): relatedOption에 실제
+                                    # 판매 상품번호(relatedGoodsNo)+재고가 내려옴 (#332).
+                                    # 가격/재고 정정에 사용하므로 보존.
+                                    _ro = inv.get("relatedOption") or {}
                                     inventory_map[opt_item_no] = {
                                         "remainQuantity": inv.get("remainQuantity"),
                                         "outOfStock": inv.get("outOfStock", False),
                                         "isRedirect": inv.get("isRedirect", False),
+                                        "relatedGoodsNo": (
+                                            str(_ro.get("relatedGoodsNo") or "") or None
+                                        ),
+                                        "relatedOutOfStock": _ro.get("outOfStock"),
                                         "deliveryType": _dd.get("deliveryType", ""),
                                         "willReleaseDate": _dd.get(
                                             "willReleaseDate", ""
@@ -1183,6 +1216,33 @@ class MusinsaClient:
                 logger.info(
                     f"[옵션] {goods_no} base_price=0 → normalPrice {base_price:,} 폴백"
                 )
+
+            # 혼합배송 정정 (#332): isRedirect 옵션은 브랜드배송 사이즈로, 본상품 직배송
+            # 할인가가 아니라 relatedGoodsNo 실상품의 할인가가 실제 원가다. 본상품가로
+            # 깔리면 브랜드배송 사이즈 판매 시 역마진. distinct relatedGoodsNo만 추가 조회.
+            # 가격 스케일은 옵션 price 와 동일한 base_price(할인가) 사용 — bestBenefitPrice는
+            # 정책 토글(excludeHeldPoint) 영향을 받아 수집 시점엔 확정 불가하므로 부적합.
+            _related_base_prices: dict[str, int] = {}
+            _redirect_goods_nos = {
+                m["relatedGoodsNo"]
+                for m in inventory_map.values()
+                if m.get("isRedirect") and m.get("relatedGoodsNo")
+            }
+            for _rno in _redirect_goods_nos:
+                try:
+                    _rp = await self._fetch_goods_base_price(client, _rno)
+                    if _rp > 0:
+                        _related_base_prices[_rno] = _rp
+                        logger.info(
+                            f"[옵션] {goods_no} 브랜드배송 relatedGoodsNo={_rno} "
+                            f"할인가={_rp:,} (본상품 {base_price:,})"
+                        )
+                except Exception as _re_err:
+                    logger.warning(
+                        f"[옵션] {goods_no} relatedGoodsNo={_rno} 할인가 조회 실패(무시): "
+                        f"{type(_re_err).__name__}: {_re_err}"
+                    )
+
             for item in items:
                 if not item.get("activated") or item.get("isDeleted"):
                     continue
@@ -1203,8 +1263,14 @@ class MusinsaClient:
                         stock = 0
                         is_sold_out = True
                     elif is_brand_delivery:
-                        stock = 99  # 브랜드직배: 재고 불명 → 99
-                        is_sold_out = False
+                        # 브랜드배송: relatedOption.outOfStock 이 실제 재고 (#332).
+                        # 상단 outOfStock(=True 고정)이 아니라 relatedOutOfStock 사용.
+                        if inv.get("relatedOutOfStock") is True:
+                            stock = 0
+                            is_sold_out = True
+                        else:
+                            stock = 99  # 브랜드배송 재고 불명 → 99
+                            is_sold_out = False
                     elif inv.get("remainQuantity") is not None:
                         stock = inv["remainQuantity"]
                     else:
@@ -1230,17 +1296,34 @@ class MusinsaClient:
                         except ValueError:
                             pass
 
+                # 혼합배송 정정 (#332): 브랜드배송 옵션은 relatedGoodsNo 실상품의
+                # 할인가를 원가로 사용 (조회 성공 시). 실패 시 본상품 base_price 폴백.
+                _opt_base_price = base_price
+                if is_brand_delivery and inv:
+                    _rno = inv.get("relatedGoodsNo")
+                    if _rno and _related_base_prices.get(_rno):
+                        _opt_base_price = _related_base_prices[_rno]
+
                 options.append(
                     {
                         "no": item.get("no"),
                         "name": " / ".join(vals) or item.get("managedCode", ""),
-                        "price": (base_price or 0) + (item.get("price") or 0),
+                        "price": (_opt_base_price or 0) + (item.get("price") or 0),
                         "stock": stock,
                         "isSoldOut": is_sold_out,
                         "isBrandDelivery": is_brand_delivery,
                         "deliveryType": (inv or {}).get("deliveryType", ""),
                         "managedCode": item.get("managedCode", ""),
                     }
+                )
+
+            # 전(全) 브랜드배송 상품 경고 (#332): 모든 옵션이 redirect면 대표가가 본상품
+            # 직배송가에 고정되고 옵션 delta가 0이라 전체 과소수집 가능 — 측정상 드물지만
+            # silent 방지 위해 로깅. (혼합배송 = 일부만 redirect 인 케이스는 정상 정정됨)
+            if options and all(o.get("isBrandDelivery") for o in options):
+                logger.warning(
+                    f"[옵션] {goods_no} 전 옵션 브랜드배송(redirect) — 대표가가 본상품가에 "
+                    f"고정될 수 있음. 옵션 수={len(options)}"
                 )
 
             # 의미없는 단일값 축 제거 — FREE/ONE COLOR/ONESIZE 등 한 가지 값만 있는 축
