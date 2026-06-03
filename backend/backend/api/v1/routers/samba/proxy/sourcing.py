@@ -1,4 +1,4 @@
-"""소싱 관련 엔드포인트 (sourcing_queue_router 포함)."""
+﻿"""소싱 관련 엔드포인트 (sourcing_queue_router 포함)."""
 
 import asyncio
 from typing import Any
@@ -242,7 +242,7 @@ async def sourcing_collect_queue(request: Request) -> Any:
 # ====================================================================
 
 # build/release 시 갱신. 데몬이 시작 시 비교하여 신버전이면 자기 종료(다음 시작 시 갱신).
-AUTOTUNE_DAEMON_LATEST_VERSION = "1.4.29"
+AUTOTUNE_DAEMON_LATEST_VERSION = "1.4.30"
 # asset 명에 버전 박힘 (`samba-v{ver}.exe`) — 지침: 데몬 설치파일명 버전 노출 필수.
 AUTOTUNE_DAEMON_DOWNLOAD_URL = (
     f"https://github.com/sbk0674-web/samba-wave/releases/download/"

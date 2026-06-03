@@ -78,7 +78,7 @@ except ImportError:
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.4.29"
+DAEMON_VERSION = "1.4.30"
 
 
 # ── 가격수집 도메인 화이트리스트 ───────────────────────────────────────────
@@ -3325,8 +3325,39 @@ def _supervisor_loop() -> int:
             f"supervisor: worker spawn pid={child.pid} "
             f"(총 {restart_count + 1}회, backoff={backoff}s)"
         )
+        # [2026-06-03] worker hang 워치독 — child.wait() 무한 대기로 잡 안에서 멈춘(hung)
+        # worker 를 영영 못 살리던 사고(SSG/a-rt 송장 잡 claim 후 무응답 → 데몬 사실상 정지,
+        # max-uptime self-restart 는 worker 루프가 살아있어야만 동작하므로 hung 엔 무력).
+        # max-uptime(정상 자가재시작 주기) + grace 초과 시 worker 프로세스 강제 kill → 재시작
+        # → 신버전 자동 갱신까지 자가치유. max-uptime=0(비활성)이면 큰 기본값으로 워치독.
+        _mu = 3600
+        for _i, _a in enumerate(sys.argv):
+            if _a == "--max-uptime" and _i + 1 < len(sys.argv):
+                try:
+                    _mu = int(sys.argv[_i + 1])
+                except Exception:
+                    pass
+            elif _a.startswith("--max-uptime="):
+                try:
+                    _mu = int(_a.split("=", 1)[1])
+                except Exception:
+                    pass
+        _watchdog = (_mu if _mu > 0 else 3600) + 300  # 정상 종료 여유(grace) 5분
         try:
-            rc = child.wait()
+            try:
+                rc = child.wait(timeout=_watchdog)
+            except subprocess.TimeoutExpired:
+                logger_print(
+                    f"supervisor: worker {_watchdog}s 무응답(hung 의심) — 강제 kill 후 재시작"
+                )
+                try:
+                    child.kill()
+                except Exception:
+                    pass
+                try:
+                    rc = child.wait(timeout=15)
+                except Exception:
+                    rc = -1
         except KeyboardInterrupt:
             logger_print("supervisor: KeyboardInterrupt — worker 종료 후 본인도 종료")
             try:
