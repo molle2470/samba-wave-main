@@ -217,9 +217,9 @@ function getDeletionRegex(deletionWords: string[]): RegExp | null {
 }
 
 function getSourceSiteMargin(
-  sourceSiteMargins: Record<string, { marginRate?: number; marginAmount?: number }>,
+  sourceSiteMargins: Record<string, { marginRate?: number; marginAmount?: number; pointOnly?: boolean }>,
   sourceSite: string,
-): { marginRate?: number; marginAmount?: number } {
+): { marginRate?: number; marginAmount?: number; pointOnly?: boolean } {
   if (sourceSiteMargins[sourceSite]) return sourceSiteMargins[sourceSite]
   if (sourceSite === 'GSSHOP' && sourceSiteMargins.GSShop) return sourceSiteMargins.GSShop
   if (sourceSite === 'GSShop' && sourceSiteMargins.GSSHOP) return sourceSiteMargins.GSSHOP
@@ -471,10 +471,14 @@ const ProductCard = React.memo(function ProductCard({
   const feeRate = (pricing.feeRate as number) || 0
   const minMarginAmount = (pricing.minMarginAmount as number) || 0
   // 소싱처별 추가 마진 추출
-  const sourceSiteMargins = (pricing.sourceSiteMargins || {}) as Record<string, { marginRate?: number; marginAmount?: number }>
+  const sourceSiteMargins = (pricing.sourceSiteMargins || {}) as Record<string, { marginRate?: number; marginAmount?: number; pointOnly?: boolean }>
   const ssmData = getSourceSiteMargin(sourceSiteMargins, p.source_site)
-  const ssMRate = ssmData.marginRate || 0
-  const ssMAmount = ssmData.marginAmount || 0
+  // 백엔드 calc_market_price 와 동일 게이트: pointOnly=true 면 적립금 사용 가능 상품
+  // (is_point_restricted === false) 에만 소싱추가마진 적용. None/true 는 제외(백엔드 'is False' 일치).
+  // 이 게이트 없으면 적립금제한 상품에 UI 만 소싱마진을 얹어 전송가(오토튠)와 불일치(199,100 vs 187,700).
+  const ssmApply = !ssmData.pointOnly || p.is_point_restricted === false
+  const ssMRate = ssmApply ? ssmData.marginRate || 0 : 0
+  const ssMAmount = ssmApply ? ssmData.marginAmount || 0 : 0
 
   // 공통 가격 계산 (useMemo 캐싱)
   const { price: marketPrice, calcStr } = useMemo(
