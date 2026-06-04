@@ -191,10 +191,20 @@ class SambaTetrisService:
                     registered_accounts IS NULL
                     OR NOT (registered_accounts::jsonb ? :account_id)
                   )
-                  AND COALESCE(
-                    (last_sent_data -> :account_id ->> 'failure_count')::int,
-                    0
-                  ) < 3
+                  AND (
+                    -- 3회 미만 실패: 정상 재시도 대상
+                    COALESCE(
+                      (last_sent_data -> :account_id ->> 'failure_count')::int,
+                      0
+                    ) < 3
+                    -- 3회 이상 실패라도 마지막 실패가 1일 지났으면 다시 시도
+                    -- (일시적 실패 자동 회복 + 영구 실패는 하루 1회로 throttle).
+                    -- issue #187 무한 재등록은 '매 사이클'이 아니라 '하루 1회'로 억제됨.
+                    OR COALESCE(
+                      (last_sent_data -> :account_id ->> 'failed_at')::timestamptz,
+                      'epoch'::timestamptz
+                    ) < (now() - interval '1 day')
+                  )
             """),
             {
                 "tid": tenant_id,
