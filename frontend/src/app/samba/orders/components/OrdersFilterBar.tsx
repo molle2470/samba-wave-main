@@ -231,6 +231,7 @@ export default function OrdersFilterBar(props: Props) {
           </select>
           <select style={{ ...inputStyle, width: '140px', padding: '0.22rem 0.4rem', fontSize: '0.75rem' }} value={accountFilter} onChange={e => setAccountFilter(e.target.value)}>
             <option value="">전체 소싱계정</option>
+            <option value="etc">기타(미매핑)</option>
             {[...new Set(sourcingAccounts.map(sa => sa.site_name))].sort().map(site => (
               <optgroup key={site} label={site}>
                 {sourcingAccounts.filter(sa => sa.site_name === site).map(sa => (
