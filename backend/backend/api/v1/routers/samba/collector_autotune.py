@@ -2074,6 +2074,35 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                 _failed_at_str > _sent_at_str
                                             )
 
+                                    # orphan preemptive 만료 [2026-06-04]:
+                                    # preemptive failed_at 는 fire-and-forget transmit task 가
+                                    # 배포 재시작/cancel/SIGTERM 로 사라지면 영구히 안 떼짐 →
+                                    # 매 사이클 재시도 → 전 사이트 5.5만건 백로그(MUSINSA 71%) 적체.
+                                    # failure_count==0(=실패경로 미경유, 순수 preemptive)이고
+                                    # failed_at 가 grace(30분) 넘게 묵었으면 = task 유실 확정 →
+                                    # stale 판정해 무시(무한 재시도 차단). 실제 키 제거는 전송
+                                    # 성공 덮어쓰기/일회성 청소에 위임(hot loop DB write 금지).
+                                    # fc>=1 진짜 실패는 만료 안 함(재시도 유지).
+                                    if _has_failed_mark and acc_last:
+                                        _fc_mark = int(
+                                            acc_last.get("failure_count") or 0
+                                        )
+                                        if _fc_mark == 0:
+                                            try:
+                                                _fa_dt = datetime.fromisoformat(
+                                                    str(acc_last.get("failed_at") or "")
+                                                )
+                                                if _fa_dt.tzinfo is None:
+                                                    _fa_dt = _fa_dt.replace(
+                                                        tzinfo=timezone.utc
+                                                    )
+                                                if (
+                                                    datetime.now(timezone.utc) - _fa_dt
+                                                ).total_seconds() > 1800:
+                                                    _has_failed_mark = False
+                                            except Exception:
+                                                pass
+
                                     # 초기 cost 교정 — 이전 전송 cost가 정가 폴백(과거 추출실패 잔재)인 경우
                                     # 새로 정확한 혜택가가 들어와도 "가격변동"으로 인식되어 전송되는 사고 차단.
                                     # 조건: 이전 acc_last.cost == product.original_price (정가 폴백 의심)
