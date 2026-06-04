@@ -620,6 +620,8 @@ class LotteHomeClient:
         """매입담당자(MD) 목록 조회."""
         cert_key = await self._ensure_auth()
         params: dict[str, Any] = {"subscriptionId": cert_key}
+        if self.agnc_no:
+            params["agnc_no"] = self.agnc_no
         if md_nm:
             params["md_nm"] = md_nm
         if md_id:
@@ -676,10 +678,13 @@ class LotteHomeClient:
     async def search_delivery_policies(self) -> dict[str, Any]:
         """배송비정책 목록 조회."""
         cert_key = await self._ensure_auth()
+        params: dict[str, Any] = {"subscriptionId": cert_key}
+        if self.agnc_no:
+            params["agnc_no"] = self.agnc_no
         return await self._call_api_auto_retry(
             "searchDlvPolcInfoListOpenApi.lotte",
             "GET",
-            {"subscriptionId": cert_key},
+            params,
         )
 
     async def register_delivery_policy(
@@ -700,10 +705,13 @@ class LotteHomeClient:
         for tp, target in (("10", shipping_places), ("20", return_places)):
             try:
                 cert_key = await self._ensure_auth()
+                tp_params: dict[str, Any] = {"subscriptionId": cert_key, "dlvp_tp_cd": tp}
+                if self.agnc_no:
+                    tp_params["agnc_no"] = self.agnc_no
                 res = await self._call_api_auto_retry(
                     "searchReturnListOpenApi.lotte",
                     "GET",
-                    {"subscriptionId": cert_key, "dlvp_tp_cd": tp},
+                    tp_params,
                 )
                 data = res.get("data", {})
                 result = data.get("Result", data)
