@@ -553,14 +553,28 @@ class LotteHomePlugin(MarketPlugin):
                     price_result = await client.update_price(
                         existing_no, sale_price, margin_rate
                     )
-                    if price_result.get("success"):
-                        results["updated"].append("price")
-                        logger.info(
-                            f"[롯데홈쇼핑] 가격 업데이트 완료: {existing_no} → {sale_price}원"
-                        )
+                    # <Result> 코드 기반 분기 (#351): 1=즉시승인, 3=MD승인 대기, 2=실패
+                    if price_result.get("ok"):
+                        if price_result.get("approval") == "md_pending":
+                            # MD승인 대기 — 접수됐으나 미반영. 재전송 폭주 방지 위해
+                            # 성공으로 두되 'price_pending' 으로 구분(반영완료 아님).
+                            results["updated"].append("price_pending")
+                            logger.info(
+                                f"[롯데홈쇼핑] 가격 MD승인 대기: {existing_no} → "
+                                f"{sale_price}원 (승인 후 반영)"
+                            )
+                        else:
+                            results["updated"].append("price")
+                            logger.info(
+                                f"[롯데홈쇼핑] 가격 업데이트 완료(즉시승인): {existing_no} → {sale_price}원"
+                            )
                     else:
+                        # Result=2(실패)/불명 — 더 이상 false success 로 묻지 않음
+                        _pmsg = price_result.get("message") or "Result 불명"
+                        results["success"] = False
+                        results["message"] = f"롯데홈쇼핑 가격 수정 실패: {_pmsg}"
                         logger.warning(
-                            f"[롯데홈쇼핑] 가격 업데이트 실패: {price_result.get('message')}"
+                            f"[롯데홈쇼핑] 가격 업데이트 실패: {existing_no} → {_pmsg}"
                         )
                 except Exception as e:
                     logger.error(f"[롯데홈쇼핑] 가격 업데이트 오류: {e}")

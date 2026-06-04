@@ -848,7 +848,13 @@ class LotteHomeClient:
     async def update_price(
         self, goods_no: str, sale_price: int, margin_rate: int = 0
     ) -> dict[str, Any]:
-        """판매가 수정 (updateGoodsSalePrcOpenApi)."""
+        """판매가 수정 (updateGoodsSalePrcOpenApi).
+
+        공식 명세 응답 <Result>: 1=즉시승인(반영), 2=실패, 3=MD승인(대기·미반영).
+        기존엔 <Errors> 없으면 무조건 success 로 봐 Result=2(실패)를 false success 로,
+        Result=3(MD승인 대기)를 반영완료로 오인 → last_sent_data 가 실제 SalePrc 와
+        불일치(#351). Result 코드를 파싱해 정확히 분기한다.
+        """
         cert_key = await self._ensure_auth()
         params: dict[str, Any] = {
             "subscriptionId": cert_key,
@@ -857,9 +863,46 @@ class LotteHomeClient:
         }
         if margin_rate > 0:
             params["mrgnRt"] = str(margin_rate)
-        return await self._call_api_auto_retry(
+        result = await self._call_api_auto_retry(
             "updateGoodsSalePrcOpenApi.lotte", "POST", params
         )
+        data = result.get("data", {}) or {}
+        # <Response><Result>1</Result></Response> — leaf 값(문자열)
+        res_val = data.get("Result") if isinstance(data, dict) else None
+        result_code = str(res_val).strip() if res_val is not None else ""
+        if result_code == "1":
+            return {
+                "ok": True,
+                "approval": "immediate",
+                "result_code": "1",
+                "raw": data,
+            }
+        if result_code == "3":
+            # MD승인 대기 — 요청은 접수됐으나 승인 전까지 SalePrc 미반영.
+            # 성공이되 '반영완료' 아님 → 호출자가 재전송 폭주 없이 별도 처리.
+            return {
+                "ok": True,
+                "approval": "md_pending",
+                "result_code": "3",
+                "message": "롯데홈 판매가 MD승인 대기 — 승인 후 반영",
+                "raw": data,
+            }
+        if result_code == "2":
+            return {
+                "ok": False,
+                "approval": "failed",
+                "result_code": "2",
+                "message": "롯데홈 판매가 수정 실패(Result=2) — 가격변동률 90%↑ 등",
+                "raw": data,
+            }
+        # Result 불명/누락 — false success 방지 위해 실패로 처리
+        return {
+            "ok": False,
+            "approval": "unknown",
+            "result_code": result_code,
+            "message": f"롯데홈 판매가 수정 응답 Result 불명({result_code!r})",
+            "raw": data,
+        }
 
     async def search_stock(self, goods_no: str = "") -> dict[str, Any]:
         """재고 목록 조회."""
