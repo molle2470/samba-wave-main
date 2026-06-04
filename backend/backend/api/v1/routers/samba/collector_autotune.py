@@ -3726,6 +3726,20 @@ async def _autotune_loop(device_id: str):
                 )
                 await asyncio.sleep(2)
             except Exception as e:
+                # 죽은 DB 커넥션(pool_pre_ping=False + pool_recycle=60)으로 인한
+                # 일시적 연결끊김(Transaction.rollback/PreparedStatement.fetch 등)은
+                # 인프라 블립이므로 재시작 상한(MAX_RESTART_COUNT)에 포함하지 않는다.
+                # 짧게 쉬고 즉시 재시도 — DB 복구 시 자동 회복(자가치유).
+                # 미포함 안 하면 일 2~3회 블립이 누적돼 _pc_restart_count(성공 사이클에
+                # 리셋 안 됨)가 ~25h 만에 50 도달 → 오토튠 무음 중단 사고.
+                if _is_stale_conn_error(e):
+                    log.warning(
+                        "[오토튠][%s] 코디네이터 일시 연결끊김 — 재시도(상한 미포함): %s",
+                        _dev_tag,
+                        str(e)[:120],
+                    )
+                    await asyncio.sleep(3)
+                    continue
                 _pc_restart_count[device_id] = _pc_restart_count.get(device_id, 0) + 1
                 if _pc_restart_count[device_id] >= MAX_RESTART_COUNT:
                     log.error(
