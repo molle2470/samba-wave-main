@@ -433,6 +433,19 @@ export const orderApi = {
       `${SAMBA_PREFIX}/orders/tracking-sync/retry-failed?days=${days}`,
       { method: 'POST' },
     ),
+  // 전담 송장 PC (데몬 device_id) 조회/지정 — 멀티PC 동시 SSG 로그인 잠금 차단
+  getTrackingOwnerDevice: () =>
+    request<{ tracking_owner_device: string }>(`${SAMBA_PREFIX}/orders/tracking-sync/owner-device`),
+  setTrackingOwnerDevice: (device: string) =>
+    request<{ success: boolean; tracking_owner_device: string }>(
+      `${SAMBA_PREFIX}/orders/tracking-sync/owner-device?device=${encodeURIComponent(device)}`,
+      { method: 'POST' },
+    ),
+  // 연결된 데몬 PC 목록 (전담 PC 드롭다운용) — autotune 분담 엔드포인트 재사용
+  listDaemonPcs: () =>
+    request<{ daemons: { device_id: string; sites: string[]; last_seen_ago: number | null; alive: boolean }[] }>(
+      `${SAMBA_PREFIX}/collector/autotune/pc-allowed-sites`,
+    ),
   getAutoSyncInterval: () =>
     request<{ interval_minutes: number }>(`${SAMBA_PREFIX}/orders/auto-sync-interval`),
   setAutoSyncInterval: (interval_minutes: number) =>

@@ -1724,6 +1724,35 @@ async def sync_order_tracking_bulk(
     )
 
 
+@router.get("/tracking-sync/owner-device")
+async def get_tracking_owner_device() -> dict:
+    """현재 전담 송장 PC(데몬 device_id) 조회. ''이면 전담 미지정(모든 PC)."""
+    from backend.api.v1.routers.samba.proxy._helpers import _get_setting
+    from backend.db.orm import get_write_session
+
+    async with get_write_session() as s:
+        v = await _get_setting(s, "tracking_owner_device")
+    return {"tracking_owner_device": str(v).strip() if v else ""}
+
+
+@router.post("/tracking-sync/owner-device")
+async def set_tracking_owner_device(device: str = Query("")) -> dict:
+    """전담 송장 PC 지정. device='' 면 해제(모든 PC). 데몬 device_id(samba-daemon-)만 허용.
+
+    지정 시 송장 잡 owner_device_id 가 그 데몬으로 박혀 그 PC만 수신 →
+    여러 PC가 같은 SSG 계정 동시 로그인하는 멀티PC 보안잠금 차단.
+    """
+    from backend.api.v1.routers.samba.proxy._helpers import _set_setting
+    from backend.db.orm import get_write_session
+
+    dev = (device or "").strip()
+    if dev and not dev.startswith("samba-daemon-"):
+        raise HTTPException(400, "데몬 device_id(samba-daemon-...)만 지정 가능합니다")
+    async with get_write_session() as s:
+        await _set_setting(s, "tracking_owner_device", dev)
+    return {"success": True, "tracking_owner_device": dev}
+
+
 @router.post("/tracking-sync/dispatch/bulk")
 async def dispatch_tracking_bulk(dry_run: bool = False) -> dict:
     """SCRAPED + DISPATCH_FAILED 잡 전부 일괄 마켓 전송 (재시도 포함)."""
