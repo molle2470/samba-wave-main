@@ -1777,14 +1777,19 @@ class LotteonClient:
             return success, message or ("정상 처리" if success else "실패")
         except Exception as e:
             err_msg = str(e)
-            # 3006 = "주문의 상태를 확인해 주세요" — 같은 odNo의 다른 옵션이 먼저 취소되어
-            # 롯데ON 쪽에서는 이미 전체 주문이 취소 상태. 삼바 DB 동기화를 위해 성공으로 처리.
-            # _call_api가 "응답 에러 (3006): ..." 형식으로 LotteonApiError를 던지므로 메시지로 구분.
+            # 3006 = "주문의 상태를 확인해 주세요" — 직접취소가 거부된 상태.
+            # 의미가 두 가지로 갈림:
+            #   (a) 같은 odNo의 다른 옵션이 이미 취소되어 전체 주문 취소 상태 (멱등)
+            #   (b) 취소요청 클레임이 살아있어 직접취소 불가 → 클레임 승인이 필요
+            # 이전 코드는 (a)만 가정하고 무조건 success 반환했으나, 실제로는 (b) 케이스가
+            # 흔하고 이게 false-success(미승인 클레임인데 삼바만 '취소완료')의 진앞이었다.
+            # 안전하게 fail 로 신호 — 호출 측(_lotteon_approve_or_direct_cancel)이 3006 을
+            # 감지하면 클레임 재조회 후 cnclRequestApproval 로 fallback 한다.
             if "(3006)" in err_msg:
                 logger.info(
-                    f"[롯데ON][판매자취소] 이미 취소된 주문 (3006): odNo={od_no}"
+                    f"[롯데ON][판매자취소] 3006 — 직접취소 거부 (클레임 대기 가능성): odNo={od_no}"
                 )
-                return True, "이미 취소된 주문"
+                return False, "3006: 직접취소 거부 — 클레임 승인 필요"
             logger.warning(f"[롯데ON][판매자취소] 실패: odNo={od_no} / {err_msg}")
             return False, err_msg
 

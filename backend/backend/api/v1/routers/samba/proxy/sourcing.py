@@ -464,6 +464,29 @@ async def sourcing_tracking_result(body: dict[str, Any]) -> dict[str, Any]:
 _LOTTEON_CANCEL_DONE_STEPS = {"13", "21"}
 
 
+def _lotteon_candidate_od_nos(raw: str) -> list[str]:
+    """ord_row.od_no/order_number 에서 클레임 odNo 매칭용 후보 토큰들 추출.
+
+    삼바 DB 의 order_number 가 라이브 클레임 응답의 odNo 와 다른 형식인 케이스를 흡수한다.
+      예) 'L02682376475_2682376509' → ['L02682376475_2682376509', 'L02682376475', '02682376475']
+      예) '20260601139900099_1'    → ['20260601139900099_1', '20260601139900099']
+    매칭 누락 → 직접취소 fallback → 3006 false-success 의 진앞을 차단.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    out = [raw]
+    if "_" in raw:
+        head = raw.split("_", 1)[0]
+        if head and head not in out:
+            out.append(head)
+    # L 접두 (롯데ON 내부 식별자) 제거한 순수 숫자 토큰
+    last = out[-1]
+    if last.startswith("L") and last[1:].isdigit():
+        out.append(last[1:])
+    return out
+
+
 async def _lotteon_approve_or_direct_cancel(client, ord_row) -> tuple[bool, str]:
     """롯데ON 취소 마무리 — 라이브 취소클레임 조회로 승인 대상 판별.
 
@@ -473,33 +496,54 @@ async def _lotteon_approve_or_direct_cancel(client, ord_row) -> tuple[bool, str]
       - 완료 클레임만 있음 → 이미 승인됨(멱등) → 성공
 
     클레임이 존재하는데 직접취소로 fallback 하지 않는 이유: 직접취소는 취소요청 대기 건에
-    3006 반환 + seller_cancel_order 가 3006 을 성공으로 처리 → '미승인인데 완료' false-success.
+    3006 반환 + 이전 seller_cancel_order 가 3006 을 success 로 처리 → '미승인인데 완료'
+    false-success. 현재 seller_cancel_order 는 3006 을 fail 로 신호하고, 본 함수는 3006
+    감지 시 클레임 재조회 후 승인 fallback 을 한 번 더 시도한다.
     """
-    od_no = ord_row.od_no or ord_row.order_number
+    raw = ord_row.od_no or ord_row.order_number
+    candidates = _lotteon_candidate_od_nos(raw)
     try:
         claims = await client.get_cancel_orders(days=14)
     except Exception as e:
         # 조회 실패 시 직접취소로 내려가면 false-success 위험 → 실패 처리(운영자 수동)
         return False, f"취소클레임 조회 실패: {e}"
 
-    matched = [c for c in claims if str(c.get("odNo", "") or "") == str(od_no)]
-    if ord_row.od_seq:
-        by_seq = [
-            c for c in matched if str(c.get("odSeq", "") or "") == str(ord_row.od_seq)
-        ]
-        if by_seq:
-            matched = by_seq
+    def _match(claim_list):
+        cand_set = {str(c) for c in candidates}
+        m = [c for c in claim_list if str(c.get("odNo", "") or "") in cand_set]
+        if ord_row.od_seq:
+            by_seq = [
+                c for c in m if str(c.get("odSeq", "") or "") == str(ord_row.od_seq)
+            ]
+            if by_seq:
+                m = by_seq
+        return m
+
+    matched = _match(claims)
 
     if not matched:
-        # 마켓 측 고객 취소요청 없음 → 판매자가 직접 취소
+        # 마켓 측 고객 취소요청 없음(또는 매칭 누락) → 판매자가 직접 취소
         success, message = await client.seller_cancel_order(
-            od_no=od_no,
+            od_no=candidates[-1] if candidates else raw,
             reason_code="CC11",  # 고객변심
             reason_text="고객 취소요청",
             od_seq=int(ord_row.od_seq or 1),
             proc_seq=int(ord_row.proc_seq or 1),
         )
-        return success, (message if not success else "판매자직접취소 완료")
+        if success:
+            return True, "판매자직접취소 완료"
+        # 3006 = 직접취소 거부 (클레임 대기 가능성). 클레임 재조회 후 승인 시도.
+        if "3006" in (message or ""):
+            try:
+                claims2 = await client.get_cancel_orders(days=30)
+            except Exception as e:
+                return False, f"3006 후 클레임 재조회 실패: {e}"
+            matched = _match(claims2)
+            if not matched:
+                return False, "3006: 직접취소 거부 + 클레임 매칭 실패 — 운영자 확인 필요"
+            # ↓ 아래 승인 흐름으로 이어짐
+        else:
+            return False, message
 
     pending = [
         c
@@ -511,9 +555,10 @@ async def _lotteon_approve_or_direct_cancel(client, ord_row) -> tuple[bool, str]
         return True, "이미 취소 처리된 클레임"
 
     claim = pending[0]
+    matched_od_no = str(claim.get("odNo", "") or "") or (candidates[0] if candidates else raw)
     try:
         await client.approve_cancel(
-            od_no=od_no,
+            od_no=matched_od_no,
             clm_no=str(claim.get("clmNo", "") or ""),
             items=[
                 {

@@ -2619,33 +2619,40 @@ async def approve_cancel(
         # 0) 결제완료 단계 즉시취소 분기 — 쿠팡이 자동 취소하므로 승인 호출 불필요.
         #    발주서 단건 재조회로 쿠팡 현재 상태(진실의 원천)를 확인해 이미 CANCEL이면
         #    상태만 '취소완료'로 동기화하고 종료. (receiptId 없는 즉시취소 케이스 구제)
+        #
+        # ⚠️ 진실의 원천 = 쿠팡. DB 자체 자료(order.status)만 보고 이 분기에 빠지면
+        # 마켓 API 한 번도 호출 안 한 채 DB만 cancelled로 박는 false-success 발생
+        # (사례: 동기화 잡이 status를 cancelled로 선점 → 사용자가 취소승인 누름 →
+        #  마켓엔 '출고중지요청' 그대로인데 삼바만 '취소완료'로 보이는 사고).
+        # 따라서 ① 항상 단건 조회로 live_status 확보 시도 ② live_status == 'CANCEL' 일
+        # 때만 즉시취소 분기로 통과. live_status 확보 실패면 명시적 에러 → 운영자가
+        # 동기화 후 재시도하도록 유도.
         live_status = ""
-        if order.status != "cancelled":
+        _box_id = None
+        try:
+            # 쿠팡 order_number = shipmentBoxId (parse 규칙)
+            _box_id = int(order.order_number)
+        except (TypeError, ValueError):
             _box_id = None
+        if _box_id:
             try:
-                # 쿠팡 order_number = shipmentBoxId (parse 규칙)
-                _box_id = int(order.order_number)
-            except (TypeError, ValueError):
-                _box_id = None
-            if _box_id:
-                try:
-                    _sheet = await client.get_ordersheet_by_box_id(_box_id)
-                    _data = _sheet.get("data") if isinstance(_sheet, dict) else None
-                    if isinstance(_data, list):
-                        _data = _data[0] if _data else None
-                    if isinstance(_data, dict):
-                        live_status = (_data.get("status") or "").upper()
-                except Exception as _le:
-                    logger.warning(f"[취소승인] 쿠팡 단건 조회 실패(무시): {_le}")
+                _sheet = await client.get_ordersheet_by_box_id(_box_id)
+                _data = _sheet.get("data") if isinstance(_sheet, dict) else None
+                if isinstance(_data, list):
+                    _data = _data[0] if _data else None
+                if isinstance(_data, dict):
+                    live_status = (_data.get("status") or "").upper()
+            except Exception as _le:
+                logger.warning(f"[취소승인] 쿠팡 단건 조회 실패: {_le}")
 
-        if order.status == "cancelled" or live_status == "CANCEL":
+        if live_status == "CANCEL":
             await svc.update_order(
                 order_id,
                 {"shipping_status": "취소완료", "status": "cancelled"},
             )
             logger.info(
-                f"[취소승인] 쿠팡 {order.order_number} 즉시취소 완료 — 상태 동기화 "
-                f"(live_status={live_status or 'DB cancelled'})"
+                f"[취소승인] 쿠팡 {order.order_number} 즉시취소 확인 — 상태 동기화 "
+                f"(live_status=CANCEL)"
             )
             return {"ok": True, "message": "쿠팡 즉시취소 완료 (상태 동기화)"}
 
