@@ -181,8 +181,8 @@ asyncio.run(fix())
     # 컬럼/인덱스가 이미 DB에 존재하는 상태에서 hot 테이블 ALTER 데드락 회피.
     _HEADS=$(uv run alembic heads -q 2>/dev/null | head -1)
     if [ -z "$_HEADS" ]; then
-      echo "Warning: alembic heads 조회 실패, zzzzzzzzzzzzzzz_gallery_include_sub으로 fallback"
-      _HEADS="zzzzzzzzzzzzzzz_gallery_include_sub"
+      echo "Warning: alembic heads 조회 실패, z_ret_editable_001으로 fallback"
+      _HEADS="z_ret_editable_001"
     fi
     uv run alembic stamp --purge $_HEADS 2>/dev/null || true
     _MIGRATION_OK=0
