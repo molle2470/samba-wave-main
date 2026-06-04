@@ -1349,6 +1349,19 @@ class JobWorker:
                             await item_session.commit()
                             return 0, 1, 0, None
 
+                    # 전송 후 stale item_session 접근 차단 — 계정 라벨을 전송 전에 미리 적재.
+                    # 롯데홈쇼핑 등 1건 60~90초 전송 동안 item_session이 pool_recycle(60s)로
+                    # 닫혀, 전송 후 acc_repo.get_async가 'connection is closed'로 실패하던 버그
+                    # (증상2 — 느린 마켓만 세션만료를 넘겨 등록이 실패로 집계됨).
+                    _acc_label_map: dict[str, str] = {}
+                    for _lid in effective_account_ids:
+                        _lacc = await acc_repo.get_async(_lid)
+                        _acc_label_map[_lid] = (
+                            f"{_lacc.market_name}({_lacc.seller_id or _lacc.business_name or '-'})"
+                            if _lacc
+                            else _lid
+                        )
+
                     # 마켓 HTTP 동안 item_session 미점유 — 별도 단명 세션 사용
                     # (item_session이 여러 계정×마켓HTTP 동안 열리면 pool_recycle 만료
                     # → greenlet_spawn 에러. _transmit_session은 전송 중에만 점유)
@@ -1383,12 +1396,9 @@ class JobWorker:
                     any_success = False
                     _s = _sk = _f = 0
                     for acc_id, acc_status in tx_result.items():
-                        acc = await acc_repo.get_async(acc_id)
-                        acc_label = (
-                            f"{acc.market_name}({acc.seller_id or acc.business_name or '-'})"
-                            if acc
-                            else acc_id
-                        )
+                        # 전송 전 적재한 라벨 사용 — stale item_session 재조회 금지
+                        # (느린 마켓 전송 후 acc_repo.get_async 'connection is closed' 방지)
+                        acc_label = _acc_label_map.get(acc_id) or acc_id
                         ur = r.get("update_result", {})
                         rl = (
                             f" [{ur.get('refresh', '')}]"
@@ -1477,7 +1487,14 @@ class JobWorker:
                         if not any_success and status not in ("skipped", "completed")
                         else None
                     )
-                    await item_session.commit()
+                    # item_session은 전송 전 읽기만 함(쓰기는 _transmit_session에서 commit됨).
+                    # 느린 전송 동안 연결이 닫혔어도 성공을 실패로 뒤집지 않도록 best-effort.
+                    try:
+                        await item_session.commit()
+                    except Exception as _commit_e:
+                        logger.warning(
+                            f"[잡워커] item_session commit 실패(무시, 쓰기 없음): {pid} — {_commit_e}"
+                        )
                     return _s, _sk, _f, _failed_pid
             except Exception as e:
                 _add_job_log(job.id, f"[{i + 1}/{total}] {prod_name}: {e}")
