@@ -27,6 +27,7 @@ JSON 구조 주의: SSG는 XStream 기반이므로 배열을
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -1319,7 +1320,27 @@ class SSGClient:
                     return m["brandId"], m["brandNm"]
             return "", ""
 
-        _mappings = brand_mappings or []
+        # ssgBrandMappings 정규화 — 프론트 직렬화 오류로 list[dict]가 아닌 문자열로
+        # 저장된 경우 복원 시도. 유효 JSON 문자열(예: '[{"brandNm":...}]')이면 파싱해
+        # 실제 매핑을 살리고, 복원 불가('[object Object]' 같은 toString 잔해)면 로그를
+        # 남기고 빈 목록 처리 — 조용한 브랜드 오등록 대신 원인을 가시화한다.
+        _mappings = brand_mappings
+        if isinstance(_mappings, str):
+            try:
+                _mappings = json.loads(_mappings)
+            except (ValueError, TypeError):
+                logger.warning(
+                    "[SSG] ssgBrandMappings 복원 불가 문자열 — 브랜드매핑 건너뜀: %.80s",
+                    _mappings,
+                )
+                _mappings = []
+        if not isinstance(_mappings, list):
+            _mappings = []
+        # dict 가 아닌 원소 혼입 방어 (부분 손상 데이터)
+        _bad = [m for m in _mappings if not isinstance(m, dict)]
+        if _bad:
+            logger.warning("[SSG] ssgBrandMappings dict 아닌 원소 %d개 제외", len(_bad))
+            _mappings = [m for m in _mappings if isinstance(m, dict)]
         matched_brand_id, matched_brand_name = _match_from_mappings(brand, _mappings)
         if not matched_brand_id and manufacturer:
             matched_brand_id, matched_brand_name = _match_from_mappings(
