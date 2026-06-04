@@ -6,33 +6,16 @@
 
 from __future__ import annotations
 
-import asyncio
 import math as _math
 import re
-import time as _time
 from typing import Any
 
 from backend.domain.samba.plugins.market_base import MarketPlugin
 from backend.utils import add_lazy_loading
 from backend.utils.logger import logger
 
-# goods_no → {opt_name: item_no} 캐시 (프로세스 내 메모리)
-# A안: 미스 1회 발생 시 searchStockList 33MB 전체 카탈로그를 한 번 받아 전 상품 ItemNo 를
-#      한꺼번에 채운다(상품마다 호출 → 사이클당 1회). B안: 아래 _ITEM_NO_CACHE_KEY 로 DB 영속.
+# goods_no → {opt_name: item_no} 캐시 (프로세스 내 영구 유지, 재시작 시 1회만 API 조회)
 _item_no_cache: dict[str, dict[str, str]] = {}
-
-# B안: 재시작/배포에도 유지되는 DB 영속 캐시 (samba_settings 단일 blob).
-# gunicorn 워커 1개(entrypoint.sh -w 1, compose WEB_CONCURRENCY=1) 전제 →
-# 단일 키 원자적 덮어쓰기라 멀티워커 race 없음. 워커를 늘리면 전용 테이블로 전환 필요.
-_ITEM_NO_CACHE_KEY = "lottehome_item_no_cache"
-_db_loaded = False  # 콜드스타트 시 1회만 DB blob → 메모리 로드
-
-# A안 bulk 갱신 제어 — 같은 33MB 응답을 사이클 내 1회만 받도록 직렬화 + 최소간격
-_bulk_lock = asyncio.Lock()
-_bulk_at = 0.0  # 마지막 bulk 시각(monotonic)
-_BULK_MIN_INTERVAL = (
-    21600.0  # 6시간 — 캐시에 없는 신규/미존재 상품 재bulk 최소간격(폭주 방지)
-)
 
 
 def _sanitize_image_url(url: str) -> str:
@@ -89,110 +72,6 @@ async def _get_setting(session, key: str) -> Any:
     except Exception:
         pass
     return val
-
-
-async def _ensure_db_loaded(session) -> None:
-    """콜드스타트 1회: DB 영속 blob(samba_settings) → 메모리 _item_no_cache 로드.
-    재시작/배포 후에도 ItemNo 맵 유지 → searchStockList 재호출 없이 즉시 캐시 히트."""
-    global _db_loaded
-    if _db_loaded:
-        return
-    try:
-        blob = await _get_setting(session, _ITEM_NO_CACHE_KEY)
-    except Exception as e:
-        # 일시적 DB 오류면 latch 하지 않고 다음 호출에 재시도(복구 시 정상 로드).
-        # 영구 latch 하면 회복돼도 영영 안 읽어 매번 bulk 1회 발생.
-        logger.warning(f"[롯데홈쇼핑] DB ItemNo 캐시 로드 실패(재시도예정): {e}")
-        return
-    _db_loaded = True  # 정상 조회(빈 결과 포함) → latch, 이후 재조회 안 함
-    if isinstance(blob, dict):
-        loaded = 0
-        for gno, opt_map in blob.items():
-            if isinstance(opt_map, dict) and gno not in _item_no_cache:
-                _item_no_cache[gno] = {str(k): str(v) for k, v in opt_map.items()}
-                loaded += 1
-        logger.info(f"[롯데홈쇼핑] DB ItemNo 캐시 로드: {loaded:,}개 상품")
-
-
-def _parse_all_item_no(stock_result: dict[str, Any]) -> dict[str, dict[str, str]]:
-    """searchStockList 응답(전체 카탈로그)에서 goods_no별 {옵션명: item_no} 전부 추출.
-    기존엔 trigger 상품 1건만 필터해 버렸으나, 응답에 전 상품이 들어오므로 모두 수확한다."""
-    stock_data = stock_result.get("data", {})
-    result_data = stock_data.get("Result", stock_data)
-    all_items = result_data.get(
-        "GoodsInfoList",
-        result_data.get("ItemInfo", result_data.get("items", [])),
-    )
-    if isinstance(all_items, dict):
-        all_items = [all_items]
-    out: dict[str, dict[str, str]] = {}
-    for it in all_items if isinstance(all_items, list) else []:
-        gno = str(it.get("GoodNo", "")).strip()
-        if not gno:
-            continue
-        raw = str(it.get("OptDesc", it.get("ItemNm", ""))).strip()
-        opt_name = raw.split(":")[-1].strip() if ":" in raw else raw
-        item_no = str(it.get("ItemNo", ""))
-        out.setdefault(gno, {})[opt_name] = item_no
-    return out
-
-
-async def _save_item_no_cache_bulk(session) -> None:
-    """현재 메모리 캐시(비어있는 음성캐시 제외) 전체를 DB blob 으로 원자적 덮어쓰기.
-    워커 1개 전제 → read-modify-write race 없음. bulk 갱신 시에만 호출(저빈도)."""
-    from backend.domain.samba.forbidden.model import SambaSettings
-    from sqlmodel import select
-
-    payload = {gno: opts for gno, opts in _item_no_cache.items() if opts}
-    try:
-        stmt = select(SambaSettings).where(SambaSettings.key == _ITEM_NO_CACHE_KEY)
-        row = (await session.execute(stmt)).scalars().first()
-        if row:
-            row.value = payload
-            session.add(row)
-        else:
-            session.add(SambaSettings(key=_ITEM_NO_CACHE_KEY, value=payload))
-        await session.commit()
-        logger.info(f"[롯데홈쇼핑] DB ItemNo 캐시 저장: {len(payload):,}개 상품")
-    except Exception as e:
-        try:
-            await session.rollback()
-        except Exception:
-            pass
-        logger.warning(f"[롯데홈쇼핑] DB ItemNo 캐시 저장 실패(무시): {e}")
-
-
-async def _maybe_bulk_refresh(session, client, trigger_goods_no: str) -> None:
-    """캐시에 없는 상품 발생 시 searchStockList 1회로 전 상품 ItemNo 채움.
-    - asyncio.Lock 으로 같은 사이클 내 33MB 응답 중복 수신 차단
-    - _BULK_MIN_INTERVAL(6h) 내 재bulk 금지 → 신규/미존재 상품은 음성캐시({})로 마킹해 폭주 방지"""
-    global _bulk_at
-    async with _bulk_lock:
-        # Lock 대기 중 다른 코루틴이 이미 채웠으면 종료
-        if trigger_goods_no in _item_no_cache:
-            return
-        now = _time.monotonic()
-        if _bulk_at and (now - _bulk_at) < _BULK_MIN_INTERVAL:
-            # 최근 bulk 했는데도 없음 = 진짜 미존재(또는 신규 미승인). 재호출 안 함.
-            _item_no_cache[trigger_goods_no] = {}  # 음성 캐시
-            return
-        try:
-            stock_result = await client.search_stock(trigger_goods_no)
-        except Exception as e:
-            logger.warning(f"[롯데홈쇼핑] bulk searchStockList 실패(무시): {e}")
-            return
-        _bulk_at = now
-        parsed = _parse_all_item_no(stock_result)
-        if parsed:
-            _item_no_cache.update(parsed)
-            await _save_item_no_cache_bulk(session)
-            logger.info(
-                f"[롯데홈쇼핑] bulk ItemNo 채움: {len(parsed):,}개 상품 "
-                f"(trigger={trigger_goods_no})"
-            )
-        # trigger 상품이 카탈로그에 없으면 음성 캐시로 마킹(재bulk 방지)
-        if trigger_goods_no not in _item_no_cache:
-            _item_no_cache[trigger_goods_no] = {}
 
 
 def _transform_for_lottehome(
@@ -690,18 +569,59 @@ class LotteHomePlugin(MarketPlugin):
             source_options = product.get("options") or []
             if source_options:
                 try:
-                    # ItemNo 조회 — searchStockList 폭주 방지 3단 캐시:
-                    #   1) 메모리 캐시 → 2) DB 영속 캐시(콜드스타트 로드) → 3) bulk 1회(전 상품 채움)
-                    await _ensure_db_loaded(session)
-                    item_no_map: dict[str, str] = _item_no_cache.get(existing_no, {})
-                    if existing_no not in _item_no_cache:
-                        # 메모리·DB 모두 미스 → bulk 갱신(간격/Lock 가드 내장)
-                        await _maybe_bulk_refresh(session, client, existing_no)
-                        item_no_map = _item_no_cache.get(existing_no, {})
-                    else:
+                    # 캐시 우선 — 없을 때만 searchGoodsViewListOpenApi 호출
+                    # (searchStockList는 33MB 응답으로 타임아웃 발생 → goods view로 대체)
+                    # 멤버십 체크(in)로 음성캐시 동작 보장 — 빈 dict 는 falsy 라
+                    # truthiness 로 판단하면 옵션 매칭 0건 상품을 매 사이클 재호출하게 됨.
+                    if existing_no in _item_no_cache:
+                        item_no_map: dict[str, str] = _item_no_cache[existing_no]
                         logger.debug(
                             f"[롯데홈쇼핑] item_no_map 캐시 히트: {existing_no} ({len(item_no_map)}개 옵션)"
                         )
+                    else:
+                        item_no_map = {}
+                        goods_view = await client.search_goods_view(existing_no)
+                        # 응답 구조 방어 — 형제 호출처(qa_poller/collector_autotune)와 동일하게
+                        # Result/GoodsInfo 래퍼가 없는 응답도 fallback 으로 흡수(엄격 체이닝 시
+                        # 래퍼 없으면 {} → 재고 스킵되어 원버그 재현).
+                        data = goods_view.get("data", {})
+                        result_data = (
+                            data.get("Result", data) if isinstance(data, dict) else {}
+                        )
+                        goods_info = (
+                            result_data.get("GoodsInfo", result_data)
+                            if isinstance(result_data, dict)
+                            else {}
+                        )
+                        if not isinstance(goods_info, dict):
+                            goods_info = {}
+                        item_info_list = goods_info.get("ItemInfo", [])
+                        if isinstance(item_info_list, dict):
+                            item_info_list = [item_info_list]
+
+                        lotte_opt_names: set[str] = set()
+                        for it in (
+                            item_info_list if isinstance(item_info_list, list) else []
+                        ):
+                            corp_item_no = str(it.get("CorpItemNo", "")).strip()
+                            item_no = str(it.get("ItemNo", "")).strip()
+                            if corp_item_no and item_no:
+                                item_no_map[corp_item_no] = item_no
+                                lotte_opt_names.add(corp_item_no)
+
+                        # 빈 결과도 음성캐시로 저장 → 다음 사이클 재호출 방지
+                        # (search_goods_view 매 사이클 폭주 차단, IP 차단 예방).
+                        # 옵션이 나중에 등록되면 프로세스 재시작(배포) 시 갱신됨.
+                        _item_no_cache[existing_no] = item_no_map
+                        if item_no_map:
+                            logger.info(
+                                f"[롯데홈쇼핑] item_no_map 캐시 저장: {existing_no} → {lotte_opt_names}"
+                            )
+                        else:
+                            logger.info(
+                                f"[롯데홈쇼핑] item_no_map 빈 결과 음성캐시: {existing_no} "
+                                f"(옵션 매칭 0건, 재호출 방지)"
+                            )
 
                     if not item_no_map:
                         logger.warning(
@@ -734,18 +654,30 @@ class LotteHomePlugin(MarketPlugin):
                             )
                             source_opt_map[opt_name] = stock_val
 
-                        # 1. 롯데에 있는 옵션 → 소싱사이트 재고로 업데이트
-                        # 2. 롯데에 있지만 소싱사이트에 없는 옵션 → 재고 0 (품절)
+                        # 롯데에 있는 옵션 → 소싱사이트 재고로 업데이트
+                        # 롯데에 있지만 소싱사이트에 없는 옵션 → 재고 0 (품절)
+                        # registStock: inv_qty=0이면 ItemSaleStatCd=20(품절) 자동 설정.
+                        # inv_qty>0은 InvQty만 업데이트되며 ItemSaleStatCd는 변경되지 않음.
+                        max_stock = int(product.get("_max_stock") or 0)
                         stock_updated = False
                         for lotte_opt, item_no in item_no_map.items():
                             stock_val = source_opt_map.get(
                                 lotte_opt, 0
                             )  # 소싱에 없으면 0
+                            if max_stock > 0:
+                                stock_val = min(stock_val, max_stock)
                             logger.info(
                                 f"[롯데홈쇼핑] 재고 전송: {lotte_opt} item_no={item_no} stock={stock_val}"
                             )
-                            await client.update_stock(existing_no, item_no, stock_val)
-                            stock_updated = True
+                            try:
+                                await client.update_stock(
+                                    existing_no, item_no, stock_val
+                                )
+                                stock_updated = True
+                            except Exception as _se:
+                                logger.error(
+                                    f"[롯데홈쇼핑] 재고 업데이트 오류: {lotte_opt} → {_se}"
+                                )
 
                         if stock_updated:
                             results["updated"].append("stock")

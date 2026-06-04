@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-import time as _time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from xml.etree import ElementTree as ET
@@ -28,53 +27,6 @@ from backend.utils.logger import logger
 _cert_cache: dict[str, tuple[str, datetime]] = {}
 # 동시 인증 방지 Lock
 _auth_locks: dict[str, asyncio.Lock] = {}
-
-# ── searchStockList 폭주 가드 ────────────────────────────────────────────
-# 시스템 에러/재시도 루프가 롯데 재고API 를 폭격해 IP 차단되는 사고 방지(2026-06-04).
-# 슬라이딩 윈도 레이트리밋 + 연속실패 서킷브레이커. 정상 호출은 사이클당 1회(bulk)라
-# 한도를 넉넉히 둬도 폭주만 차단된다.
-_SS_WINDOW_SEC = 600.0  # 10분 창
-_SS_MAX_PER_WINDOW = 20  # 창당 최대 호출 수(초과 시 호출 자체 차단)
-_SS_CIRCUIT_FAILS = 5  # 연속 실패 임계 → 서킷 개방
-_SS_CIRCUIT_COOLDOWN = 300.0  # 서킷 개방 쿨다운(5분)
-_ss_call_ts: list[float] = []  # 최근 호출 시각(monotonic) 슬라이딩 윈도
-_ss_consecutive_fails = 0
-_ss_circuit_open_until = 0.0
-
-
-def _ss_guard_check() -> None:
-    """searchStockList 호출 직전 폭주 가드. 차단 시 LotteApiError(RATE_LIMIT) raise →
-    호출자(플러그인)는 try/except 로 잡아 재고 업데이트만 건너뛴다(상품 자체는 정상)."""
-    now = _time.monotonic()
-    if now < _ss_circuit_open_until:
-        raise LotteApiError(
-            "RATE_LIMIT",
-            f"searchStockList 서킷 개방 — 연속 {_SS_CIRCUIT_FAILS}회 실패 후 쿨다운 중",
-        )
-    cutoff = now - _SS_WINDOW_SEC
-    while _ss_call_ts and _ss_call_ts[0] < cutoff:
-        _ss_call_ts.pop(0)
-    if len(_ss_call_ts) >= _SS_MAX_PER_WINDOW:
-        raise LotteApiError(
-            "RATE_LIMIT",
-            f"searchStockList 호출한도 초과 — {_SS_WINDOW_SEC / 60:.0f}분당 {_SS_MAX_PER_WINDOW}회 제한",
-        )
-    _ss_call_ts.append(now)
-
-
-def _ss_record_result(success: bool) -> None:
-    """서킷브레이커 상태 갱신 — 연속 실패 누적 시 서킷 개방."""
-    global _ss_consecutive_fails, _ss_circuit_open_until
-    if success:
-        _ss_consecutive_fails = 0
-        return
-    _ss_consecutive_fails += 1
-    if _ss_consecutive_fails >= _SS_CIRCUIT_FAILS:
-        _ss_circuit_open_until = _time.monotonic() + _SS_CIRCUIT_COOLDOWN
-        logger.error(
-            f"[롯데홈쇼핑] searchStockList 연속 {_ss_consecutive_fails}회 실패 → "
-            f"서킷 개방 {_SS_CIRCUIT_COOLDOWN / 60:.0f}분 (롯데 API 폭주 차단)"
-        )
 
 
 async def _persist_cert_to_db(
@@ -868,7 +820,7 @@ class LotteHomeClient:
     async def update_stock(
         self, goods_no: str, item_no: str, inv_qty: int
     ) -> dict[str, Any]:
-        """재고수정."""
+        """재고수정. inv_qty=0이면 ItemSaleStatCd=20(품절) 자동 설정. inv_qty>0은 InvQty만 업데이트되며 ItemSaleStatCd는 변경되지 않는다."""
         cert_key = await self._ensure_auth()
         return await self._call_api_auto_retry(
             "registStock.lotte",
@@ -910,20 +862,13 @@ class LotteHomeClient:
         )
 
     async def search_stock(self, goods_no: str = "") -> dict[str, Any]:
-        """재고 목록 조회(전체 카탈로그 반환). 폭주 가드 + 서킷브레이커 적용."""
+        """재고 목록 조회."""
         cert_key = await self._ensure_auth()
-        _ss_guard_check()  # 호출한도/서킷 초과 시 여기서 RATE_LIMIT raise
-        try:
-            result = await self._call_api_auto_retry(
-                "searchStockList.lotte",
-                "GET",
-                {"subscriptionId": cert_key, "goods_no": goods_no},
-            )
-            _ss_record_result(True)
-            return result
-        except Exception:
-            _ss_record_result(False)
-            raise
+        return await self._call_api_auto_retry(
+            "searchStockList.lotte",
+            "GET",
+            {"subscriptionId": cert_key, "goods_no": goods_no},
+        )
 
     # ------------------------------------------------------------------
     # 주문
