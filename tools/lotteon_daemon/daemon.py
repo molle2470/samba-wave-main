@@ -78,7 +78,7 @@ except ImportError:
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.4.32"
+DAEMON_VERSION = "1.4.33"
 
 
 # ── 가격수집 도메인 화이트리스트 ───────────────────────────────────────────
@@ -1388,6 +1388,24 @@ _last_tracking_account: dict[str, str] = {}
 _failed_login_accounts: dict[str, float] = {}
 _FAILED_LOGIN_COOLDOWN_SEC = 1800  # 30분
 
+# 송장 로그인+스크랩 사이트별 직렬화 Lock (2026-06-04 SSG 계정잠금 근본fix).
+# 한 데몬의 송장 워커 N개(SSG#1/#2/#3)가 단일 BrowserContext(쿠키함)를 공유하는데,
+# 서로 다른 계정 잡을 동시에 처리하면 워커A 로그인 직후 워커B 가 쿠키 클리어(로그아웃)
+# + 다른계정 로그인 → 워커A 세션 증발 → "needs_login" → 재로그인 폭주 → SSG 가
+# "비정상 자동접근" 으로 계정 보안잠금. 사이트별 Lock 으로 로그인~스크랩 전체를
+# 직렬화해 동시 로그인/쿠키클리어 충돌을 제거(한 번에 한 계정만). 세션 재사용
+# (_account_session_cookies)과 결합되면 같은 계정 연속 잡은 로그인 스킵돼 느려지지 않음.
+_tracking_login_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_tracking_login_lock(site: str) -> asyncio.Lock:
+    lk = _tracking_login_locks.get(site)
+    if lk is None:
+        lk = asyncio.Lock()
+        _tracking_login_locks[site] = lk
+    return lk
+
+
 # ── 계정별 세션 쿠키 재사용 (2026-06-04) ───────────────────────────────────
 # SSG 등이 반복 자동 로그인을 "비정상 자동접근(이상 환경)"으로 감지 → 계정 보안잠금
 # (findIdPw 리다이렉트 + "비번 변경 후 이용" alert). 헤드리스 핑거프린트는 깨끗
@@ -1827,35 +1845,41 @@ async def process_tracking_job(
     )
     t0 = time.time()
 
-    # 1) 주문 매칭 계정 로그인 (송장은 마이페이지라 로그인 필수)
-    login_ok = await ensure_logged_in_as_account(
-        page, client, backend_url, device_id, api_key, handler, account_id
-    )
-    if not login_ok:
-        await post_tracking_result(
-            client,
-            backend_url,
-            request_id,
-            {"success": False, "error": f"{site} 계정 로그인 실패 (acc={account_id})"},
-            api_key,
+    # 로그인+스크랩 전체를 사이트별 Lock 으로 직렬화 — 워커들이 쿠키함 공유하므로
+    # 동시 로그인/쿠키클리어가 서로 세션을 날리는 것 차단(SSG 계정잠금 근본fix).
+    async with _get_tracking_login_lock(site):
+        # 1) 주문 매칭 계정 로그인 (송장은 마이페이지라 로그인 필수)
+        login_ok = await ensure_logged_in_as_account(
+            page, client, backend_url, device_id, api_key, handler, account_id
         )
-        state.record_failure()
-        return
+        if not login_ok:
+            await post_tracking_result(
+                client,
+                backend_url,
+                request_id,
+                {
+                    "success": False,
+                    "error": f"{site} 계정 로그인 실패 (acc={account_id})",
+                },
+                api_key,
+            )
+            state.record_failure()
+            return
 
-    # 2) 송장조회 페이지 스크랩
-    # 배송조회 클릭 후 member.one SSO 재인증 튕김 대비 — 같은 계정 자격증명 전달(in-place 재로그인용)
-    _cred_for_trace = await fetch_credential(
-        client, backend_url, device_id, api_key, site, account_id=account_id
-    )
-    try:
-        data = await asyncio.wait_for(
-            extract_tracking(page, url, handler, credential=_cred_for_trace),
-            timeout=90.0,
+        # 2) 송장조회 페이지 스크랩
+        # 배송조회 클릭 후 member.one SSO 재인증 튕김 대비 — 같은 계정 자격증명 전달(in-place 재로그인용)
+        _cred_for_trace = await fetch_credential(
+            client, backend_url, device_id, api_key, site, account_id=account_id
         )
-    except asyncio.TimeoutError:
-        data = {"success": False, "error": "daemon 송장 추출 타임아웃"}
-    except Exception as exc:
-        data = {"success": False, "error": f"daemon 송장 예외: {str(exc)[:120]}"}
+        try:
+            data = await asyncio.wait_for(
+                extract_tracking(page, url, handler, credential=_cred_for_trace),
+                timeout=90.0,
+            )
+        except asyncio.TimeoutError:
+            data = {"success": False, "error": "daemon 송장 추출 타임아웃"}
+        except Exception as exc:
+            data = {"success": False, "error": f"daemon 송장 예외: {str(exc)[:120]}"}
 
     # needsLogin 신호면 다음 잡에서 재로그인하도록 캐시 무효화
     if data.get("needsLogin"):
