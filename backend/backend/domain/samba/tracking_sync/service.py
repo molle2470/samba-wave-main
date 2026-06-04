@@ -72,6 +72,9 @@ def build_tracking_url(site: str, sourcing_order_number: str) -> str:
         return f"https://www.nike.com/kr/orders/sales/{ord_no}/"
     if s == "OLIVEYOUNG":
         return f"https://www.oliveyoung.co.kr/store/mypage/getOrderDetail.do?ordNo={ord_no}"
+    if s == "THEHYUNDAI":
+        # 더현대(현대Hi) 주문상세 — 배송정보 포함 (사용자 제공 URL, 2026-06-04)
+        return f"https://hi.thehyundai.com/mypage/order/detail?ordNo={ord_no}"
     if s == "KREAM":
         # KREAM 송장 URL 추정값 — 마이페이지 주문 상세. 실측 검증 필요.
         return f"https://kream.co.kr/my/orders/{ord_no}"
@@ -168,6 +171,8 @@ def _detect_site_from_url(url: str) -> str:
         return "GSSHOP"
     if "oliveyoung.co.kr" in host:
         return "OLIVEYOUNG"
+    if "thehyundai.com" in host:
+        return "THEHYUNDAI"
     return ""
 
 
@@ -183,19 +188,39 @@ _KNOWN_SOURCE_SITES = {
     "NIKE",
     "FASHIONPLUS",
     "OLIVEYOUNG",
+    "THEHYUNDAI",
 }
 
 
 async def _resolve_actual_source_site(order, session) -> str:
-    """주문의 진짜 소싱처 코드 결정.
+    """송장 수집할 발주처(소싱처) 코드 결정.
 
-    우선순위: source_url 도메인 → collected_product.source_site → order.source_site
-    OrderInfoCell.tsx의 배지 로직과 동일.
+    우선순위:
+      0) 주문계정(sourcing_account)의 site_name — [최우선, 사용자 지시 2026-06-04]
+         소싱처가 무신사로 보여도 실제 구매는 그 계정 사이트(예: ABC/더현대)에서
+         일어나므로, 송장은 '주문계정이 속한 사이트'에서 수집해야 한다.
+         소싱주문번호(sourcing_order_number)는 그대로 그 사이트 조회에 사용.
+      1) source_url 도메인 → 2) collected_product.source_site → 3) order.source_site
 
     Note: order.source_site 에 PlayAuto 별칭(예: "GS이숍(캐논)")이 과거 데이터로
-    남아있을 수 있어, 괄호 포함 / 미지의 코드는 무시한다. 이런 경우 송장 추출은
-    collected_product 매칭이 되어야만 가능.
+    남아있을 수 있어, 괄호 포함 / 미지의 코드는 무시한다.
     """
+    # 0순위: 주문계정 site_name (etc/미매핑 제외 — 그건 enqueue 단계에서 이미 패스)
+    _said = (order.sourcing_account_id or "").strip()
+    if _said and _said.lower() != "etc":
+        try:
+            from backend.domain.samba.sourcing_account.model import (
+                SambaSourcingAccount,
+            )
+
+            acc = await session.get(SambaSourcingAccount, _said)
+            if acc and acc.site_name:
+                _code = acc.site_name.strip().upper()
+                if _code in _KNOWN_SOURCE_SITES:
+                    return _code
+        except Exception as exc:
+            logger.warning(f"[송장동기화] 주문계정 site 조회 실패: {exc}")
+
     detected = _detect_site_from_url(order.source_url or "")
     if detected:
         return detected
@@ -238,12 +263,13 @@ async def enqueue_for_order(order_id: str, *, force: bool = False) -> dict[str, 
             }
         if not order.sourcing_order_number:
             return {"success": False, "error": "소싱처 주문번호가 없습니다"}
-        # 주문 매칭 계정이 '기타(etc)'/미매핑이면 송장수집 패스.
-        # 어느 소싱처 계정으로 로그인해야 하는지 모르면 기본계정으로 시도해도
-        # 그 계정 주문이 아니라 로그인/조회 실패(특히 a-rt GrandStage 서브도메인
-        # 세션 302). 계정 매핑 후 재시도하면 됨. (사용자 지시 2026-06-04)
+        # 주문계정을 명시적으로 '기타(etc)'로 지정한 주문만 송장수집 패스.
+        # 어느 소싱처 계정인지 '기타'로 못 박은 주문은 기본계정 로그인해도 그 계정
+        # 주문이 아니라 실패 → 패스. 계정 지정 후 재시도. (사용자 지시 2026-06-04)
+        # NULL/빈값(미지정)은 '기타'가 아님 → 패스 안 함. source_url/source_site 로
+        # 발주처 판단해 정상 수집(미지정 주문 4,880건이 여기 해당).
         _acc_norm = (order.sourcing_account_id or "").strip().lower()
-        if _acc_norm in ("", "etc"):
+        if _acc_norm == "etc":
             return {
                 "success": True,
                 "skipped": True,
