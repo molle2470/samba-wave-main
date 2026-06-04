@@ -67,9 +67,25 @@ export default function ReturnsPage() {
 
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
 
-  // 신규 금액 입력칸 (백엔드 저장 없이 로컬 표시용) — 행 id 기준
-  const [customerAmounts, setCustomerAmounts] = useState<Record<string, string>>({})
-  const [companyAmounts, setCompanyAmounts] = useState<Record<string, string>>({})
+  // 편집칸(고객/회사/반품링크) 포커스 시점의 값 보관 — 저장 실패 시 되돌리기용
+  // key = `${field}:${id}`
+  const cellEditRef = useRef<Record<string, string>>({})
+
+  // 편집칸 onBlur 저장 공통 처리: 실패 시 console.error + 알림 + 직전 값 복원
+  const saveCell = async (
+    id: string,
+    data: Parameters<typeof returnApi.patch>[1],
+    revert: () => void,
+    label: string,
+  ) => {
+    try {
+      await returnApi.patch(id, data)
+    } catch (e) {
+      console.error(`[반품교환] ${label} 저장 실패 (id=${id}):`, e)
+      showAlert(`${label} 저장에 실패했습니다. 입력값을 직전 값으로 되돌립니다.`, 'error')
+      revert()
+    }
+  }
 
   const [siteFilter, setSiteFilter] = useState('')
   const [pageSize, setPageSize] = useState(50)
@@ -545,18 +561,42 @@ export default function ReturnsPage() {
                       <td style={{ ...tdCenter, padding: '0.375rem' }}>
                         <input
                           type="text"
-                          value={customerAmounts[r.id] || ''}
+                          value={r.customer_amount || ''}
                           placeholder=""
-                          onChange={(e) => setCustomerAmounts(prev => ({ ...prev, [r.id]: e.target.value }))}
+                          onFocus={(e) => { cellEditRef.current[`customer_amount:${r.id}`] = e.target.value }}
+                          onChange={(e) => {
+                            const val = e.target.value
+                            setReturns(prev => prev.map(x => x.id === r.id ? { ...x, customer_amount: val } : x))
+                          }}
+                          onBlur={(e) => {
+                            const val = e.target.value
+                            const prevVal = cellEditRef.current[`customer_amount:${r.id}`] ?? ''
+                            if (val === prevVal) return
+                            saveCell(r.id, { customer_amount: val }, () => {
+                              setReturns(prev => prev.map(x => x.id === r.id ? { ...x, customer_amount: prevVal } : x))
+                            }, '고객')
+                          }}
                           style={{ width: '80px', padding: '0.3rem 0.5rem', background: '#1A1A1A', border: '1px solid #2D2D2D', borderRadius: '4px', color: '#E5E5E5', fontSize: '0.8rem', textAlign: 'right' }}
                         />
                       </td>
                       <td style={{ ...tdCenter, padding: '0.375rem' }}>
                         <input
                           type="text"
-                          value={companyAmounts[r.id] || ''}
+                          value={r.company_amount || ''}
                           placeholder=""
-                          onChange={(e) => setCompanyAmounts(prev => ({ ...prev, [r.id]: e.target.value }))}
+                          onFocus={(e) => { cellEditRef.current[`company_amount:${r.id}`] = e.target.value }}
+                          onChange={(e) => {
+                            const val = e.target.value
+                            setReturns(prev => prev.map(x => x.id === r.id ? { ...x, company_amount: val } : x))
+                          }}
+                          onBlur={(e) => {
+                            const val = e.target.value
+                            const prevVal = cellEditRef.current[`company_amount:${r.id}`] ?? ''
+                            if (val === prevVal) return
+                            saveCell(r.id, { company_amount: val }, () => {
+                              setReturns(prev => prev.map(x => x.id === r.id ? { ...x, company_amount: prevVal } : x))
+                            }, '회사')
+                          }}
                           style={{ width: '80px', padding: '0.3rem 0.5rem', background: '#1A1A1A', border: '1px solid #2D2D2D', borderRadius: '4px', color: '#E5E5E5', fontSize: '0.8rem', textAlign: 'right' }}
                         />
                       </td>
@@ -633,8 +673,27 @@ export default function ReturnsPage() {
                           style={{ width: '100px', padding: '0.3rem 0.5rem', background: '#1A1A1A', border: '1px solid #2D2D2D', borderRadius: '4px', color: '#E5E5E5', fontSize: '0.8rem', textAlign: 'center' }}
                         />
                       </td>
-                      <td style={tdCenter}>
-                        {r.return_link ? <a href={r.return_link} target="_blank" rel="noopener noreferrer" style={{ color: '#4C9AFF', textDecoration: 'none' }}>링크</a> : '-'}
+                      <td style={{ ...tdCenter, padding: '0.375rem' }}>
+                        <input
+                          type="text"
+                          value={r.return_link_manual || ''}
+                          placeholder={r.return_link || ''}
+                          title={r.return_link_manual || r.return_link || ''}
+                          onFocus={(e) => { cellEditRef.current[`return_link_manual:${r.id}`] = e.target.value }}
+                          onChange={(e) => {
+                            const val = e.target.value
+                            setReturns(prev => prev.map(x => x.id === r.id ? { ...x, return_link_manual: val } : x))
+                          }}
+                          onBlur={(e) => {
+                            const val = e.target.value
+                            const prevVal = cellEditRef.current[`return_link_manual:${r.id}`] ?? ''
+                            if (val === prevVal) return
+                            saveCell(r.id, { return_link_manual: val }, () => {
+                              setReturns(prev => prev.map(x => x.id === r.id ? { ...x, return_link_manual: prevVal } : x))
+                            }, '반품링크')
+                          }}
+                          style={{ width: '110px', padding: '0.3rem 0.5rem', background: '#1A1A1A', border: '1px solid #2D2D2D', borderRadius: '4px', color: '#E5E5E5', fontSize: '0.8rem', textAlign: 'center' }}
+                        />
                       </td>
                       <td style={{ ...tdCenter, color: '#888' }}>{fmtMD(r.return_request_date || r.created_at)}</td>
                       <td style={{ ...tdCenter, padding: '0.375rem' }}>

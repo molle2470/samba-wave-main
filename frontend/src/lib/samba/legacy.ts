@@ -1858,6 +1858,9 @@ export interface SambaReturn {
   order_date?: string;
   settlement_amount?: number;
   recovery_amount?: number;
+  customer_amount?: string;
+  company_amount?: string;
+  return_link_manual?: string;
   customer_id?: string;
   company?: string;
   completion_detail?: string;
@@ -1906,7 +1909,7 @@ export const returnApi = {
       `${SAMBA_PREFIX}/returns/sync-from-markets`, { method: "POST", body: JSON.stringify(body) }
     )
   },
-  patch: (id: string, data: { confirmed?: boolean; settlement_amount?: number; recovery_amount?: number; check_date?: string; memo?: string; product_location?: string; completion_detail?: string; status?: string; customer_order_no?: string; original_order_no?: string; type?: string; market_order_status?: string; return_source?: string }) =>
+  patch: (id: string, data: { confirmed?: boolean; settlement_amount?: number; recovery_amount?: number; check_date?: string; memo?: string; product_location?: string; completion_detail?: string; status?: string; customer_order_no?: string; original_order_no?: string; type?: string; market_order_status?: string; return_source?: string; customer_amount?: string; company_amount?: string; return_link_manual?: string }) =>
     request<SambaReturn>(`${SAMBA_PREFIX}/returns/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
   exchangeAction: (id: string, action: string, reason?: string, extra?: { tracking_number?: string; shipping_company?: string; clm_no?: string }) =>
     request<{ ok: boolean; message: string }>(`${SAMBA_PREFIX}/returns/${id}/exchange-action`, {

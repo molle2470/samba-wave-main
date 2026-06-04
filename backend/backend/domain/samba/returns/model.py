@@ -85,6 +85,21 @@ class SambaReturn(SQLModel, table=True):
     # 환수금액
     recovery_amount: Optional[float] = Field(default=None)
 
+    # 고객 (수기 입력 — 자유 텍스트)
+    customer_amount: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+
+    # 회사 (수기 입력 — 자유 텍스트)
+    company_amount: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+
+    # 반품링크 (수기 입력 — 자동 계산 return_link와 별개로 영구 저장)
+    return_link_manual: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+
     # 메모
     memo: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
 
