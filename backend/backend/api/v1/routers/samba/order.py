@@ -3230,6 +3230,64 @@ async def seller_cancel(
         )
         return {"ok": True, "message": "롯데홈쇼핑 발송불가 처리 완료"}
 
+    elif account.market_type == "ssg":
+        # SSG 판매자취소 = 결품등록(saveNoSellRequestRegist, scEvnt=I).
+        # 등록 후 익일 17시 SSG가 자동으로 취소/환불처리 + 고객에게 품절안내 발송.
+        # 배송지시/피킹완료 상태에서만 가능.
+        # shipment_id 형식: "shppNo|shppSeq" — parse_order에서 저장.
+        from backend.domain.samba.proxy.ssg import SSGClient
+        from backend.domain.samba.forbidden.repository import SambaSettingsRepository
+
+        raw_shipment = order.shipment_id or ""
+        parts = raw_shipment.split("|")
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"SSG 배송번호 형식 오류 (shppNo|shppSeq 필요, 현재값={raw_shipment!r})",
+            )
+        shpp_no, shpp_seq = parts[0], parts[1]
+
+        item_id = order.product_id or ""
+        if not item_id:
+            raise HTTPException(status_code=400, detail="SSG 상품코드(itemId) 없음")
+
+        extras = account.additional_fields or {}
+        ssg_api_key = extras.get("apiKey", "") or account.api_key or ""
+        if not ssg_api_key:
+            settings_repo = SambaSettingsRepository(session)
+            row = await settings_repo.find_by_async(key="store_ssg")
+            if row and isinstance(row.value, dict):
+                ssg_api_key = row.value.get("apiKey", "") or ""
+        if not ssg_api_key:
+            raise HTTPException(status_code=400, detail="SSG API Key 없음")
+
+        client = SSGClient(ssg_api_key)
+        try:
+            await client.register_no_sell(
+                shpp_no=shpp_no,
+                shpp_seq=shpp_seq,
+                item_id=item_id,
+                reason_code="08",  # 08 = 상품정보오류 → SSG 화면에 "품절(상품정보/가격오류)" 표시
+                reason_text="품절",
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"SSG 결품 등록 실패: {e}")
+
+        # 결품 등록은 신청 상태 — SSG가 익일 17시에 자동으로 취소완료 처리하므로
+        # 즉시 "취소완료"가 아닌 "취소요청"으로 마킹. 자동 동기화 시 취소완료로 갱신됨.
+        await svc.update_order(
+            order_id,
+            {"shipping_status": "취소요청", "status": "cancel_requested"},
+        )
+        logger.info(
+            f"[판매자취소][SSG] {order.order_number} 결품 등록 완료 "
+            f"(shppNo={shpp_no}, shppSeq={shpp_seq}, itemId={item_id})"
+        )
+        return {
+            "ok": True,
+            "message": "SSG 결품 등록 완료 — 익일 17시 자동 취소/환불 예정",
+        }
+
     raise HTTPException(
         status_code=400, detail=f"{account.market_type} 판매자 취소 미지원"
     )
