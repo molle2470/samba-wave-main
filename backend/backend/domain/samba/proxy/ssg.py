@@ -2103,6 +2103,51 @@ class SSGClient:
             )
         return data
 
+    async def register_no_sell(
+        self,
+        shpp_no: str,
+        shpp_seq: str,
+        item_id: str,
+        reason_code: str = "09",
+        reason_text: str = "결품",
+    ) -> dict[str, Any]:
+        """판매불가처리(결품등록).
+
+        배송지시/피킹완료 상태의 주문을 결품 처리한다. 등록 후 익일 17시에
+        SSG가 자동으로 취소/환불처리하며, 고객에게 품절안내 메시지가 발송된다.
+
+        - reason_code: "08"(상품정보오류) | "09"(결품)
+        - reason_text: 판매불가 사유 내용 (필수)
+        """
+        body = {
+            "requestNoSellRequestRegist": {
+                "shppNo": shpp_no,
+                "scEvnt": "I",
+                "shppSeq": str(shpp_seq),
+                "shortgRsnCd": reason_code,
+                "shortgProcDtlc": reason_text,
+                "itemId": item_id,
+            }
+        }
+        data = await self._call_api(
+            "POST", "/api/pd/1/saveNoSellRequestRegist.ssg", body=body
+        )
+        result_obj = data.get("result", data) if isinstance(data, dict) else {}
+        if not isinstance(result_obj, dict):
+            result_obj = {}
+        result_code = result_obj.get("resultCode", "")
+        if result_code != "00":
+            raise SSGApiError(
+                f"결품 등록 실패: resultCode={result_code}, "
+                f"msg={result_obj.get('resultMessage', '')}, "
+                f"desc={result_obj.get('resultDesc', '')}"
+            )
+        logger.info(
+            f"[SSG 결품등록] 성공: shppNo={shpp_no}, shppSeq={shpp_seq}, "
+            f"itemId={item_id}, reason={reason_code}"
+        )
+        return data
+
     @staticmethod
     def _parse_ssg_dts(raw_val: Any) -> Optional[datetime]:
         """SSG 일시 문자열을 UTC datetime으로 변환.
