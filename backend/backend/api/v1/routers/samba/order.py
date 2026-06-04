@@ -1687,18 +1687,40 @@ async def sync_order_tracking_bulk(
     limit: int = Query(500, ge=1, le=1000),
     days: int = Query(7, ge=1, le=90),
     force: bool = Query(True),
+    owner_device: str = Query(
+        "",
+        description="이 송장수집을 트리거한 PC의 데몬 device_id (전담 송장 PC 지정용)",
+    ),
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict:
     """미발송 주문 일괄 송장 추출 큐잉 — 최근 N일 + 소싱처 주문번호 있음 + 송장 미입력.
 
-    force=True (기본): 트리거 시점에 옛 sourcing_job tracking + 옛 tracking_sync_job PENDING/DISPATCHED 모두
-    리셋 후 새 batch 적재 — 모달 리스트 = 큐 카운트 1:1 매칭 보장.
-    force=False 사용 케이스 없음 (단건 호출은 sync-tracking/<id> 사용).
+    owner_device: 전달 시 그 데몬을 '전담 송장 PC'로 저장(samba_settings)하고 잡 owner 로
+    지정 → 그 PC만 송장 수신. 여러 PC가 같은 SSG 계정 동시 로그인 → 멀티PC 보안잠금 차단.
+    이후 자동 송장수집(스케줄러)도 저장된 전담 PC를 사용.
     """
     from backend.domain.samba.tracking_sync.service import enqueue_pending_orders
 
+    _owner = (owner_device or "").strip()
+    # 데몬 device_id 형식만 허용 — 확장앱 device_id(다른 형식)는 데몬이 매칭 못 해 잡 미수신.
+    if _owner.startswith("samba-daemon-"):
+        try:
+            from backend.api.v1.routers.samba.proxy._helpers import _set_setting
+            from backend.db.orm import get_write_session
+
+            async with get_write_session() as _s:
+                await _set_setting(_s, "tracking_owner_device", _owner)
+        except Exception:
+            pass
+    else:
+        _owner = ""  # 비데몬/빈값 → 설정값 사용(enqueue 내부 해석)
+
     return await enqueue_pending_orders(
-        tenant_id=tenant_id, limit=limit, days=days, force=force
+        tenant_id=tenant_id,
+        limit=limit,
+        days=days,
+        force=force,
+        owner_device_id=_owner or None,
     )
 
 
@@ -2753,15 +2775,22 @@ async def approve_cancel(
         try:
             res = await client.register_deliver(ord_no, ord_dtl_sn, "imps")
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"롯데홈쇼핑 발송불가 처리 실패: {e}")
+            raise HTTPException(
+                status_code=500, detail=f"롯데홈쇼핑 발송불가 처리 실패: {e}"
+            )
         if not res.get("ok"):
-            raise HTTPException(status_code=500, detail=f"롯데홈쇼핑 발송불가 처리 실패: result={res.get('result')}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"롯데홈쇼핑 발송불가 처리 실패: result={res.get('result')}",
+            )
 
         await svc.update_order(
             order_id,
             {"shipping_status": "취소완료", "status": "cancelled"},
         )
-        logger.info(f"[취소승인][롯데홈쇼핑] {ord_no}:{ord_dtl_sn} 발송불가(imps) 처리 완료")
+        logger.info(
+            f"[취소승인][롯데홈쇼핑] {ord_no}:{ord_dtl_sn} 발송불가(imps) 처리 완료"
+        )
         return {"ok": True, "message": "롯데홈쇼핑 발송불가 처리 완료"}
 
     else:
@@ -3154,15 +3183,22 @@ async def seller_cancel(
         try:
             res = await client.register_deliver(ord_no, ord_dtl_sn, "imps")
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"롯데홈쇼핑 발송불가 처리 실패: {e}")
+            raise HTTPException(
+                status_code=500, detail=f"롯데홈쇼핑 발송불가 처리 실패: {e}"
+            )
         if not res.get("ok"):
-            raise HTTPException(status_code=500, detail=f"롯데홈쇼핑 발송불가 처리 실패: result={res.get('result')}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"롯데홈쇼핑 발송불가 처리 실패: result={res.get('result')}",
+            )
 
         await svc.update_order(
             order_id,
             {"shipping_status": "취소완료", "status": "cancelled"},
         )
-        logger.info(f"[판매자취소][롯데홈쇼핑] {ord_no}:{ord_dtl_sn} 발송불가(imps) 처리 완료")
+        logger.info(
+            f"[판매자취소][롯데홈쇼핑] {ord_no}:{ord_dtl_sn} 발송불가(imps) 처리 완료"
+        )
         return {"ok": True, "message": "롯데홈쇼핑 발송불가 처리 완료"}
 
     raise HTTPException(

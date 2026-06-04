@@ -413,11 +413,21 @@ export const orderApi = {
       `${SAMBA_PREFIX}/orders/${orderId}/sync-tracking?force=${force}`,
       { method: 'POST' },
     ),
-  syncTrackingBulk: (limit = 500, days = 7, force = false) =>
-    request<{ success: boolean; queued: number; skipped: number; errors: string[]; job_ids: string[] }>(
-      `${SAMBA_PREFIX}/orders/sync-tracking/bulk?limit=${limit}&days=${days}&force=${force}`,
+  syncTrackingBulk: (limit = 500, days = 7, force = false) => {
+    // 이 PC 의 데몬 device_id 를 전담 송장 PC 로 지정 — 여러 PC 동시 SSG 로그인 잠금 차단.
+    // (warroom 이 생성/보관하는 로컬 데몬 deviceId. 없으면 미전송 → 백엔드가 기존 설정값 사용)
+    let ownerDevice = ''
+    try {
+      ownerDevice = (typeof window !== 'undefined' && window.localStorage.getItem('samba.autotune.daemon.deviceId')) || ''
+    } catch {
+      ownerDevice = ''
+    }
+    const ownerQs = ownerDevice ? `&owner_device=${encodeURIComponent(ownerDevice)}` : ''
+    return request<{ success: boolean; queued: number; skipped: number; errors: string[]; job_ids: string[] }>(
+      `${SAMBA_PREFIX}/orders/sync-tracking/bulk?limit=${limit}&days=${days}&force=${force}${ownerQs}`,
       { method: 'POST' },
-    ),
+    )
+  },
   retryFailedTrackingJobs: (days = 7) =>
     request<{ success: boolean; target: number; queued: number; skipped: number; errors: string[]; job_ids: string[] }>(
       `${SAMBA_PREFIX}/orders/tracking-sync/retry-failed?days=${days}`,

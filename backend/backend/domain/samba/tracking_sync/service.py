@@ -239,10 +239,33 @@ async def _resolve_actual_source_site(order, session) -> str:
     return raw if raw.upper() in _KNOWN_SOURCE_SITES else ""
 
 
-async def enqueue_for_order(order_id: str, *, force: bool = False) -> dict[str, Any]:
+async def _resolve_tracking_owner(session, explicit: Optional[str]) -> str:
+    """송장 잡 전담 PC(데몬 device_id) 해석.
+
+    explicit 우선 → 없으면 samba_settings 'tracking_owner_device' → 없으면 ''.
+    빈 문자열 = 전담 미지정(아무 데몬 수신, 레거시 동작). 값 있으면 그 데몬만 수신
+    → 여러 PC가 같은 SSG 계정을 동시 로그인하는 멀티PC 잠금 차단. (사용자 지시 2026-06-04)
+    """
+    if explicit and explicit.strip():
+        return explicit.strip()
+    try:
+        from backend.api.v1.routers.samba.proxy._helpers import _get_setting
+
+        v = await _get_setting(session, "tracking_owner_device")
+        if v:
+            return str(v).strip()
+    except Exception as exc:
+        logger.warning(f"[송장동기화] tracking_owner_device 조회 실패(무시): {exc}")
+    return ""
+
+
+async def enqueue_for_order(
+    order_id: str, *, force: bool = False, owner_device_id: Optional[str] = None
+) -> dict[str, Any]:
     """단건 주문에 대해 송장 추출 잡을 큐에 적재.
 
     force=False (기본): 이미 PENDING/DISPATCHED 잡이 있으면 중복 큐잉 안 함.
+    owner_device_id: 전담 송장 PC(데몬 device_id). None이면 설정값 사용.
     """
     from backend.domain.samba.proxy.sourcing_queue import SourcingQueue
 
@@ -355,9 +378,11 @@ async def enqueue_for_order(order_id: str, *, force: bool = False) -> dict[str, 
                 }
             _ = stale_existed  # 컨벤션 유지용
 
-        # owner_device_id 미사용 — 어느 PC가 폴링하든 잡을 가져갈 수 있게 None 으로 적재.
-        # 확장앱이 받아 현재 로그인 계정으로 시도 → 다른 계정 주문이면 패스(NO_TRACKING).
-        # 계정 분리 운영은 사용자가 PC별 로그인으로 관리.
+        # 전담 송장 PC(데몬 device_id) 해석 — 지정 시 그 데몬만 잡 수신.
+        # 여러 PC가 같은 SSG 계정 동시 로그인 → 멀티PC 보안잠금 차단(2026-06-04).
+        # 미지정('')이면 None 적재 = 레거시(아무 데몬 수신).
+        _owner = await _resolve_tracking_owner(session, owner_device_id)
+        _owner = _owner or None
 
         # 1) SourcingQueue에 잡 적재 — 데몬 전용 사이트는 데몬, 그 외는 확장앱 폴링
         try:
@@ -377,7 +402,7 @@ async def enqueue_for_order(order_id: str, *, force: bool = False) -> dict[str, 
                 url=url,
                 order_id=order.id,
                 sourcing_order_number=order.sourcing_order_number,
-                owner_device_id=None,
+                owner_device_id=_owner,
                 sourcing_account_id=_said,
             )
         except RuntimeError as exc:
@@ -400,7 +425,7 @@ async def enqueue_for_order(order_id: str, *, force: bool = False) -> dict[str, 
             sourcing_site=actual_site,
             sourcing_order_number=order.sourcing_order_number,
             sourcing_account_id=_said,
-            owner_device_id=None,
+            owner_device_id=_owner,
             request_id=request_id,
             status=STATUS_PENDING,
         )
@@ -419,12 +444,17 @@ async def enqueue_pending_orders(
     limit: int = 500,
     days: int = 7,
     force: bool = False,
+    owner_device_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """미발송 주문 일괄 적재 — 수동 트리거 + 스케줄러 공용.
 
     조건: KST 캘린더 7일(오늘 포함 -6일) + paid_at(폴백 created_at) +
           소싱처 주문번호 있음 + 송장번호 없음 + 소싱처 식별됨.
+    owner_device_id: 전담 송장 PC(데몬 device_id). None이면 설정값 사용(루프 1회 해석).
     """
+    # 전담 송장 PC 1회 해석 → 루프에서 enqueue_for_order 마다 설정 재조회(N회) 방지.
+    async with get_write_session() as _own_sess:
+        _resolved_owner = await _resolve_tracking_owner(_own_sess, owner_device_id)
     queued = 0
     skipped = 0
     errors: list[str] = []
@@ -580,7 +610,9 @@ async def enqueue_pending_orders(
             skipped += 1
             continue
         try:
-            res = await enqueue_for_order(order.id, force=force)
+            res = await enqueue_for_order(
+                order.id, force=force, owner_device_id=_resolved_owner
+            )
             jid = res.get("jobId")
             if jid:
                 job_ids.append(jid)
