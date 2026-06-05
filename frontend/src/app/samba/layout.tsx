@@ -98,8 +98,17 @@ export default function SambaLayout({
       issuing = true;
       try {
         const { SAMBA_PREFIX, fetchWithAuth } = await import("@/lib/samba/legacy");
-        const { getAccessToken } = await import("@/lib/api");
-        if (!getAccessToken()) return; // 미로그인 — 발급 불가
+        // samba 인증 토큰은 STORAGE_KEYS.SAMBA_USER(samba_user)에 저장됨.
+        // @/lib/api의 getAccessToken은 app_access_token(미사용 키)을 읽어 항상 null →
+        // 키 자동발급이 영구 스킵되던 버그(4cc84269 도입). samba_user 기준으로 교정.
+        let authed = false;
+        try {
+          const rawUser = localStorage.getItem(STORAGE_KEYS.SAMBA_USER);
+          authed = !!(rawUser && JSON.parse(rawUser)?.access_token);
+        } catch {
+          authed = false;
+        }
+        if (!authed) return; // 미로그인 — 발급 불가
         const { getDeviceId } = await import("@/lib/samba/deviceId");
         const did = getDeviceId();
         const headers: Record<string, string> = { "Content-Type": "application/json" };
