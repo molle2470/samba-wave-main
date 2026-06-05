@@ -331,7 +331,11 @@ class SSGPlugin(MarketPlugin):
             except Exception as _e:
                 logger.warning(f"[SSG] SSG.COM(6005) 전시카테고리 조회 실패: {_e}")
 
-        if category_id and _ssg_com_enabled:
+        # 경량 수정(skip_image=price/stock-only + existing_no)에는 전시카테고리
+        # 후보 재산출 불필요 — displayCategory/listDispCtg 다중 호출이 SSG 응답 지연 시
+        # 호출당 30초 타임아웃 누적 → 상품당 300초 초과로 SSG 전송 전멸
+        # (issue #354). 기존 6005 보존은 하단 get_item_detail 경로가 담당.
+        if category_id and _ssg_com_enabled and not skip_image:
             await _lookup_6005_main_cat()
 
         # 6005 전시카테고리 보존(회귀 #312 보정) — 수정(existing_no) 인데 위 조회로

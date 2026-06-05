@@ -317,6 +317,7 @@ class CoupangClient:
         "편의점택배": "CVSNET",
         "합동택배": "HDEXP",
         "천일택배": "CHUNIL",
+        "딜리박스": "JMNP",
         "DHL": "DHL",
         "기타": "ETC",
     }

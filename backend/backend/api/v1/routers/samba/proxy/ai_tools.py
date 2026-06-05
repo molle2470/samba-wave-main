@@ -657,17 +657,25 @@ async def bg_jobs_complete(
         if item.get("success"):
             new_images = item.get("new_images")
             new_detail = item.get("new_detail_images")
-            new_tags = list(
-                set((product.tags or []) + ["__ai_image__", "__img_edited__"])
-            )
 
             if new_images is not None:
                 product.images = new_images
             if new_detail is not None:
                 product.detail_images = new_detail
-            product.tags = new_tags
             product.ai_image_transformed = True
             session.add(product)
+            # 태그는 fetch-then-write race 차단 위해 atomic merge UPDATE 사용
+            # (issue #356 — 통째 SET 시 동시 워커 보고로 __ai_image__ 유실 → 미변환 오표시)
+            from backend.api.v1.routers.samba.proxy.ai_tags import (
+                _atomic_merge_tags,
+            )
+
+            await _atomic_merge_tags(
+                session,
+                [pid],
+                ["__ai_image__", "__img_edited__"],
+                add_ai_tagged_marker=False,
+            )
             success_count += 1
         else:
             fail_count += 1
@@ -761,11 +769,20 @@ async def bg_jobs_progress(
                     product.images = new_images
                 if new_detail is not None:
                     product.detail_images = new_detail
-                product.tags = list(
-                    set((product.tags or []) + ["__ai_image__", "__img_edited__"])
-                )
                 product.ai_image_transformed = True
                 session.add(product)
+                # 태그는 fetch-then-write race 차단 위해 atomic merge UPDATE 사용
+                # (issue #356 — 통째 SET 시 동시 워커 보고로 __ai_image__ 유실)
+                from backend.api.v1.routers.samba.proxy.ai_tags import (
+                    _atomic_merge_tags,
+                )
+
+                await _atomic_merge_tags(
+                    session,
+                    [pid],
+                    ["__ai_image__", "__img_edited__"],
+                    add_ai_tagged_marker=False,
+                )
                 res["total_transformed"] = int(res.get("total_transformed", 0)) + 1
             else:
                 res["total_failed"] = int(res.get("total_failed", 0)) + 1

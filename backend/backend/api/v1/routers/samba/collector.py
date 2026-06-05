@@ -1179,9 +1179,18 @@ async def scroll_products(
     elif ai_filter == "ai_tag_no":
         conditions.append(or_(_CP.tags.is_(None), ~_CP.tags.op("@>")(_ai_tag)))
     elif ai_filter == "ai_img_yes":
-        conditions.append(_CP.tags.op("@>")(_ai_img))
+        # 출하자격 컬럼(ai_image_transformed) 기준 + 구데이터 호환 tag fallback
+        # (issue #356 — tag 단독 판정 시 태그 race 유실로 변환완료 상품이 '미변환' 오표시)
+        conditions.append(
+            or_(_CP.ai_image_transformed.is_(True), _CP.tags.op("@>")(_ai_img))
+        )
     elif ai_filter == "ai_img_no":
-        conditions.append(or_(_CP.tags.is_(None), ~_CP.tags.op("@>")(_ai_img)))
+        conditions.append(
+            and_(
+                _CP.ai_image_transformed.is_(False),
+                or_(_CP.tags.is_(None), ~_CP.tags.op("@>")(_ai_img)),
+            )
+        )
     elif ai_filter == "filter_yes":
         conditions.append(_CP.tags.op("@>")(_img_filtered))
     elif ai_filter == "filter_no":
