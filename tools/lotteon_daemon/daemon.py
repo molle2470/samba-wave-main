@@ -78,7 +78,7 @@ except ImportError:
 # ====================================================================
 # 데몬 버전 — build.ps1 가 갱신. 자동 업데이트 비교 기준.
 # ====================================================================
-DAEMON_VERSION = "1.4.34"
+DAEMON_VERSION = "1.4.35"
 
 
 # ── 가격수집 도메인 화이트리스트 ───────────────────────────────────────────
@@ -1254,15 +1254,6 @@ async def auto_login_site(
         handler.site,
         credential["username"][:4] + "***",
     )
-    try:
-        await page.goto(
-            handler.login_url, wait_until="domcontentloaded", timeout=30_000
-        )
-    except Exception as exc:
-        logger.warning("%s 로그인 페이지 로드 실패: %s", handler.site, exc)
-        return False
-    await page.wait_for_timeout(2_500)
-
     selectors_payload = json.dumps(handler.login_selectors)
     cred_payload = json.dumps(credential)
     fill_js = f"""
@@ -1298,36 +1289,65 @@ async def auto_login_site(
       return {{ ok: true }}
     }})()
     """
-    res = await page.evaluate(fill_js)
-    if not (isinstance(res, dict) and res.get("ok")):
-        logger.warning("%s 로그인 form fill 실패: %s", handler.site, res)
-        return False
 
-    # 로그인 제출 후 리다이렉트/세션 설정이 끝나도록 정착 대기 (3초).
-    # 직후 is_site_logged_in 이 home_url 로 goto 하는데, 로그인 POST 가 아직
-    # 진행 중이면 그 goto 가 로그인 네비게이션을 끊어 세션이 안 잡히는 race 방지.
-    await page.wait_for_timeout(3_000)
-    # 제출 직후 페이지 상태 스냅샷 — 실패 시 진짜 원인(캡차/에러문구/로그인폼 잔존) 진단용.
-    _post_url = page.url
-    try:
-        _post_body = (
-            await page.evaluate("(document.body?.innerText||'').slice(0,400)")
-        ).replace("\n", " ")
-    except Exception:
-        _post_body = ""
+    # [2026-06-05] 로그인 제출 즉시 재시도 — 빠른 계정 스왑 중 제출이 한 번에 안 먹혀
+    # "확정 안 됨"(로그인페이지 머묾)으로 실패하는 일시 케이스를 그 자리서 복구.
+    # 실패→30분쿨다운→반복→SSG findIdPw 잠금 에스컬레이션을 끊는다.
+    # findIdPw(이미 잠김)면 재시도 무의미하므로 즉시 중단.
+    _MAX_LOGIN_ATTEMPTS = 3
+    for _attempt in range(_MAX_LOGIN_ATTEMPTS):
+        try:
+            await page.goto(
+                handler.login_url, wait_until="domcontentloaded", timeout=30_000
+            )
+        except Exception as exc:
+            logger.warning("%s 로그인 페이지 로드 실패: %s", handler.site, exc)
+            return False
+        await page.wait_for_timeout(2_500)
 
-    # 로그인 후 세션 안정화 대기. 최대 15초.
-    for _ in range(15):
-        await page.wait_for_timeout(1_000)
-        if await is_site_logged_in(page, handler):
-            logger.info("%s 자동로그인 성공", handler.site)
-            return True
-    logger.warning(
-        "%s 자동로그인 — 15초 후에도 확정 안 됨. 제출직후 url=%s body=%s",
-        handler.site,
-        _post_url,
-        _post_body[:300],
-    )
+        res = await page.evaluate(fill_js)
+        if not (isinstance(res, dict) and res.get("ok")):
+            logger.warning("%s 로그인 form fill 실패: %s", handler.site, res)
+            return False
+
+        # 로그인 POST/리다이렉트 정착 대기(3초) 후 최대 15초 세션 확정 대기.
+        await page.wait_for_timeout(3_000)
+        _post_url = page.url
+        for _ in range(15):
+            await page.wait_for_timeout(1_000)
+            if await is_site_logged_in(page, handler):
+                logger.info(
+                    "%s 자동로그인 성공%s",
+                    handler.site,
+                    f" (재시도 {_attempt}회 후)" if _attempt else "",
+                )
+                return True
+
+        _cur = page.url
+        # findIdPw = SSG 보안잠금. 재시도해도 계속 튕기며 잠금 유지 → 즉시 중단.
+        if "findIdPw" in _cur or "findIdPw" in _post_url:
+            try:
+                _body = (
+                    await page.evaluate("(document.body?.innerText||'').slice(0,200)")
+                ).replace("\n", " ")
+            except Exception:
+                _body = ""
+            logger.warning(
+                "%s 자동로그인 — findIdPw(계정잠금) 감지, 재시도 중단. url=%s body=%s",
+                handler.site,
+                _cur,
+                _body[:150],
+            )
+            return False
+
+        # 로그인페이지 머묾/일시 미확정 → 다음 시도에서 재제출(즉시 복구 시도)
+        logger.warning(
+            "%s 자동로그인 확정 안 됨 (시도 %d/%d) — 즉시 재시도. url=%s",
+            handler.site,
+            _attempt + 1,
+            _MAX_LOGIN_ATTEMPTS,
+            _post_url,
+        )
     return False
 
 
