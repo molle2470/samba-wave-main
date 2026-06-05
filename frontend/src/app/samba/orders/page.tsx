@@ -418,51 +418,8 @@ export default function OrdersPage() {
     error: string | null
   }
   const [autoSyncHistory, setAutoSyncHistory] = useState<AutoSyncHistoryItem[]>([])
-  // 전담 송장 PC (멀티PC 동시 SSG 로그인 잠금 차단) — "이 PC 전담" 토글 방식
-  const [trackingOwnerDevice, setTrackingOwnerDevice] = useState<string>('')
-  const [localDaemonId, setLocalDaemonId] = useState<string>('')
-  const [ownerSaving, setOwnerSaving] = useState<boolean>(false)
-  const loadTrackingOwner = useCallback(() => {
-    // 데몬 id를 localhost:51425(같은 PC 데몬 loopback)에서 직접 fetch — warroom 안 들른
-    // 브라우저에서도 localDaemonId 채워져 전담 토글 동작. (localStorage 읽기만 하면
-    // warroom 미방문 PC는 빈값 → 토글 비활성/ON 유지 안 됨 버그 fix)
-    ;(async () => {
-      let daemonDev = ''
-      try {
-        const ctrl = new AbortController()
-        const t = setTimeout(() => ctrl.abort(), 1500)
-        const r = await fetch('http://localhost:51425/device_id', { signal: ctrl.signal })
-        clearTimeout(t)
-        if (r.ok) {
-          const j = await r.json()
-          if (j && typeof j.device_id === 'string' && j.device_id) {
-            daemonDev = j.device_id
-            try { window.localStorage.setItem('samba.autotune.daemon.deviceId', daemonDev) } catch { /* ignore */ }
-          }
-        }
-      } catch { /* 데몬 미기동 PC — localStorage 폴백 */ }
-      if (!daemonDev) {
-        try {
-          daemonDev = (typeof window !== 'undefined' &&
-            window.localStorage.getItem('samba.autotune.daemon.deviceId')) || ''
-        } catch { daemonDev = '' }
-      }
-      setLocalDaemonId(daemonDev)
-    })()
-    orderApi.getTrackingOwnerDevice().then(r => setTrackingOwnerDevice(r.tracking_owner_device || '')).catch(() => {})
-  }, [])
-  useEffect(() => { loadTrackingOwner() }, [loadTrackingOwner])
-  const handleSetTrackingOwner = useCallback(async (device: string) => {
-    setOwnerSaving(true)
-    try {
-      const res = await orderApi.setTrackingOwnerDevice(device)
-      setTrackingOwnerDevice(res.tracking_owner_device || '')
-    } catch (e) {
-      showAlert(e instanceof Error ? e.message : '전담 PC 설정 실패', 'error')
-    } finally {
-      setOwnerSaving(false)
-    }
-  }, [])
+  // [2026-06-05] 송장 전담 PC 토글 제거 — 송장수집을 확장앱(owner='') 방식으로 복구하면서
+  // 데몬 시절 전담(tracking_owner_device) 개념이 무의미해짐. 관련 state/핸들러 일괄 삭제.
   useEffect(() => {
     orderApi.getAutoSyncInterval()
       .then(res => {
@@ -686,47 +643,9 @@ export default function OrdersPage() {
           </div>
         </div>
 
-        {/* 송장 전담 PC — "이 PC 전담" 토글. 송장 돌릴 PC에서 켜면 그 PC만 수집(멀티PC 잠금 차단) */}
-        {(() => {
-          const isThisPc = !!localDaemonId && trackingOwnerDevice === localDaemonId
-          const ownerSetElsewhere = !!trackingOwnerDevice && trackingOwnerDevice !== localDaemonId
-          let statusText = ''
-          let statusColor = '#888'
-          if (isThisPc) { statusText = '✅ 이 PC가 송장 전담 — 이 PC만 송장 수집'; statusColor = '#22C55E' }
-          else if (ownerSetElsewhere) { statusText = `다른 PC가 전담 중(${trackingOwnerDevice.replace('samba-daemon-', '').slice(0, 8)}) — 이 PC로 바꾸려면 켜기`; statusColor = '#FFB84D' }
-          else { statusText = '⚠ 전담 미지정 — 모든 PC가 송장 수집(SSG 동시로그인 잠금 위험)'; statusColor = '#FF8C00' }
-          return (
-            <div style={{
-              marginTop: 10, paddingTop: 8, borderTop: '1px solid rgba(255,255,255,0.06)',
-              display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
-            }}>
-              <span style={{ fontSize: '0.8125rem', fontWeight: 700, color: '#E5E5E5' }}>🖥️ 이 PC가 송장 전담</span>
-              <button
-                onClick={() => handleSetTrackingOwner(isThisPc ? '' : localDaemonId)}
-                disabled={ownerSaving || !localDaemonId}
-                title={!localDaemonId ? '이 PC에 데몬 deviceId가 없습니다(오토튠 페이지 1회 방문 필요)' : ''}
-                style={{
-                  minWidth: 64, padding: '0.4rem 0.8rem', borderRadius: '999px',
-                  border: isThisPc ? '1px solid rgba(34,197,94,0.35)' : '1px solid #444',
-                  background: isThisPc ? '#22C55E' : '#2A2A2A',
-                  color: isThisPc ? '#06130A' : '#FFB84D',
-                  fontSize: '0.8125rem', fontWeight: 700,
-                  cursor: (ownerSaving || !localDaemonId) ? 'not-allowed' : 'pointer',
-                  opacity: (ownerSaving || !localDaemonId) ? 0.6 : 1,
-                }}
-              >{ownerSaving ? '저장 중' : isThisPc ? 'ON' : 'OFF'}</button>
-              <span style={{ fontSize: '0.72rem', color: statusColor }}>{statusText}</span>
-              <button
-                onClick={loadTrackingOwner}
-                style={{
-                  padding: '4px 10px', borderRadius: 6, border: '1px solid #3D3D3D',
-                  background: 'rgba(50,50,50,0.9)', color: '#C5C5C5', fontSize: '0.72rem',
-                  cursor: 'pointer', whiteSpace: 'nowrap',
-                }}
-              >새로고침</button>
-            </div>
-          )
-        })()}
+        {/* [2026-06-05] 송장 전담 PC 토글 제거 — 송장수집을 확장앱(owner='') 방식으로 복구하면서
+            데몬 시절 전담(tracking_owner_device) 개념이 무의미해짐. 송장은 켜진 확장앱이 처리.
+            멀티PC SSG 동시로그인 잠금 방지는 "송장 PC 1대만 확장앱 켜기" 운영으로 대체. */}
 
         {/* 최근 자동실행 이력 2건 요약 — 작동 여부 확인용 */}
         {autoSyncHistory.length > 0 && (
