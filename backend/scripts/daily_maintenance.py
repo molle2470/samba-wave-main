@@ -930,6 +930,95 @@ async def task_daily_snapshot(conn: asyncpg.Connection) -> dict:
     return {"date": snapshot_date, "count": count}
 
 
+# ===== TASK 6b: 일별 미발송(송장 대기) 스냅샷 =====
+async def task_daily_unshipped_snapshot(conn: asyncpg.Connection) -> dict:
+    """현재 "트레일링 7일 송장 대기수"(송장 진행현황 모달 '대기'와 동일 산식)를
+    KST 기준 오늘 날짜로 스냅샷 저장.
+
+    대시보드 "최근 일주일 매출" 미발송 칼럼의 과거 행 데이터로 사용됨.
+    (오늘 행은 대시보드 엔드포인트가 라이브로 재계산)
+
+    산식 = list_recent_tracking_sync_jobs / dashboardStats 라이브 계산과 동일:
+      SambaTrackingSyncJob + SambaOrder JOIN → order_id별 최신 1건(DISTINCT ON) →
+      PENDING + 취소/반품/교환 제외 + 배송중/완료 키워드 제외 + 송장 미입력 +
+      소싱처정보 있음 + kkadaegi 제외, 윈도우 = KST 오늘-6일 00:00 이후.
+    """
+    import datetime as _dt
+
+    # 산식 상수 — backend.domain.samba.order.model 과 반드시 동일하게 유지(인라인).
+    #   daily_maintenance.py 는 순수 asyncpg 스크립트(backend.* import 미보장)라
+    #   import 대신 리터럴 복제 — 모델 측 값 변경 시 여기도 같이 갱신.
+    EXCLUDED_ORDER_STATUSES = (
+        "cancel_requested",
+        "cancelling",
+        "cancelled",
+        "return_requested",
+        "returning",
+        "returned",
+        "return_completed",
+        "exchange_requested",
+        "exchanging",
+        "exchanged",
+        "exchange_pending",
+        "exchange_done",
+        "ship_failed",
+        "undeliverable",
+    )
+    SHIPPED_SHIPPING_STATUS_KEYWORDS = (
+        "배송중",
+        "배송완료",
+        "구매확정",
+        "국내배송중",
+        "송장전송완료",
+    )
+
+    print("\n[TASK 6b] 일별 미발송(송장 대기) 스냅샷 저장 시작")
+    _KST = _dt.timezone(_dt.timedelta(hours=9))
+    _now_kst = _dt.datetime.now(_KST)
+    _today_kst0 = _now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
+    # 윈도우 = [KST 오늘-6일 00:00, KST 내일 00:00) — enqueue_pending_orders [since, until) 동일
+    since = (_today_kst0 - _dt.timedelta(days=6)).astimezone(_dt.timezone.utc)
+    until = (_today_kst0 + _dt.timedelta(days=1)).astimezone(_dt.timezone.utc)
+    # 송장 수집대상 주문 수 — enqueue_pending_orders WHERE(SambaOrder 직접) + 배송키워드 제외.
+    # 모달 '대기'(PENDING 잡)는 처리되면 빠지는 순간값이라 부적합 → 결정적 대상집합 사용.
+    row = await conn.fetchrow(
+        """
+        SELECT COUNT(*) AS cnt FROM samba_order o
+        WHERE (o.tracking_number IS NULL OR o.tracking_number = '')
+          AND o.sourcing_order_number IS NOT NULL AND o.sourcing_order_number <> ''
+          AND (
+                (o.source_site IS NOT NULL AND o.source_site <> '')
+             OR (o.source_url IS NOT NULL AND o.source_url <> '')
+             OR o.collected_product_id IS NOT NULL
+          )
+          AND COALESCE(o.paid_at, o.created_at) >= $1
+          AND COALESCE(o.paid_at, o.created_at) < $2
+          AND (o.status IS NULL OR o.status <> ALL($3::text[]))
+          AND POSITION(',kkadaegi,' IN ',' || COALESCE(o.action_tag, '') || ',') = 0
+          AND NOT (COALESCE(o.shipping_status, '') LIKE ANY($4::text[]))
+        """,
+        since,
+        until,
+        list(EXCLUDED_ORDER_STATUSES),
+        [f"%{kw}%" for kw in SHIPPED_SHIPPING_STATUS_KEYWORDS],
+    )
+    count = int(row["cnt"]) if row else 0
+    snapshot_date = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 9 * 3600))
+    await conn.execute(
+        """
+        INSERT INTO samba_daily_unshipped_snapshot (snapshot_date, unshipped_count)
+        VALUES ($1, $2)
+        ON CONFLICT (snapshot_date) DO UPDATE
+          SET unshipped_count = EXCLUDED.unshipped_count,
+              created_at = now()
+        """,
+        snapshot_date,
+        count,
+    )
+    print(f"  미발송 스냅샷 저장: {snapshot_date} = {count:,}건")
+    return {"date": snapshot_date, "count": count}
+
+
 # ===== TASK 5b: 신규 그룹 AI 태그 확인 =====
 async def task_new_group_check(conn: asyncpg.Connection) -> dict:
     """수집 잡 완료 후 생성된 신규 그룹에 AI 태그 적용 여부 확인."""
@@ -1017,6 +1106,12 @@ async def run():
 
         # 일별 등록상품수 스냅샷 (config 토글 없음 — 항상 실행)
         results["snapshot"] = await task_daily_snapshot(conn)
+        # 일별 미발송(송장 대기) 스냅샷 (항상 실행, 실패해도 다른 작업 비차단)
+        try:
+            results["unshipped_snapshot"] = await task_daily_unshipped_snapshot(conn)
+        except Exception as e:
+            print(f"  [TASK 6b] 미발송 스냅샷 실패(무시): {e}")
+            results["unshipped_snapshot"] = {"error": str(e)}
 
         # 수집 잡 생성 직후 미적용 현황 확인 (수집 완료 후 다음 실행에서 처리됨)
         check = await task_new_group_check(conn)
@@ -1051,6 +1146,13 @@ async def run_tasks(task_ids: list[int]):
         # 하나가 예외를 던져도 그날 0시 스냅샷은 반드시 기록되도록 보장 (#235).
         if 6 in task_ids:
             results["snapshot"] = await task_daily_snapshot(conn)
+            try:
+                results["unshipped_snapshot"] = await task_daily_unshipped_snapshot(
+                    conn
+                )
+            except Exception as e:
+                print(f"  [TASK 6b] 미발송 스냅샷 실패(무시): {e}")
+                results["unshipped_snapshot"] = {"error": str(e)}
         if 5 in task_ids:
             results["collect"] = await task_brand_collect_jobs(conn, interval_days=5)
         if 4 in task_ids:

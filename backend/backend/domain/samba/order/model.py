@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import BigInteger, Index, String, text
+from sqlalchemy import BigInteger, Index, Integer, String, text
 from sqlmodel import Column, DateTime, Field, SQLModel, Text
 
 from ulid import ULID
@@ -443,3 +443,29 @@ def _register_auto_cancel_trigger() -> None:
                     prev_status=prev_status,
                 )
             )
+
+
+class SambaDailyUnshippedSnapshot(SQLModel, table=True):
+    """일별 미발송(송장 대기) 스냅샷 — 대시보드 "최근 일주일 매출" 미발송 칼럼 데이터.
+
+    매일 0시 크론(daily_maintenance.task_daily_unshipped_snapshot)에서
+    "현재 트레일링 7일 송장 대기수"(송장 진행현황 모달 '대기'와 동일 산식)를
+    그날의 snapshot_date(KST)로 저장.
+
+    오늘 행은 대시보드 엔드포인트가 라이브로 재계산하고, 과거 행은 이 스냅샷을 사용.
+    스냅샷 없는 과거일은 None(프론트 "-" 표시) — 거짓 0 채움 금지.
+    """
+
+    __tablename__ = "samba_daily_unshipped_snapshot"
+
+    snapshot_date: str = Field(
+        sa_column=Column(String(10), primary_key=True),
+        description="YYYY-MM-DD (KST)",
+    )
+    unshipped_count: int = Field(
+        sa_column=Column(Integer, nullable=False, server_default="0")
+    )
+    created_at: datetime = Field(
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+        default_factory=lambda: datetime.now(tz=timezone.utc),
+    )

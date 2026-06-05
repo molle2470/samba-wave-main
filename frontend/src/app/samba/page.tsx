@@ -137,7 +137,7 @@ export default function SambaDashboard() {
     fulfillmentSale: w.fulfillmentSales,
     rate: w.sales > 0 ? Math.round(w.fulfillmentSales / w.sales * 100) : 0,
     shippedCount: w.shippedCount ?? 0,
-    unshippedCount: w.unshippedCount ?? 0,
+    unshippedCount: w.unshippedCount as number | null | undefined,
     newRegistered: w.newRegistered as number | null | undefined,
     marketDeleted: w.marketDeleted ?? 0,
     registeredCount: w.registeredCount as number | null | undefined,
@@ -293,7 +293,7 @@ export default function SambaDashboard() {
                   <td style={{ padding: '0.625rem 0', textAlign: 'right', color: '#E5E5E5' }}>₩{fmtNum(d.fulfillmentSale)}</td>
                   <td style={{ padding: '0.625rem 0', textAlign: 'right', color: '#E5E5E5' }}>{d.rate}%</td>
                   <td style={{ padding: '0.625rem 0', textAlign: 'right', color: '#4ADE80' }}>{fmtNum(d.shippedCount)}</td>
-                  <td style={{ padding: '0.625rem 0', textAlign: 'right', color: d.unshippedCount > 0 ? '#FF6B6B' : '#E5E5E5' }}>{fmtNum(d.unshippedCount)}</td>
+                  <td style={{ padding: '0.625rem 0', textAlign: 'right', color: (d.unshippedCount ?? 0) > 0 ? '#FF6B6B' : '#E5E5E5' }}>{d.unshippedCount == null ? '—' : fmtNum(d.unshippedCount)}</td>
                   <td style={{ padding: '0.625rem 0', textAlign: 'right', color: '#E5E5E5' }}>{d.newRegistered == null ? '—' : fmtNum(d.newRegistered)}</td>
                   <td style={{ padding: '0.625rem 0', textAlign: 'right', color: '#E5E5E5' }}>{fmtNum(d.marketDeleted)}</td>
                   <td style={{ padding: '0.625rem 0', textAlign: 'right', color: '#FF8C00' }}>{d.registeredCount == null ? '—' : fmtNum(d.registeredCount)}</td>

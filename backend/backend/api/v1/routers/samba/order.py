@@ -823,17 +823,6 @@ async def dashboard_stats(
     )
 
     _ship_col = func.coalesce(SambaOrder.shipping_status, "")
-    unshipped_cond = and_(
-        or_(
-            SambaOrder.tracking_number == None,  # noqa: E711
-            SambaOrder.tracking_number == "",
-        ),
-        or_(
-            SambaOrder.status == None,  # noqa: E711
-            SambaOrder.status.notin_(EXCLUDED_ORDER_STATUSES),
-        ),
-        *[_ship_col.notlike(f"%{kw}%") for kw in SHIPPED_SHIPPING_STATUS_KEYWORDS],
-    )
     # 발송 조건 — 운송장 입력됨 또는 배송완료 키워드 + 취소/반품/교환 상태 제외
     shipped_cond = and_(
         or_(
@@ -877,12 +866,6 @@ async def dashboard_stats(
                     else_=0,
                 )
             ).label("shipped_count"),
-            func.sum(
-                case(
-                    (unshipped_cond, 1),
-                    else_=0,
-                )
-            ).label("unshipped_count"),
         )
         .where(SambaOrder.paid_at != None, order_date >= week_ago)  # noqa: E711
         .group_by(func.date(order_date))
@@ -895,11 +878,88 @@ async def dashboard_stats(
             )
         )
     daily_rows = (await session.execute(daily_q)).all()
+
+    # 미발송(unshippedCount) = "송장 수집대상 주문 수"(송장 진행현황 모달이 일괄수집할 대상).
+    #   주의: 모달 '대기'(PENDING 잡)는 잡이 처리되면 곧바로 빠지는 순간값 → 스냅샷 부적합.
+    #   대신 enqueue_pending_orders WHERE(SambaOrder 직접) + 모달 배송키워드 제외 = 결정적 집합.
+    #   오늘 행: 라이브 계산(트레일링 7일). 과거 행: samba_daily_unshipped_snapshot(매일 0시 cron).
+    #   스냅샷 없는 과거일은 None("-") — 거짓 0 채움 금지.
+    from backend.domain.samba.order.model import SambaDailyUnshippedSnapshot
+
+    _action_tag_expr = func.concat(",", func.coalesce(SambaOrder.action_tag, ""), ",")
+    # order_date = paid_at(폴백 created_at) + 9h(KST). week_ago = KST 오늘-6일 00:00.
+    #   윈도우 = [week_ago, week_ago+7일) = enqueue_pending_orders 의 [since, until) 와 동일.
+    _unshipped_target_q = (
+        select(func.count())
+        .select_from(SambaOrder)
+        .where(
+            or_(
+                SambaOrder.tracking_number == None,  # noqa: E711
+                SambaOrder.tracking_number == "",
+            ),
+            SambaOrder.sourcing_order_number != None,  # noqa: E711
+            SambaOrder.sourcing_order_number != "",
+            or_(
+                and_(
+                    SambaOrder.source_site != None,  # noqa: E711
+                    SambaOrder.source_site != "",
+                ),
+                and_(
+                    SambaOrder.source_url != None,  # noqa: E711
+                    SambaOrder.source_url != "",
+                ),
+                SambaOrder.collected_product_id != None,  # noqa: E711
+            ),
+            order_date >= week_ago,
+            order_date < (week_ago + timedelta(days=7)),
+            or_(
+                SambaOrder.status == None,  # noqa: E711
+                SambaOrder.status.notin_(EXCLUDED_ORDER_STATUSES),
+            ),
+            *[_ship_col.notlike(f"%{kw}%") for kw in SHIPPED_SHIPPING_STATUS_KEYWORDS],
+            ~_action_tag_expr.like("%,kkadaegi,%"),
+        )
+    )
+    if tenant_id is not None:
+        _unshipped_target_q = _unshipped_target_q.where(
+            or_(
+                SambaOrder.tenant_id == tenant_id,
+                SambaOrder.tenant_id == None,  # noqa: E711
+            )
+        )
+    unshipped_live_total = int(
+        (await session.execute(_unshipped_target_q)).scalar() or 0
+    )
+
+    # 과거 6일 미발송 스냅샷 (오늘 행은 위 라이브값 사용)
+    _unshipped_today_str = (week_ago + timedelta(days=6)).strftime("%Y-%m-%d")
+    _unshipped_past_dates = [
+        (week_ago + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6)
+    ]
+    unshipped_snap_rows = (
+        await session.execute(
+            select(
+                SambaDailyUnshippedSnapshot.snapshot_date,
+                SambaDailyUnshippedSnapshot.unshipped_count,
+            ).where(
+                SambaDailyUnshippedSnapshot.snapshot_date.in_(_unshipped_past_dates)
+            )
+        )
+    ).all()
+    unshipped_snap_map = {
+        r.snapshot_date: int(r.unshipped_count) for r in unshipped_snap_rows
+    }
+
     weekly = []
     for i in range(7):
         d = week_ago + timedelta(days=i)
         day_str = d.strftime("%Y-%m-%d")
         row = next((r for r in daily_rows if str(r.day) == day_str), None)
+        if day_str == _unshipped_today_str:
+            _unshipped = unshipped_live_total
+        else:
+            # 스냅샷 없으면 None → 프론트 "-" 표시 (거짓 0 채움 금지)
+            _unshipped = unshipped_snap_map.get(day_str)
         weekly.append(
             {
                 "date": day_str,
@@ -908,7 +968,7 @@ async def dashboard_stats(
                 "fulfillmentSales": float(row.fulfillment_sales) if row else 0,
                 "fulfillmentCount": int(row.fulfillment_count) if row else 0,
                 "shippedCount": int(row.shipped_count) if row else 0,
-                "unshippedCount": int(row.unshipped_count) if row else 0,
+                "unshippedCount": _unshipped,
             }
         )
 
