@@ -2171,7 +2171,16 @@ async def register_esm_options(
                 return True, None
             except RuntimeError as exc:
                 msg = str(exc)
-                if "잘못된 상품 이미지" in msg or "404" in msg:
+                # 이미지 propagation 미완 케이스 — 재시도 대상.
+                # "이미지 다운로드…지연/작업 시간 초과"(resultCode=1000)는 ESM이 메인
+                # 상품이미지 ingest 전 옵션 set 시 5초 타임아웃으로 반환되는 메시지.
+                # 이게 빠져 있으면 옵션상품이 조용히 단일옵션으로 등록됨 (#361).
+                if (
+                    "잘못된 상품 이미지" in msg
+                    or "404" in msg
+                    or "이미지 다운로드" in msg
+                    or "작업 시간이 초과" in msg
+                ):
                     last_exc = exc
                     continue
                 # 이미지 외 에러 — 재시도 없이 즉시 실패로 처리

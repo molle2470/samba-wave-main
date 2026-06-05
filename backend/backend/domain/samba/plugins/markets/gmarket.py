@@ -302,6 +302,8 @@ class GMarketMarketPlugin(MarketPlugin):
 
         # 추천옵션 등록 — samba options 있고 cat_code 있을 때만.
         # register_esm_options 가 이미지 propagation polling (0/30/60s, 최대 90s) 자체 처리.
+        # 옵션 실패 시 message 에 표면화 — 무음 단일옵션 등록 방지 (#361).
+        opt_msg = ""
         if samba_options and goods_no and cat_code:
             try:
                 import asyncio as _asyncio
@@ -314,21 +316,28 @@ class GMarketMarketPlugin(MarketPlugin):
                     timeout=120,
                 )
                 if opt_result.get("success"):
+                    opt_msg = f" [옵션 {opt_result.get('matched')}/{opt_result.get('requested')}개 등록]"
                     logger.info(
                         f"[지마켓] 옵션 등록 완료: goodsNo={goods_no} matched={opt_result.get('matched')}/{opt_result.get('requested')}"
                     )
                 else:
+                    opt_msg = (
+                        f" [옵션 등록 실패: {str(opt_result.get('message', ''))[:80]}]"
+                    )
                     logger.warning(
                         f"[지마켓] 옵션 등록 부분 실패: {opt_result.get('message')}"
                     )
             except (_asyncio.TimeoutError, Exception) as opt_e:
+                opt_msg = f" [옵션 등록 오류: {str(opt_e)[:60]}]"
                 logger.warning(
                     f"[지마켓] 옵션 등록 실패 (상품 등록은 성공 처리): {opt_e}"
                 )
+        elif samba_options and not cat_code:
+            opt_msg = " [옵션 등록 스킵: cat_code 없음]"
 
         return {
             "success": True,
-            "message": "지마켓 등록 성공",
+            "message": f"지마켓 등록 성공{opt_msg}",
             "data": {
                 "sellerProductId": str(site_goods_no or goods_no),
                 "siteGoodsNo": site_goods_no,
