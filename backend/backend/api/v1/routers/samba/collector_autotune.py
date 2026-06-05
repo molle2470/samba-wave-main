@@ -3278,20 +3278,18 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                     f"{_sp_site_tag}{_sp_brand_part}{_sp.name or _sp.id}: 품절잔존 → {_del_label} 마켓삭제 완료",
                                                 )
                                             else:
-                                                _del_msg = _dr.get("message") or ""
-                                                # 승인 대기류 = 승인 전 삭제 불가 → 6시간 재시도 차단
-                                                # (매 사이클 헛시도 폭주 → 무신사 4분 점유 방지)
-                                                if (
-                                                    "승인 대기" in _del_msg
-                                                    or "승인대기" in _del_msg
-                                                ):
-                                                    _soldout_delete_retry_block[
-                                                        _sp.id
-                                                    ] = datetime.now(
-                                                        timezone.utc
-                                                    ) + timedelta(
+                                                # 영구실패(승인대기/중복상품/판매금지/삭제불가 등
+                                                # 마켓·사유 무관) 6시간 재시도 차단. 매 사이클 25건
+                                                # 헛시도(각 blocking)가 무신사 사이클 600초 점유 →
+                                                # STUCK_TIMEOUT 초과 Watchdog 강제재시작 → 처리량
+                                                # 1/5 토막의 주범. 6시간 auto-expire라 일시적 실패
+                                                # (쿠팡 동기화 지연 등)도 안전(최대 6시간 더 노출).
+                                                _soldout_delete_retry_block[_sp.id] = (
+                                                    datetime.now(timezone.utc)
+                                                    + timedelta(
                                                         seconds=_SOLDOUT_DELETE_BLOCK_TTL_SEC
                                                     )
+                                                )
                                                 log.warning(
                                                     "[오토튠] 품절잔존 %s → %s 마켓삭제 실패: %s",
                                                     _sp.id,
@@ -3299,6 +3297,13 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                     _dr.get("message"),
                                                 )
                                         except Exception as _del_err:
+                                            # 삭제 호출 자체 예외도 영구실패로 간주 → 쿨다운 차단
+                                            _soldout_delete_retry_block[_sp.id] = (
+                                                datetime.now(timezone.utc)
+                                                + timedelta(
+                                                    seconds=_SOLDOUT_DELETE_BLOCK_TTL_SEC
+                                                )
+                                            )
                                             log.error(
                                                 "[오토튠] 품절잔존 %s → 마켓삭제 오류: %s",
                                                 _sp.id,
