@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -485,39 +485,45 @@ async def ghost_summary(
     )
     rows = (await session.execute(sql, {"h": str(hours)})).mappings().all()
 
+    def _extract_count(detail: Any) -> int:
+        # JSONB는 dict로 들어옴
+        if isinstance(detail, dict):
+            for k in ("total_missing", "ghosts", "total"):
+                v = detail.get(k)
+                if isinstance(v, (int, float)):
+                    return int(v)
+        return 0
+
+    # reconciler가 사이클·배포마다 같은 유령을 monitor_event에 반복 기록하므로,
+    # 계정(account_id) 단위 '최신 1건'만 합산해야 함. rows가 created_at DESC라
+    # 같은 (market, account_id)의 첫 등장 = 최신 → 그 1건만 count, 이후 중복은 스킵.
+    # (이 dedup 누락이 배너 11,190 = 실제 795 × 사이클수 과대집계 버그의 원인)
     by_market: dict[str, dict] = {}
+    seen_accounts: dict[str, set[str]] = {}
     for r in rows:
         m = r.get("market_type") or "unknown"
+        detail = r.get("detail") or {}
+        if not isinstance(detail, dict):
+            detail = {}
+        # account_id 없으면 이벤트 고유 키로 취급(병합 안 함 — 과소집계 방지)
+        acct_key = str(detail.get("account_id") or f"_row_{r.get('created_at')}")
         if m not in by_market:
-            detail = r.get("detail") or {}
-            # JSONB는 dict로 들어옴
-            count_keys = ("total_missing", "ghosts", "total")
-            n = 0
-            if isinstance(detail, dict):
-                for k in count_keys:
-                    v = detail.get(k)
-                    if isinstance(v, (int, float)):
-                        n = int(v)
-                        break
+            # 마켓 최초 등장 = 최신 이벤트 → 배너 표시 필드(요약/심각도/시각)로 사용
             by_market[m] = {
                 "market": m,
                 "event_type": r.get("event_type"),
                 "severity": r.get("severity"),
                 "summary": r.get("summary"),
-                "count": n,
+                "count": 0,
                 "created_at": r.get("created_at").isoformat()
                 if r.get("created_at")
                 else None,
             }
-        else:
-            # 같은 마켓 추가 이벤트는 count 누적 (계정별 분리)
-            detail = r.get("detail") or {}
-            if isinstance(detail, dict):
-                for k in ("total_missing", "ghosts", "total"):
-                    v = detail.get(k)
-                    if isinstance(v, (int, float)):
-                        by_market[m]["count"] += int(v)
-                        break
+            seen_accounts[m] = set()
+        if acct_key in seen_accounts[m]:
+            continue  # 같은 계정의 오래된 중복 이벤트 — 합산 제외
+        seen_accounts[m].add(acct_key)
+        by_market[m]["count"] += _extract_count(detail)
 
     markets = list(by_market.values())
     total = sum(m.get("count", 0) for m in markets)
