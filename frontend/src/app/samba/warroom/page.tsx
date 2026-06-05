@@ -367,6 +367,10 @@ interface ActiveCycle {
   stock_count: number
   soldout_count: number
   last_seen_ago_sec?: number | null
+  // 데몬 생존 — 데몬 전용 사이트(SSG/ABC/GrandStage/LOTTEON)일 때만 채워짐.
+  // false = 데몬 죽음(백엔드 루프는 활성이지만 실제 데몬 폴링 끊김).
+  daemon_alive?: boolean | null
+  daemon_last_seen_ago_sec?: number | null
 }
 
 function ActiveCyclesPanel(): React.ReactElement {
@@ -491,11 +495,15 @@ function ActiveCyclesPanel(): React.ReactElement {
                   : `${fmtNum(m)}:${String(sec).padStart(2,'0')}`
               }
               const isInactive = c.status === 'inactive'
-              const rowOpacity = isInactive ? 0.55 : 1
+              // 데몬 죽음 — 백엔드 루프는 활성이나 실제 데몬 폴링 끊김(전건 헛 실패).
+              const isDaemonDead = !isInactive && c.daemon_alive === false
+              const rowOpacity = isInactive ? 0.55 : (isDaemonDead ? 0.7 : 1)
               const statusLabel = isInactive
                 ? (c.last_seen_ago_sec != null ? `비활성 (${fmtNum(c.last_seen_ago_sec)}초 전 폴링)` : '비활성 (폴링 없음)')
-                : '활성'
-              const statusColor = isInactive ? '#888' : '#4CD964'
+                : (isDaemonDead
+                    ? (c.daemon_last_seen_ago_sec != null ? `데몬끊김 (${fmtNum(c.daemon_last_seen_ago_sec)}초 전)` : '데몬끊김')
+                    : '활성')
+              const statusColor = isInactive ? '#888' : (isDaemonDead ? '#EF4444' : '#4CD964')
               return (
                 <tr key={k} style={{ borderBottom: '1px solid #2A2A2A', opacity: rowOpacity }}>
                   <td style={{ padding: '0.4rem', fontFamily: 'monospace', fontSize: '0.75rem' }}>

@@ -936,6 +936,27 @@ async def _site_autotune_loop(device_id: str, site: str):
                     await asyncio.sleep(30)
                     continue
 
+                # 데몬 전용 사이트(SSG/ABC/GrandStage/LOTTEON)는 살아있는 데몬이 없으면
+                # 잡 발행이 전건 "데몬 미등록"으로 즉시 실패 → 진행 카운터 헛증가 + 로그 폭주.
+                # 살아있는 데몬 없으면 SELECT/배치/발행 전부 스킵하고 대기. 데몬 복구 시 재개.
+                # (idx 보존 — 데몬 복귀하면 멈췄던 진행 순번부터 이어감)
+                from backend.domain.samba.proxy.sourcing_queue import (
+                    DAEMON_ONLY_SITES,
+                )
+
+                if site in DAEMON_ONLY_SITES:
+                    from backend.domain.samba.proxy.daemon_pool import (
+                        pick_daemon_owner,
+                    )
+
+                    if pick_daemon_owner(site) is None:
+                        log.info(
+                            "[오토튠][%s] 살아있는 데몬 없음 — 사이클 스킵(대기). 데몬 복구 시 자동 재개",
+                            site,
+                        )
+                        await asyncio.sleep(30)
+                        continue
+
                 from backend.db.orm import get_write_session
 
                 async with get_write_session() as session:
@@ -4628,6 +4649,23 @@ async def autotune_active_cycles():
                 soldout_count = len(_cstats.get("deleted_pids") or set())
             except Exception:
                 pass
+            # 데몬 생존 — 백엔드 루프 heartbeat 와 별개로 실제 데몬 폴링 여부 표시.
+            # 데몬 죽어도 루프는 계속 돌아 "활성"으로 보이던 착시 제거.
+            # 데몬 전용 사이트(SSG/ABC/GrandStage/LOTTEON)이고 데몬 device 일 때만 의미.
+            # last_seen 180초 초과 = 죽음(잡 발행 게이트 pick_daemon_owner TTL 과 동일 기준).
+            daemon_alive: Optional[bool] = None
+            daemon_last_seen_ago: Optional[int] = None
+            try:
+                from backend.domain.samba.proxy.sourcing_queue import (
+                    DAEMON_ONLY_SITES as _DOS,
+                )
+
+                if site in _DOS and dev.startswith("samba-daemon-"):
+                    _d_last = _pc_last_seen.get(dev, 0.0)
+                    daemon_last_seen_ago = int(now_ts - _d_last) if _d_last else None
+                    daemon_alive = bool(_d_last and (now_ts - _d_last) <= 180.0)
+            except Exception:
+                pass
             cycles.append(
                 {
                     "device_id": dev,
@@ -4644,6 +4682,8 @@ async def autotune_active_cycles():
                     "price_count": price_count,
                     "stock_count": stock_count,
                     "soldout_count": soldout_count,
+                    "daemon_alive": daemon_alive,
+                    "daemon_last_seen_ago_sec": daemon_last_seen_ago,
                 }
             )
     # 2) 비활성 분담 entry — DB 에 등록됐지만 task 없음 (죽은 데몬/꺼진 PC).
