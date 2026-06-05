@@ -374,6 +374,27 @@ async def autotune_daemon_concurrency(request: Request) -> dict[str, Any]:
         _my = get_pc_allowed_sites(device_id)
         if _my:
             assigned = sorted(_my)
+        # 전담 송장 데몬 디커플 — autotune 사이트가 없어도(=[]) 데몬 tracking 사이트
+        # (SSG/ABCmart/GrandStage/LOTTEON) 워커를 띄워야 송장을 처리한다. assigned 에 tracking
+        # 사이트를 union 해 데몬이 워커를 스폰하게 한다. detail/search 잡은 owner 불일치로 안
+        # 받아 autotune 충돌 없음(owner 라우팅은 _pc_allowed_sites 기준이라 이 응답 추가는 무영향).
+        # 2026-06-05: SSG autotune을 원격으로 옮기니 전담 PC assigned=[] → 워커 0 → 송장 전면정지 fix.
+        if device_id.startswith("samba-daemon-"):
+            from backend.api.v1.routers.samba.proxy._helpers import _get_setting
+            from backend.db.orm import get_read_session
+            from backend.domain.samba.proxy.sourcing_queue import (
+                DAEMON_ONLY_TRACKING_SITES,
+            )
+
+            try:
+                async with get_read_session() as _own_sess:
+                    _track_owner = (
+                        await _get_setting(_own_sess, "tracking_owner_device") or ""
+                    )
+                if str(_track_owner).strip() == device_id:
+                    assigned = sorted(set(assigned) | set(DAEMON_ONLY_TRACKING_SITES))
+            except Exception:
+                pass
     except Exception:
         assigned = []
 
@@ -389,6 +410,11 @@ async def autotune_daemon_concurrency(request: Request) -> dict[str, Any]:
     # 데몬은 담당 사이트만 워커 스폰 — 배정 없으면 빈 conc(대기). 비데몬은 legacy 전체.
     if device_id.startswith("samba-daemon-"):
         conc = {s: n for s, n in conc.items() if s in assigned}
+        # 전담 송장 데몬에 union된 tracking 사이트가 conc에 없으면(autotune 동시성 미설정)
+        # 워커 미스폰 → 송장 처리 불가. 누락 사이트에 기본 캡 부여해 워커가 반드시 뜨게 한다.
+        for _s in assigned:
+            if _s not in conc:
+                conc[_s] = 2
     return {"concurrency": conc, "assigned_sites": assigned}
 
 

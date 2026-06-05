@@ -382,6 +382,17 @@ async def enqueue_for_order(
         # 여러 PC가 같은 SSG 계정 동시 로그인 → 멀티PC 보안잠금 차단(2026-06-04).
         # 미지정('')이면 None 적재 = 레거시(아무 데몬 수신).
         _owner = await _resolve_tracking_owner(session, owner_device_id)
+        # 전담 데몬은 데몬 tracking 사이트(SSG/ABCmart/GrandStage/LOTTEON)만 처리 가능.
+        # MUSINSA/GSShop 등은 헤드리스 데몬이 trace(배송조회)를 못 뚫어(member.one SSO +
+        # cf_clearance 토큰, 2026-06-01 실측) 확장앱 전용이다. 그런 사이트에 전담 데몬 owner를
+        # 박으면 데몬은 dequeue 가드로 차단(sourcing_queue:802) + 확장앱은 owner 불일치로 못 받아
+        # → 영구 stuck. 그 사이트는 owner 미지정('')으로 확장앱 폴링에 맡긴다. (2026-06-05 사고)
+        from backend.domain.samba.proxy.sourcing_queue import DAEMON_ONLY_TRACKING_SITES
+
+        if _owner and (actual_site or "").upper() not in {
+            s.upper() for s in DAEMON_ONLY_TRACKING_SITES
+        }:
+            _owner = ""
         _owner = _owner or None
 
         # 1) SourcingQueue에 잡 적재 — 데몬 전용 사이트는 데몬, 그 외는 확장앱 폴링
