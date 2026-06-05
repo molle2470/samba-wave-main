@@ -453,9 +453,14 @@ def build_market_registered_conditions(model_class: Any) -> list:
     """
     return [
         model_class.registered_accounts.isnot(None),
-        func.jsonb_typeof(model_class.registered_accounts) == "array",
-        # jsonb_array_length 금지: PostgreSQL은 WHERE 절 단락 평가를 보장하지 않아
-        # jsonb_typeof 체크보다 먼저 평가되면 스칼라값에서 에러 발생
+        # jsonb_typeof(...)='array' → JSONB 리터럴 비교로 교체.
+        # jsonb_typeof() 함수는 selectivity 추정 불가 → 플래너가 정렬 인덱스
+        # (ix_scp_autotune_cycle) 회피, 4.7만 행 Bitmap 스캔(오토튠 SELECT 24초).
+        # registered_accounts != 'null' AND != '[]' 는 동일 row-set(전 사이트+타입
+        # 격리 0건 검증)이면서 리터럴이라 인덱스 활용. SELECT 24초→sub-second.
+        # 주의: 쓰기경로가 array/null만 저장(스칼라 0건 확인)이라 안전. 향후 스칼라
+        # 값이 들어오면 != 'null' 은 통과시킴(jsonb_typeof는 배제했음).
+        model_class.registered_accounts.op("!=")(cast("null", _JSONB)),
         model_class.registered_accounts.op("!=")(cast("[]", _JSONB)),
         model_class.market_product_nos.isnot(None),
         cast(model_class.market_product_nos, _StrType) != "null",
