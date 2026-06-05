@@ -228,7 +228,9 @@ const AutotuneLogPanel = memo(function AutotuneLogPanel({ onStatusChange, extern
             ) { color = '#FF6B6B'; fontWeight = 600 }
             else if (log.msg.includes('품절')) color = '#A78BFA'
             else if (log.msg.includes('사이클 완료')) { color = '#4C9AFF'; fontWeight = 700 }
-            else if (log.msg.includes('전송완료')) {
+            else if (log.msg.includes('전송')) {
+              // dispatch 로그가 '전송완료'→'전송'으로 바뀜(전송 시작 시점 표시).
+              // '전송실패'는 위 실패 분기에서 먼저 잡히므로 여기엔 정상 전송만 도달.
               if (log.msg.includes('가격변동') && log.msg.includes('재고전송')) color = '#4C9AFF'  // 가격+재고 동시 전송
               else if (log.msg.includes('재고전송')) color = '#FFD93D'  // 재고만
               // 가격변동만 → 기본색(흰색) 유지
