@@ -2812,17 +2812,15 @@ async def _site_autotune_loop(device_id: str, site: str):
                                         if _acc_ok:
                                             _synced_count += 1
                                             _logged = True
+                                            # 성공 완료 로그는 dispatch 로그(전송 시작 시점)로
+                                            # 갈음 — 늦은 완료 로그가 스킵을 밀어내던 문제 해소.
+                                            # 단 마켓삭제(품절)는 dispatch 예고("전송")와 결과가
+                                            # 달라 별도 출력 유지.
                                             if _acc_was_deleted:
                                                 _log_line(
                                                     _site,
                                                     _pid,
                                                     f"{_idx_pfx}{_label}: {_action_text} → 마켓삭제(품절){_t}",
-                                                )
-                                            else:
-                                                _log_line(
-                                                    _site,
-                                                    _pid,
-                                                    f"{_idx_pfx}{_label}: {_action_text} 전송완료{_t}",
                                                 )
                                         else:
                                             # 실제 에러가 transmit_error['_all'](상품단위 —
@@ -2863,6 +2861,17 @@ async def _site_autotune_loop(device_id: str, site: str):
                                             )
                                     await asyncio.sleep(0.3)
 
+                                # 전송 시작(dispatch) 즉시 로그 — 진행순서 정렬용.
+                                # background 완료 로그는 전송이 끝나야 찍혀 늦고 순서가
+                                # 뒤섞임 → 화면 30줄을 점령해 스킵 로그를 밀어냄
+                                # (진행 200인데 스킵 0줄 현상). 평가 순서대로 여기서 찍어
+                                # 스킵 로그와 시간순 정렬. 성공 완료 로그는 제거(이 줄로 갈음),
+                                # 마켓삭제·실패만 background에서 별도 출력.
+                                _log_line(
+                                    site,
+                                    _tx_pid,
+                                    f"{_idx_prefix}{_tx_label}: {_tx_action_text} 전송{_tail}",
+                                )
                                 # 계정별 fire-and-forget task
                                 _bg_task = asyncio.create_task(
                                     _run_transmit_in_background(
