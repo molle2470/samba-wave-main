@@ -475,8 +475,11 @@ async def sourcing_tracking_result(body: dict[str, Any]) -> dict[str, Any]:
         },
     )
 
-    # tracking 잡 도메인 처리 — DB 저장 + (옵션) 마켓 dispatch
-    # auto_dispatch는 안정화 전까지 False, dry_run=True 기본
+    # tracking 잡 도메인 처리 — DB 저장 + 마켓 dispatch
+    # [2026-06-05] auto_dispatch 활성화 — 그동안 "안정화 전까지 False"로 꺼둔 게 방치돼
+    # 송장 수집(SCRAPED)만 되고 마켓 전송·주문상태(배송중) 갱신이 영구 미실행되던 버그 fix.
+    # dispatch_to_market은 취소 가드 + 수동 전송과 동일 service(send_invoice_to_market) 사용,
+    # 실패 시 DISPATCH_FAILED로 표시돼 재시도 가능 → 활성화 안전.
     res = await apply_tracking_result(
         request_id,
         success=success,
@@ -484,8 +487,8 @@ async def sourcing_tracking_result(body: dict[str, Any]) -> dict[str, Any]:
         tracking_number=tracking_number,
         error=error,
         cancelled=cancelled,
-        auto_dispatch=False,
-        dry_run=True,
+        auto_dispatch=True,
+        dry_run=False,
     )
     return res
 
