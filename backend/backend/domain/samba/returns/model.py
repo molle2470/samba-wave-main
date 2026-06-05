@@ -100,6 +100,17 @@ class SambaReturn(SQLModel, table=True):
         default=None, sa_column=Column(Text, nullable=True)
     )
 
+    # 고객전화번호 (수기 입력 — 마켓 customer_phone과 별개로 영구 저장.
+    # 마켓 번호가 안심번호일 때 직접 덮어쓰기용. 재동기화에 덮이지 않음)
+    customer_phone_manual: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+
+    # 소싱주문번호 (수기 입력 — 마켓 주문번호와 별개로 직접 입력·영구 저장)
+    sourcing_order_no: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+
     # 메모
     memo: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
 

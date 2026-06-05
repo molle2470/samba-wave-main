@@ -93,6 +93,14 @@ async def _apply_startup_schema_fixes(logger: logging.Logger) -> None:
             "alter_return_link_manual",
             "ALTER TABLE samba_return ADD COLUMN IF NOT EXISTS return_link_manual TEXT",
         ),
+        (
+            "alter_return_customer_phone_manual",
+            "ALTER TABLE samba_return ADD COLUMN IF NOT EXISTS customer_phone_manual TEXT",
+        ),
+        (
+            "alter_return_sourcing_order_no",
+            "ALTER TABLE samba_return ADD COLUMN IF NOT EXISTS sourcing_order_no TEXT",
+        ),
         # (제거됨) drop_market_account_sort_order — 컬럼 이미 드롭 완료(프로덕션 ABSENT 확인,
         # 2026-06-03 #331). no-op DROP도 매 startup ACCESS EXCLUSIVE 락을 잡아 고부하 시
         # 계정 테이블 읽기 큐를 최대 lock_timeout(5s)만큼 막으므로 statements에서 제거.

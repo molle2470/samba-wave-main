@@ -551,8 +551,33 @@ export default function ReturnsPage() {
                       </td>
                       <td style={tdCenter}>{r.customer_name || '-'}</td>
                       <td style={tdCenter}>{r.business_name || '-'}</td>
-                      <td style={{ ...tdCenter, padding: '0.625rem' }}>
-                        <button onClick={() => setDetailItem(r)} style={{ background: 'none', border: 'none', color: '#E5E5E5', cursor: 'pointer', fontSize: '0.8125rem', fontWeight: 400 }}>{r.order_number || r.order_id || '-'}</button>
+                      <td style={{ ...tdCenter, padding: '0.375rem' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.25rem' }}>
+                          <input
+                            type="text"
+                            value={r.sourcing_order_no ?? ''}
+                            placeholder="소싱주문번호"
+                            onFocus={(e) => { cellEditRef.current[`sourcing_order_no:${r.id}`] = e.target.value }}
+                            onChange={(e) => {
+                              const val = e.target.value
+                              setReturns(prev => prev.map(x => x.id === r.id ? { ...x, sourcing_order_no: val } : x))
+                            }}
+                            onBlur={(e) => {
+                              const val = e.target.value
+                              const prevVal = cellEditRef.current[`sourcing_order_no:${r.id}`] ?? ''
+                              if (val === prevVal) return
+                              saveCell(r.id, { sourcing_order_no: val }, () => {
+                                setReturns(prev => prev.map(x => x.id === r.id ? { ...x, sourcing_order_no: prevVal } : x))
+                              }, '소싱주문번호')
+                            }}
+                            style={{ width: '110px', padding: '0.3rem 0.5rem', background: '#1A1A1A', border: '1px solid #2D2D2D', borderRadius: '4px', color: '#E5E5E5', fontSize: '0.8rem', textAlign: 'center' }}
+                          />
+                          <button
+                            onClick={() => setDetailItem(r)}
+                            title="반품 상세 보기"
+                            style={{ flexShrink: 0, padding: '0.3rem 0.4rem', background: '#1A1A1A', border: '1px solid #2D2D2D', borderRadius: '4px', color: '#4C9AFF', cursor: 'pointer', fontSize: '0.7rem', fontWeight: 500 }}
+                          >상세</button>
+                        </div>
                       </td>
                       <td style={tdCenter}>
                         <span>{r.market || '-'}</span>
@@ -646,7 +671,27 @@ export default function ReturnsPage() {
                           style={{ width: 0, height: 0, opacity: 0, position: 'absolute', pointerEvents: 'none' }}
                         />
                       </td>
-                      <td style={tdCenter}>{r.customer_phone || '-'}</td>
+                      <td style={{ ...tdCenter, padding: '0.375rem' }}>
+                        <input
+                          type="text"
+                          value={r.customer_phone_manual ?? r.customer_phone ?? ''}
+                          placeholder=""
+                          onFocus={(e) => { cellEditRef.current[`customer_phone_manual:${r.id}`] = e.target.value }}
+                          onChange={(e) => {
+                            const val = e.target.value
+                            setReturns(prev => prev.map(x => x.id === r.id ? { ...x, customer_phone_manual: val } : x))
+                          }}
+                          onBlur={(e) => {
+                            const val = e.target.value
+                            const prevVal = cellEditRef.current[`customer_phone_manual:${r.id}`] ?? ''
+                            if (val === prevVal) return
+                            saveCell(r.id, { customer_phone_manual: val }, () => {
+                              setReturns(prev => prev.map(x => x.id === r.id ? { ...x, customer_phone_manual: prevVal } : x))
+                            }, '고객전화번호')
+                          }}
+                          style={{ width: '110px', padding: '0.3rem 0.5rem', background: '#1A1A1A', border: '1px solid #2D2D2D', borderRadius: '4px', color: '#E5E5E5', fontSize: '0.8rem', textAlign: 'center' }}
+                        />
+                      </td>
                       <td style={tdCenter}>
                         {r.region ? (
                           <span

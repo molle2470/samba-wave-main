@@ -447,6 +447,8 @@ class ReturnPatchBody(BaseModel):
     customer_amount: Optional[str] = None
     company_amount: Optional[str] = None
     return_link_manual: Optional[str] = None
+    customer_phone_manual: Optional[str] = None
+    sourcing_order_no: Optional[str] = None
 
 
 @router.patch("/{return_id}")
@@ -503,6 +505,10 @@ async def patch_return(
         update_fields["company_amount"] = body.company_amount
     if body.return_link_manual is not None:
         update_fields["return_link_manual"] = body.return_link_manual
+    if body.customer_phone_manual is not None:
+        update_fields["customer_phone_manual"] = body.customer_phone_manual
+    if body.sourcing_order_no is not None:
+        update_fields["sourcing_order_no"] = body.sourcing_order_no
     if not update_fields:
         return ret
     return await svc.repo.update_async(return_id, **update_fields)
