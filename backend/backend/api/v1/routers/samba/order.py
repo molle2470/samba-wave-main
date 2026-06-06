@@ -7339,6 +7339,9 @@ async def sync_orders_from_markets(
             synced = 0
             _processed = 0
             _total = len(orders_data)
+            # 롯데홈쇼핑 style_code 보강 캐시 (issue #365) — account 단위.
+            # (ch, 토큰셋) → _matched entry. 같은 토큰 조합 DB 재조회 차단.
+            _lh_style_cache: dict = {}
             for order_data in orders_data:
                 _processed += 1
                 if _processed % 50 == 0:
@@ -7371,6 +7374,21 @@ async def sync_orders_from_markets(
                     _cand = _mpn_global.get(_pid)
                     if _cand and not _cand.get("ambiguous"):
                         _matched = _cand
+                # 3.5) 롯데홈쇼핑 중복 goods_no 보강 (issue #365) — 위 정확/글로벌 모두 실패 시.
+                # 주문 goods_no(구·판매중)와 cp 저장 goods_no(신·품절)가 중복등록으로
+                # 불일치 → product_name의 제조사 style_code로 cp를 매칭(순수 DB, 외부 API 無).
+                # product_id 가드 없음 — 취소/배송 주문(ProdCode/GoodsNo 미제공으로 _pid 빈값,
+                # product_id 없는 미등록 1,600여건)도 product_name만 있으면 매칭(issue #365 P4).
+                if (
+                    not _matched
+                    and order_data.get("source") == "lottehome"
+                    and order_data.get("product_name")
+                ):
+                    _matched = await _lh_resolve_by_style_code(
+                        str(order_data.get("product_name", "")),
+                        _ch_id,
+                        _lh_style_cache,
+                    )
                 # 플레이오토 별칭(site_id) 단위 매칭 검증 — 1 channel_id에 5개 별칭이
                 # 묶인 구조에서 사용자가 특정 별칭에만 등록한 cp가 다른 별칭 주문에
                 # 잘못 매칭되는 것을 차단. cp.market_product_nos에 `{account_id}_sites`
@@ -9625,6 +9643,107 @@ def _apply_ebay_claims_to_orders(
                 od["shipping_status"] = ss
                 od["status"] = "cancelled" if ss == "취소완료" else "cancel_requested"
                 break
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 롯데홈쇼핑 중복 goods_no 미매칭 보강 (issue #365)
+# 같은 상품이 롯데홈에 여러 goods_no로 중복등록 → 고객은 구(판매중) 번호로 주문하나
+# 삼바 DB market_product_nos에는 신(품절) 번호만 저장돼 goods_no 정확매칭 실패.
+# 해결: 주문 product_name에 박힌 제조사 모델코드(style_code)로 cp를 매칭한다.
+#   - goods_no는 재등록마다 바뀌고 상품명은 AI가공/재수집으로 drift 하지만
+#     제조사 style_code(HF9375-010, CRS212095 등)는 불변 → 안정적 연결키.
+#   - 토큰 필터: 숫자 1개 이상 AND 길이 6 이상 (색상/일반어 SILVER/KIDS/GIORDANO 배제).
+#   - 단일 후보만 연결. 다중 후보(cp 중복등록 포함)는 수동으로 넘긴다(오매칭 0).
+#   - cp.style_code 는 DB 컬럼이라 외부 API 호출 없음(순수 DB 조인). 폭주/IP차단 무관.
+# 프로덕션 실측(미등록 791건): 복구 368(46.5%) / 다중후보 skip 69 / cp없음 354,
+# 다중후보 자동링크 0, 복구쌍 스팟체크 전수 동일상품 확인.
+# ──────────────────────────────────────────────────────────────────────────
+
+_LH_STYLE_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*")
+
+
+def _lh_style_tokens(name: str) -> list[str]:
+    """롯데홈 상품명에서 모델코드(style_code) 후보 추출 — 숫자 1+ AND 길이 6+."""
+    return [
+        t
+        for t in _LH_STYLE_TOKEN_RE.findall(name or "")
+        if len(t) >= 6 and any(c.isdigit() for c in t)
+    ]
+
+
+async def _lh_resolve_by_style_code(
+    product_name: str, channel_id: str, cache: dict
+) -> dict | None:
+    """미등록 롯데홈 주문을 product_name의 style_code로 cp 단일후보 매칭(순수 DB).
+
+    채널 등록 cp 우선, 없으면 글로벌 단일후보(등록기록만 끊긴 orphan 구제 — 같은
+    style_code 단일이면 같은 물리상품이라 원가/소싱 보강 유효). 다중후보는 None(수동).
+    반환: _matched entry dict(_mpn 캐시와 동일 형식) | None
+    """
+    import json as _json
+
+    tokens = _lh_style_tokens(product_name)
+    if not tokens:
+        return None
+    key = (channel_id, tuple(sorted(set(tokens))))
+    if key in cache:
+        return cache[key]
+    res: dict | None = None
+    try:
+        from sqlalchemy import text as _sa_text2
+
+        _cols = (
+            "id, source_site, source_url, (images->>0) AS thumb, category, style_code"
+        )
+        async with get_read_session() as _s:
+            ch_rows = (
+                await _s.execute(
+                    _sa_text2(
+                        f"SELECT {_cols} FROM samba_collected_product "
+                        "WHERE registered_accounts @> CAST(:a AS jsonb) "
+                        "AND style_code = ANY(:t)"
+                    ),
+                    {"a": _json.dumps([channel_id]), "t": tokens},
+                )
+            ).fetchall()
+            _picked = None
+            _route = ""
+            _ch_ids = {str(r[0]) for r in ch_rows}
+            if len(_ch_ids) == 1:
+                _picked = ch_rows[0]
+                _route = "channel"
+            elif not _ch_ids:
+                gl_rows = (
+                    await _s.execute(
+                        _sa_text2(
+                            f"SELECT {_cols} FROM samba_collected_product "
+                            "WHERE style_code = ANY(:t)"
+                        ),
+                        {"t": tokens},
+                    )
+                ).fetchall()
+                _gl_ids = {str(r[0]) for r in gl_rows}
+                if len(_gl_ids) == 1:
+                    _picked = gl_rows[0]
+                    _route = "global"
+            # 다중후보(채널>1 또는 글로벌>1)는 자동연결 금지 → None(수동)
+            if _picked is not None:
+                res = {
+                    "collected_product_id": str(_picked[0]),
+                    "source_site": _picked[1] or "",
+                    "product_image": _picked[3] or "",
+                    "original_link": _picked[2] or "",
+                    "category": _picked[4] or "",
+                    "site_ids_by_account": {},
+                }
+                logger.info(
+                    f"[주문매칭/롯데홈] style_code 보강({_route}): ch={channel_id} "
+                    f"tokens={tokens} → cp {_picked[0]}(style={_picked[5]})"
+                )
+    except Exception as e:
+        logger.warning(f"[주문매칭/롯데홈] style_code 매칭 실패 ch={channel_id}: {e}")
+    cache[key] = res
+    return res
 
 
 def _parse_lottehome_order_multi(

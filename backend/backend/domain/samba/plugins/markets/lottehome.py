@@ -74,6 +74,65 @@ async def _get_setting(session, key: str) -> Any:
     return val
 
 
+async def _find_reusable_goods_no(session, product: dict[str, Any], account) -> str:
+    """중복방지(issue #365): 같은 style_code 가 같은 계정에 이미 등록한 goods_no 반환.
+
+    같은 상품(동일 제조사 style_code)이 여러 collected_product 로 중복 존재할 때,
+    각 cp 가 따로 register_goods → 새 goods_no 발급 → 구·신 번호 공존 →
+    주문(구 번호)과 DB(신 번호) 불일치로 미등록(원가0/오토튠누락)이 발생한다.
+    신규등록 직전 같은 style_code 의 기존 goods_no(단일)를 찾아 재사용해 발급을 차단한다.
+    실측: 1계정에서 같은 style_code 가 2~3 goods_no 로 중복등록 1,005건.
+
+    단일 후보만 재사용(다중이면 이미 중복 → 모호하므로 신규 진행, 사후 매칭으로 처리).
+    style_code 는 색상별 SKU 코드(II1259-200 등)라 같은 값=같은 SKU=재사용 안전.
+    """
+    import json as _json
+
+    from sqlalchemy import text as _t
+
+    _style = str(product.get("style_code") or "").strip()
+    _self_id = str(product.get("id") or "")
+    if not _style and _self_id:
+        _r = await session.execute(
+            _t("SELECT style_code FROM samba_collected_product WHERE id = :i"),
+            {"i": _self_id},
+        )
+        _style = str(_r.scalar() or "").strip()
+    if not _style or not account:
+        return ""
+    _acc_id = str(account.id)
+    try:
+        rows = (
+            await session.execute(
+                _t(
+                    "SELECT DISTINCT market_product_nos->>:k AS gno "
+                    "FROM samba_collected_product "
+                    "WHERE registered_accounts @> CAST(:a AS jsonb) "
+                    "AND style_code = :s "
+                    "AND jsonb_exists(market_product_nos, :k) "
+                    "AND id <> :self"
+                ),
+                {
+                    "k": _acc_id,
+                    "a": _json.dumps([_acc_id]),
+                    "s": _style,
+                    "self": _self_id,
+                },
+            )
+        ).fetchall()
+        gnos = {str(r[0]) for r in rows if r[0]}
+        if len(gnos) == 1:
+            return next(iter(gnos))
+        if len(gnos) > 1:
+            logger.warning(
+                f"[롯데홈쇼핑][중복방지] style={_style} goods_no 다중 {gnos} — "
+                f"모호하여 신규 진행(사후 매칭 처리)"
+            )
+    except Exception as e:
+        logger.warning(f"[롯데홈쇼핑][중복방지] 기존 goods_no 조회 실패(무시): {e}")
+    return ""
+
+
 def _transform_for_lottehome(
     product: dict[str, Any],
     category_id: str,
@@ -826,17 +885,33 @@ class LotteHomePlugin(MarketPlugin):
             f"img_url4={_img_tag(goods_data.get('img_url4'))}, "
             f"img_url5={_img_tag(goods_data.get('img_url5'))}"
         )
-        result = await client.register_goods(goods_data)
-        # 진단: 응답 raw XML 전체 로그 — 이미지 거부 메시지 있는지 확인용
-        logger.info(f"[롯데홈쇼핑 진단/RES] rawXml={result.get('rawXml', '')[:4000]}")
-        logger.info(f"[롯데홈쇼핑 진단/RES_DATA] data={result.get('data', {})}")
+        # P2 중복방지(issue #365): 같은 style_code 가 이미 이 계정에 등록돼 있으면
+        # register_goods(새 goods_no 발급)를 스킵하고 기존 goods_no 를 공유한다.
+        # → 중복 goods_no 발급 차단(주문 미매칭 근원 제거). 실제 등록 API 호출 0건.
+        _reuse_no = ""
+        if not existing_no and account:
+            _reuse_no = await _find_reusable_goods_no(session, product, account)
+        if _reuse_no:
+            goods_no = _reuse_no
+            result = {"data": {"_reused_goods_no": _reuse_no}}
+            logger.info(
+                f"[롯데홈쇼핑][중복방지] style 동일 기존 goods_no={goods_no} 공유 "
+                f"— 신규등록 스킵(중복 발급 차단)"
+            )
+        else:
+            result = await client.register_goods(goods_data)
+            # 진단: 응답 raw XML 전체 로그 — 이미지 거부 메시지 있는지 확인용
+            logger.info(
+                f"[롯데홈쇼핑 진단/RES] rawXml={result.get('rawXml', '')[:4000]}"
+            )
+            logger.info(f"[롯데홈쇼핑 진단/RES_DATA] data={result.get('data', {})}")
 
-        # 상품번호 추출
-        g_data = result.get("data", {})
-        g_result = g_data.get("GoodsResults", g_data.get("Result", g_data))
-        goods_no = ""
-        if isinstance(g_result, dict):
-            goods_no = g_result.get("goods_no", "") or g_result.get("Result", "")
+            # 상품번호 추출
+            g_data = result.get("data", {})
+            g_result = g_data.get("GoodsResults", g_data.get("Result", g_data))
+            goods_no = ""
+            if isinstance(g_result, dict):
+                goods_no = g_result.get("goods_no", "") or g_result.get("Result", "")
 
         # DB에 등록 정보 저장 (registered_accounts, market_product_nos)
         if goods_no and account:
