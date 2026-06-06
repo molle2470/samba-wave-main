@@ -606,11 +606,14 @@ async function _ensureLoggedInImpl(siteKey, accountId) {
       try {
         globalThis._lastAutoLoginSuccessAt = globalThis._lastAutoLoginSuccessAt || {}
         const accKey = accountId || '_default'
-        const prevSite = globalThis._lastAutoLoginSuccessAt[siteKey]
-        // 기존에 number(구버전)였으면 객체로 마이그레이션
-        const siteMap = (prevSite && typeof prevSite === 'object') ? prevSite : {}
-        siteMap[accKey] = Date.now()
-        globalThis._lastAutoLoginSuccessAt[siteKey] = siteMap
+        // [2026-06-06] 소싱처는 한 브라우저 세션에 한 계정만 로그인 가능(무신사/SSG 등 SPA).
+        // 계정별 캐시를 누적(siteMap[accKey]=now)하면 병기 로그인 후 성희 로그인 시 병기 캐시가
+        // 살아남아 다음 병기 잡에서 line 575 "이미 로그인됨" 오판(false positive) → 실제 세션
+        // (성희)으로 조회 → 무신사=WRONG_ACCOUNT / SSG=비로그인 리다이렉트 timeout.
+        // 단일 세션 반영: 마지막 로그인 1계정만 유효하게 **교체**(다른 계정 캐시 삭제).
+        // CDP 3단계 검증(무신사): 캐시 클리어 시 ensureLoggedIn 이 실제 로그아웃+병기 로그인으로
+        // 세션 전환 성공(myinfo ID=cannonfort) → 캐시 교체가 정확한 스왑 유도.
+        globalThis._lastAutoLoginSuccessAt[siteKey] = { [accKey]: Date.now() }
         chrome.storage.local.set({ _lastAutoLoginSuccessAt: globalThis._lastAutoLoginSuccessAt }).catch(() => {})
       } catch {}
       console.log(`[자동로그인] ✅ ${site.name} 성공 — 폴링 자동 재개`)
