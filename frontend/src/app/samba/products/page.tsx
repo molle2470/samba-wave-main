@@ -681,7 +681,16 @@ export default function ProductsPage() {
     const options = Array.from(counts.entries())
       .map(([accountId, productCount]) => {
         const account = accountsMap.get(accountId)
-        if (!account) return null
+        // orphan 등록계정(계정 삭제·비활성으로 accountsMap에서 빠짐): drop 대신 옵션 유지.
+        // 강제삭제로 DB 등록기록 정리 가능 (issue #362). marketType은 표시용이라 fallback 안전.
+        if (!account) {
+          return {
+            accountId,
+            label: `삭제된 계정 (${accountId.slice(0, 8)})`,
+            marketType: '연결 끊김',
+            productCount,
+          }
+        }
         const marketLabel = MARKETS.find(item => item.id === account.market_type)?.name || account.market_name || account.market_type
         return {
           accountId,
