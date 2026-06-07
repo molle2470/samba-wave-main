@@ -282,10 +282,15 @@ async function _spaDirectLogin(siteKey, username, password) {
               btnId: '#login',
             },
             ssg: {
-              // member.ssg.com 실측(2026-05-15): id="inp_id" name="mbrLoginId" / pw id="inp_pw" / 버튼 id="loginBtn"
-              id: ['#inp_id', 'input[name="mbrLoginId"]', '#userId', 'input[name="userId"]', 'input[name="usrId"]', 'input[type="email"]'],
-              pw: ['#inp_pw', 'input[type="password"]'],
-              btnId: '#loginBtn, #btn_login, .btn_login, button[type="submit"]',
+              // member.ssg.com 실측(2026-06-08, CDP 9222): id="mem_id" name="mbrLoginId" /
+              //   pw id="mem_pw" name="password" / 버튼은 id="loginBtn" 이 2개(숨김 div + 진짜 button).
+              // [중요·2026-06-08] '#loginBtn' querySelector 는 숨김 <div id="loginBtn">(visible:false)를
+              //   먼저 잡아 .click() 무반응 → SSG 로그인 전건 실패 → 송장 26일 정지. 데몬은 v1.4.22에서
+              //   동일 버그 고쳤으나(button#loginBtn) 확장앱 auto-login은 누락돼 있었음.
+              //   → 태그 한정 'button#loginBtn' 을 맨 앞에 둬 숨김 div 를 건너뛴다.
+              id: ['#mem_id', 'input[name="mbrLoginId"]', '#inp_id', '#userId', 'input[name="userId"]', 'input[name="usrId"]', 'input[type="email"]'],
+              pw: ['#mem_pw', 'input[name="password"]', '#inp_pw', 'input[type="password"]'],
+              btnId: 'button#loginBtn, button[type="submit"], #btn_login, .btn_login',
             },
             musinsa: {
               // member.one.musinsa.com/login — SPA, selector 실측 불가 → 흔한 패턴 다 등록
