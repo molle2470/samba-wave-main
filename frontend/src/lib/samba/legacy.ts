@@ -2701,7 +2701,6 @@ export interface BrandSales {
 export const analyticsApi = {
   channels: () => request<{ channel_name: string; sales: number; orders: number; profit: number }[]>(`${SAMBA_PREFIX}/analytics/channels`),
   daily: (days = 30) => request<{ date: string; sales: number; orders: number; profit: number }[]>(`${SAMBA_PREFIX}/analytics/daily?days=${days}`),
-  monthly: () => request<{ month: string; sales: number; orders: number; profit: number }[]>(`${SAMBA_PREFIX}/analytics/monthly`),
   sourcingRoi: (start?: string, end?: string) => {
     const p = new URLSearchParams()
     if (start) p.set('start_date', start)
@@ -2717,8 +2716,6 @@ export const analyticsApi = {
     statuses?.forEach(s => p.append('statuses', s))
     return request<ProductPerformance[]>(`${SAMBA_PREFIX}/analytics/best-sellers?${p}`)
   },
-  worstSellers: (limit = 10, days = 30) =>
-    request<ProductPerformance[]>(`${SAMBA_PREFIX}/analytics/worst-sellers?limit=${limit}&days=${days}`),
   brands: (start?: string, end?: string, markets?: string[], sites?: string[], statuses?: string[]) => {
     const p = new URLSearchParams()
     if (start) p.set('start_date', start)
