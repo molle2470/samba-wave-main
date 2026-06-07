@@ -2184,6 +2184,7 @@ async def sync_returns_from_markets(
                     UTC as _esm_UTC,
                     datetime as _esm_dt,
                     timedelta as _esm_td,
+                    timezone as _esm_tz,
                 )
 
                 esm_hosting_id, esm_secret_key = await resolve_esm_credentials(
@@ -2210,12 +2211,15 @@ async def sync_returns_from_markets(
 
                 # claim API SiteType: 1=옥션, **3=G마켓** (주문 API의 2=G마켓과 다름!)
                 _esm_claim_site_type = 3 if market_type == "gmarket" else 1
-                # 7일 max — claim API 한도
-                _esm_days_claim = min(int(body.days or 1), 7)
-                _esm_end_claim = _esm_dt.now(_esm_UTC)
-                _esm_start_claim = _esm_end_claim - _esm_td(days=_esm_days_claim)
-                _esm_from_claim = _esm_start_claim.strftime("%Y-%m-%d")
-                _esm_to_claim = _esm_end_claim.strftime("%Y-%m-%d")
+                # 7일 max — claim API 한도. to=내일(+1) 여유 위해 -1.
+                _esm_days_claim = min(int(body.days or 1), 6)
+                # KST 기준 + EndDate=내일 — to=오늘이면 당일 클레임 누락(#369)
+                _esm_KST = _esm_tz(_esm_td(hours=9))
+                _esm_now_claim = _esm_dt.now(_esm_KST)
+                _esm_from_claim = (
+                    _esm_now_claim - _esm_td(days=_esm_days_claim)
+                ).strftime("%Y-%m-%d")
+                _esm_to_claim = (_esm_now_claim + _esm_td(days=1)).strftime("%Y-%m-%d")
 
                 _esm_client = ESMPlusClient(
                     esm_hosting_id, esm_secret_key, seller_id, site=market_type

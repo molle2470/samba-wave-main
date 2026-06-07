@@ -2800,10 +2800,12 @@ async def _do_sync_cs_from_markets(
             esm_qna_types = [3] if esm_mt == "gmarket" else [1, 2]
 
             # 7일 단위 (claim/CS API 한도)
-            esm_end = datetime.now(timezone.utc)
-            esm_start = esm_end - timedelta(days=7)
-            esm_from = esm_start.strftime("%Y-%m-%d")
-            esm_to = esm_end.strftime("%Y-%m-%d")
+            # KST 기준 + endDate=내일 — ESM은 to=오늘이면 당일 문의 누락(#369).
+            # 7일 한도라 from은 -6일(+내일 1일 여유). 타 CS경로(playauto/스스)와 정합.
+            _cs_kst = timezone(timedelta(hours=9))
+            esm_now = datetime.now(_cs_kst)
+            esm_from = (esm_now - timedelta(days=6)).strftime("%Y-%m-%d")
+            esm_to = (esm_now + timedelta(days=1)).strftime("%Y-%m-%d")
 
             esm_client = ESMPlusClient(
                 esm_hosting_id, esm_secret_key, esm_seller_id, site=esm_mt

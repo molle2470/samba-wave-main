@@ -7093,20 +7093,22 @@ async def sync_orders_from_markets(
 
                 _esm_site = market_type  # "gmarket" or "auction"
                 _esm_site_type = 2 if market_type == "gmarket" else 1
-                # 기간 클램프: G마켓 31일 / 옥션 180일
+                # 기간 클램프: G마켓 31일 / 옥션 180일. to=내일(+1) 여유 위해 -1.
                 _esm_max_days = 31 if market_type == "gmarket" else 180
-                _esm_days = min(int(body.days or 1), _esm_max_days)
+                _esm_days = min(int(body.days or 1), _esm_max_days - 1)
 
                 from datetime import (
                     datetime as _esm_dt,
                     timedelta as _esm_td,
-                    UTC as _esm_UTC,
+                    timezone as _esm_tz,
                 )
 
-                _esm_end = _esm_dt.now(_esm_UTC)
-                _esm_start = _esm_end - _esm_td(days=_esm_days)
-                _esm_from = _esm_start.strftime("%Y-%m-%d")
-                _esm_to = _esm_end.strftime("%Y-%m-%d")
+                # KST 기준 + requestDateTo=내일 — ESM은 to=오늘이면 당일/전날밤 경계
+                # 주문을 date-only 경계로 제외(필터 아닌 조회조건이라 영구 누락). #369
+                _esm_KST = _esm_tz(_esm_td(hours=9))
+                _esm_now = _esm_dt.now(_esm_KST)
+                _esm_from = (_esm_now - _esm_td(days=_esm_days)).strftime("%Y-%m-%d")
+                _esm_to = (_esm_now + _esm_td(days=1)).strftime("%Y-%m-%d")
 
                 esm_client = ESMPlusClient(
                     esm_hosting_id, esm_secret_key, seller_id, site=_esm_site
