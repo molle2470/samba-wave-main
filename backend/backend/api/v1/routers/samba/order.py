@@ -9674,7 +9674,9 @@ def _apply_ebay_claims_to_orders(
 # 다중후보 자동링크 0, 복구쌍 스팟체크 전수 동일상품 확인.
 # ──────────────────────────────────────────────────────────────────────────
 
-_LH_STYLE_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*")
+# 언더스코어 포함 — cp.style_code 가 사이즈 접미사를 '_'로 붙이는 경우
+# (예: 'NBRJGS140P_25')와 정확 매칭. '-' 코드(HF9375-010)는 그대로 흡수.
+_LH_STYLE_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
 def _lh_style_tokens(name: str) -> list[str]:
