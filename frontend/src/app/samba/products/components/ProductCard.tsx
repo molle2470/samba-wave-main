@@ -451,14 +451,18 @@ const ProductCard = React.memo(function ProductCard({
   } | null>(null)
   const [actualSizeLoaded, setActualSizeLoaded] = useState(false)
   useEffect(() => {
-    if (!expanded || actualSizeLoaded) return
+    // 상세 표시 조건은 카드뷰(compact=false)면 항상, compact뷰면 expanded일 때.
+    // (렌더 게이트 `(compact && !expanded)`와 동일) — expanded만 보면 카드뷰에서
+    // 영영 fetch 안 됨. MUSINSA만(타 소싱처는 실측표 없음) 호출해 부하 제한.
+    const detailShown = !compact || expanded
+    if (!detailShown || actualSizeLoaded || p.source_site !== 'MUSINSA') return
     setActualSizeLoaded(true)
     collectorApi.getProduct(p.id).then((full) => {
       const ed = (full?.extra_data as Record<string, unknown> | undefined) || {}
       const as = ed.actualSize as typeof actualSize
       if (as && Array.isArray(as.sizes) && as.sizes.length > 0) setActualSize(as)
     }).catch(() => {})
-  }, [expanded, actualSizeLoaded, p.id])
+  }, [compact, expanded, actualSizeLoaded, p.id, p.source_site])
 
   // 모달 열 때 상세이미지/HTML 단일 fetch (목록 API에서는 defer되어 비어있음)
   const openImageModal = () => {
