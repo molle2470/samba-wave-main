@@ -148,6 +148,28 @@ async function _fetchLoginCredential(siteKey, accountId) {
   }
 }
 
+// [2026-06-07] SSG 쿠키 도메인 클리어 강제 로그아웃.
+// SSG logout.ssg URL 이 에러 페이지("원하셨던 페이지가 아닌가요")를 응답 → 세션이 안 끊겨
+// 계정 전환 실패 → 로그인폼 미표시 → 송장 timeout. 데몬 v1.4.29 와 동일하게 쿠키를 직접
+// 비워 강제 로그아웃한다. (getAll({domain:'ssg.com'})은 ssg.com + 모든 서브도메인 포함)
+async function _clearSsgCookies() {
+  let n = 0
+  try {
+    const cookies = await chrome.cookies.getAll({ domain: 'ssg.com' })
+    for (const ck of cookies) {
+      const host = ck.domain.replace(/^\./, '')
+      const proto = ck.secure ? 'https' : 'http'
+      try {
+        await chrome.cookies.remove({ url: `${proto}://${host}${ck.path}`, name: ck.name })
+        n++
+      } catch {}
+    }
+  } catch (e) {
+    console.warn(`[자동로그인][SPA] SSG 쿠키 클리어 실패: ${e?.message || e}`)
+  }
+  return n
+}
+
 // SPA 직접 로그인 — Chrome 자동완성 의존 없이 .value 직접 설정 + button.click()
 // LOTTEON / ABCmart / SSG처럼 vanilla input + form submit 구조의 사이트에서 작동
 // (검증 완료: 가짜 자격증명으로도 click()이 서버 응답까지 도달함을 확인)
@@ -163,20 +185,27 @@ async function _spaDirectLogin(siteKey, username, password) {
     lotteon: 'https://www.lotteon.com/p/member/logout',
     abcmart: 'https://abcmart.a-rt.com/member/logout',
   }
-  const _logoutUrl = _LOGOUT_URLS[siteKey]
-  if (_logoutUrl) {
-    let logoutTabId = null
-    try {
-      const logoutTab = await chrome.tabs.create({ url: _logoutUrl, active: false })
-      logoutTabId = logoutTab.id
-      try { await waitForTabLoad(logoutTabId, 15000) } catch {}
-      await wait(1500)  // 로그아웃 처리 + Set-Cookie 적용 대기
-      console.log(`[자동로그인][SPA] ${site.name} 정식 로그아웃 완료 (계정 전환 위해)`)
-    } catch (e) {
-      console.warn(`[자동로그인][SPA] 로그아웃 호출 실패: ${e?.message || e}`)
-    } finally {
-      if (logoutTabId) {
-        try { await chrome.tabs.remove(logoutTabId) } catch {}
+  if (siteKey === 'ssg') {
+    // [2026-06-07] SSG 는 logout URL 이 에러 페이지라 세션이 안 끊김 → 쿠키 직접 클리어로 강제.
+    const _cleared = await _clearSsgCookies()
+    await wait(800)
+    console.log(`[자동로그인][SPA] SSG 쿠키 클리어 강제 로그아웃 (${_cleared}개, logout URL 에러 회피)`)
+  } else {
+    const _logoutUrl = _LOGOUT_URLS[siteKey]
+    if (_logoutUrl) {
+      let logoutTabId = null
+      try {
+        const logoutTab = await chrome.tabs.create({ url: _logoutUrl, active: false })
+        logoutTabId = logoutTab.id
+        try { await waitForTabLoad(logoutTabId, 15000) } catch {}
+        await wait(1500)  // 로그아웃 처리 + Set-Cookie 적용 대기
+        console.log(`[자동로그인][SPA] ${site.name} 정식 로그아웃 완료 (계정 전환 위해)`)
+      } catch (e) {
+        console.warn(`[자동로그인][SPA] 로그아웃 호출 실패: ${e?.message || e}`)
+      } finally {
+        if (logoutTabId) {
+          try { await chrome.tabs.remove(logoutTabId) } catch {}
+        }
       }
     }
   }

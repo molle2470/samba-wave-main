@@ -577,6 +577,8 @@ class SambaShipmentService:
             for p in products:
                 # OOM 방지: 전송에 불필요한 대용량 필드 제외
                 pd = p.model_dump(exclude={"last_sent_data", "extra_data"})
+                # 실측 사이즈표 — extra_data는 제외되므로 row에서 직접 주입 (#실측표)
+                pd["actual_size"] = (p.extra_data or {}).get("actualSize")
 
                 # 상세 HTML 재생성
                 pd["detail_html"] = await self._build_detail_html(pd)
@@ -847,6 +849,8 @@ class SambaShipmentService:
 
         # OOM 방지: 전송에 불필요한 대용량 필드 제외
         product_dict = product_row.model_dump(exclude={"last_sent_data", "extra_data"})
+        # 실측 사이즈표 — extra_data는 제외되므로 row에서 직접 주입 (#실측표)
+        product_dict["actual_size"] = (product_row.extra_data or {}).get("actualSize")
 
         # 수동등록 상품의 계정별 카테고리 (extra_data.manual_market_categories: {account_id: category_id})
         # extra_data는 product_dict에서 제외되므로 product_row에서 직접 읽음
@@ -2682,6 +2686,7 @@ class SambaShipmentService:
             "title": False,
             "option": False,
             "detail": False,
+            "sizeChart": True,  # 실측 사이즈표 (무신사 의류) — 기본 켬
             "bottomImg": True,
         }
         img_order: list[str] = [
@@ -2691,6 +2696,7 @@ class SambaShipmentService:
             "title",
             "option",
             "detail",
+            "sizeChart",
             "bottomImg",
         ]
 
@@ -2723,8 +2729,16 @@ class SambaShipmentService:
                 bottom_img = _extract_url(tpl.bottom_image_s3_key or "")
                 if tpl.img_checks:
                     img_checks.update(tpl.img_checks)
+                    # 실측표 토글 신규 — 기존 템플릿엔 키 없음 → 기본 켬 유지
+                    img_checks.setdefault("sizeChart", True)
                 if tpl.img_order:
-                    img_order = tpl.img_order
+                    img_order = list(tpl.img_order)
+                    # 실측표는 신규 항목 — 기존 순서엔 없으므로 하단이미지 앞에 보강
+                    if "sizeChart" not in img_order:
+                        if "bottomImg" in img_order:
+                            img_order.insert(img_order.index("bottomImg"), "sizeChart")
+                        else:
+                            img_order.append("sizeChart")
                 main_image_index = int(getattr(tpl, "main_image_index", 0) or 0)
                 gallery_include_sub = bool(getattr(tpl, "gallery_include_sub", True))
                 logger.info(
@@ -2794,6 +2808,10 @@ class SambaShipmentService:
                         logger.info(
                             f"[상세HTML] detail 비어있음 → 추가이미지 {len(fallback_imgs)}장 폴백"
                         )
+            elif item_id == "sizeChart":
+                size_html = self._build_size_chart_html(product.get("actual_size"))
+                if size_html:
+                    parts.append(size_html)
             elif item_id == "bottomImg" and bottom_img:
                 parts.append(img_tag.format(url=bottom_img))
 
@@ -2801,6 +2819,94 @@ class SambaShipmentService:
             return f"<p>{product.get('name', '')}</p>"
 
         return "\n".join(parts)
+
+    @staticmethod
+    def _build_size_chart_html(actual_size: Optional[dict[str, Any]]) -> str:
+        """실측 사이즈표 데이터 → 상세페이지용 HTML 테이블.
+
+        무신사 actual-size 구조:
+            {typeName, description, sizes: [{name, items: [{name, value}]}]}
+        데이터 없거나(신발/타소싱처) 형식 불일치면 빈 문자열 반환 → 토글 켜도 무해.
+        """
+        import html as _html
+
+        if not actual_size or not isinstance(actual_size, dict):
+            return ""
+        sizes = actual_size.get("sizes") or []
+        if not sizes or not isinstance(sizes, list):
+            return ""
+
+        # 컬럼(부위명) 순서 — 첫 사이즈의 items 순서 기준
+        first_items = (sizes[0] or {}).get("items") or []
+        col_names: list[str] = [
+            str(it.get("name", "")).strip()
+            for it in first_items
+            if isinstance(it, dict) and str(it.get("name", "")).strip()
+        ]
+        if not col_names:
+            return ""
+
+        def _fmt(v: Any) -> str:
+            # 60.0 → "60", 17.5 → "17.5"
+            try:
+                f = float(v)
+                return str(int(f)) if f == int(f) else str(f)
+            except (TypeError, ValueError):
+                return _html.escape(str(v)) if v is not None else "-"
+
+        th_style = (
+            "border:1px solid #ddd;padding:8px 10px;background:#f5f5f5;"
+            "font-weight:600;color:#333;white-space:nowrap;"
+        )
+        td_style = (
+            "border:1px solid #ddd;padding:8px 10px;color:#444;"
+            "text-align:center;white-space:nowrap;"
+        )
+
+        header_cells = f'<th style="{th_style}">사이즈</th>' + "".join(
+            f'<th style="{th_style}">{_html.escape(c)}</th>' for c in col_names
+        )
+        rows_html: list[str] = []
+        for sz in sizes:
+            if not isinstance(sz, dict):
+                continue
+            sz_name = _html.escape(str(sz.get("name", "")).strip())
+            item_map = {
+                str(it.get("name", "")).strip(): it.get("value")
+                for it in (sz.get("items") or [])
+                if isinstance(it, dict)
+            }
+            cells = f'<td style="{td_style}">{sz_name}</td>' + "".join(
+                f'<td style="{td_style}">{_fmt(item_map.get(c))}</td>'
+                for c in col_names
+            )
+            rows_html.append(f"<tr>{cells}</tr>")
+
+        if not rows_html:
+            return ""
+
+        type_name = _html.escape(str(actual_size.get("typeName", "")).strip())
+        description = _html.escape(str(actual_size.get("description", "")).strip())
+        title = "실측 사이즈" + (f" ({type_name})" if type_name else "")
+
+        return (
+            '<div style="max-width:860px;width:100%;margin:1.5rem auto;'
+            'font-family:inherit;">'
+            f'<h3 style="font-size:1.1rem;font-weight:700;color:#333;'
+            f'margin:0 0 0.75rem;text-align:center;">{title}</h3>'
+            '<table style="border-collapse:collapse;width:100%;'
+            'font-size:0.9rem;"><thead><tr>'
+            f"{header_cells}</tr></thead><tbody>"
+            f"{''.join(rows_html)}</tbody></table>"
+            + (
+                f'<p style="font-size:0.8rem;color:#888;margin:0.5rem 0 0;'
+                f'text-align:center;">{description} (단위: cm)</p>'
+                if description
+                else '<p style="font-size:0.8rem;color:#888;margin:0.5rem 0 0;'
+                'text-align:center;">단위: cm</p>'
+            )
+            + "</div>"
+        )
 
     # ==================== 카테고리 매핑 자동 조회 ====================
 
@@ -2919,6 +3025,8 @@ class SambaShipmentService:
             return shipment
         # OOM 방지: 전송에 불필요한 대용량 필드 제외
         product_dict = product_row.model_dump(exclude={"last_sent_data", "extra_data"})
+        # 실측 사이즈표 — extra_data는 제외되므로 row에서 직접 주입 (#실측표)
+        product_dict["actual_size"] = (product_row.extra_data or {}).get("actualSize")
 
         # 재전송
         await self.repo.update_async(shipment_id, status="transmitting")

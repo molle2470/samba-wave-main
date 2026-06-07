@@ -233,6 +233,13 @@ class MusinsaClient:
                 {} if refresh_only else await self._fetch_essential(client, goods_no)
             )
 
+            # 3-1) 실측 사이즈표 API (갱신 모드에서는 스킵, 의류만 데이터 있음)
+            actual_size = (
+                None
+                if refresh_only
+                else await self._fetch_actual_size(client, goods_no)
+            )
+
             # 카테고리
             category_levels = [cat.get(f"categoryDepth{i}Name") for i in range(1, 5)]
             category_levels = [c for c in category_levels if c]
@@ -567,6 +574,8 @@ class MusinsaClient:
                 "manufacturer": essential.get("manufacturer", ""),
                 "color": essential.get("color", ""),
                 "sizeInfo": essential.get("size", ""),
+                # 실측 사이즈표 (의류만 존재, 신발 등은 None) — extra_data로 자동 저장됨
+                "actualSize": actual_size,
                 "care_instructions": essential.get("careInstructions", ""),
                 "quality_guarantee": essential.get("qualityGuarantee", ""),
                 "brandNation": brand_info.get("brandNationName", ""),
@@ -1534,6 +1543,47 @@ class MusinsaClient:
             )
 
         return essential
+
+    async def _fetch_actual_size(
+        self, client: httpx.AsyncClient, goods_no: str
+    ) -> Optional[dict[str, Any]]:
+        """실측 사이즈표 API 호출.
+
+        무신사 PDP "사이즈 정보 > 실측 사이즈" 데이터.
+        의류는 사이즈별 부위 측정값(총장/가슴단면 등)이 채워지고,
+        신발 등은 data=null 로 내려온다(실측 없음 → None 반환).
+
+        반환 구조(data 그대로):
+            {typeName, typeNumber, description, mobileImage, webImage,
+             sizes: [{name, items: [{name, value, recommendSizeRange}]}], mySize}
+        """
+        try:
+            resp = await client.get(
+                f"{self.BASE_DETAIL}/{goods_no}/actual-size",
+                headers=self._headers(),
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    f"[실측] {goods_no} actual-size API {resp.status_code}: {resp.text[:200]}"
+                )
+                return None
+            size_json = resp.json()
+            if (size_json.get("meta") or {}).get("result") != "SUCCESS":
+                # FAIL/잘못된 요청 등 — 조용히 스킵
+                return None
+            data = size_json.get("data")
+            # 신발 등 실측 없는 상품은 data=null → None
+            if not data or not isinstance(data, dict):
+                return None
+            sizes = data.get("sizes") or []
+            if not sizes:
+                return None
+            return data
+        except Exception as exc:
+            logger.warning(
+                f"[실측] {goods_no} 실측 사이즈 수집 실패(무시): {exc!r}", exc_info=True
+            )
+            return None
 
     async def _fetch_coupons(
         self,

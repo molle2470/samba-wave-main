@@ -2012,6 +2012,32 @@ async def _resolve_esm_group(
     return g, [v for v in values if v.get("recommendedOptValueNo")]
 
 
+# 한글 브랜드 → ESM 정식 검색어 alias.
+# ESM이 일부 정식 브랜드를 영문명으로만 노출 → 한글 검색은 변종(키즈/플레이 등)만
+# 반환하고 정식 브랜드가 누락됨. 검증된 케이스만 등재(추측 금지).
+#   예: '엠엘비' 검색 → 엠엘비키즈/엠엘비(마스크)/엠엘비그루/엠엘비플레이 (정식 누락)
+#       'MLB' 검색 → 'Mlb'(brandNo=23347, 정식) 노출 (2026-06-07 nanol06 실측)
+_ESM_BRAND_ALIASES: dict[str, str] = {
+    "엠엘비": "MLB",
+}
+
+
+async def _search_brand_exact(client: ESMPlusClient, query: str) -> int | None:
+    """query 로 검색 후 brandName 정확일치(공백/대소문자 무시) brandNo 반환."""
+    try:
+        resp = await client.search_brands(query.strip())
+    except Exception as e:
+        logger.warning(f"[ESM] 브랜드 코드 조회 실패: '{query}' {e}")
+        return None
+    brands = (resp or {}).get("brands") or []
+    target = re.sub(r"\s+", "", query).lower()
+    for b in brands:
+        bn = re.sub(r"\s+", "", (b.get("brandName") or "")).lower()
+        if bn == target and b.get("brandNo"):
+            return int(b["brandNo"])
+    return None
+
+
 async def resolve_esm_brand_no(client: ESMPlusClient, brand_name: str) -> int | None:
     """브랜드명 → ESM brandNo 매핑 (정확명 매칭).
 
@@ -2019,23 +2045,30 @@ async def resolve_esm_brand_no(client: ESMPlusClient, brand_name: str) -> int | 
     문자열 brand 만 보내면 ESM이 무시 → 마켓 리스팅 브랜드 빈칸.
     search_brands 응답: {"brands": [{"brandNo", "brandName", "makerNo", ...}]}.
     오매칭 방지 위해 공백/대소문자 무시 '정확 일치'만 채택. 없으면 None.
+
+    1차 원본명 정확매칭 → 실패 시 한글→영문 alias 재검색(여전히 정확매칭).
     """
     if not brand_name or not brand_name.strip():
         return None
-    try:
-        resp = await client.search_brands(brand_name.strip())
-    except Exception as e:
-        logger.warning(f"[ESM] 브랜드 코드 조회 실패: '{brand_name}' {e}")
-        return None
-    brands = (resp or {}).get("brands") or []
-    target = re.sub(r"\s+", "", brand_name).lower()
-    for b in brands:
-        bn = re.sub(r"\s+", "", (b.get("brandName") or "")).lower()
-        if bn == target and b.get("brandNo"):
-            return int(b["brandNo"])
+
+    # 1차: 원본명 정확매칭
+    no = await _search_brand_exact(client, brand_name.strip())
+    if no:
+        return no
+
+    # 2차: 한글→영문 alias 재검색 (ESM이 정식 브랜드를 영문으로만 노출하는 케이스)
+    key = re.sub(r"\s+", "", brand_name).lower()
+    alias = _ESM_BRAND_ALIASES.get(key) or _ESM_BRAND_ALIASES.get(brand_name.strip())
+    if alias:
+        no = await _search_brand_exact(client, alias)
+        if no:
+            logger.info(
+                f"[ESM] 브랜드 alias 매칭: '{brand_name}' → '{alias}' brandNo={no}"
+            )
+            return no
+
     logger.warning(
-        f"[ESM] 브랜드 정확매칭 없음 — catalog.brandNo 미설정 (brand='{brand_name}', "
-        f"후보 {len(brands)}건)"
+        f"[ESM] 브랜드 정확매칭 없음 — catalog.brandNo 미설정 (brand='{brand_name}')"
     )
     return None
 

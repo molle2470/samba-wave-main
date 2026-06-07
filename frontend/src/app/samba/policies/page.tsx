@@ -265,9 +265,9 @@ export default function PoliciesPage() {
   const [selectedNameRuleId, setSelectedNameRuleId] = useState('')
   const [dragIdx, setDragIdx] = useState<number | null>(null)
   const [imgChecks, setImgChecks] = useState<Record<string, boolean>>({
-    main: true, sub: true, title: false, option: false, detail: false, topImg: false, bottomImg: false,
+    main: true, sub: true, title: false, option: false, detail: false, sizeChart: true, topImg: false, bottomImg: false,
   })
-  const [imgOrder, setImgOrder] = useState<string[]>(['topImg', 'main', 'sub', 'title', 'option', 'detail', 'bottomImg'])
+  const [imgOrder, setImgOrder] = useState<string[]>(['topImg', 'main', 'sub', 'title', 'option', 'detail', 'sizeChart', 'bottomImg'])
   const [imgSaving, setImgSaving] = useState<string>('')
   const [previewProduct, setPreviewProduct] = useState<SambaCollectedProduct | null>(null)
 
@@ -453,16 +453,24 @@ export default function PoliciesPage() {
     const t = detailTemplates.find(x => x.id === selectedDetailTemplateId)
     if (!t) return
     if (t.img_checks) {
-      setImgChecks(t.img_checks)
+      // 실측표 토글 신규 — 기존 템플릿엔 키 없음 → 기본 켬(백엔드 기본값과 일치)
+      setImgChecks({ sizeChart: true, ...t.img_checks })
     } else {
       setImgChecks({
-        main: true, sub: true, title: false, option: false, detail: false,
+        main: true, sub: true, title: false, option: false, detail: false, sizeChart: true,
         topImg: !!t.top_image_s3_key,
         bottomImg: !!t.bottom_image_s3_key,
       })
     }
     if (t.img_order) {
-      setImgOrder(t.img_order)
+      // 실측표는 신규 항목 — 기존 순서에 없으면 하단이미지 앞에 보강
+      const order = [...t.img_order]
+      if (!order.includes('sizeChart')) {
+        const bi = order.indexOf('bottomImg')
+        if (bi >= 0) order.splice(bi, 0, 'sizeChart')
+        else order.push('sizeChart')
+      }
+      setImgOrder(order)
     }
   }, [selectedDetailTemplateId, detailTemplates])
 
@@ -1625,6 +1633,7 @@ export default function PoliciesPage() {
             { id: 'title', label: '상품제목', color: '#FFD93D', bg: 'rgba(255,217,61,0.05)', border: 'rgba(255,217,61,0.3)' },
             { id: 'option', label: '옵션이미지', color: '#888', bg: 'rgba(136,136,136,0.05)', border: 'rgba(136,136,136,0.3)' },
             { id: 'detail', label: '상세이미지', color: '#CC5DE8', bg: 'rgba(204,93,232,0.05)', border: 'rgba(204,93,232,0.3)' },
+            { id: 'sizeChart', label: '실측표 (무신사 의류)', color: '#20C997', bg: 'rgba(32,201,151,0.05)', border: 'rgba(32,201,151,0.3)' },
             { id: 'bottomImg', label: '하단이미지', color: '#FF8C00', bg: 'rgba(255,140,0,0.05)', border: 'rgba(255,140,0,0.3)' },
           ]
 
