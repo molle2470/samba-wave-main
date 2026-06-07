@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState, useMemo, useCallback } from 'react'
+import React, { useState, useMemo, useCallback, useEffect } from 'react'
 import {
   collectorApi,
   type SambaCollectedProduct,
@@ -442,6 +442,24 @@ const ProductCard = React.memo(function ProductCard({
       : (p.detail_html || '').match(/src=["']([^"']+)["']/gi)
           ?.map((m: string) => m.replace(/src=["']/i, '').replace(/["']$/, '')) || []
   )
+  // 실측 사이즈표 — extra_data는 목록(scroll)에서 defer되므로 펼침 시 단건 fetch
+  // {typeName, description, sizes:[{name, items:[{name, value}]}]} (무신사 의류만, 없으면 null)
+  const [actualSize, setActualSize] = useState<{
+    typeName?: string
+    description?: string
+    sizes?: { name?: string; items?: { name?: string; value?: number }[] }[]
+  } | null>(null)
+  const [actualSizeLoaded, setActualSizeLoaded] = useState(false)
+  useEffect(() => {
+    if (!expanded || actualSizeLoaded) return
+    setActualSizeLoaded(true)
+    collectorApi.getProduct(p.id).then((full) => {
+      const ed = (full?.extra_data as Record<string, unknown> | undefined) || {}
+      const as = ed.actualSize as typeof actualSize
+      if (as && Array.isArray(as.sizes) && as.sizes.length > 0) setActualSize(as)
+    }).catch(() => {})
+  }, [expanded, actualSizeLoaded, p.id])
+
   // 모달 열 때 상세이미지/HTML 단일 fetch (목록 API에서는 defer되어 비어있음)
   const openImageModal = () => {
     setProductImages(p.images || [])
@@ -1918,6 +1936,47 @@ const ProductCard = React.memo(function ProductCard({
                   })()}
                 </td>
               </tr>
+              {/* 실측표 (무신사 의류 — extra_data.actualSize) */}
+              {actualSize && actualSize.sizes && actualSize.sizes.length > 0 && (() => {
+                const cols = (actualSize.sizes![0].items || [])
+                  .map(it => (it.name || '').trim())
+                  .filter(Boolean)
+                const fmtVal = (v: number | undefined) =>
+                  v === undefined || v === null ? '-' : (Number.isInteger(v) ? String(v) : String(v))
+                return (
+                  <tr style={{ borderBottom: '1px solid #1E1E1E' }}>
+                    <td style={{ ...tdLabel, verticalAlign: 'top', paddingTop: '10px' }}>
+                      실측표{actualSize.typeName ? ` (${actualSize.typeName})` : ''}
+                    </td>
+                    <td style={tdVal}>
+                      <table style={{ borderCollapse: 'collapse', fontSize: '0.72rem' }}>
+                        <thead>
+                          <tr>
+                            <th style={{ border: '1px solid #333', padding: '3px 8px', background: '#1A1A1A', color: '#999' }}>사이즈</th>
+                            {cols.map(c => (
+                              <th key={c} style={{ border: '1px solid #333', padding: '3px 8px', background: '#1A1A1A', color: '#999' }}>{c}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {actualSize.sizes!.map((sz, si) => {
+                            const m = new Map((sz.items || []).map(it => [(it.name || '').trim(), it.value]))
+                            return (
+                              <tr key={si}>
+                                <td style={{ border: '1px solid #333', padding: '3px 8px', color: '#C5C5C5', textAlign: 'center' }}>{sz.name || '-'}</td>
+                                {cols.map(c => (
+                                  <td key={c} style={{ border: '1px solid #333', padding: '3px 8px', color: '#999', textAlign: 'center' }}>{fmtVal(m.get(c))}</td>
+                                ))}
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                      <span style={{ color: '#555', fontSize: '0.68rem', display: 'block', marginTop: '3px' }}>단위: cm</span>
+                    </td>
+                  </tr>
+                )
+              })()}
               {/* 검색그룹 */}
               <tr style={{ borderBottom: '1px solid #1E1E1E' }}>
                 <td style={tdLabel}>검색그룹</td>
