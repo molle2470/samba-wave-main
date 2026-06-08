@@ -1314,7 +1314,6 @@ class JobWorker:
                             job.id,
                             f"[{i + 1}/{total:,}] {prod_name}: 스킵 (전송 대상 계정 없음)",
                         )
-                        await item_session.commit()
                         return 0, 1, 0, None
 
                     # 잡 단위 차단 계정 제거 — 등록 한도 초과 등으로 더 이상 시도 불가
@@ -1334,7 +1333,6 @@ class JobWorker:
                                     f"[{i + 1}/{total:,}] {prod_name} → 계정 {_ra}: 스킵 (잡 차단: {_reason[:80]})",
                                 )
                         if not effective_account_ids:
-                            await item_session.commit()
                             return 0, 1, 0, None
 
                     # 전송 후 stale item_session 접근 차단 — 계정 라벨을 전송 전에 미리 적재.
@@ -1350,140 +1348,127 @@ class JobWorker:
                             else _lid
                         )
 
-                    # 마켓 HTTP 동안 item_session 미점유 — 별도 단명 세션 사용
-                    # (item_session이 여러 계정×마켓HTTP 동안 열리면 pool_recycle 만료
-                    # → greenlet_spawn 에러. _transmit_session은 전송 중에만 점유)
-                    async with get_write_session() as _transmit_session:
-                        item_svc = SambaShipmentService(
-                            SambaShipmentRepository(_transmit_session),
-                            _transmit_session,
-                        )
-                        result = await item_svc.start_update(
-                            [pid],
-                            update_items,
-                            effective_account_ids,
-                            skip_unchanged=skip_unchanged,
-                            skip_policy_account_filter=_tetris_enabled,
-                        )
-                        await _transmit_session.commit()
-                    # 작업취소/비상정지로 start_update가 루프 첫 줄에서 break →
-                    # results 비어 있고 cancelled>0. 취소는 실패가 아니므로(취소 ≠ 실패)
-                    # 집계에서 제외하고 즉시 반환. 배치 루프(1487)가 다음 주기에 정상 중단 처리.
-                    if result.get("cancelled", 0) > 0 and not result.get("results"):
-                        _add_job_log(
-                            job.id,
-                            f"[{i + 1}/{total}] {prod_name}: 작업취소됨",
-                        )
-                        await item_session.commit()
-                        return 0, 0, 0, None
-                    results_list = result.get("results", [])
-                    r = results_list[0] if results_list else {}
-                    status = r.get("status", "unknown")
-                    tx_result = r.get("transmit_result", {})
-                    tx_error = r.get("transmit_error", {})
-                    any_success = False
-                    _s = _sk = _f = 0
-                    for acc_id, acc_status in tx_result.items():
-                        # 전송 전 적재한 라벨 사용 — stale item_session 재조회 금지
-                        # (느린 마켓 전송 후 acc_repo.get_async 'connection is closed' 방지)
-                        acc_label = _acc_label_map.get(acc_id) or acc_id
-                        ur = r.get("update_result", {})
-                        rl = (
-                            f" [{ur.get('refresh', '')}]"
-                            if isinstance(ur, dict) and ur.get("refresh")
+                # 마켓 HTTP 동안 item_session 미점유 — 별도 단명 세션 사용
+                # (item_session이 여러 계정×마켓HTTP 동안 열리면 pool_recycle 만료
+                # → greenlet_spawn 에러. _transmit_session은 전송 중에만 점유)
+                async with get_write_session() as _transmit_session:
+                    item_svc = SambaShipmentService(
+                        SambaShipmentRepository(_transmit_session),
+                        _transmit_session,
+                    )
+                    result = await item_svc.start_update(
+                        [pid],
+                        update_items,
+                        effective_account_ids,
+                        skip_unchanged=skip_unchanged,
+                        skip_policy_account_filter=_tetris_enabled,
+                    )
+                    await _transmit_session.commit()
+                # 작업취소/비상정지로 start_update가 루프 첫 줄에서 break →
+                # results 비어 있고 cancelled>0. 취소는 실패가 아니므로(취소 ≠ 실패)
+                # 집계에서 제외하고 즉시 반환. 배치 루프(1487)가 다음 주기에 정상 중단 처리.
+                if result.get("cancelled", 0) > 0 and not result.get("results"):
+                    _add_job_log(
+                        job.id,
+                        f"[{i + 1}/{total}] {prod_name}: 작업취소됨",
+                    )
+                    return 0, 0, 0, None
+                results_list = result.get("results", [])
+                r = results_list[0] if results_list else {}
+                status = r.get("status", "unknown")
+                tx_result = r.get("transmit_result", {})
+                tx_error = r.get("transmit_error", {})
+                any_success = False
+                _s = _sk = _f = 0
+                for acc_id, acc_status in tx_result.items():
+                    # 전송 전 적재한 라벨 사용 — stale item_session 재조회 금지
+                    # (느린 마켓 전송 후 acc_repo.get_async 'connection is closed' 방지)
+                    acc_label = _acc_label_map.get(acc_id) or acc_id
+                    ur = r.get("update_result", {})
+                    rl = (
+                        f" [{ur.get('refresh', '')}]"
+                        if isinstance(ur, dict) and ur.get("refresh")
+                        else ""
+                    )
+                    if acc_status in ("success", "completed"):
+                        any_success = True
+                        _s += 1
+                        label = "품절삭제" if acc_status == "completed" else "전송"
+                        _pm = (
+                            (ur.get("plugin_messages") or {}).get(acc_id, "")
+                            if isinstance(ur, dict)
                             else ""
                         )
-                        if acc_status in ("success", "completed"):
-                            any_success = True
-                            _s += 1
-                            label = "품절삭제" if acc_status == "completed" else "전송"
-                            _pm = (
-                                (ur.get("plugin_messages") or {}).get(acc_id, "")
-                                if isinstance(ur, dict)
-                                else ""
-                            )
-                            _pm_suffix = f" {_pm}" if _pm else ""
-                            _add_job_log(
-                                job.id,
-                                f"[{i + 1}/{total:,}] {prod_name} → {acc_label}: {label}{rl}{_pm_suffix}",
-                            )
-                        elif acc_status == "skipped":
-                            _sk += 1
-                            _skip_reason = str(tx_error.get(acc_id, "") or "")[:200]
-                            _reason_suffix = (
-                                f" ({_skip_reason})" if _skip_reason else ""
-                            )
-                            _add_job_log(
-                                job.id,
-                                f"[{i + 1}/{total:,}] {prod_name} → {acc_label}: 스킵{_reason_suffix}{rl}",
-                            )
-                        else:
-                            _f += 1
-                            err = str(tx_error.get(acc_id, "실패"))[:500]
-                            if "<asyncio" in err or "Semaphore" in err:
-                                err = "전송 동시성 오류"
-                            _add_job_log(
-                                job.id,
-                                f"[{i + 1}/{total:,}] {prod_name} → {acc_label}: {err}{rl}",
-                            )
-                            # 계정 등록 한도 초과 등 — 이후 상품에서 이 계정 자동 스킵
-                            if (
-                                _is_account_blocking_error(err)
-                                and acc_id not in blocked_account_ids
-                            ):
-                                blocked_account_ids.add(acc_id)
-                                blocked_account_reasons[acc_id] = err
-                                _add_job_log(
-                                    job.id,
-                                    f"[잡차단] {acc_label} 계정 등록 차단 — 이후 상품에서 이 계정은 자동 스킵 (사유: {err[:120]})",
-                                )
-                                logger.warning(
-                                    f"[잡워커] 계정 등록 차단: job={job.id} account={acc_id} reason={err[:200]}"
-                                )
-                    if not tx_result:
-                        if status == "skipped":
-                            _sk += 1
-                            refresh_info = r.get("update_result", {})
-                            rl = (
-                                refresh_info.get("refresh", "")
-                                if isinstance(refresh_info, dict)
-                                else ""
-                            )
-                            _skip_reason = str(tx_error.get("_all", "") or "")[:200]
-                            _reason_suffix = (
-                                f" ({_skip_reason})" if _skip_reason else ""
-                            )
-                            _add_job_log(
-                                job.id,
-                                f"[{i + 1}/{total}] {prod_name}: 스킵{_reason_suffix} [{rl}]",
-                            )
-                        elif r.get("error") or tx_error.get("_all"):
-                            _f += 1
-                            err_msg = r.get("error") or tx_error.get("_all", "실패")
-                            _add_job_log(
-                                job.id,
-                                f"[{i + 1}/{total}] {prod_name}: {str(err_msg)[:500]}",
-                            )
-                        else:
-                            _f += 1
-                            _add_job_log(
-                                job.id,
-                                f"[{i + 1}/{total}] {prod_name}: 실패 (사유 불명, status={status})",
-                            )
-                    _failed_pid = (
-                        pid
-                        if not any_success and status not in ("skipped", "completed")
-                        else None
-                    )
-                    # item_session은 전송 전 읽기만 함(쓰기는 _transmit_session에서 commit됨).
-                    # 느린 전송 동안 연결이 닫혔어도 성공을 실패로 뒤집지 않도록 best-effort.
-                    try:
-                        await item_session.commit()
-                    except Exception as _commit_e:
-                        logger.warning(
-                            f"[잡워커] item_session commit 실패(무시, 쓰기 없음): {pid} — {_commit_e}"
+                        _pm_suffix = f" {_pm}" if _pm else ""
+                        _add_job_log(
+                            job.id,
+                            f"[{i + 1}/{total:,}] {prod_name} → {acc_label}: {label}{rl}{_pm_suffix}",
                         )
-                    return _s, _sk, _f, _failed_pid
+                    elif acc_status == "skipped":
+                        _sk += 1
+                        _skip_reason = str(tx_error.get(acc_id, "") or "")[:200]
+                        _reason_suffix = f" ({_skip_reason})" if _skip_reason else ""
+                        _add_job_log(
+                            job.id,
+                            f"[{i + 1}/{total:,}] {prod_name} → {acc_label}: 스킵{_reason_suffix}{rl}",
+                        )
+                    else:
+                        _f += 1
+                        err = str(tx_error.get(acc_id, "실패"))[:500]
+                        if "<asyncio" in err or "Semaphore" in err:
+                            err = "전송 동시성 오류"
+                        _add_job_log(
+                            job.id,
+                            f"[{i + 1}/{total:,}] {prod_name} → {acc_label}: {err}{rl}",
+                        )
+                        # 계정 등록 한도 초과 등 — 이후 상품에서 이 계정 자동 스킵
+                        if (
+                            _is_account_blocking_error(err)
+                            and acc_id not in blocked_account_ids
+                        ):
+                            blocked_account_ids.add(acc_id)
+                            blocked_account_reasons[acc_id] = err
+                            _add_job_log(
+                                job.id,
+                                f"[잡차단] {acc_label} 계정 등록 차단 — 이후 상품에서 이 계정은 자동 스킵 (사유: {err[:120]})",
+                            )
+                            logger.warning(
+                                f"[잡워커] 계정 등록 차단: job={job.id} account={acc_id} reason={err[:200]}"
+                            )
+                if not tx_result:
+                    if status == "skipped":
+                        _sk += 1
+                        refresh_info = r.get("update_result", {})
+                        rl = (
+                            refresh_info.get("refresh", "")
+                            if isinstance(refresh_info, dict)
+                            else ""
+                        )
+                        _skip_reason = str(tx_error.get("_all", "") or "")[:200]
+                        _reason_suffix = f" ({_skip_reason})" if _skip_reason else ""
+                        _add_job_log(
+                            job.id,
+                            f"[{i + 1}/{total}] {prod_name}: 스킵{_reason_suffix} [{rl}]",
+                        )
+                    elif r.get("error") or tx_error.get("_all"):
+                        _f += 1
+                        err_msg = r.get("error") or tx_error.get("_all", "실패")
+                        _add_job_log(
+                            job.id,
+                            f"[{i + 1}/{total}] {prod_name}: {str(err_msg)[:500]}",
+                        )
+                    else:
+                        _f += 1
+                        _add_job_log(
+                            job.id,
+                            f"[{i + 1}/{total}] {prod_name}: 실패 (사유 불명, status={status})",
+                        )
+                _failed_pid = (
+                    pid
+                    if not any_success and status not in ("skipped", "completed")
+                    else None
+                )
+                return _s, _sk, _f, _failed_pid
             except Exception as e:
                 _add_job_log(job.id, f"[{i + 1}/{total}] {prod_name}: {e}")
                 return 0, 0, 1, pid
