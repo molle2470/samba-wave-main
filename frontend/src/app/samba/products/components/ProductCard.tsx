@@ -610,7 +610,7 @@ const ProductCard = React.memo(function ProductCard({
       .map(acc => {
         const market = MARKETS.find(m => m.id === acc.market_type)
         // channelProductNo(구매페이지용) 우선, 없으면 originProductNo 사용
-        const productNo = marketProductNos[acc.id] || marketProductNos[`${acc.id}_origin`] || ''
+        const productNo = marketProductNos[acc.id] || marketProductNos[`${acc.id}_site`] || marketProductNos[`${acc.id}_origin`] || ''
         // 마켓 상품번호가 있으면 구매페이지 직접 링크, 없으면 검색 URL
         const extras = (acc.additional_fields || {}) as Record<string, string>
         const url = buildMarketProductUrl(
