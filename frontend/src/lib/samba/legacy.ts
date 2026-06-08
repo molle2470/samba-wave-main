@@ -306,6 +306,8 @@ export const orderApi = {
     search_text?: string
     search_category?: string
     sort_by?: string
+    // 'ub1' (default, 소싱처 발주) | 'lotte' (롯데택배 송장 양식)
+    format?: 'ub1' | 'lotte'
   }) => {
     const res = await fetchWithAuth(`${SAMBA_PREFIX}/orders/excel-export`, {
       method: 'POST',
