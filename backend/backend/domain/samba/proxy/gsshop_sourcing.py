@@ -672,11 +672,15 @@ class GsShopSourcingClient:
                     f"[GSSHOP] 모바일 상세 HTTP {resp.status_code}: {product_id}"
                 )
                 return ""
-            # GS샵은 모바일 UA에 redirect 대신 HTTP 200 + "DustView 에러 페이지"
+            # GS샵은 모바일 UA에 redirect 대신 HTTP 200 + "DustView" 에러
             # HTML을 반환하는 경우가 있다 (예: 존재 안 하는 prdid). 마커 검출로
             # 영구 삭제 신호를 잡는다.
+            # 주의: "에러 페이지" substring 마커 금지 — 정상 판매중 상품 페이지의
+            # 공통 JS 주석("공통 에러 컨트롤러 ... 에러 페이지의 goBack ...")에도
+            # 항상 포함되어 전상품 오삭제를 유발했다(이슈 #380, 라이브 검증 완료).
+            # 진짜 삭제건은 DustView 마커 / 302 redirect / 상품명 추출 실패로 감지된다.
             body = resp.text
-            if "DustView" in body or "에러 페이지" in body:
+            if "DustView" in body:
                 logger.warning(
                     f"[GSSHOP] 상품 영구 삭제 감지 (에러 페이지 본문): {product_id}"
                 )
