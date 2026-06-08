@@ -2112,6 +2112,43 @@ async def _build_esm_master_map(
     return site_map, masters
 
 
+async def _esm_targeted_resolve(
+    client: ESMPlusClient, val: str, site_key: str
+) -> str | None:
+    """타깃 조회(#371 ②): 전체스캔 전 1~2콜로 master 변환 시도.
+
+    1) query.goodsNo=[val] → 이미 master이면 그대로 반환 (0→1콜)
+    2) query.siteGoodsNo=[val] → master 변환 (1→2콜)
+    실패 시 None 반환 → 호출자가 전체스캔으로 폴백.
+    """
+    try:
+        # ① val이 이미 master goodsNo인지 확인
+        try:
+            gno_int = int(val)
+        except (ValueError, TypeError):
+            gno_int = None
+        if gno_int is not None:
+            r = await client.search_products(
+                {"query": {"goodsNo": [gno_int]}, "pageIndex": 1, "pageSize": 1}
+            )
+            for it in r.get("items") or []:
+                if str(it.get("goodsNo") or "").strip() == val:
+                    return val
+        # ② siteGoodsNo → master 변환
+        r2 = await client.search_products(
+            {"query": {"siteGoodsNo": [val]}, "pageIndex": 1, "pageSize": 1}
+        )
+        for it in r2.get("items") or []:
+            sno = str((it.get("siteGoodsNo") or {}).get(site_key) or "").strip()
+            if sno == val:
+                master = str(it.get("goodsNo") or "").strip()
+                if master and master not in ("0", "0.0"):
+                    return master
+    except Exception as e:
+        logger.debug(f"[ESM] 타깃조회 실패(폴백): {e}")
+    return None
+
+
 async def resolve_esm_master_goods_no(
     client: ESMPlusClient, goods_no: str
 ) -> str | None:
@@ -2119,23 +2156,29 @@ async def resolve_esm_master_goods_no(
 
     ESM 수정/삭제/판매상태 API(/goods/{goodsNo}/...)는 마스터번호 필수.
     과거 저장값은 siteGoodsNo(옥션 F.../지마켓 숫자)라 그대로 호출 시 404.
-    카탈로그 전체 스캔으로 매핑(셀러별 10분 캐시). 이미 master면 그대로 반환.
+
+    순서(#371 ②): 캐시(0콜) → 타깃조회(1~2콜) → 전체스캔(폴백).
     """
     val = str(goods_no or "").strip()
     if not val:
         return None
+    site_key = client.cfg["siteKey"].lower()
     cache_key = f"{client.site}:{client.seller_id}"
     now = time.time()
     cached = _ESM_MASTER_MAP_CACHE.get(cache_key)
-    if not cached or (now - cached[0]) >= _ESM_MASTER_MAP_TTL:
-        cached = (now, await _build_esm_master_map(client))
-        _ESM_MASTER_MAP_CACHE[cache_key] = cached
-    site_map, masters = cached[1]
-    if val in masters:
-        return val
-    if val in site_map:
-        return site_map[val]
-    # 캐시 miss — 신규 등록 직후 stale 대비 1회 강제 재스캔
+    if cached and (now - cached[0]) < _ESM_MASTER_MAP_TTL:
+        site_map, masters = cached[1]
+        if val in masters:
+            return val
+        if val in site_map:
+            return site_map[val]
+
+    # 캐시 없음/stale — 타깃조회 먼저 (rate-limit 절약)
+    targeted = await _esm_targeted_resolve(client, val, site_key)
+    if targeted is not None:
+        return targeted
+
+    # 전체스캔 폴백 (캐시 갱신 겸)
     fresh = await _build_esm_master_map(client)
     _ESM_MASTER_MAP_CACHE[cache_key] = (now, fresh)
     site_map, masters = fresh
