@@ -744,6 +744,8 @@ def _build_market_product_url(
         "GS샵": f"https://www.gsshop.com/prd/prd.gs?prdid={product_no}",
         "KREAM": f"https://kream.co.kr/products/{product_no}",
         "Toss": f"https://toss.im/shopping/product/{product_no}",
+        "G마켓": f"https://item.gmarket.co.kr/Item?goodscode={product_no}",
+        "옥션": f"https://itempage3.auction.co.kr/DetailView.aspx?ItemNo={product_no}",
     }
     return urls.get(market, "")
 
