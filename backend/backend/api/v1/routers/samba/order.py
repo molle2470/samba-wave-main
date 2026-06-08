@@ -2697,11 +2697,15 @@ async def approve_cancel(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"취소승인 실패: {e}")
 
-        # DB 상태 업데이트
+        # DB 상태 업데이트 — status='cancelled' 도 같이 변경 (쿠팡/롯데ON/eBay 분기와 일관).
+        # status 누락 시 OrdersTable 의 isCancelRequested(=status==='cancel_requested')
+        # 가 true 로 유지돼 빨간 '취소요청' 배지·승인/거부 버튼이 안 사라지는 UX 버그
+        # 발생 (2026-06-08 사용자 보고).
         await svc.update_order(
             order_id,
             {
                 "shipping_status": "취소완료",
+                "status": "cancelled",
             },
         )
         logger.info(f"[취소승인] {order.order_number} 취소승인 완료")
@@ -2735,7 +2739,12 @@ async def approve_cancel(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"취소승인 실패: {e}")
 
-        await svc.update_order(order_id, {"shipping_status": "취소완료"})
+        # status='cancelled' 도 같이 변경 — 쿠팡/롯데ON/eBay 분기와 일관.
+        # status 누락 시 빨간 '취소요청' 배지가 처리 후에도 안 사라지는 UX 버그
+        # (2026-06-08 사용자 보고).
+        await svc.update_order(
+            order_id, {"shipping_status": "취소완료", "status": "cancelled"}
+        )
         if ret:
             await return_repo.update_async(
                 ret.id, status="cancelled", market_order_status="취소완료"
