@@ -927,113 +927,6 @@ async def _sync_lotteon_qna(
     return synced
 
 
-async def _sync_lotteon_product_qna(
-    client: "Any",
-    session: "AsyncSession",
-    svc: "Any",
-    account_name: str,
-    account_id: str | None = None,
-) -> int:
-    """롯데ON 상품 Q&A 동기화.
-
-    GET /v1/openapi/product/v1/product/qna/list 결과를 DB에 저장한다.
-    market_inquiry_no = "PQNA_{qnaNo}" 형태로 저장하여 판매자문의와 구분.
-
-    Returns:
-        새로 동기화된 문의 건수
-    """
-    import logging
-    from sqlmodel import select
-    from backend.domain.samba.cs_inquiry.model import SambaCSInquiry
-
-    logger = logging.getLogger(__name__)
-    synced = 0
-
-    items = await client.get_product_qna_list(days=30)
-
-    for item in items:
-        qna_no = str(item.get("qnaNo", "") or "")
-        if not qna_no or qna_no == "0":
-            continue
-
-        # PQNA_ 접두사로 판매자문의(slrInqNo)와 구분
-        market_inquiry_no = f"PQNA_{qna_no}"
-
-        # 중복 체크
-        existing = await session.execute(
-            select(SambaCSInquiry).where(
-                SambaCSInquiry.market == "롯데ON",
-                SambaCSInquiry.market_inquiry_no == market_inquiry_no,
-            )
-        )
-        if existing.scalars().first():
-            continue
-
-        market_product_no = str(item.get("pdNo", "") or "")
-
-        # 답변 여부 (ansStatCd: ANS=답변완료, UNANS=미답변)
-        ans_stat = str(item.get("ansStatCd", "UNANS") or "UNANS")
-        is_answered = ans_stat == "ANS"
-        reply_content = str(item.get("ansCnts", "") or "")
-
-        # 등록일시 파싱 (regDttm: yyyyMMddHHmmss)
-        raw_date = str(item.get("regDttm", "") or "")
-        parsed_date = None
-        if raw_date and len(raw_date) >= 8:
-            try:
-                from datetime import datetime as _dt
-
-                parsed_date = _dt.strptime(raw_date[:14], "%Y%m%d%H%M%S")
-            except Exception:
-                try:
-                    from dateutil.parser import parse as parse_dt
-
-                    parsed_date = parse_dt(raw_date)
-                except Exception:
-                    parsed_date = None
-
-        # 수집 상품 매칭
-        _pd_nm = str(item.get("pdNm", "") or "")
-        matched = await _find_collected_product_by_market_product_no(
-            session, market_product_no, _pd_nm
-        )
-        product_link = (
-            _build_market_product_url("롯데ON", market_product_no)
-            if market_product_no
-            else ""
-        )
-
-        inquiry_data = {
-            "market": "롯데ON",
-            "market_inquiry_no": market_inquiry_no,
-            "market_answer_no": None,
-            "market_order_id": None,
-            "market_product_no": market_product_no or None,
-            "account_name": account_name,
-            "account_id": account_id,
-            "inquiry_type": "product_question",  # 상품 Q&A는 항상 product_question
-            "questioner": str(item.get("buyerId", "") or ""),
-            "product_name": str(item.get("pdNm", "") or ""),
-            "product_image": matched["product_image"] if matched else "",
-            "product_link": product_link,
-            "original_link": matched["original_link"] if matched else "",
-            "collected_product_id": matched["id"] if matched else None,
-            "content": str(item.get("qnaCnts", "") or ""),
-            "reply": reply_content if is_answered else None,
-            "reply_status": "replied" if is_answered else "pending",
-            "inquiry_date": parsed_date,
-            "replied_at": None,
-        }
-
-        await svc.create_inquiry(inquiry_data)
-        synced += 1
-
-    logger.info(
-        f"[CS동기화] 롯데ON({account_name}) 상품Q&A: {len(items)}건 조회, {synced}건 동기화"
-    )
-    return synced
-
-
 async def _sync_lotteon_contact(
     client: "Any",
     session: "AsyncSession",
@@ -1963,14 +1856,12 @@ async def _do_sync_cs_from_markets(
             )
             synced += lo_synced
 
-            # 상품 Q&A 동기화
-            try:
-                lo_pqna_synced = await _sync_lotteon_product_qna(
-                    lo_client, session, svc, account_name, account_id
-                )
-                synced += lo_pqna_synced
-            except Exception as pqe:
-                logger.warning(f"[CS동기화] 롯데ON 상품Q&A 동기화 실패 (무시): {pqe}")
+            # 상품 Q&A 동기화 제거 (2026-06-08)
+            # 롯데ON OpenAPI 고객센터 메뉴에 "상품 Q&A 목록 조회" 엔드포인트가 없음.
+            # 코드가 부르던 /v1/openapi/product/v1/product/qna/list 는 존재하지 않아 항상 405 →
+            # 처음부터 데이터 0건. 판매자 문의는 getSellerInquiryList(_sync_lotteon_qna)가,
+            # 판매자 연락은 getSellerContactList(_sync_lotteon_contact)가 이미 커버.
+            # 없는 엔드포인트 재호출 금지 — 호출부 + _sync_lotteon_product_qna 함수 제거됨.
 
             # 판매자 연락(Contact) 동기화
             try:

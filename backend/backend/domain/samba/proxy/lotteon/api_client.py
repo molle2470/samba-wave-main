@@ -2341,59 +2341,6 @@ class LotteonClient:
     # CS — 상품 Q&A
     # ──────────────────────────────────────────────────────────────────────
 
-    async def get_product_qna_list(self, days: int = 30) -> list[dict[str, Any]]:
-        """상품 Q&A 목록 조회.
-
-        GET /v1/openapi/product/v1/product/qna/list
-
-        Args:
-          days: 조회 기간 (일 수, 기본 30일)
-
-        Returns:
-          목록 항목 리스트. 주요 필드:
-            qnaNo           — Q&A 번호 (market_inquiry_no: PQNA_{qnaNo})
-            qnaCnts         — 질문 내용
-            ansCnts         — 답변 내용
-            ansStatCd       — 답변 상태 (ANS=답변완료, UNANS=미답변)
-            pdNo            — 상품번호 (market_product_no)
-            pdNm            — 상품명
-            spdNo           — 판매자상품번호
-            buyerId         — 구매자 ID
-            regDttm         — 등록일시 (yyyyMMddHHmmss)
-        """
-
-        now = now_kst()
-        end_dt = (now + timedelta(days=1)).strftime("%Y%m%d")
-        start_dt = (now - timedelta(days=days)).strftime("%Y%m%d")
-
-        try:
-            result = await self._call_api(
-                "GET",
-                "/v1/openapi/product/v1/product/qna/list",
-                params={
-                    "scStrtDt": start_dt,
-                    "scEndDt": end_dt,
-                    "pageNo": "1",
-                    "rowsPerPage": "100",
-                },
-            )
-            # 응답 구조: rsltList 또는 content 또는 list
-            items = (
-                result.get("rsltList")
-                or result.get("content")
-                or result.get("list")
-                or []
-            )
-            if not isinstance(items, list):
-                items = []
-            logger.info(
-                f"[롯데ON][CS] 상품Q&A 조회 완료: {len(items)}건 (기간: {start_dt}~{end_dt})"
-            )
-            return items
-        except LotteonApiError as e:
-            logger.warning(f"[롯데ON][CS] 상품Q&A 목록 조회 실패: {e}")
-            return []
-
     async def reply_product_qna(self, qna_no: str, content: str) -> dict[str, Any]:
         """상품 Q&A 답변 등록/수정.
 
