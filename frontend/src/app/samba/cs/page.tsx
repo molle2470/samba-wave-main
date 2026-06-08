@@ -742,11 +742,24 @@ export default function CSPage() {
                             </span>
                           )}
                           <button
-                            onClick={() => { setReplyModal(item); setReplyText(sanitizeReplyTextForInquiry(item.reply || '', item)); setSelectedTemplate('') }}
+                            onClick={() => { setReplyModal(item); setReplyText(sanitizeReplyTextForInquiry(item.reply || item.draft_reply || '', item)); setSelectedTemplate('') }}
                             style={{ marginLeft: item.product_name ? '0.375rem' : 0, padding: '0.1rem 0.4rem', background: item.reply_status === 'pending' ? 'rgba(255,140,0,0.15)' : 'rgba(81,207,102,0.1)', border: `1px solid ${item.reply_status === 'pending' ? 'rgba(255,140,0,0.3)' : 'rgba(81,207,102,0.3)'}`, borderRadius: '4px', color: item.reply_status === 'pending' ? '#FF8C00' : '#51CF66', fontSize: '0.6875rem', cursor: 'pointer', whiteSpace: 'nowrap', verticalAlign: 'middle' }}
                           >
-                            {item.reply_status === 'pending' ? '답변' : '답변수정'}
+                            {item.reply_status === 'pending'
+                              ? (item.draft_reply ? '초안검토' : '답변')
+                              : '답변수정'}
                           </button>
+                          {/* CS 자동화 — Claude 초안/자동전송 배지 */}
+                          {item.draft_status === 'auto_sent' && (
+                            <span style={{ marginLeft: '0.375rem', padding: '0.1rem 0.4rem', background: 'rgba(76,154,255,0.12)', border: '1px solid rgba(76,154,255,0.3)', borderRadius: '4px', color: '#4C9AFF', fontSize: '0.6875rem', whiteSpace: 'nowrap', verticalAlign: 'middle' }}>
+                              자동전송됨
+                            </span>
+                          )}
+                          {item.reply_status === 'pending' && item.draft_status === 'suggested' && item.draft_reply && (
+                            <span title={`의도: ${item.intent || '-'}`} style={{ marginLeft: '0.375rem', padding: '0.1rem 0.4rem', background: 'rgba(186,104,255,0.12)', border: '1px solid rgba(186,104,255,0.3)', borderRadius: '4px', color: '#BA68FF', fontSize: '0.6875rem', whiteSpace: 'nowrap', verticalAlign: 'middle' }}>
+                              AI초안 {item.draft_confidence != null ? `${Math.round(item.draft_confidence * 100)}%` : ''}
+                            </span>
+                          )}
                         </div>
 
                         {/* 문의 내용 — eBay [sender] 형식은 색상 구분 */}
@@ -880,6 +893,18 @@ export default function CSPage() {
               {replyModal.product_name && <div style={{ color: '#aaa', marginBottom: '0.375rem' }}>{replyModal.product_name}</div>}
               <div style={{ color: '#ccc', lineHeight: '1.5', whiteSpace: 'pre-wrap' }}>{htmlToText(replyModal.content || '')}</div>
             </div>
+
+            {/* CS 자동화 — Claude AI 초안 안내 (아래 입력창에 자동 채움, 검토 후 전송) */}
+            {replyModal.reply_status === 'pending' && replyModal.draft_status === 'suggested' && replyModal.draft_reply && (
+              <div style={{ background: 'rgba(186,104,255,0.08)', border: '1px solid rgba(186,104,255,0.3)', borderRadius: '8px', padding: '0.625rem 0.875rem', marginBottom: '0.75rem', fontSize: '0.75rem', color: '#BA68FF', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <span style={{ fontWeight: 700 }}>AI 초안</span>
+                <span style={{ color: '#9a7bbf' }}>
+                  의도 {replyModal.intent || '-'}
+                  {replyModal.draft_confidence != null ? ` · 신뢰도 ${Math.round(replyModal.draft_confidence * 100)}%` : ''}
+                  {' · 아래 입력창에 채워졌습니다. 검토 후 전송하세요.'}
+                </span>
+              </div>
+            )}
 
             {/* 템플릿 카드 그리드 — 추가/수정/삭제 인라인 */}
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.5rem', marginBottom: '0.75rem' }}>

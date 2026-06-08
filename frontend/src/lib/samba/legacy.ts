@@ -1959,6 +1959,13 @@ export interface SambaCSInquiry {
   market_inquiry_no?: string
   collected_at: string
   created_at: string
+  // CS 자동화 (Tier 0~3)
+  intent?: string
+  draft_reply?: string
+  draft_status?: string // none/suggested/auto_sent/accepted/edited/rejected
+  draft_confidence?: number
+  draft_source?: string
+  drafted_at?: string
 }
 
 export interface CSInquiryListResponse {
