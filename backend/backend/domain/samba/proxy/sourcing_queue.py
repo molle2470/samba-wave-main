@@ -411,8 +411,12 @@ class SourcingQueue:
         *,
         owner_device_id: str | None = None,
         sourcing_account_id: str | None = None,
+        is_return: bool = False,
     ) -> tuple[str, asyncio.Future[Any]]:
         """송장 추출 작업 큐에 추가 (소싱처 배송조회 페이지 → 운송장 스크래핑).
+
+        is_return=True: 반품 회수송장 수집 — 확장앱이 '회수조회' 버튼을 눌러 회수송장을
+        추출하고, 결과는 order.return_collect_*에만 저장(마켓 전송 안 함).
 
         결과는 별도 라우터 `/proxy/sourcing/tracking-result` 로 수신되어
         tracking_sync_service.apply_tracking_result()로 라우팅됨.
@@ -442,6 +446,7 @@ class SourcingQueue:
             "sourcingOrderNumber": sourcing_order_number,
             "ownerDeviceId": owner_device_id or "",
             "sourcingAccountId": sourcing_account_id or "",
+            "isReturn": bool(is_return),
         }
         cls.resolvers[request_id] = future
         await _db_insert_job(job, "tracking")

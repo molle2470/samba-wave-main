@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from sqlmodel import select
+from sqlmodel import col, select
 
 from backend.db.orm import get_write_session
 from backend.domain.samba.order.model import (
@@ -79,6 +79,20 @@ def build_tracking_url(site: str, sourcing_order_number: str) -> str:
         # KREAM 송장 URL 추정값 — 마이페이지 주문 상세. 실측 검증 필요.
         return f"https://kream.co.kr/my/orders/{ord_no}"
     raise ValueError(f"지원하지 않는 소싱처 송장조회: {site}")
+
+
+def build_return_tracking_url(site: str, sourcing_order_number: str) -> str:
+    """반품 회수송장 조회 URL — 소싱처 회수조회 페이지.
+
+    확장앱이 '회수조회' 버튼을 눌러 회수 택배사/송장번호를 추출한다.
+    현재 LOTTEON 만 지원(claim/orderDetail?odNo=). 무신사는 ord_opt_no/returnId
+    키 부재로 보류(2026-06-08 라이브 검증).
+    """
+    s = (site or "").upper()
+    ord_no = sourcing_order_number
+    if s == "LOTTEON":
+        return f"https://www.lotteon.com/p/order/claim/orderDetail?odNo={ord_no}"
+    raise ValueError(f"반품 회수송장 미지원 소싱처: {site}")
 
 
 # 택배사 이름 정규화 — overlink utils.js의 매핑을 백엔드로 이식
@@ -439,6 +453,140 @@ async def enqueue_for_order(
             f"ord_no={order.sourcing_order_number} req={request_id}"
         )
         return {"success": True, "jobId": job.id, "requestId": request_id}
+
+
+# 반품 회수송장 지원 소싱처 (라이브 검증 완료 사이트만)
+RETURN_TRACKING_SITES = {"LOTTEON", "MUSINSA"}
+
+
+async def enqueue_return_for_order(
+    order_id: str, *, owner_device_id: Optional[str] = None
+) -> dict[str, Any]:
+    """단건 주문에 대해 반품 회수송장 수집 잡을 큐에 적재 (정방향과 분리).
+
+    확장앱이 소싱처 회수조회 페이지에서 '회수조회'를 눌러 회수송장을 추출하고
+    order.return_collect_*에만 저장한다(마켓 전송 안 함).
+    """
+    from backend.domain.samba.proxy.sourcing_queue import SourcingQueue
+
+    async with get_write_session() as session:
+        order = await session.get(SambaOrder, order_id)
+        if not order:
+            return {"success": False, "error": "주문을 찾을 수 없습니다"}
+        if not order.sourcing_order_number:
+            return {"success": False, "error": "소싱처 주문번호 없음"}
+        actual_site = (order.source_site or order.source or "").upper()
+        if actual_site not in RETURN_TRACKING_SITES:
+            return {
+                "success": False,
+                "error": f"{actual_site} 회수송장 미지원",
+            }
+        # 이미 회수송장 수집됨 → 중복 skip
+        if order.return_collect_tracking:
+            return {"success": True, "skipped": True, "reason": "이미 회수송장 보유"}
+        # 같은 order의 미완료 반품 잡 중복 방지
+        existing = (
+            (
+                await session.execute(
+                    select(SambaTrackingSyncJob).where(
+                        SambaTrackingSyncJob.order_id == order_id,
+                        SambaTrackingSyncJob.is_return == True,  # noqa: E712
+                        col(SambaTrackingSyncJob.status).in_(
+                            [STATUS_PENDING, STATUS_DISPATCHED]
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if existing:
+            return {"success": True, "skipped": True, "reason": "이미 진행 중"}
+
+        try:
+            url = build_return_tracking_url(actual_site, order.sourcing_order_number)
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+
+        _said = (order.sourcing_account_id or "").strip()
+        _said = None if _said in ("", "etc") else _said
+        _owner = (owner_device_id or "").strip() or None
+
+        try:
+            request_id, _future = await SourcingQueue.add_tracking_job(
+                site=actual_site,
+                url=url,
+                order_id=order.id,
+                sourcing_order_number=order.sourcing_order_number,
+                owner_device_id=_owner,
+                sourcing_account_id=_said,
+                is_return=True,
+            )
+        except RuntimeError as exc:
+            return {"success": True, "skipped": True, "reason": str(exc)}
+
+        job = SambaTrackingSyncJob(
+            tenant_id=order.tenant_id,
+            order_id=order.id,
+            sourcing_site=actual_site,
+            sourcing_order_number=order.sourcing_order_number,
+            sourcing_account_id=_said,
+            owner_device_id=_owner,
+            request_id=request_id,
+            status=STATUS_PENDING,
+            is_return=True,
+        )
+        session.add(job)
+        await session.commit()
+        logger.info(
+            f"[회수송장] 큐 적재: order={order.id} site={actual_site} "
+            f"ord_no={order.sourcing_order_number} req={request_id}"
+        )
+        return {"success": True, "jobId": job.id, "requestId": request_id}
+
+
+async def enqueue_return_pending(
+    limit: int = 200, owner_device_id: Optional[str] = None
+) -> dict[str, Any]:
+    """반품 진행 중 + 회수송장 미보유 LOTTEON 주문 일괄 회수송장 수집 적재."""
+    from sqlalchemy import or_ as _or
+
+    queued = 0
+    skipped = 0
+    async with get_write_session() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(SambaOrder.id)
+                    .where(
+                        col(SambaOrder.source_site).in_(["LOTTEON", "MUSINSA"])
+                        | col(SambaOrder.source).in_(
+                            ["lotteon", "LOTTEON", "musinsa", "MUSINSA"]
+                        ),
+                        SambaOrder.sourcing_order_number.is_not(None),
+                        (SambaOrder.return_collect_tracking.is_(None))
+                        | (SambaOrder.return_collect_tracking == ""),
+                        _or(
+                            col(SambaOrder.shipping_status).like("%반품%"),
+                            col(SambaOrder.status).in_(
+                                ["returning", "returned", "return_requested"]
+                            ),
+                        ),
+                    )
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    for oid in rows:
+        r = await enqueue_return_for_order(oid, owner_device_id=owner_device_id)
+        if r.get("success") and not r.get("skipped"):
+            queued += 1
+        else:
+            skipped += 1
+    logger.info(f"[회수송장] 일괄 적재 완료: queued={queued} skipped={skipped}")
+    return {"success": True, "queued": queued, "skipped": skipped}
 
 
 async def enqueue_pending_orders(
@@ -827,6 +975,34 @@ async def apply_tracking_result(
             return {"success": False, "status": job.status, "reason": reason}
 
         normalized_courier = normalize_courier_name(courier_name)
+
+        # 반품 회수송장 분기 — order.return_collect_*에만 저장, 정방향 송장/마켓전송 안 건드림
+        if getattr(job, "is_return", False):
+            job.scraped_courier = normalized_courier
+            job.scraped_tracking = tracking_number.strip()
+            job.scraped_at = datetime.now(_UTC)
+            job.status = STATUS_SCRAPED
+            order = await session.get(SambaOrder, job.order_id)
+            if order:
+                order.return_collect_courier = normalized_courier
+                order.return_collect_tracking = job.scraped_tracking
+                order.return_collect_at = datetime.now(_UTC)
+                order.updated_at = datetime.now(_UTC)
+                session.add(order)
+            session.add(job)
+            await session.commit()
+            logger.info(
+                f"[회수송장] 추출 완료: order={job.order_id} "
+                f"courier={normalized_courier} tracking={job.scraped_tracking}"
+            )
+            return {
+                "success": True,
+                "jobId": job.id,
+                "courier": normalized_courier,
+                "tracking": tracking_number,
+                "is_return": True,
+            }
+
         job.scraped_courier = normalized_courier
         job.scraped_tracking = tracking_number.strip()
         job.scraped_at = datetime.now(_UTC)

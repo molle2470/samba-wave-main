@@ -71,15 +71,19 @@
   // 주문상세 페이지에서 "배송 조회" 버튼 탐색 또는 "주문정보 없음" 모달 감지
   // 모달은 XHR 응답 후 등장하므로 단발 체크가 아닌 폴링으로 잡아야 함.
   // 반환: { btn } | { wrongAccount: true } | null(타임아웃)
-  async function findTraceButtonOrWrongAccount(timeoutMs) {
+  async function findTraceButtonOrWrongAccount(timeoutMs, isReturn) {
     const start = Date.now()
     while (Date.now() - start < timeoutMs) {
       // 1) wrong_account 모달 우선 체크 — 등장 즉시 종료
       if (isWrongAccount()) return { wrongAccount: true }
-      // 2) 배송조회 버튼 탐색
-      const buttons = Array.from(document.querySelectorAll('button'))
+      // 2) 버튼 탐색 — 회수(반품)/정방향 분기
+      //    isReturn=true: "회수 배송 조회"/"반품 현황" 버튼 → trace?...&is_return=1 SPA navigation
+      const buttons = Array.from(document.querySelectorAll('button, a'))
       const btn = buttons.find(b => {
         const t = (b.textContent || '').replace(/\s+/g, '').trim()
+        if (isReturn) {
+          return t === '회수배송조회' || t.includes('회수배송조회') || t === '반품현황' || t.includes('반품현황')
+        }
         return t === '배송조회' || t.includes('배송조회')
       })
       if (btn && !btn.disabled) return { btn }
@@ -131,7 +135,7 @@
   }
 
   // 주문상세 페이지에서 배송조회 버튼 클릭 — 같은 탭 navigation 후 trace 페이지에서 이어받음
-  async function clickTraceButton(requestId) {
+  async function clickTraceButton(requestId, isReturn) {
     try {
       sessionStorage.setItem(SS_KEY, requestId)
     } catch {}
@@ -151,10 +155,10 @@
     }
 
     // 배송조회 버튼 or wrong_account 모달 — 폴링 (XHR 응답으로 모달이 늦게 뜨는 케이스 대응)
-    const found = await findTraceButtonOrWrongAccount(MAX_WAIT_MS)
+    const found = await findTraceButtonOrWrongAccount(MAX_WAIT_MS, isReturn)
     if (!found) {
-      // 둘 다 안 뜸 = 아직 배송이 시작되지 않은 단계 (택배사가 송장 발급 전)
-      send(requestId, { success: false, error: '배송대기중' })
+      // 둘 다 안 뜸 = 아직 배송/회수가 시작되지 않은 단계 (택배사가 송장 발급 전)
+      send(requestId, { success: false, error: isReturn ? '회수대기중' : '배송대기중' })
       try { sessionStorage.removeItem(SS_KEY) } catch {}
       return
     }
@@ -208,7 +212,7 @@
     if (msg?.type === 'TRACKING_REQUEST') {
       sendResponse({ ack: true })
       if (isOrderDetailPage()) {
-        clickTraceButton(msg.requestId).catch((err) =>
+        clickTraceButton(msg.requestId, !!msg.isReturn).catch((err) =>
           send(msg.requestId, { success: false, error: String(err?.message || err) })
         )
       } else if (isTracePage()) {

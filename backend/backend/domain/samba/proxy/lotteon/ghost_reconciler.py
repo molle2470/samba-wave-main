@@ -4,7 +4,8 @@
 1. list_registered_products(slStatCd=SALE) 전체 페이지 수집
 2. 우리 DB market_product_nos 와 diff → 유령(LOTTEON-only) spdNo 도출
 3. 임계치 초과 시 monitor_event 기록 + WARN 로그
-4. AUTO_SOUT_GHOSTS=1 환경변수 켜져 있으면 자동 SOUT (기본은 알림만)
+4. LOTTEON_AUTO_END_GHOSTS=1 환경변수 켜져 있으면 자동 END(마켓삭제) (기본은 알림만)
+   — 수동 '정리하기' 버튼(cleanup-orphans)과 동일하게 change_status(slStatCd=END) 처리
 """
 
 from __future__ import annotations
@@ -29,13 +30,13 @@ RUN_INTERVAL_SECONDS = 24 * 3600  # 하루 1회
 INITIAL_DELAY_SECONDS = 60 * 30  # 부팅 직후 30분 뒤 첫 실행
 PAGE_SIZE = 100
 ALERT_THRESHOLD = 50  # 유령 N개 초과 시 강한 알림
-AUTO_SOUT = os.environ.get("LOTTEON_AUTO_SOUT_GHOSTS", "").lower() in (
+AUTO_END = os.environ.get("LOTTEON_AUTO_END_GHOSTS", "").lower() in (
     "1",
     "true",
     "yes",
 )
-SOUT_BATCH = 50
-SOUT_BATCH_DELAY = 0.5
+END_BATCH = 50
+END_BATCH_DELAY = 0.5
 
 
 async def _fetch_active_lotteon_accounts() -> list[dict[str, Any]]:
@@ -146,7 +147,7 @@ async def _log_monitor_event(
                         "account_label": account_label,
                         "ghosts": ghosts,
                         "lotteon_sale_total": lotteon_total,
-                        "auto_sout_enabled": AUTO_SOUT,
+                        "auto_end_enabled": AUTO_END,
                     },
                 )
             )
@@ -155,13 +156,13 @@ async def _log_monitor_event(
         logger.debug(f"[ghost_reconciler] monitor_event 기록 스킵: {e}")
 
 
-async def _auto_sout(client: LotteonClient, ghosts: list[str]) -> tuple[int, int]:
-    """AUTO_SOUT=on 일 때만 호출. (success, failed) 반환."""
+async def _auto_end(client: LotteonClient, ghosts: list[str]) -> tuple[int, int]:
+    """AUTO_END=on 일 때만 호출. 유령 spdNo 를 END(마켓삭제) 처리. (success, failed) 반환."""
     ok = 0
     fail = 0
-    for i in range(0, len(ghosts), SOUT_BATCH):
-        batch = ghosts[i : i + SOUT_BATCH]
-        payload = [{"spdNo": s, "slStatCd": "SOUT"} for s in batch]
+    for i in range(0, len(ghosts), END_BATCH):
+        batch = ghosts[i : i + END_BATCH]
+        payload = [{"spdNo": s, "slStatCd": "END"} for s in batch]
         try:
             res = await client.change_status(payload)
             data = (res or {}).get("data") or []
@@ -175,9 +176,9 @@ async def _auto_sout(client: LotteonClient, ghosts: list[str]) -> tuple[int, int
             else:
                 ok += len(batch)
         except Exception as e:
-            logger.warning(f"[ghost_reconciler] SOUT 배치 실패: {e}")
+            logger.warning(f"[ghost_reconciler] END 배치 실패: {e}")
             fail += len(batch)
-        await asyncio.sleep(SOUT_BATCH_DELAY)
+        await asyncio.sleep(END_BATCH_DELAY)
     return ok, fail
 
 
@@ -208,12 +209,12 @@ async def _reconcile_one_account(acc: dict[str, Any]) -> dict[str, Any]:
             )
             await _log_monitor_event(account_id, label, len(ghosts), len(lotteon_sale))
 
-            if AUTO_SOUT:
-                ok, fail = await _auto_sout(client, ghosts)
-                summary["auto_sout_success"] = ok
-                summary["auto_sout_failed"] = fail
+            if AUTO_END:
+                ok, fail = await _auto_end(client, ghosts)
+                summary["auto_end_success"] = ok
+                summary["auto_end_failed"] = fail
                 logger.warning(
-                    f"[ghost_reconciler] {label} AUTO_SOUT 완료 success={ok} failed={fail}"
+                    f"[ghost_reconciler] {label} AUTO_END 완료 success={ok} failed={fail}"
                 )
         else:
             logger.info(
@@ -243,7 +244,7 @@ async def reconcile_all_accounts_once() -> list[dict[str, Any]]:
 async def ghost_reconciler_loop() -> None:
     """24시간 주기 백그라운드 루프 — lifecycle에서 create_task 로 기동."""
     logger.info(
-        f"[ghost_reconciler] 시작 — interval=24h, auto_sout={AUTO_SOUT}, "
+        f"[ghost_reconciler] 시작 — interval=24h, auto_end={AUTO_END}, "
         f"first_run_in={INITIAL_DELAY_SECONDS}s"
     )
     await asyncio.sleep(INITIAL_DELAY_SECONDS)

@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import String
+from sqlalchemy import Boolean, String
 from sqlmodel import Column, DateTime, Field, JSON, SQLModel, Text
 
 from ulid import ULID
@@ -55,6 +55,11 @@ class SambaTrackingSyncJob(SQLModel, table=True):
         default=None, sa_column=Column(Text, nullable=True)
     )
     status: str = Field(default=STATUS_PENDING, sa_column=Column(Text, nullable=False))
+    # 반품 회수송장 수집 잡 여부 — True면 마켓 전송 안 하고 order.return_collect_*에만 저장
+    is_return: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default="false"),
+    )
     attempts: int = Field(default=0)
     last_error: Optional[str] = Field(
         default=None, sa_column=Column(Text, nullable=True)

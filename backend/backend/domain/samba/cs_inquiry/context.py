@@ -39,6 +39,7 @@ async def _fetch_order(
                 "SELECT order_number, product_name, product_option, quantity, "
                 "       status, payment_status, shipping_status, shipping_company, "
                 "       tracking_number, sourcing_order_number, customer_name, "
+                "       return_collect_courier, return_collect_tracking, "
                 "       created_at, paid_at "
                 "FROM samba_order "
                 "WHERE order_number = :k OR ext_order_number = :k "
@@ -59,9 +60,14 @@ async def _fetch_order(
         "payment_status": m["payment_status"],
         "shipping_status": m["shipping_status"],
         "shipping_company": m["shipping_company"],
-        "tracking_number": m["tracking_number"],
+        # 고객에게 보낸 정방향 배송 송장 — ⚠ 회수/반품 답변에 절대 쓰지 말 것
+        "forward_tracking_number": m["tracking_number"],
         "sourcing_order_number": m["sourcing_order_number"],
         "customer_name": m["customer_name"],
+        # 반품 회수송장 (고객→판매자 회수) — "회수 송장번호?" 질문은 이것만 사용.
+        # 비어있으면 회수송장 미수집 → 번호 지어내지 말고 "확인 후 안내" 보수 답변.
+        "return_collect_courier": m["return_collect_courier"],
+        "return_collect_tracking": m["return_collect_tracking"],
         "created_at": m["created_at"].isoformat() if m["created_at"] else None,
         "paid_at": m["paid_at"].isoformat() if m["paid_at"] else None,
     }

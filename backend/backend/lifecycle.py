@@ -104,6 +104,27 @@ async def _apply_startup_schema_fixes(logger: logging.Logger) -> None:
         # (제거됨) drop_market_account_sort_order — 컬럼 이미 드롭 완료(프로덕션 ABSENT 확인,
         # 2026-06-03 #331). no-op DROP도 매 startup ACCESS EXCLUSIVE 락을 잡아 고부하 시
         # 계정 테이블 읽기 큐를 최대 lock_timeout(5s)만큼 막으므로 statements에서 제거.
+        # 반품 회수송장 컬럼 (롯데ON 회수조회 자동수집)
+        (
+            "alter_order_return_collect_courier",
+            "ALTER TABLE samba_order ADD COLUMN IF NOT EXISTS "
+            "return_collect_courier TEXT",
+        ),
+        (
+            "alter_order_return_collect_tracking",
+            "ALTER TABLE samba_order ADD COLUMN IF NOT EXISTS "
+            "return_collect_tracking TEXT",
+        ),
+        (
+            "alter_order_return_collect_at",
+            "ALTER TABLE samba_order ADD COLUMN IF NOT EXISTS "
+            "return_collect_at TIMESTAMP WITH TIME ZONE",
+        ),
+        (
+            "alter_tsj_is_return",
+            "ALTER TABLE samba_tracking_sync_job ADD COLUMN IF NOT EXISTS "
+            "is_return BOOLEAN NOT NULL DEFAULT false",
+        ),
         # CS 자동화(Tier 0) 컬럼 — 소규모 테이블이라 데드락 위험 없음
         (
             "alter_cs_intent",
@@ -961,6 +982,17 @@ async def _order_auto_sync_loop() -> None:
                     tenant_id=None, limit=500, days=7, force=True
                 )
                 _log.info(f"[주문 auto sync] 송장수집 큐 적재 완료: {ts_result}")
+
+                # 반품 회수송장 수집 (롯데ON) — 회수송장 미보유 반품주문 적재
+                try:
+                    from backend.domain.samba.tracking_sync.service import (
+                        enqueue_return_pending,
+                    )
+
+                    rt_result = await enqueue_return_pending(limit=200)
+                    _log.info(f"[주문 auto sync] 회수송장 큐 적재: {rt_result}")
+                except Exception as rte:
+                    _log.error(f"[주문 auto sync] 회수송장 큐 적재 오류: {rte}")
                 tracking_summary = {
                     "success": bool(ts_result.get("success")),
                     "queued": int(ts_result.get("queued") or 0),
@@ -1285,6 +1317,38 @@ async def _start_coupang_pid_reconciler() -> None:
     )
 
 
+_smartstore_ghost_reconciler_task: asyncio.Task | None = None
+
+
+async def _start_smartstore_ghost_reconciler() -> None:
+    """스마트스토어 유령상품 일일 자동 감지·정리 잡 — 24시간 주기."""
+    global _smartstore_ghost_reconciler_task
+    from backend.domain.samba.proxy.smartstore_ghost_reconciler import (
+        ghost_reconciler_loop,
+    )
+
+    _smartstore_ghost_reconciler_task = asyncio.create_task(ghost_reconciler_loop())
+    logging.getLogger("backend.lifecycle").info(
+        "[lifecycle] 스마트스토어 유령상품 reconciler 시작"
+    )
+
+
+_coupang_ghost_reconciler_task: asyncio.Task | None = None
+
+
+async def _start_coupang_ghost_reconciler() -> None:
+    """쿠팡 유령상품 일일 자동 감지·정리 잡 — 24시간 주기."""
+    global _coupang_ghost_reconciler_task
+    from backend.domain.samba.proxy.coupang_ghost_reconciler import (
+        ghost_reconciler_loop,
+    )
+
+    _coupang_ghost_reconciler_task = asyncio.create_task(ghost_reconciler_loop())
+    logging.getLogger("backend.lifecycle").info(
+        "[lifecycle] 쿠팡 유령상품 reconciler 시작"
+    )
+
+
 def _validate_startup_settings() -> None:
     if sys.version_info[:3] != SUPPORTED_PYTHON_VERSION:
         current = ".".join(str(part) for part in sys.version_info[:3])
@@ -1447,6 +1511,8 @@ async def lifespan(app: FastAPI):
         await _start_filters_warmup()
         await _start_coupang_pid_reconciler()
         await _start_ssg_status_reconciler()
+        await _start_smartstore_ghost_reconciler()
+        await _start_coupang_ghost_reconciler()
     _validate_startup_settings()
 
     try:
@@ -1469,6 +1535,8 @@ async def lifespan(app: FastAPI):
         await _cancel_task(_reward_auto_task)
         await _cancel_task(_lotteon_ghost_reconciler_task)
         await _cancel_task(_elevenst_ghost_reconciler_task)
+        await _cancel_task(_smartstore_ghost_reconciler_task)
+        await _cancel_task(_coupang_ghost_reconciler_task)
         await _shutdown_worker_runtime(worker_runtime)
         await _cancel_task(getattr(app.state, "_pool_monitor_task", None))
         await _disconnect_cache()

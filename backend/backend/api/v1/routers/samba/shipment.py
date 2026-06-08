@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
+from sqlalchemy.orm import defer
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from backend.db.orm import get_read_session_dependency, get_write_session_dependency
@@ -143,7 +144,14 @@ async def cleanup_smartstore_orphans(
     from sqlalchemy import or_
 
     tenant_ids = list({a.tenant_id for a in accounts if a.tenant_id})
-    prod_query = select(SambaCollectedProduct)
+    # 무거운 컬럼 defer — 전체 카탈로그 스캔 시 TOAST 로드로 인한 풀 고갈 방지
+    # (이 함수는 market_product_nos/style_code/name/registered_accounts 만 사용)
+    prod_query = select(SambaCollectedProduct).options(
+        defer(SambaCollectedProduct.detail_html),
+        defer(SambaCollectedProduct.detail_images),
+        defer(SambaCollectedProduct.images),
+        defer(SambaCollectedProduct.extra_data),
+    )
     if body.product_ids:
         # 화면 필터 결과로 분석 범위 한정
         prod_query = prod_query.where(SambaCollectedProduct.id.in_(body.product_ids))
@@ -477,7 +485,8 @@ async def ghost_summary(
         WHERE event_type IN (
             'lotteon_ghost_detected',
             'elevenst_missing_prdno_detected',
-            'smartstore_ghost_detected'
+            'smartstore_ghost_detected',
+            'coupang_ghost_detected'
         )
           AND created_at >= NOW() - (:h || ' hours')::interval
         ORDER BY created_at DESC
@@ -1059,7 +1068,13 @@ async def cleanup_coupang_orphans(
         raise HTTPException(status_code=404, detail="활성 쿠팡 계정 없음")
 
     # 2) DB 상품 로드 (화면 필터)
-    prod_q = select(SambaCollectedProduct)
+    # 무거운 컬럼 defer — 전체 카탈로그 스캔 시 TOAST 로드로 인한 풀 고갈 방지
+    prod_q = select(SambaCollectedProduct).options(
+        defer(SambaCollectedProduct.detail_html),
+        defer(SambaCollectedProduct.detail_images),
+        defer(SambaCollectedProduct.images),
+        defer(SambaCollectedProduct.extra_data),
+    )
     if body.product_ids:
         prod_q = prod_q.where(SambaCollectedProduct.id.in_(body.product_ids))
     all_db_products = (await session.execute(prod_q)).scalars().all()

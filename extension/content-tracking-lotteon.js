@@ -29,6 +29,19 @@
     return false
   }
 
+  // 반품 회수송장 — claim/orderDetail 페이지의 '회수조회' 버튼 → 회수예정 모달
+  //   (택배사/송장번호). 정방향 '배송상세조회'와 같은 페이지·같은 추출 로직, 버튼만 다름.
+  function clickReturnCollect() {
+    for (const btn of document.querySelectorAll('button, a')) {
+      const t = (btn.textContent || '').trim()
+      if (t === '회수조회' || t === '회수 조회' || t.includes('회수조회')) {
+        btn.click()
+        return true
+      }
+    }
+    return false
+  }
+
   function waitForDialog(timeout = 5000) {
     return new Promise((resolve, reject) => {
       const existing = document.querySelector('dialog[open], [role="dialog"]')
@@ -70,7 +83,7 @@
     } catch { return false }
   }
 
-  async function scrape() {
+  async function scrape(isReturn) {
     if (isLoginRedirect()) {
       return { success: false, needsLogin: true, error: 'needs_login: LOTTEON 로그인 페이지로 리다이렉트' }
     }
@@ -79,11 +92,17 @@
     }
     let dialog = document.querySelector('dialog[open], [role="dialog"]')
     if (!dialog) {
-      if (!clickDeliveryDetail()) {
+      const opened = isReturn ? clickReturnCollect() : clickDeliveryDetail()
+      if (!opened) {
         if (isLoginRedirect()) {
           return { success: false, needsLogin: true, error: 'needs_login: LOTTEON 로그인 페이지로 리다이렉트' }
         }
-        return { success: false, error: 'no_tracking: 배송상세조회 버튼 없음 (미발송)' }
+        return {
+          success: false,
+          error: isReturn
+            ? 'no_tracking: 회수조회 버튼 없음 (회수 전/미진행)'
+            : 'no_tracking: 배송상세조회 버튼 없음 (미발송)',
+        }
       }
       try { dialog = await waitForDialog(5000) } catch {
         return { success: false, error: 'dialog 미열림' }
@@ -113,7 +132,7 @@
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg?.type === 'TRACKING_REQUEST') {
       sendResponse({ ack: true })
-      scrape().then(r => send(msg.requestId, r))
+      scrape(!!msg.isReturn).then(r => send(msg.requestId, r))
         .catch(err => send(msg.requestId, { success: false, error: String(err?.message || err) }))
       return true
     }

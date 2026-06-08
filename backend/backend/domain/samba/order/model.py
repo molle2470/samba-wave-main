@@ -168,6 +168,16 @@ class SambaOrder(SQLModel, table=True):
     tracking_number: Optional[str] = Field(
         default=None, sa_column=Column(Text, nullable=True)
     )
+    # 반품 회수 송장 (소싱처 회수조회에서 자동 수집 — CS 답변용, 마켓 전송 안 함)
+    return_collect_courier: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    return_collect_tracking: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    return_collect_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
     customer_note: Optional[str] = Field(
         default=None, sa_column=Column(Text, nullable=True)
     )

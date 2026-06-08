@@ -1047,7 +1047,8 @@ chrome.runtime.onMessage.addListener((msg, sender, _sendResponse) => {
 
 async function handleTrackingJob(job) {
   const { requestId, site, url, sourcingOrderNumber, sourcingAccountId } = job
-  console.log(`[송장] 잡 수신 site=${site} ord=${sourcingOrderNumber} acc=${sourcingAccountId || '-'} req=${requestId}`)
+  const isReturn = !!job.isReturn
+  console.log(`[송장] 잡 수신 site=${site} ord=${sourcingOrderNumber} acc=${sourcingAccountId || '-'} req=${requestId}${isReturn ? ' [회수송장]' : ''}`)
 
   // [정책 2026-05-16] — 한 PC 다계정 순회 지원.
   // → 0단계: 현재 로그인 계정 감지 (캐시 30분)
@@ -1113,6 +1114,7 @@ async function handleTrackingJob(job) {
             requestId,
             site,
             sourcingOrderNumber,
+            isReturn,
           }, (_resp) => {
             void chrome.runtime.lastError
           })
