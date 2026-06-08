@@ -83,12 +83,13 @@ export default function OrdersFilterBar(props: Props) {
   } = props
 
   const [excelDownloading, setExcelDownloading] = useState(false)
-  const handleExcelDownload = async () => {
+  const [excelMenuOpen, setExcelMenuOpen] = useState(false)
+  const handleExcelDownload = async (format: 'ub1' | 'lotte' = 'ub1') => {
     if (excelDownloading) return
     setExcelDownloading(true)
     try {
       if (selectedOrderIds.length > 0) {
-        await orderApi.downloadExcel({ order_ids: selectedOrderIds, sort_by: sortBy })
+        await orderApi.downloadExcel({ order_ids: selectedOrderIds, sort_by: sortBy, format })
       } else {
         if (!customStart || !customEnd) {
           showAlert('날짜 범위를 선택해주세요', 'info')
@@ -108,6 +109,7 @@ export default function OrdersFilterBar(props: Props) {
           search_text: searchText,
           search_category: searchCategory,
           sort_by: sortBy,
+          format,
         })
       }
     } catch (e) {
@@ -296,27 +298,107 @@ export default function OrdersFilterBar(props: Props) {
             <option value={200}>200개</option>
             <option value={500}>500개</option>
           </select>
-          <button
-            onClick={handleExcelDownload}
-            disabled={excelDownloading}
-            style={{
-              padding: '0.22rem 0.65rem',
-              fontSize: '0.75rem',
-              background: selectedOrderIds.length > 0 ? '#1F6F3A' : 'rgba(50,50,50,0.9)',
-              border: '1px solid #3D3D3D',
-              color: selectedOrderIds.length > 0 ? '#fff' : '#C5C5C5',
-              borderRadius: '4px',
-              cursor: excelDownloading ? 'not-allowed' : 'pointer',
-              whiteSpace: 'nowrap',
-            }}
-            title={selectedOrderIds.length > 0 ? `선택 ${fmtNum(selectedOrderIds.length)}건 다운로드` : '현재 필터 전체 다운로드'}
-          >
-            {excelDownloading
-              ? '다운로드 중...'
-              : selectedOrderIds.length > 0
-                ? `엑셀 다운(${fmtNum(selectedOrderIds.length)})`
-                : '엑셀 다운'}
-          </button>
+          <div style={{ position: 'relative', display: 'inline-block' }}>
+            <button
+              onClick={() => setExcelMenuOpen(prev => !prev)}
+              disabled={excelDownloading}
+              style={{
+                padding: '0.22rem 0.65rem',
+                fontSize: '0.75rem',
+                background: selectedOrderIds.length > 0 ? '#1F6F3A' : 'rgba(50,50,50,0.9)',
+                border: '1px solid #3D3D3D',
+                color: selectedOrderIds.length > 0 ? '#fff' : '#C5C5C5',
+                borderRadius: '4px',
+                cursor: excelDownloading ? 'not-allowed' : 'pointer',
+                whiteSpace: 'nowrap',
+              }}
+              title={selectedOrderIds.length > 0 ? `선택 ${fmtNum(selectedOrderIds.length)}건 — 양식 선택 후 다운로드` : '현재 필터 전체 — 양식 선택 후 다운로드'}
+            >
+              {excelDownloading
+                ? '다운로드 중...'
+                : selectedOrderIds.length > 0
+                  ? `엑셀 다운(${fmtNum(selectedOrderIds.length)}) ▾`
+                  : '엑셀 다운 ▾'}
+            </button>
+            {excelMenuOpen && !excelDownloading && (
+              <>
+                {/* 외부 클릭 감지용 투명 오버레이 */}
+                <div
+                  onClick={() => setExcelMenuOpen(false)}
+                  style={{
+                    position: 'fixed',
+                    inset: 0,
+                    zIndex: 20,
+                    background: 'transparent',
+                  }}
+                />
+                <div
+                  style={{
+                    position: 'absolute',
+                    top: 'calc(100% + 4px)',
+                    right: 0,
+                    minWidth: '200px',
+                    background: '#1A1A1A',
+                    border: '1px solid #3D3D3D',
+                    borderRadius: '6px',
+                    boxShadow: '0 8px 24px rgba(0,0,0,0.45)',
+                    zIndex: 30,
+                    overflow: 'hidden',
+                  }}
+                >
+                  <button
+                    onClick={() => {
+                      setExcelMenuOpen(false)
+                      handleExcelDownload('ub1')
+                    }}
+                    style={{
+                      display: 'block',
+                      width: '100%',
+                      padding: '0.5rem 0.75rem',
+                      fontSize: '0.78rem',
+                      textAlign: 'left',
+                      background: 'transparent',
+                      border: 'none',
+                      borderBottom: '1px solid #2A2A2A',
+                      color: '#E5E5E5',
+                      cursor: 'pointer',
+                    }}
+                    onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.05)' }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent' }}
+                  >
+                    <div style={{ fontWeight: 600 }}>기본 양식 (UB1 발주)</div>
+                    <div style={{ fontSize: '0.68rem', color: '#888', marginTop: '2px' }}>
+                      마켓·마켓주문번호·구매가격 등 10컬럼
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => {
+                      setExcelMenuOpen(false)
+                      handleExcelDownload('lotte')
+                    }}
+                    style={{
+                      display: 'block',
+                      width: '100%',
+                      padding: '0.5rem 0.75rem',
+                      fontSize: '0.78rem',
+                      textAlign: 'left',
+                      background: 'transparent',
+                      border: 'none',
+                      color: '#E5E5E5',
+                      cursor: 'pointer',
+                    }}
+                    onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.05)' }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent' }}
+                  >
+                    <div style={{ fontWeight: 600 }}>롯데택배 송장 양식</div>
+                    <div style={{ fontSize: '0.68rem', color: '#888', marginTop: '2px' }}>
+                      수령자·연락처·주소·상품명·수량·배송메세지 7컬럼
+                    </div>
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
         </div>
       </div>
     </>

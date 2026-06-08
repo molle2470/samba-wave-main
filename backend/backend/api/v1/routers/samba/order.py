@@ -1353,7 +1353,13 @@ async def list_orders_by_collected_product_paged(
 
 
 class ExcelExportRequest(BaseModel):
-    """엑셀 다운로드 요청 — 선택ID 우선, 없으면 필터 전체."""
+    """엑셀 다운로드 요청 — 선택ID 우선, 없으면 필터 전체.
+
+    format 분기:
+      - 'ub1' (default): 소싱처 발주 양식 — 마켓주문일자/마켓명/.../옵션1 (10컬럼)
+      - 'lotte': 롯데택배 양식 (수령자명/전화번호/우편번호/주소/상품명/수량/배송메세지)
+                 플레이오토 다운로드 양식과 동일 헤더·순서.
+    """
 
     order_ids: Optional[list[str]] = None
     start: Optional[str] = None
@@ -1369,6 +1375,7 @@ class ExcelExportRequest(BaseModel):
     search_text: str = ""
     search_category: str = "customer"
     sort_by: str = "date_desc"
+    format: str = "ub1"  # 'ub1' | 'lotte'
 
 
 @router.post("/excel-export")
@@ -1382,7 +1389,7 @@ async def export_orders_excel(
     - 체크박스 선택 ID 우선 (`order_ids`), 없으면 필터 전체.
     - 필터 모드는 50,000건 상한, 초과 시 400.
     """
-    from datetime import timedelta, timezone
+    from datetime import datetime, timedelta, timezone
     from io import BytesIO
     from urllib.parse import quote
 
@@ -1464,6 +1471,72 @@ async def export_orders_excel(
 
     wb = Workbook()
     ws = wb.active
+
+    bold = Font(bold=True)
+
+    fmt = (payload.format or "ub1").strip().lower()
+
+    if fmt == "lotte":
+        # 롯데택배 송장 발송용 양식 — 플레이오토 다운 양식과 동일 헤더·순서 (2026-06-08 사용자 캡처).
+        # 합포장 주소/연락처/배송메시지 그대로 1행 1주문. 헤더는 굵게만 (배경색 X — 양식 원본 따라감).
+        today_kst = datetime.now(timezone.utc).astimezone(KST).strftime("%Y-%m-%d")
+        ws.title = today_kst
+        headers = [
+            "수령자명",
+            "수령자전화번호",
+            "배송지우편번호",
+            "배송지주소",
+            "상품명",
+            "주문수량",
+            "배송메세지",
+        ]
+        ws.append(headers)
+        for c in ws[1]:
+            c.font = bold
+
+        def _join_addr(addr: Optional[str], detail: Optional[str]) -> str:
+            a = (addr or "").strip()
+            d = (detail or "").strip()
+            if a and d:
+                return f"{a} {d}"
+            return a or d
+
+        for o in rows:
+            ws.append(
+                [
+                    o.customer_name or "",
+                    o.customer_phone or "",
+                    o.customer_postal_code or "",
+                    _join_addr(o.customer_address, o.customer_address_detail),
+                    o.product_name or "",
+                    int(o.quantity or 0),
+                    o.customer_note or "",
+                ]
+            )
+
+        # 컬럼 너비 — 캡처에서 실측 유사 비율
+        widths = [10, 18, 12, 50, 50, 8, 30]
+        for i, w in enumerate(widths, 1):
+            ws.column_dimensions[chr(64 + i)].width = w
+
+        buf = BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+
+        if payload.order_ids:
+            fname = f"롯데택배_선택{len(rows)}건.xlsx"
+        else:
+            fname = f"롯데택배_{payload.start}_{payload.end}.xlsx"
+        quoted = quote(fname)
+        return StreamingResponse(
+            buf,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename=\"lotte_courier.xlsx\"; filename*=UTF-8''{quoted}"
+            },
+        )
+
+    # ── 기본: UB1 소싱처 발주 양식 (10컬럼) ──
     ws.title = "orders"
     headers = [
         "마켓주문일자",
@@ -1479,7 +1552,6 @@ async def export_orders_excel(
     ]
     ws.append(headers)
     yellow = PatternFill("solid", fgColor="FFFF00")
-    bold = Font(bold=True)
     center = Alignment(horizontal="center")
     for c in ws[1]:
         c.font = bold
