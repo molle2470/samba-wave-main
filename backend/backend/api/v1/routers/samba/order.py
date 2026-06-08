@@ -74,7 +74,12 @@ def _index_mpn_row(_row, by_global: dict, by_account: dict, sourcing_urls: dict)
 
     _ambiguous_new = 0
     for _k, _v in _mpnos.items():
-        if not _v or _k.endswith("_qa") or _k.endswith("_sites"):
+        if (
+            not _v
+            or _k.endswith("_qa")
+            or _k.endswith("_sites")
+            or _k.endswith("_master")
+        ):
             continue
         # _origin 키도 인덱싱한다 — 스마트스토어 주문 product_id 에는
         # channelProductNo 대신 originProductNo 가 들어오는 케이스가 있어
