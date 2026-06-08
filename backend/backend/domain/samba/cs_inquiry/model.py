@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Boolean
+from sqlalchemy import Boolean, Float
 from sqlmodel import Column, DateTime, Field, SQLModel, Text
 
 from ulid import ULID
@@ -119,3 +119,31 @@ class SambaCSInquiry(SQLModel, table=True):
     )
     # 카페24 CS 게시판 번호 (board_no 기반 문의 조회용)
     board_no: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
+
+    # ==================== CS 자동화 (Tier 0~3) ====================
+    # 룰기반 의도 분류 결과 (stock_check/delivery_eta/exchange_return/
+    #   refund_status/sizing/notice_ack/general 등). NULL=미분류
+    intent: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True, index=True)
+    )
+    # Claude 스케줄잡이 작성한 답변 초안 (전송 전 검토 대상)
+    draft_reply: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    # 초안 상태: none/suggested/auto_sent/accepted/edited/rejected
+    draft_status: str = Field(
+        default="none",
+        sa_column=Column(Text, nullable=False, server_default="none", index=True),
+    )
+    # 초안 신뢰도 0.0~1.0 — 자동전송 게이트 판정
+    draft_confidence: Optional[float] = Field(
+        default=None, sa_column=Column(Float, nullable=True)
+    )
+    # 초안 출처: claude/template/rule
+    draft_source: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    # 초안 작성 일시
+    drafted_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
