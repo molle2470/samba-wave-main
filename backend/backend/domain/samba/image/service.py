@@ -912,6 +912,15 @@ class ImageTransformService:
         # 실제 GS샵 메인 이미지 CDN은 asset.m-gs.kr / static.m-gs.kr 사용
         "asset.m-gs.kr",
         "static.m-gs.kr",
+        # 무신사 상세에 박히는 브랜드 자체 CDN — SSG 등 서버 fetch 마켓이 직접
+        # 다운로드 못 해 "파일 다운로드 도중 오류" 등록거부 유발(프로덕션 987건).
+        # 우리 서버는 다운로드 가능(검증) → R2 선미러 필요.
+        "puma.net",
+        "skecherskorea.co.kr",
+        "leecom01.kr",
+        "innerplan.co.kr",
+        "yswholesale.com",
+        "cloudinary.com",
     )
 
     async def mirror_external_to_r2(
@@ -1370,6 +1379,50 @@ class ImageTransformService:
             if new:
                 new_html = new_html.replace(orig, new)
         return new_html
+
+    async def strip_external_imgs_in_html(self, html: str) -> str:
+        """detail_html에서 our-domain/R2가 아닌 <img> 태그를 제거.
+
+        SSG 등 서버 fetch 마켓은 등록 시 detail_html의 모든 <img>를 직접 다운로드
+        하는데, 미러링에 실패해 외부 URL이 남으면(puma_notice 깨진 이미지·용량초과
+        등) 그 한 장 때문에 상품 전체 등록이 거부된다("파일 다운로드 도중 오류").
+        미러 이후 호출해 our-domain/R2가 아닌 <img>를 통째로 제거 → SSG가 fetch
+        못 하는 URL을 payload에서 0으로 만든다. 이미 미러된 정상 이미지는 보존.
+        data:/상대경로/src 없는 태그는 유지.
+        """
+        if not html:
+            return html
+        import re as _re
+        from urllib.parse import urlparse as _up
+
+        r2 = await self._get_r2_client()
+        public_host = ""
+        if r2:
+            try:
+                public_host = (_up(r2[2]).netloc or "").lower()
+            except Exception:
+                public_host = ""
+        allowed_tokens = [
+            t
+            for t in (public_host, "samba-wave", "r2.dev", "r2.cloudflarestorage")
+            if t
+        ]
+
+        def _keep(m: "_re.Match[str]") -> str:
+            tag = m.group(0)
+            src = _re.search(
+                r'src=(["\'])((?:https?:)?//[^"\']+)\1', tag, _re.IGNORECASE
+            )
+            if not src:
+                return tag  # data:/상대경로/src 없음 → 유지
+            url = src.group(2)
+            norm = ("https:" + url) if url.startswith("//") else url
+            host = (_up(norm).netloc or "").lower()
+            if any(tok in host for tok in allowed_tokens):
+                return tag  # our-domain/R2 → 유지
+            return ""  # 외부(미러 실패) → 제거
+
+        return _re.sub(r"<img\b[^>]*>", _keep, html, flags=_re.IGNORECASE)
 
     async def transform_single_image(
         self,

@@ -418,8 +418,12 @@ class SSGPlugin(MarketPlugin):
                         _,
                     ) = await _img_svc.mirror_with_persistence(_pid, _detail_images)
                 if _detail_html:
-                    product["detail_html"] = await _img_svc.mirror_urls_in_html(
-                        _detail_html
+                    _mirrored_html = await _img_svc.mirror_urls_in_html(_detail_html)
+                    # 미러 실패로 남은 외부 <img>(puma_notice 깨진 이미지·용량초과 등)
+                    # 제거 — SSG가 fetch 못 해 "파일 다운로드 도중 오류"로 상품 전체
+                    # 등록 거부되는 것 방지. 미러된 정상 이미지는 보존.
+                    product["detail_html"] = await _img_svc.strip_external_imgs_in_html(
+                        _mirrored_html
                     )
                 if not product.get("images"):
                     return {
