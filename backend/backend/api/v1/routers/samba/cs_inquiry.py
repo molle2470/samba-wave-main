@@ -853,7 +853,7 @@ async def _sync_lotteon_qna(
                 SambaCSInquiry.market_inquiry_no == qna_no,
             )
         )
-        if existing.scalar_one_or_none():
+        if existing.scalars().first():
             continue
 
         # 상품번호 (pdNo)
@@ -966,7 +966,7 @@ async def _sync_lotteon_product_qna(
                 SambaCSInquiry.market_inquiry_no == market_inquiry_no,
             )
         )
-        if existing.scalar_one_or_none():
+        if existing.scalars().first():
             continue
 
         market_product_no = str(item.get("pdNo", "") or "")
@@ -1084,7 +1084,7 @@ async def _sync_lotteon_contact(
                 SambaCSInquiry.market_inquiry_no == market_inq_no,
             )
         )
-        if existing.scalar_one_or_none():
+        if existing.scalars().first():
             continue
 
         # 내용 — 여러 필드명 시도
@@ -1199,7 +1199,7 @@ async def _sync_lotteon_compensate(
                 SambaCSInquiry.market_inquiry_no == market_inq_no,
             )
         )
-        if existing.scalar_one_or_none():
+        if existing.scalars().first():
             continue
 
         content = str(
@@ -1493,7 +1493,7 @@ async def _do_sync_cs_from_markets(
                         SambaCSInquiry.account_id == sync_account_id,
                     )
                 )
-                if existing.scalar_one_or_none():
+                if existing.scalars().first():
                     continue
 
                 inquiry_type = "product_question"
@@ -1599,7 +1599,7 @@ async def _do_sync_cs_from_markets(
                             SambaCSInquiry.account_id == sync_account_id,
                         )
                     )
-                    if existing.scalar_one_or_none():
+                    if existing.scalars().first():
                         continue
 
                     # 문의 유형 (category 필드: 배송, 교환/반품 등)
@@ -1781,7 +1781,7 @@ async def _do_sync_cs_from_markets(
                             SambaCSInquiry.market_inquiry_no == inq_id,
                         )
                     )
-                    if exists_q.scalar_one_or_none():
+                    if exists_q.scalars().first():
                         continue
                     item_id = str(inq.get("itemId", "") or "")
                     buyer = (inq.get("buyer") or {}).get("userId", "") or ""
@@ -1835,7 +1835,7 @@ async def _do_sync_cs_from_markets(
                             SambaCSInquiry.market_inquiry_no == f"msg_{msg_id}",
                         )
                     )
-                    if exists_m.scalar_one_or_none():
+                    if exists_m.scalars().first():
                         continue
                     recv = m.get("receiveDate") or ""
                     recv_dt = None
@@ -2302,7 +2302,7 @@ async def _do_sync_cs_from_markets(
                                 SambaCSInquiry.is_hidden == False,  # noqa: E712
                             )
                         )
-                        if existing_result.scalar_one_or_none():
+                        if existing_result.scalars().first():
                             continue
 
                         is_answered = str(qna.get("answerYn", "N")).upper() == "Y"
@@ -2534,7 +2534,7 @@ async def _do_sync_cs_from_markets(
                                 SambaCSInquiry.is_hidden == False,  # noqa: E712
                             )
                         )
-                        if existing_result.scalar_one_or_none():
+                        if existing_result.scalars().first():
                             continue
 
                         # v5 응답 키: inquiryId, content, inquiryAt, productId,
@@ -2647,7 +2647,7 @@ async def _do_sync_cs_from_markets(
                                 SambaCSInquiry.is_hidden == False,  # noqa: E712
                             )
                         )
-                        if cc_existing.scalar_one_or_none():
+                        if cc_existing.scalars().first():
                             continue
 
                         cc_content = str(cc_item.get("content", "") or "")
@@ -2913,7 +2913,7 @@ async def _do_sync_cs_from_markets(
                                 SambaCSInquiry.is_hidden == False,  # noqa: E712
                             )
                         )
-                        if existing_result.scalar_one_or_none():
+                        if existing_result.scalars().first():
                             continue
                         product_no = str(item.get("siteGoodsNo") or "")
                         content = str(item.get("question") or item.get("content") or "")

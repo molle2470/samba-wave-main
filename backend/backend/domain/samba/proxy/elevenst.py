@@ -1699,12 +1699,17 @@ class ElevenstClient:
 
         result_code = root.findtext("result_code", "")
         if result_code:
-            result_text = root.findtext("result_text", "")
+            # 11번가는 메시지를 result_message 태그로 내려줌(result_text 아님)
+            result_text = root.findtext("result_message", "") or root.findtext(
+                "result_text", ""
+            )
             logger.info(
                 "[11번가] Q&A result_code=%s, result_text=%s", result_code, result_text
             )
-            # "0" 또는 "-1"은 정상 응답(결과 없음 포함) → 빈 리스트 반환
-            if result_code in ("0", "-1"):
+            # 정상 응답(결과 없음 포함) → 빈 리스트 반환
+            # - "0"/"-1": 정상 코드
+            # - "500" + "검색된 대상이 없습니다": 11번가가 무결과를 500으로 내려줌(에러 아님)
+            if result_code in ("0", "-1") or "검색된 대상이 없습니다" in result_text:
                 return []
             raise ElevenstApiError(f"Q&A 조회 에러 ({result_code}): {result_text}")
 
