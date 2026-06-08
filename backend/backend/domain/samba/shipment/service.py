@@ -1959,7 +1959,12 @@ class SambaShipmentService:
 
                 # 404 → 상품번호 초기화
                 if result.get("_clear_product_no"):
-                    res["clear_nos"] = [account_id, f"{account_id}_origin"]
+                    res["clear_nos"] = [
+                        account_id,
+                        f"{account_id}_origin",
+                        f"{account_id}_master",
+                        f"{account_id}_site",
+                    ]
                     logger.info(
                         f"[전송] 404 상품번호 초기화: {market_type} (계정: {account_id})"
                     )
@@ -2053,11 +2058,17 @@ class SambaShipmentService:
                             # 저장 안 하면 siteGoodsNo로 호출돼 404 (오토튠 가격/재고 실패).
                             _master_no = str(_esm_d.get("goodsNo", "") or "")
                             # "0"/"0.0" 무효값 차단(이슈#278) — 기존 유효 ID 덮어쓰기 방지
-                            if _site_goods_no and _site_goods_no.strip() not in (
-                                "0",
-                                "0.0",
-                            ):
+                            _sgn_valid = bool(
+                                _site_goods_no
+                                and _site_goods_no.strip() not in ("0", "0.0")
+                            )
+                            if _sgn_valid:
                                 nos[account_id] = _site_goods_no
+                                nos[f"{account_id}_site"] = _site_goods_no
+                            else:
+                                # siteGoodsNo 미포함(수정 응답) — bare 키를 nos에서 제거해
+                                # merged_nos.update(nos)가 기존 bare(siteGoodsNo)를 보존하게 함
+                                nos.pop(account_id, None)
                             if _seller_pid and _seller_pid.strip() not in (
                                 "0",
                                 "0.0",
@@ -3330,6 +3341,8 @@ class SambaShipmentService:
                 remove_keys = set(success_ids)
                 for aid in success_ids:
                     remove_keys.add(f"{aid}_origin")
+                    remove_keys.add(f"{aid}_master")
+                    remove_keys.add(f"{aid}_site")
                 new_nos = {
                     k: v for k, v in market_product_nos.items() if k not in remove_keys
                 }
