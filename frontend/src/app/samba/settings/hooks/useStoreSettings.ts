@@ -338,8 +338,14 @@ export function useStoreSettings(): StoreSettingsState & StoreSettingsActions {
         // 인증 성공 시 배송비정책/출고지/회수지 목록 자동 로드
         if (lotteonResult.success) {
           const [polRes, whRes] = await Promise.all([
-            proxyApi.lotteonDeliveryPolicies(editingAccountId ?? undefined),
-            proxyApi.lotteonWarehouses(editingAccountId ?? undefined),
+            proxyApi.lotteonDeliveryPolicies(
+              editingAccountId ?? undefined,
+              editingAccountId ? undefined : String(safeData.apiKey || ''),
+            ),
+            proxyApi.lotteonWarehouses(
+              editingAccountId ?? undefined,
+              editingAccountId ? undefined : String(safeData.apiKey || ''),
+            ),
           ])
           if (polRes.success) setLotteonDeliveryPolicyOptions(polRes.policies)
           if (whRes.success) setLotteonWarehouseOptions({ departure: whRes.departure, return_: whRes.return_ })
@@ -448,8 +454,14 @@ export function useStoreSettings(): StoreSettingsState & StoreSettingsActions {
     const d = savedStoreData['lotteon'] || storeData['lotteon'] || {}
     if (!d.apiKey) return
     Promise.all([
-      proxyApi.lotteonDeliveryPolicies(editingAccountId ?? undefined),
-      proxyApi.lotteonWarehouses(editingAccountId ?? undefined),
+      proxyApi.lotteonDeliveryPolicies(
+        editingAccountId ?? undefined,
+        editingAccountId ? undefined : String(d.apiKey || ''),
+      ),
+      proxyApi.lotteonWarehouses(
+        editingAccountId ?? undefined,
+        editingAccountId ? undefined : String(d.apiKey || ''),
+      ),
     ])
       .then(([polRes, whRes]) => {
         if (polRes.success) setLotteonDeliveryPolicyOptions(polRes.policies)

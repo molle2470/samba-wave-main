@@ -482,12 +482,21 @@ async def lotteon_auth_test(
 @router.get("/lotteon/delivery-policies")
 async def lotteon_delivery_policies(
     account_id: Optional[str] = None,
+    api_key: Optional[str] = None,
     session: AsyncSession = Depends(get_read_session_dependency),
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
-    """롯데ON 배송비정책 목록 조회. account_id 지정 시 그 계정, 미지정 시 default."""
+    """롯데ON 배송비정책 목록 조회.
+
+    account_id 지정 시 그 계정, 미지정+api_key 지정 시 폼 입력값(신규 등록),
+    둘 다 없으면 default. (이슈 #374 — 신규 등록 시 타 계정 정책 폴백 방지)
+    """
     creds = await _resolve_lotteon_creds(
-        session, tenant_id, account_id=account_id, allow_default_fallback=True
+        session,
+        tenant_id,
+        form_api_key=api_key,
+        account_id=account_id,
+        allow_default_fallback=True,
     )
     api_key = (creds.get("apiKey", "") or "").strip()
     if not api_key:
@@ -532,12 +541,21 @@ async def lotteon_delivery_policies(
 @router.get("/lotteon/warehouses")
 async def lotteon_warehouses(
     account_id: Optional[str] = None,
+    api_key: Optional[str] = None,
     session: AsyncSession = Depends(get_read_session_dependency),
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ) -> dict[str, Any]:
-    """롯데ON 출고지/회수지 목록 조회. account_id 지정 시 그 계정, 미지정 시 default."""
+    """롯데ON 출고지/회수지 목록 조회.
+
+    account_id 지정 시 그 계정, 미지정+api_key 지정 시 폼 입력값(신규 등록),
+    둘 다 없으면 default. (이슈 #374 — 신규 등록 시 타 계정 정보 폴백 방지)
+    """
     creds = await _resolve_lotteon_creds(
-        session, tenant_id, account_id=account_id, allow_default_fallback=True
+        session,
+        tenant_id,
+        form_api_key=api_key,
+        account_id=account_id,
+        allow_default_fallback=True,
     )
     api_key = (creds.get("apiKey", "") or "").strip()
     if not api_key:

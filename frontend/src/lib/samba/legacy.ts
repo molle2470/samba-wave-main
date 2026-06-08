@@ -1622,15 +1622,25 @@ export const proxyApi = {
       `${SAMBA_PREFIX}/proxy/lotteon/auth-test`,
       { method: 'POST', body: JSON.stringify(payload || {}) }
     ),
-  lotteonDeliveryPolicies: (accountId?: string) =>
-    request<{ success: boolean; policies: { value: string; label: string }[] }>(
-      `${SAMBA_PREFIX}/proxy/lotteon/delivery-policies${accountId ? `?account_id=${encodeURIComponent(accountId)}` : ''}`),
-  lotteonWarehouses: (accountId?: string) =>
-    request<{
+  lotteonDeliveryPolicies: (accountId?: string, apiKey?: string) => {
+    const qs = new URLSearchParams()
+    if (accountId) qs.set('account_id', accountId)
+    if (apiKey) qs.set('api_key', apiKey)
+    const q = qs.toString()
+    return request<{ success: boolean; policies: { value: string; label: string }[] }>(
+      `${SAMBA_PREFIX}/proxy/lotteon/delivery-policies${q ? `?${q}` : ''}`)
+  },
+  lotteonWarehouses: (accountId?: string, apiKey?: string) => {
+    const qs = new URLSearchParams()
+    if (accountId) qs.set('account_id', accountId)
+    if (apiKey) qs.set('api_key', apiKey)
+    const q = qs.toString()
+    return request<{
       success: boolean
       departure: { value: string; label: string }[]
       return_: { value: string; label: string }[]
-    }>(`${SAMBA_PREFIX}/proxy/lotteon/warehouses${accountId ? `?account_id=${encodeURIComponent(accountId)}` : ''}`),
+    }>(`${SAMBA_PREFIX}/proxy/lotteon/warehouses${q ? `?${q}` : ''}`)
+  },
   ssgAuthTest: (payload?: { api_key?: string; account_id?: string }) =>
     request<{ success: boolean; message: string }>(
       `${SAMBA_PREFIX}/proxy/ssg/auth-test`,
