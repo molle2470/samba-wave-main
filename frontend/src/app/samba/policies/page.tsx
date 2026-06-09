@@ -2021,7 +2021,7 @@ export default function PoliciesPage() {
             reps.splice(to, 0, moved)
             updateRule({ replacements: reps })
           }
-          const COMP_TAGS = ['{상품명}', '{브랜드명}', '{모델명}', '{사이트명}', '{상품번호}', '{검색키워드}']
+          const COMP_TAGS = ['{상품명}', '{브랜드명}', '{브랜드명_영문}', '{모델명}', '{사이트명}', '{상품번호}', '{검색키워드}']
           return (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
               {/* 규칙명 */}

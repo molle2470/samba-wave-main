@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable, Optional
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from backend.domain.samba.exchange_rate_service import convert_cost_by_source_site
+from backend.domain.samba.policy.brand_en import brand_en as _brand_en
 from backend.domain.samba.shipment.model import SambaShipment
 from backend.domain.samba.shipment.repository import SambaShipmentRepository
 from backend.utils.logger import logger
@@ -2564,6 +2565,7 @@ class SambaShipmentService:
         tag_map = {
             "{상품명}": product.get("name", ""),
             "{브랜드명}": product.get("brand", ""),
+            "{브랜드명_영문}": _brand_en(product.get("brand", "")),
             "{모델명}": product.get("style_code", ""),
             "{사이트명}": product.get("source_site", ""),
             "{상품번호}": product.get("site_product_id", ""),
