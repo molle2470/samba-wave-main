@@ -1537,24 +1537,74 @@ class CoupangClient:
         days: int = 30,
         status: str = "",
         max_per_page: int = 50,
+        cancel_type: str = "",
     ) -> list[dict[str, Any]]:
-        """반품요청 목록 조회.
+        """반품·취소 요청 목록 조회.
 
         쿠팡 Wing API: GET /v2/.../vendors/{vendorId}/returnRequests
         페이징: nextToken 기반 커서 방식
+
+        cancel_type 분기 (공식 API 명세):
+          - "" (default): RETURN 카테고리 — 상품준비중 이후 출고중지요청·반품·환불
+            status 4개 (RU/CC/PR/UC) 전부 합산 조회.
+          - "CANCEL": CANCEL 카테고리 — 결제완료 단계에서 취소된 주문
+            공식 명시: "status, orderId 파라메터를 제외하고 cancelType=CANCEL 사용"
+            nextToken 미지원, maxPerPage 도 요청보다 적게 떨어질 수 있음.
+
+        쿠팡 returnRequests 의 status 코드 (공식 API 문서 기준):
+          RU = 출고중지요청 (상품준비중 단계에서 고객이 취소요청 — 진짜 '출고전 중지요청')
+          UC = 반품접수 (상품 받은 후 반품 신청)
+          CC = 반품완료
+          PR = 쿠팡확인요청
+        공식 명시: "고객이 출고중지요청 시(상품준비중 단계에서 반품을 접수할 경우)
+                  RU(출고중지요청) 와 UC(반품접수) 상태에서 조회됩니다."
+        → RETURN 카테고리에서 4개 status 모두 호출하면 출고중지요청 포함 모든 케이스 잡힘.
+
+        2026-06-09 팀장님 피드백 보강: 결제완료 단계 취소(CANCEL 카테고리) 가 누락돼
+        있어 cancel_type="CANCEL" 별도 호출 추가. get_cancel_and_return_requests 가
+        RETURN + CANCEL 둘 다 호출 후 머지.
         """
         now = datetime.now(timezone.utc)
         since = now - timedelta(days=days)
 
-        # 쿠팡 API 변경: status 또는 orderId 중 하나 필수 — 미전달 시 400 (#228)
-        # 호출자가 status 미지정 시 4개 상태 전부 합산 조회
-        statuses = [status] if status else ["RU", "CC", "PR", "UC"]
+        path = (
+            f"/v2/providers/openapi/apis/api/v4/vendors/{self.vendor_id}/returnRequests"
+        )
         all_returns: list[dict[str, Any]] = []
+
+        # ── CANCEL 카테고리 (결제완료 단계 취소) ──────────────────────────
+        if cancel_type.upper() == "CANCEL":
+            # 공식 명세 준수: status 와 nextToken 미지원. 단발 호출.
+            params: dict[str, str] = {
+                "createdAtFrom": since.strftime("%Y-%m-%d"),
+                "createdAtTo": now.strftime("%Y-%m-%d"),
+                "maxPerPage": str(max_per_page),
+                "cancelType": "CANCEL",
+            }
+            result = await self._call_api("GET", path, params=params)
+            data = result.get("data", []) if isinstance(result, dict) else []
+            if isinstance(data, list):
+                all_returns.extend(data)
+            elif isinstance(data, dict):
+                items = data.get("returnRequests", data.get("content", []))
+                if isinstance(items, list):
+                    all_returns.extend(items)
+
+            logger.info(
+                f"[쿠팡] 취소요청(CANCEL 카테고리) 조회 완료: {len(all_returns)}건 "
+                f"(최근 {days}일)"
+            )
+            return all_returns
+
+        # ── RETURN 카테고리 (기본) ────────────────────────────────────────
+        # 쿠팡 API 변경: status 또는 orderId 중 하나 필수 — 미전달 시 400 (#228)
+        # 호출자가 status 미지정 시 4개 상태 전부 합산 조회.
+        statuses = [status] if status else ["RU", "CC", "PR", "UC"]
 
         for st in statuses:
             next_token = ""
             for _ in range(100):  # 무한루프 방지
-                params: dict[str, str] = {
+                params = {
                     "createdAtFrom": since.strftime("%Y-%m-%d"),
                     "createdAtTo": now.strftime("%Y-%m-%d"),
                     "maxPerPage": str(max_per_page),
@@ -1563,7 +1613,6 @@ class CoupangClient:
                 if next_token:
                     params["nextToken"] = next_token
 
-                path = f"/v2/providers/openapi/apis/api/v4/vendors/{self.vendor_id}/returnRequests"
                 result = await self._call_api("GET", path, params=params)
 
                 data = result.get("data", []) if isinstance(result, dict) else []
@@ -1581,7 +1630,7 @@ class CoupangClient:
                     break
 
         logger.info(
-            f"[쿠팡] 반품요청 조회 완료: {len(all_returns)}건 "
+            f"[쿠팡] 반품요청(RETURN 카테고리) 조회 완료: {len(all_returns)}건 "
             f"(최근 {days}일, status={statuses})"
         )
         return all_returns
@@ -1635,18 +1684,42 @@ class CoupangClient:
         필드로 판별. 별도 함수로 유지하는 이유는 호출 의도 명확화(취소·반품 통합 동기화
         흐름에서 사용)와 receiptType 카운트 로그 부가.
         """
-        items = await self.get_return_requests(
+        # 1) RETURN 카테고리 (default) — 상품준비중 이후 출고중지요청·반품·환불
+        return_items = await self.get_return_requests(
             days=days, status=status, max_per_page=max_per_page
         )
+
+        # 2) CANCEL 카테고리 (2026-06-09 팀장님 피드백 보강) — 결제완료 단계 취소
+        # 공식 API 명시: 결제완료 단계 취소 조회는 cancelType=CANCEL 별도 파라미터 필요.
+        # 누락 시 결제 직후 취소 케이스가 통째로 sync 못 잡고 운영자가 수동 처리.
+        cancel_items: list[dict[str, Any]] = []
+        try:
+            cancel_items = await self.get_return_requests(
+                days=days, max_per_page=max_per_page, cancel_type="CANCEL"
+            )
+        except Exception as e:
+            # CANCEL 호출 실패해도 RETURN 결과는 반환 — 부분 실패 허용
+            logger.warning(f"[쿠팡] CANCEL 카테고리 조회 실패 (RETURN 만 반환): {e}")
+
+        items = return_items + cancel_items
+
         cancel_cnt = sum(
             1 for r in items if (r.get("receiptType") or "").upper() == "CANCEL"
         )
         return_cnt = sum(
             1 for r in items if (r.get("receiptType") or "").upper() == "RETURN"
         )
+        # receiptStatus 빈도 — 운영에서 어떤 status 코드가 들어오는지 추적용
+        # (회귀: 쿠팡이 새 status 코드 도입 시 우리 4개 리스트에서 누락 감지).
+        status_freq: dict[str, int] = {}
+        for r in items:
+            _s = (r.get("receiptStatus") or "").upper() or "(none)"
+            status_freq[_s] = status_freq.get(_s, 0) + 1
         logger.info(
             f"[쿠팡] 취소·반품 통합 조회: {len(items)}건 "
-            f"(CANCEL={cancel_cnt}, RETURN={return_cnt}, 최근 {days}일)"
+            f"(RETURN={len(return_items)}+CANCEL={len(cancel_items)}, "
+            f"receiptType: CANCEL={cancel_cnt}/RETURN={return_cnt}, 최근 {days}일) "
+            f"receiptStatus={status_freq}"
         )
         return items
 
