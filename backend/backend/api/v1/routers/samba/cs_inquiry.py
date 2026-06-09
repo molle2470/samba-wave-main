@@ -2249,8 +2249,15 @@ async def _do_sync_cs_from_markets(
                         if changed:
                             session.add(existing_row)
                             # get_write_session는 auto-commit 안 함 → 명시적 commit 필수
-                            # (안 하면 product_link/매칭/reply_status 갱신이 롤백됨)
-                            await session.commit()
+                            # (안 하면 product_link/매칭/reply_status 갱신이 롤백됨).
+                            # commit 실패 시 rollback로 세션 오염 차단(후속 마켓 줄줄이 실패 방지).
+                            try:
+                                await session.commit()
+                            except Exception as _ce:
+                                await session.rollback()
+                                logger.warning(
+                                    f"[CS동기화] 플레이오토 기존문의 갱신 commit 실패(무시): {_ce}"
+                                )
                         continue
 
                     raw_date = qna.get("WriteDate") or qna.get("QDate")
