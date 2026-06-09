@@ -2154,8 +2154,8 @@ async def _do_sync_cs_from_markets(
 
                 pa_synced = 0
                 for qna in pa_qnas:
-                    # 긴급메시지/문의만 수집, 나머지(상품평 등) 제외
-                    if qna.get("QType", "") not in ("긴급메시지", "문의"):
+                    # 긴급메시지/문의/상품평 수집, 나머지 제외
+                    if qna.get("QType", "") not in ("긴급메시지", "문의", "상품평"):
                         continue
                     qna_no = str(qna.get("Number", ""))
                     if not qna_no:
@@ -3480,17 +3480,21 @@ async def delete_cs_inquiry(
     return {"ok": True}
 
 
-@router.post("/{inquiry_id}/hide")
-async def hide_cs_inquiry(
+@router.post("/{inquiry_id}/mark-replied")
+async def mark_cs_inquiry_replied(
     inquiry_id: str,
     session: AsyncSession = Depends(get_write_session_dependency),
 ):
-    """CS 문의 숨기기."""
+    """CS 문의를 답변완료 상태로 변경 (실제 답변은 외부에서 이미 처리됨, 상태값만 변경)."""
+    from datetime import UTC, datetime as _dt
+
     svc = _write_service(session)
     inquiry = await svc.get_inquiry(inquiry_id)
     if not inquiry:
         raise HTTPException(status_code=404, detail="문의를 찾을 수 없습니다")
-    await svc.repo.update_async(inquiry_id, is_hidden=True)
+    await svc.repo.update_async(
+        inquiry_id, reply_status="replied", replied_at=_dt.now(UTC)
+    )
     return {"ok": True}
 
 
