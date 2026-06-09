@@ -597,6 +597,78 @@ async def reply_cs_inquiry(
                         else:
                             market_msg = "eBay 인증정보 없음"
 
+            elif inquiry.market == "플레이오토":
+                from backend.domain.samba.account.model import SambaMarketAccount
+                from backend.domain.samba.proxy.playauto import PlayAutoClient
+
+                # 플레이오토 문의는 수집 시 account_id 미저장(account_name만) +
+                # account_name 에 " (사이트명)" 접미사가 붙어 account_label 정확매칭 실패.
+                # → 활성 playauto 계정 직접 해석: account_label 접두 매칭 우선, 없으면 첫 계정.
+                pa_result = await session.execute(
+                    select(SambaMarketAccount).where(
+                        SambaMarketAccount.market_type == "playauto",
+                        SambaMarketAccount.is_active == True,  # noqa: E712
+                    )
+                )
+                pa_accounts = pa_result.scalars().all()
+                pa_acc = None
+                _acct_name = inquiry.account_name or ""
+                for _acc in pa_accounts:
+                    _label = _acc.account_label or _acc.business_name or ""
+                    if _label and _acct_name.startswith(_label):
+                        pa_acc = _acc
+                        break
+                if pa_acc is None and pa_accounts:
+                    pa_acc = pa_accounts[0]
+
+                if pa_acc is None:
+                    market_msg = "플레이오토 계정 없음"
+                else:
+                    _pa_af = pa_acc.additional_fields or {}
+                    pa_api_key = _pa_af.get("apiKey", "") or pa_acc.api_key or ""
+                    if not pa_api_key:
+                        market_msg = "플레이오토 API 키 미설정"
+                    else:
+                        pa_client = PlayAutoClient(pa_api_key)
+                        try:
+                            pa_resp = await pa_client.answer_qna(
+                                [
+                                    {
+                                        "number": int(inquiry.market_inquiry_no),
+                                        "Asubject": "답변드립니다",
+                                        "AContent": body.reply,
+                                    }
+                                ],
+                                overwrite=True,
+                            )
+                            # 응답 형식: [{"number": N, "status": true, "msg": "성공"}]
+                            # 예외 안 나도 status==True 검사 필수 — false success 방지
+                            # (CLAUDE.md 영구금지: playauto timeout 폴백 false success 917건 사고)
+                            _row = next(
+                                (
+                                    r
+                                    for r in pa_resp
+                                    if isinstance(r, dict)
+                                    and str(r.get("number", ""))
+                                    == str(inquiry.market_inquiry_no)
+                                ),
+                                None,
+                            )
+                            if _row and _row.get("status") is True:
+                                market_sent = True
+                                market_msg = "플레이오토 CS 답변 전송 완료"
+                            else:
+                                _emsg = (
+                                    _row.get("msg", "")
+                                    if isinstance(_row, dict)
+                                    else ""
+                                )
+                                market_msg = (
+                                    f"플레이오토 답변 전송 실패: {_emsg or pa_resp}"
+                                )
+                        finally:
+                            await pa_client.close()
+
             elif inquiry.market == "롯데홈쇼핑":
                 from backend.api.v1.routers.samba.proxy._helpers import (
                     _get_lotte_client,
@@ -691,6 +763,13 @@ async def reply_cs_inquiry(
         not inquiry.market_inquiry_no and inquiry.market not in _external_id_markets
     )
     updated = await svc.reply_inquiry(inquiry_id, body.reply, mark_replied=mark_replied)
+    # 플레이오토: 마켓 전송 실패 시 reply_inquiry가 reply 존재만으로 replied 처리하는 것을
+    # 되돌려 pending 유지 (실제 미전송인데 '답변완료'로 표시되던 가짜완료 방지)
+    if inquiry.market == "플레이오토" and not market_sent:
+        from backend.domain.samba.cs_inquiry.repository import SambaCSInquiryRepository
+
+        _pa_repo = SambaCSInquiryRepository(session)
+        updated = await _pa_repo.update_async(inquiry_id, reply_status="pending")
     if answer_no and answer_no != (inquiry.market_answer_no or ""):
         from backend.domain.samba.cs_inquiry.repository import SambaCSInquiryRepository
 
