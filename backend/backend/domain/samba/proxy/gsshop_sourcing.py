@@ -978,7 +978,14 @@ class GsShopSourcingClient:
         cpn_dc_amt = self._safe_int(prc.get("cpnDcAmt", 0))  # 쿠폰할인액
 
         # 최대혜택가 = 판매가 - 쿠폰할인
-        best_benefit_price = (sale_price - cpn_dc_amt) if cpn_dc_amt > 0 else sale_price
+        # GS샵 cpnDcAmt는 대개 "정가→판매가"를 만든 기본 할인액이라 이미 gsPrc(판매가)에 반영돼 있음
+        # (검증: salePrc - cpnDcAmt == gsPrc). 그대로 빼면 이중차감 → 원가 과소계상(역마진).
+        # 정가-쿠폰==판매가면 이미 반영된 것이므로 추가 차감하지 않음. 진짜 별도쿠폰(미반영)만 차감.
+        coupon_already_in_price = (sale_prc - cpn_dc_amt) == sale_price
+        if cpn_dc_amt > 0 and not coupon_already_in_price:
+            best_benefit_price = sale_price - cpn_dc_amt
+        else:
+            best_benefit_price = sale_price
         if best_benefit_price <= 0:
             best_benefit_price = sale_price
 
