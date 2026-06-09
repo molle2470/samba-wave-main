@@ -1323,8 +1323,17 @@ async def scroll_products(
         }
         await cache.set(counts_cache_key, counts, ttl=300)
 
+    # 브랜드 영문 표기 병기용 — 국문 brand → 공식 영문(매핑 없으면 빈 문자열)
+    from backend.domain.samba.policy.brand_en import brand_en as _brand_en_fn
+
+    items = []
+    for r in rows:
+        d = dict(r)
+        d["brand_en"] = _brand_en_fn(d.get("brand"))
+        items.append(d)
+
     return {
-        "items": [dict(r) for r in rows],
+        "items": items,
         "total": total,
         "sites": sites,
         "counts": counts

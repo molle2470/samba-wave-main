@@ -2648,6 +2648,11 @@ class SambaShipmentService:
         if suffix:
             composed = f"{composed} {suffix}"
 
+        # 방어: 데이터(style_code/name)에 섞인 <p> 등 HTML 태그가 상품명에 흘러나오지
+        # 않도록 최종 단계에서 제거 + 공백 정리
+        composed = re.sub(r"<[^>]*>", "", composed)
+        composed = re.sub(r"\s{2,}", " ", composed)
+
         return composed.strip()
 
     @staticmethod

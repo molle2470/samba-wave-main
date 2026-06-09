@@ -311,6 +311,7 @@ function composeProductName(
   const tagMap: Record<string, string> = {
     '{상품명}': product.name || '',
     '{브랜드명}': product.brand || '',
+    '{브랜드명_영문}': product.brand_en || '',
     '{모델명}': product.style_code || '',
     '{사이트명}': product.source_site || '',
     '{상품번호}': product.site_product_id || '',
@@ -357,6 +358,8 @@ function composeProductName(
   // prefix/suffix 적용
   if (nameRule?.prefix) composed = `${nameRule.prefix} ${composed}`
   if (nameRule?.suffix) composed = `${composed} ${nameRule.suffix}`
+  // 방어: 데이터(style_code/name)에 섞인 <p> 등 HTML 태그 제거 + 공백 정리
+  composed = composed.replace(/<[^>]*>/g, '').replace(/\s{2,}/g, ' ')
   return composed.trim()
 }
 
@@ -1636,6 +1639,9 @@ const ProductCard = React.memo(function ProductCard({
                 <td style={tdLabel}>브랜드</td>
                 <td style={tdVal}>
                   <span style={{ color: '#888', fontSize: '0.8rem' }}>{p.brand || '-'}</span>
+                  {p.brand_en && (
+                    <span style={{ color: '#5C7CFA', fontSize: '0.72rem', marginLeft: '0.4rem' }}>{p.brand_en}</span>
+                  )}
                 </td>
               </tr>
               {/* 정상가 */}

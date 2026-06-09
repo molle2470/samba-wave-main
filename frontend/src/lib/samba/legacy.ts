@@ -692,6 +692,7 @@ export interface SambaCollectedProduct {
   name_en?: string;
   name_ja?: string;
   brand?: string;
+  brand_en?: string; // 백엔드가 brand_en.py 매핑으로 내려주는 공식 영문 표기(매핑 없으면 '')
   original_price: number;
   sale_price: number;
   cost?: number;

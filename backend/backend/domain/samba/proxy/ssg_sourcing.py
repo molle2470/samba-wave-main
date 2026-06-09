@@ -1514,8 +1514,10 @@ class SSGSourcingClient:
             )
         )
 
-        # 기본 필드
-        name = obj.get("itemNm", "").strip()
+        # 기본 필드 — itemNm 에 <p> 등 HTML 태그가 섞여 들어오는 경우가 있어 제거
+        # (예: 푸마 "092304< p> 레이스..." → 태그 제거 후 공백 정리)
+        name = re.sub(r"<[^>]*>", "", obj.get("itemNm", ""))
+        name = re.sub(r"\s{2,}", " ", name).strip()
         brand = obj.get("repBrandNm") or obj.get("brandNm", "")
         brand_code = str(obj.get("repBrandId") or obj.get("brandId", ""))
 
@@ -1539,7 +1541,9 @@ class SSGSourcingClient:
         if _sc_match:
             _style_code = _sc_match.group(0)
         else:
-            _mdl_match = re.search(r"모델번호\s*[:：]\s*(\S+)", html)
+            # \S+ 는 뒤따르는 </p> HTML 태그까지 통째로 잡아 'DMSP75053</p>' 처럼
+            # 오염되므로, 품번에 쓰이는 문자([영숫자/-_.])로만 캡처를 제한한다.
+            _mdl_match = re.search(r"모델번호\s*[:：]\s*([A-Za-z0-9\-_./]+)", html)
             _style_code = _mdl_match.group(1).strip() if _mdl_match else ""
 
         # 고시정보 파싱 (색상, 제조국, 재질 등)
