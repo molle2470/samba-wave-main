@@ -436,14 +436,14 @@ export default function CSPage() {
     }
   }
 
-  // 숨기기
-  const handleHide = async (id: string) => {
-    if (!await showConfirm('이 문의를 숨기시겠습니까?')) return
+  // 답변완료로 변경 (이미 답변된 건 — 상태값만 변경해 미답변 필터에서 제외)
+  const handleMarkReplied = async (id: string) => {
+    if (!await showConfirm('이 문의를 답변완료 상태로 변경하시겠습니까?')) return
     try {
-      await csInquiryApi.hide(id)
+      await csInquiryApi.markReplied(id)
       load()
     } catch (e) {
-      showAlert(e instanceof Error ? e.message : '숨기기 실패', 'error')
+      showAlert(e instanceof Error ? e.message : '답변완료 변경 실패', 'error')
     }
   }
 
@@ -885,10 +885,10 @@ export default function CSPage() {
                             삭제
                           </button>
                           <button
-                            onClick={() => handleHide(item.id)}
-                            style={{ padding: '0.25rem 0.5rem', background: 'rgba(136,136,136,0.1)', border: '1px solid rgba(136,136,136,0.2)', borderRadius: '4px', color: '#888', fontSize: '0.6875rem', cursor: 'pointer' }}
+                            onClick={() => handleMarkReplied(item.id)}
+                            style={{ padding: '0.25rem 0.5rem', background: 'rgba(81,207,102,0.1)', border: '1px solid rgba(81,207,102,0.2)', borderRadius: '4px', color: '#51CF66', fontSize: '0.6875rem', cursor: 'pointer', whiteSpace: 'nowrap' }}
                           >
-                            숨기기
+                            답변완료
                           </button>
                         </div>
                       </td>

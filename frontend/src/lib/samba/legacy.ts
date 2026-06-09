@@ -2029,8 +2029,8 @@ export const csInquiryApi = {
     request<SambaCSInquiry>(`${SAMBA_PREFIX}/cs-inquiries/${id}/reply`, { method: 'POST', body: JSON.stringify({ reply }) }),
   delete: (id: string) =>
     request<{ ok: boolean }>(`${SAMBA_PREFIX}/cs-inquiries/${id}`, { method: 'DELETE' }),
-  hide: (id: string) =>
-    request<{ ok: boolean }>(`${SAMBA_PREFIX}/cs-inquiries/${id}/hide`, { method: 'POST' }),
+  markReplied: (id: string) =>
+    request<{ ok: boolean }>(`${SAMBA_PREFIX}/cs-inquiries/${id}/mark-replied`, { method: 'POST' }),
   batchDelete: (ids: string[]) =>
     request<{ deleted: number }>(`${SAMBA_PREFIX}/cs-inquiries/batch-delete`, { method: 'POST', body: JSON.stringify({ ids }) }),
   getStats: () => request<Record<string, unknown>>(`${SAMBA_PREFIX}/cs-inquiries/stats`),
