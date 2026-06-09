@@ -1721,23 +1721,10 @@ async def _build_independent(
                 }
             )
             continue
-        # 직접입력 fallback — recommendedOptValueNo=0 + koreanText 자유 텍스트.
-        # ESM 카테고리 권한에 따라 거부 가능 — 운영자 검증 후 활성화 권장.
+        # 매칭 실패 — recommendedOptValueNo=0(직접입력)을 보내면 옥션/지마켓이 이를
+        # "대표단품" 옵션값으로 노출시킨다. 0번을 보내지 말고 해당 값만 스킵.
         logger.warning(
-            f"[ESM] 옵션값 매칭 실패 → 직접입력 fallback: cat={cat_code} group={rec_opt_no} text='{v['text']}'"
-        )
-        details.append(
-            {
-                "recommendedOptValueNo": 0,
-                "recommendedOptValue": {"koreanText": v["text"][:50]},
-                "addAmnt": v["add_amnt"],
-                "qty": {site_key: 0 if v["sold_out"] else qty},
-                "isSoldOut": v["sold_out"],
-                "isDisplay": True,
-                "manageCode": _clamp_manage_code(
-                    f"OPT-FREE-{v['text'][:10]}", f"OPTF{i}"
-                ),
-            }
+            f"[ESM] 옵션값 매칭 실패 → 스킵(대표단품 방지): cat={cat_code} group={rec_opt_no} text='{v['text']}'"
         )
     # recommendedOptValueNo 중복 제거 — 같은 optValueNo가 여러 번 등록되면 ESM 1000 에러
     seen_val_nos: set[str] = set()
@@ -1840,6 +1827,7 @@ async def _build_combination(
         }
         manage_parts: list[str] = []
         any_sold_out = False
+        skip_combo = False
         first_axis_idx = combo[0]
         first_qty = axes[0][1][first_axis_idx]["qty"] or stock_per_value
         sum_add_amnt = 0
@@ -1851,25 +1839,29 @@ async def _build_combination(
                 entry[f"recommendedOptValueNo{axis_idx + 1}"] = rec_val_no
                 manage_parts.append(str(rec_val_no))
             else:
-                # 직접입력 fallback — ESM 카테고리 권한에 따라 거부 가능
-                entry[f"recommendedOptValueNo{axis_idx + 1}"] = 0
-                entry[f"recommendedOptValue{axis_idx + 1}"] = {
-                    "koreanText": v["text"][:50]
-                }
+                # 매칭 실패 — 0번(직접입력)은 "대표단품"으로 노출되므로 이 조합을 스킵.
                 logger.warning(
-                    f"[ESM] 조합형 옵션값 매칭 실패 → 직접입력 fallback: "
+                    f"[ESM] 조합형 옵션값 매칭 실패 → 조합 스킵(대표단품 방지): "
                     f"cat={cat_code} axis={axis_idx + 1} text='{v['text']}'"
                 )
-                manage_parts.append(f"FREE-{v['text'][:10]}")
+                skip_combo = True
+                break
             if v["sold_out"]:
                 any_sold_out = True
             sum_add_amnt += v["add_amnt"]
+        if skip_combo:
+            continue
         # 조합별 재고 맵이 있으면 per-combination 재고 사용, 없으면 첫 축 재고로 fallback
         _combo_key = "/".join(axes[ai][1][combo[ai]]["text"] for ai in range(len(axes)))
         _combo_info = _combo_stock_map.get(_combo_key)
         if _combo_info is not None:
             _final_qty = int(_combo_info.get("stock") or 0) or stock_per_value
             _final_sold_out = bool(_combo_info.get("isSoldOut"))
+        elif _combo_stock_map:
+            # 소싱처 조합목록(_combo_stock_map)이 있는데 이 조합이 없음 = cartesian 가짜 조합
+            # (예: 소싱엔 카멜/M·L·XL만 있는데 전조합이 카멜/2XL·3XL 생성) → 소싱에 없으므로
+            # 등록하지 않는다(소싱 불일치·오버셀 방지).
+            continue
         else:
             _final_qty = first_qty
             _final_sold_out = any_sold_out
