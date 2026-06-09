@@ -306,6 +306,58 @@ async def send_all_drafts(
     }
 
 
+@router.post("/send-reviews", dependencies=[Depends(_require_internal_token)])
+async def send_reviews(
+    session: AsyncSession = Depends(get_write_session_dependency),
+) -> Dict[str, Any]:
+    """미답변 상품평 전체 즉시 전송 — 별점 기준 표준 답변 적용.
+
+    별점 60 이상: 감사 답변 / 미만: 사과 답변.
+    """
+    import re
+
+    from backend.api.v1.routers.samba.cs_inquiry import reply_cs_inquiry
+    from backend.dtos.samba.cs_inquiry import CSInquiryReply
+
+    rows = (
+        await session.execute(
+            sa_text(
+                "SELECT id, content FROM samba_cs_inquiry "
+                "WHERE inquiry_type = '상품평' AND reply_status = 'pending' "
+                "AND is_hidden = false ORDER BY inquiry_date ASC"
+            )
+        )
+    ).all()
+
+    ok_ids: List[str] = []
+    fail_ids: List[str] = []
+
+    for iid, content in rows:
+        score = 100
+        m = re.search(r"구매여부\s*:\s*(\d+)", content or "")
+        if m:
+            score = int(m.group(1))
+
+        if score >= 60:
+            reply_text = "안녕하세요. 좋은 리뷰 남겨주셔서 감사드립니다. 앞으로도 더 좋은 상품과 서비스로 보답하겠습니다."
+        else:
+            reply_text = "안녕하세요. 불편을 드려 진심으로 죄송합니다. 더 나은 서비스를 제공할 수 있도록 최선을 다하겠습니다."
+
+        try:
+            await reply_cs_inquiry(iid, CSInquiryReply(reply=reply_text), session)
+            ok_ids.append(iid)
+            logger.info(f"[CS상품평전송] OK {iid} score={score}")
+        except Exception as e:
+            fail_ids.append(iid)
+            logger.error(f"[CS상품평전송] FAIL {iid}: {e}")
+
+    return {
+        "ok": len(ok_ids),
+        "fail": len(fail_ids),
+        "fail_ids": fail_ids,
+    }
+
+
 @router.post("/trigger-sync-playauto", dependencies=[Depends(_require_internal_token)])
 async def trigger_sync_playauto(
     session: AsyncSession = Depends(get_write_session_dependency),
