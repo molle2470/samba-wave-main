@@ -46,7 +46,7 @@ class TestLotteFormatRegistered:
     def test_lotte_branch_present(self) -> None:
         body = _excel_export_body()
         # format 분기 진입 조건
-        assert 'fmt == "lotte"' in body or 'fmt == \'lotte\'' in body, (
+        assert 'fmt == "lotte"' in body or "fmt == 'lotte'" in body, (
             "export_orders_excel 함수에 'lotte' 분기 누락"
         )
 
@@ -79,7 +79,7 @@ class TestLotteHeaders:
         l_start = body.find('fmt == "lotte"')
         l_end = body.find("# ── 기본:", l_start)
         if l_end == -1:
-            l_end = body.find("ws.title = \"orders\"", l_start)
+            l_end = body.find('ws.title = "orders"', l_start)
         lotte_body = body[l_start:l_end]
 
         # 헤더 리터럴 위치 추출
@@ -102,7 +102,7 @@ class TestLotteFieldMapping:
         l_start = body.find('fmt == "lotte"')
         l_end = body.find("# ── 기본:", l_start)
         if l_end == -1:
-            l_end = body.find("ws.title = \"orders\"", l_start)
+            l_end = body.find('ws.title = "orders"', l_start)
         self.lotte_body = body[l_start:l_end]
 
     def test_customer_name(self) -> None:
