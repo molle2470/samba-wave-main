@@ -2236,6 +2236,16 @@ async def _do_sync_cs_from_markets(
                                 if not existing_row.product_name:
                                     existing_row.product_name = m.get("name") or ""
                                 changed = True
+                        # PlayAuto 현재 답변상태로 reply_status 재동기화 (PlayAuto = 권위 소스).
+                        # 스레드 재오픈(신규)·답변 미반영 건이 답변완료로 고착돼 미답변
+                        # 목록에서 빠지던 문제 방지. reply 본문은 보존(이전 답변 참고용).
+                        if is_answered and existing_row.reply_status != "replied":
+                            existing_row.reply_status = "replied"
+                            changed = True
+                        elif not is_answered and existing_row.reply_status == "replied":
+                            existing_row.reply_status = "pending"
+                            existing_row.replied_at = None
+                            changed = True
                         if changed:
                             session.add(existing_row)
                         continue
