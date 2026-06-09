@@ -22,7 +22,10 @@ router = APIRouter(prefix="/users", tags=["samba-users"])
 
 # ── DTO ──
 
-INVITE_CODE = os.environ.get("SAMBA_INVITE_CODE", "samba_wave")
+# 초대 코드는 환경변수에서만 읽는다(소스에 기본값 박지 않음 — 포크 시 노출 방지).
+# 미설정(빈 값)이면 회원가입 자체를 차단한다. 각 운영 주체가 자기 서버 env에
+# SAMBA_INVITE_CODE 를 직접 설정해야 가입이 열린다.
+INVITE_CODE = os.environ.get("SAMBA_INVITE_CODE", "")
 
 
 class UserCreateDto(BaseModel):
@@ -95,8 +98,8 @@ async def create_user(
     session: AsyncSession = Depends(get_write_session_dependency),
 ):
     """새 사용자 계정 생성 — 초대코드 검증 + 테넌트 자동 생성."""
-    # 초대 코드 검증 (프로덕션 보호는 초대 코드로 대체)
-    if body.invite_code != INVITE_CODE:
+    # 초대 코드 검증 — env 미설정(빈 값)이면 가입 전면 차단(소스 기본값 노출 사고 방지).
+    if not INVITE_CODE or body.invite_code != INVITE_CODE:
         raise HTTPException(status_code=403, detail="초대 코드가 올바르지 않습니다")
 
     repo = SambaUserRepository(session)
