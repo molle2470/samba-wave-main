@@ -246,14 +246,21 @@ class AuctionPlugin(MarketPlugin):
                     f"[옥션] 브랜드 코드 매핑: '{_brand}' → brandNo={_brand_no}"
                 )
 
-        # 등록/수정 분기
+        # 등록/수정 모두 옵션 필요 — 수정 시 미동봉하면 PUT 전체교체로 옵션 소멸 (#394)
+        samba_options = _to_grouped_options(
+            product.get("options") or [],
+            product.get("option_group_names") or [],
+        )
         if existing_no:
-            return await self._update_product(client, existing_no, data, pending_images)
-        else:
-            samba_options = _to_grouped_options(
-                product.get("options") or [],
-                product.get("option_group_names") or [],
+            return await self._update_product(
+                client,
+                existing_no,
+                data,
+                pending_images,
+                samba_options=samba_options,
+                cat_code=category_id,
             )
+        else:
             return await self._register_product(
                 client,
                 data,
@@ -370,6 +377,8 @@ class AuctionPlugin(MarketPlugin):
         goods_no: str,
         data: dict[str, Any],
         pending_images: dict | None,
+        samba_options: list[dict] | None = None,
+        cat_code: str = "",
     ) -> dict[str, Any]:
         """기존 상품 수정."""
         from backend.domain.samba.proxy.esmplus import resolve_esm_master_goods_no
@@ -380,6 +389,42 @@ class AuctionPlugin(MarketPlugin):
         # PUT 엔드포인트는 isSell을 루트 레벨에 요구함 (POST는 itemAddtionalInfo 안)
         _is_sell = data.get("itemAddtionalInfo", {}).get("isSell", {"Iac": 1})
         update_data = {**data, "isSell": _is_sell}
+
+        # 옵션 인라인 동봉 — 미동봉 시 PUT 전체교체로 기존 옵션 소멸 (#394)
+        opt_msg = ""
+        if samba_options and cat_code:
+            try:
+                from backend.domain.samba.proxy.esmplus import register_esm_options
+
+                _bo = await register_esm_options(
+                    client,
+                    "",
+                    cat_code,
+                    samba_options,
+                    site="auction",
+                    build_only=True,
+                )
+                if _bo.get("success") and _bo.get("payload"):
+                    update_data.setdefault("itemAddtionalInfo", {})[
+                        "recommendedOpts"
+                    ] = _bo["payload"]
+                    opt_msg = (
+                        f" [옵션 {_bo.get('matched')}/{_bo.get('requested')}개 인라인]"
+                    )
+                elif _bo.get("multi_variant"):
+                    logger.warning(
+                        f"[옥션] 옵션 매핑 실패(멀티변형) → 수정 차단: {_bo.get('message')}"
+                    )
+                    return {
+                        "success": False,
+                        "message": f"옵션 매핑 실패로 수정 차단(멀티변형): {str(_bo.get('message', ''))[:80]}",
+                    }
+                else:
+                    opt_msg = f" [옵션 매핑실패·단일변형 옵션없이 수정: {str(_bo.get('message', ''))[:60]}]"
+            except Exception as opt_e:
+                logger.warning(f"[옥션] 옵션 인라인 빌드 오류(수정): {opt_e}")
+                opt_msg = f" [옵션 빌드 오류: {str(opt_e)[:60]}]"
+
         try:
             await client.update_product(master_no, update_data)
         except RuntimeError as e:
@@ -404,7 +449,7 @@ class AuctionPlugin(MarketPlugin):
 
         return {
             "success": True,
-            "message": "옥션 수정 성공",
+            "message": f"옥션 수정 성공{opt_msg}",
             "data": {"sellerProductId": goods_no, "goodsNo": master_no},
         }
 
