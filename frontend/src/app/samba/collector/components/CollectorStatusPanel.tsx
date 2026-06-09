@@ -114,18 +114,20 @@ export default function CollectorStatusPanel(props: Props) {
     // write/read pool_max 분리 — 같은 값으로 표시하면 read(실제 30) 오인 유발
     const wPoolMax = poolInfo?.write_pool_max ?? poolInfo?.write?.pool_max ?? poolInfo?.pool_max ?? 60
     const rPoolMax = poolInfo?.read_pool_max ?? poolInfo?.read?.pool_max ?? 30
-    const wPg = poolInfo?.write?.pg
-    const rPg = poolInfo?.read?.pg
-    const wTotal = wPg?.total ?? 0
-    const rTotal = rPg?.total ?? 0
+    // pg_stat_activity는 DB 서버 전역 통계 — write/read로 나뉘지 않는다.
+    // 백엔드가 단일 스냅샷(poolInfo.db)을 주므로 전역 1개 값으로 표시(과거엔 두 번 따로 세서 어긋났음).
+    const dbPg = poolInfo?.db ?? poolInfo?.write?.pg ?? poolInfo?.read?.pg
+    const gActive = dbPg?.active ?? 0
+    const gIit = dbPg?.idle_in_transaction ?? 0
+    const gIdle = dbPg?.idle ?? 0
+    const gTotal = dbPg?.total ?? 0
     // 백엔드 SQLAlchemy 풀 실제 점유 (이게 진짜 풀 사용량 — DB 전체 세션과 비교 금지)
     const wCheckedOut = poolInfo?.write?.checkedout ?? 0
     const rCheckedOut = poolInfo?.read?.checkedout ?? 0
     // IIT 임계 — 단순 카운트는 BEGIN 직후 정상 트랜잭션도 잡혀 false positive.
-    // age >= 30s 좀비(iit_zombie) 기반으로 빨강/노랑 판단.
-    const wZombie = wPg?.iit_zombie ?? 0
-    const rZombie = rPg?.iit_zombie ?? 0
-    const maxZombie = Math.max(wZombie, rZombie)
+    // age >= 30s 좀비(iit_zombie) 기반으로 빨강/노랑 판단. 전역 단일값.
+    const gZombie = dbPg?.iit_zombie ?? 0
+    const maxZombie = gZombie
     // 빨강 기준: 실제 백엔드 풀 점유율 또는 좀비 (DB 전체 세션 totals 는 다른 컨테이너/cron 포함이라 무관)
     const wPoolRatio = wPoolMax > 0 ? wCheckedOut / wPoolMax : 0
     const rPoolRatio = rPoolMax > 0 ? rCheckedOut / rPoolMax : 0
@@ -184,7 +186,7 @@ export default function CollectorStatusPanel(props: Props) {
         </div>
 
         {/* DB 커넥션 풀 테이블 */}
-        {poolInfo && wPg && rPg && (
+        {poolInfo && dbPg && (
           <div style={{
             borderRadius: '8px', overflow: 'hidden',
             border: `1px solid ${poolStatusColor === '#FF6B6B' ? 'rgba(255,107,107,0.4)' : poolStatusColor === '#FAB005' ? 'rgba(250,176,5,0.3)' : 'rgba(81,207,102,0.2)'}`,
@@ -214,22 +216,27 @@ export default function CollectorStatusPanel(props: Props) {
                     {fmtNum(rCheckedOut)} / {fmtNum(rPoolMax)} ({Math.round(rPoolRatio * 100)}%)
                   </td>
                 </tr>
+                {/* 아래 4줄은 DB 서버 전역 통계 — write/read로 나뉘지 않으므로 단일 값(2칸 병합) 표시 */}
+                <tr>
+                  <td colSpan={3} style={{ padding: '4px 14px', color: '#6A7388', fontSize: '0.68rem', background: 'rgba(255,255,255,0.015)' }}>
+                    ─ DB 서버 전역 (write/read 공통 · 풀과 무관)
+                  </td>
+                </tr>
                 {([
-                  { label: 'active', wVal: wPg.active ?? 0, rVal: rPg.active ?? 0, type: 'normal' as const },
-                  { label: 'idle in transaction', wVal: wPg.idle_in_transaction ?? 0, rVal: rPg.idle_in_transaction ?? 0, type: 'iit' as const },
-                  { label: 'idle', wVal: wPg.idle ?? 0, rVal: rPg.idle ?? 0, type: 'normal' as const },
+                  { label: 'active', val: gActive, type: 'normal' as const },
+                  { label: 'idle in transaction', val: gIit, type: 'iit' as const },
+                  { label: 'idle', val: gIdle, type: 'normal' as const },
                 ]).map((row) => (
                   <tr key={row.label} style={{ borderBottom: '1px solid rgba(28,30,42,0.8)' }}>
                     <td style={{ padding: '5px 14px', color: '#8A95B0' }}>
                       {row.label}
                       {row.type === 'iit' && (
                         <span style={{ marginLeft: 8, fontSize: '0.7rem', color: '#6A7388' }}>
-                          (좀비 ≥30s: W {fmtNum(wZombie)} / R {fmtNum(rZombie)})
+                          (좀비 ≥30s: {fmtNum(gZombie)})
                         </span>
                       )}
                     </td>
-                    <td style={{ padding: '5px 14px', textAlign: 'center', color: row.type === 'iit' ? iitCellColor(wZombie) : '#C4CAD8', fontVariantNumeric: 'tabular-nums' }}>{fmtNum(row.wVal)}개</td>
-                    <td style={{ padding: '5px 14px', textAlign: 'center', color: row.type === 'iit' ? iitCellColor(rZombie) : '#C4CAD8', fontVariantNumeric: 'tabular-nums' }}>{fmtNum(row.rVal)}개</td>
+                    <td colSpan={2} style={{ padding: '5px 14px', textAlign: 'center', color: row.type === 'iit' ? iitCellColor(gZombie) : '#C4CAD8', fontVariantNumeric: 'tabular-nums' }}>{fmtNum(row.val)}개</td>
                   </tr>
                 ))}
                 <tr style={{ borderTop: '1px solid #2D3040', background: 'rgba(255,255,255,0.02)' }}>
@@ -239,8 +246,7 @@ export default function CollectorStatusPanel(props: Props) {
                       (백엔드 + cron + admin + 다른 컨테이너 합산 — 풀 최대와 비교 X)
                     </span>
                   </td>
-                  <td style={{ padding: '6px 14px', textAlign: 'center', color: '#8A95B0', fontVariantNumeric: 'tabular-nums' }}>{fmtNum(wTotal)}개</td>
-                  <td style={{ padding: '6px 14px', textAlign: 'center', color: '#8A95B0', fontVariantNumeric: 'tabular-nums' }}>{fmtNum(rTotal)}개</td>
+                  <td colSpan={2} style={{ padding: '6px 14px', textAlign: 'center', color: '#8A95B0', fontVariantNumeric: 'tabular-nums' }}>{fmtNum(gTotal)}개</td>
                 </tr>
               </tbody>
             </table>

@@ -11,6 +11,7 @@ type PoolStat = { size: number; checkedout: number; overflow: number; checkedin:
 export type PoolInfo = {
   write: PoolStat | null
   read: PoolStat | null
+  db?: PgStat | null
   pool_max?: number
   write_pool_max?: number
   read_pool_max?: number

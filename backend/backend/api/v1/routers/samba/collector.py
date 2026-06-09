@@ -217,7 +217,6 @@ async def pool_status(
     read_session: AsyncSession = Depends(get_read_session_dependency),
 ):
     """Write/Read 커넥션 풀 현황 + pg_stat_activity 반환 — 수집 페이지 모니터링용."""
-    import asyncio
 
     from sqlalchemy import text
 
@@ -267,13 +266,15 @@ async def pool_status(
     try:
         write_pool = _pool_stats(get_write_engine())
         read_pool = _pool_stats(get_read_engine())
-        write_pg, read_pg = await asyncio.gather(
-            _pg_stats(write_session),
-            _pg_stats(read_session),
-        )
+        # pg_stat_activity는 DB 서버 전역 통계 — write/read로 나눠 두 번 조회하면
+        # 같은 값을 서로 다른 시점에 따로 세서 73 vs 59처럼 어긋나 보인다(착시).
+        # 단일 스냅샷 1번만 떠서 write/read에 동일 객체를 넣는다.
+        db_pg = await _pg_stats(write_session)
         return {
-            "write": {**write_pool, "pg": write_pg},
-            "read": {**read_pool, "pg": read_pg},
+            "write": {**write_pool, "pg": db_pg},
+            "read": {**read_pool, "pg": db_pg},
+            # 전역 세션 통계 — write/read 무관, UI는 이 값을 단일 표시
+            "db": db_pg,
             # 하위 호환 유지 — 신규 UI는 write/read 각각의 pool_max 사용
             "pool_max": write_pool["pool_max"],
             "write_pool_max": write_pool["pool_max"],
