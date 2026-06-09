@@ -2154,8 +2154,14 @@ async def _do_sync_cs_from_markets(
 
                 pa_synced = 0
                 for qna in pa_qnas:
-                    # 긴급메시지/문의/상품평 수집, 나머지 제외
-                    if qna.get("QType", "") not in ("긴급메시지", "문의", "상품평"):
+                    # 긴급메세지/문의/상품평 수집, 나머지 제외
+                    # 주의: PlayAuto 실제 QType은 "긴급메세지"(메세지) — 철자 둘 다 허용
+                    if qna.get("QType", "") not in (
+                        "긴급메세지",
+                        "긴급메시지",
+                        "문의",
+                        "상품평",
+                    ):
                         continue
                     qna_no = str(qna.get("Number", ""))
                     if not qna_no:
