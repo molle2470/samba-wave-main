@@ -20,6 +20,7 @@ class SambaCSInquiryRepository(BaseRepository[SambaCSInquiry]):
         limit: int = 30,
         market: Optional[str] = None,
         inquiry_type: Optional[str] = None,
+        exclude_inquiry_type: Optional[str] = None,
         reply_status: Optional[str] = None,
         search: Optional[str] = None,
         sort_field: str = "inquiry_date",
@@ -34,6 +35,9 @@ class SambaCSInquiryRepository(BaseRepository[SambaCSInquiry]):
             stmt = stmt.where(SambaCSInquiry.market == market)
         if inquiry_type:
             stmt = stmt.where(SambaCSInquiry.inquiry_type == inquiry_type)
+        if exclude_inquiry_type:
+            # inquiry_type 컬럼은 nullable=False → != 로 안전하게 제외
+            stmt = stmt.where(SambaCSInquiry.inquiry_type != exclude_inquiry_type)
         if reply_status:
             stmt = stmt.where(SambaCSInquiry.reply_status == reply_status)
         if search:
@@ -62,6 +66,7 @@ class SambaCSInquiryRepository(BaseRepository[SambaCSInquiry]):
         self,
         market: Optional[str] = None,
         inquiry_type: Optional[str] = None,
+        exclude_inquiry_type: Optional[str] = None,
         reply_status: Optional[str] = None,
         search: Optional[str] = None,
         start_dt: Optional[datetime] = None,
@@ -79,6 +84,9 @@ class SambaCSInquiryRepository(BaseRepository[SambaCSInquiry]):
             stmt = stmt.where(SambaCSInquiry.market == market)
         if inquiry_type:
             stmt = stmt.where(SambaCSInquiry.inquiry_type == inquiry_type)
+        if exclude_inquiry_type:
+            # inquiry_type 컬럼은 nullable=False → != 로 안전하게 제외
+            stmt = stmt.where(SambaCSInquiry.inquiry_type != exclude_inquiry_type)
         if reply_status:
             stmt = stmt.where(SambaCSInquiry.reply_status == reply_status)
         if search:

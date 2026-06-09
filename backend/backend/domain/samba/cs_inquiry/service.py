@@ -66,6 +66,7 @@ class SambaCSInquiryService:
         limit: int = 30,
         market: Optional[str] = None,
         inquiry_type: Optional[str] = None,
+        exclude_inquiry_type: Optional[str] = None,
         reply_status: Optional[str] = None,
         search: Optional[str] = None,
         sort_field: str = "inquiry_date",
@@ -86,6 +87,7 @@ class SambaCSInquiryService:
             limit=limit,
             market=market,
             inquiry_type=inquiry_type,
+            exclude_inquiry_type=exclude_inquiry_type,
             reply_status=reply_status,
             search=search,
             sort_field=sort_field,
@@ -96,6 +98,7 @@ class SambaCSInquiryService:
         total = await self.repo.count_filtered(
             market=market,
             inquiry_type=inquiry_type,
+            exclude_inquiry_type=exclude_inquiry_type,
             reply_status=reply_status,
             search=search,
             start_dt=start_dt,

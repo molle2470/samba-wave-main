@@ -57,6 +57,8 @@ export default function CSPage() {
   // 필터
   const [filterMarket, setFilterMarket] = useState('')
   const [filterType] = useState('')
+  // 상품평 필터: '' = 전체보기 / 'only' = 상품평 / 'exclude' = 상품평제외
+  const [filterReview, setFilterReview] = useState('')
   const [filterStatus, setFilterStatus] = useState('pending')
   const [search, setSearch] = useState('')
   const [searchInput, setSearchInput] = useState('')
@@ -258,7 +260,8 @@ export default function CSPage() {
             if (filterMarket.startsWith('acc:')) return accounts.find(a => a.id === filterMarket.slice(4))?.market_name
             return filterMarket
           })(),
-          inquiry_type: filterType || undefined,
+          inquiry_type: filterReview === 'only' ? '상품평' : filterType || undefined,
+          exclude_inquiry_type: filterReview === 'exclude' ? '상품평' : undefined,
           reply_status: filterStatus || undefined,
           search: search || undefined,
           sort_desc: sortDesc,
@@ -278,7 +281,7 @@ export default function CSPage() {
       // 에러 무시
     }
     setLoading(false)
-  }, [filterMarket, filterType, filterStatus, search, sortDesc, pageSize, page, csCustomStart, csCustomEnd, accounts])
+  }, [filterMarket, filterType, filterReview, filterStatus, search, sortDesc, pageSize, page, csCustomStart, csCustomEnd, accounts])
 
   useEffect(() => { load() }, [load])
   useEffect(() => { accountApi.listActiveCached(setAccounts) }, [])
@@ -552,6 +555,11 @@ export default function CSPage() {
             <option value="">답변상태</option>
             <option value="pending">미답변</option>
             <option value="replied">답변완료</option>
+          </select>
+          <select style={{ ...inputStyle, width: '105px', fontSize: '0.75rem', height: '28px', padding: '0 0.3rem' }} value={filterReview} onChange={e => { setFilterReview(e.target.value); setPage(0) }}>
+            <option value="">전체보기</option>
+            <option value="only">상품평</option>
+            <option value="exclude">상품평제외</option>
           </select>
           <span style={{ width: '1px', background: '#333', height: '18px', margin: '0 2px' }} />
           <select style={{ ...inputStyle, width: '75px', fontSize: '0.75rem', height: '28px', padding: '0 0.3rem' }} onChange={() => setSortDesc(!sortDesc)}>

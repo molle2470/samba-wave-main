@@ -2003,6 +2003,7 @@ export const csInquiryApi = {
     limit?: number
     market?: string
     inquiry_type?: string
+    exclude_inquiry_type?: string
     reply_status?: string
     search?: string
     sort_field?: string
@@ -2015,6 +2016,7 @@ export const csInquiryApi = {
     if (params?.limit) p.set('limit', String(params.limit))
     if (params?.market) p.set('market', params.market)
     if (params?.inquiry_type) p.set('inquiry_type', params.inquiry_type)
+    if (params?.exclude_inquiry_type) p.set('exclude_inquiry_type', params.exclude_inquiry_type)
     if (params?.reply_status) p.set('reply_status', params.reply_status)
     if (params?.search) p.set('search', params.search)
     if (params?.sort_field) p.set('sort_field', params.sort_field)
