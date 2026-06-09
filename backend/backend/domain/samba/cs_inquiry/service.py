@@ -117,22 +117,27 @@ class SambaCSInquiryService:
         self, inquiry_id: str, reply_content: str, mark_replied: bool = True
     ) -> Optional[SambaCSInquiry]:
         """문의에 답변 등록.
-        mark_replied=False: 답변 내용만 저장, reply_status는 pending 유지 (마켓 전송 실패 시)
+        작성된 답변(reply)이 있으면 전송 여부와 무관하게 답변완료(replied) 처리.
+        마켓 전송 성공 여부는 external_sent로 별도 추적.
+        (reply 채워졌는데 마켓별 status 갱신 누락으로 미답변으로 잡히던 오류 fix.
+         mark_replied 파라미터는 호출 호환 위해 유지하나 동작은 reply 존재 기반)
         """
         inquiry = await self.repo.get_async(inquiry_id)
         if not inquiry:
             return None
 
         update_fields: dict = {"reply": reply_content}
-        if mark_replied:
+        # 작성된 답변이 있으면 답변완료 (빈 답변만 pending 유지)
+        has_reply = bool(reply_content and reply_content.strip())
+        if has_reply:
             update_fields["reply_status"] = "replied"
             update_fields["replied_at"] = datetime.now(UTC)
 
         updated = await self.repo.update_async(inquiry_id, **update_fields)
-        if mark_replied:
+        if has_reply:
             logger.info(f"CS 문의 {inquiry_id} 답변 완료")
         else:
-            logger.info(f"CS 문의 {inquiry_id} 답변 저장 (마켓 미전송 — pending 유지)")
+            logger.info(f"CS 문의 {inquiry_id} 답변 저장 (빈 답변 — pending)")
         return updated or inquiry
 
     # ==================== 삭제 ====================

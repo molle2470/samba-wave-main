@@ -13,6 +13,25 @@ from backend.dtos.samba.cs_inquiry import (
     CSInquiryReply,
 )
 
+from datetime import datetime as _dt_type
+from zoneinfo import ZoneInfo
+
+_KST = ZoneInfo("Asia/Seoul")
+
+
+def _ensure_kst(dt: Optional[_dt_type]) -> Optional[_dt_type]:
+    """마켓 원본 날짜(KST 기준 naive) → KST aware datetime.
+
+    마켓 API 원본 시각은 KST naive 문자열(예: yyyyMMddHHmmss)이라
+    타임존 없이 저장하면 DB(timestamptz)가 UTC로 오인해 +9h 미래가 됨.
+    KST tzinfo를 부여해 삼바 표준(UTC aware 저장 + KST 표시)에 맞춤.
+    이미 aware면 그대로 둔다.
+    """
+    if dt is not None and dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_KST)
+    return dt
+
+
 router = APIRouter(prefix="/cs-inquiries", tags=["samba-cs-inquiries"])
 
 
@@ -874,12 +893,12 @@ async def _sync_lotteon_qna(
             try:
                 from datetime import datetime as _dt
 
-                parsed_date = _dt.strptime(raw_date[:14], "%Y%m%d%H%M%S")
+                parsed_date = _ensure_kst(_dt.strptime(raw_date[:14], "%Y%m%d%H%M%S"))
             except Exception:
                 try:
                     from dateutil.parser import parse as parse_dt
 
-                    parsed_date = parse_dt(raw_date)
+                    parsed_date = _ensure_kst(parse_dt(raw_date))
                 except Exception:
                     parsed_date = None
 
@@ -1010,7 +1029,7 @@ async def _sync_lotteon_contact(
             try:
                 from datetime import datetime as _dt
 
-                parsed_date = _dt.strptime(raw_date[:14], "%Y%m%d%H%M%S")
+                parsed_date = _ensure_kst(_dt.strptime(raw_date[:14], "%Y%m%d%H%M%S"))
             except Exception:
                 pass
 
@@ -1119,7 +1138,7 @@ async def _sync_lotteon_compensate(
             try:
                 from datetime import datetime as _dt
 
-                parsed_date = _dt.strptime(raw_date[:14], "%Y%m%d%H%M%S")
+                parsed_date = _ensure_kst(_dt.strptime(raw_date[:14], "%Y%m%d%H%M%S"))
             except Exception:
                 pass
 
@@ -1400,7 +1419,7 @@ async def _do_sync_cs_from_markets(
                     try:
                         from dateutil.parser import parse as parse_dt
 
-                        parsed_date = parse_dt(raw_date)
+                        parsed_date = _ensure_kst(parse_dt(raw_date))
                     except Exception:
                         parsed_date = None
 
@@ -1522,7 +1541,7 @@ async def _do_sync_cs_from_markets(
                         try:
                             from dateutil.parser import parse as parse_dt
 
-                            parsed_date = parse_dt(raw_date)
+                            parsed_date = _ensure_kst(parse_dt(raw_date))
                         except Exception:
                             parsed_date = None
 
@@ -1896,16 +1915,20 @@ async def _do_sync_cs_from_markets(
             )  # 독립 에러 격리 — 다른 마켓에 영향 없음
 
     # 미연결 CS 문의 일괄 매칭 (market_product_no → market_product_nos)
+    # 전 상품 스캔(수만 행)이라 무거움 → 주기 전체동기화(market_name=None)에서만 수행.
+    # 수동 단일마켓 "가져오기"는 스킵해 즉시 응답(미연결 매칭은 다음 주기 동기화가 처리).
     linked = 0
     try:
         from sqlmodel import select as sel
 
-        unlinked = await session.execute(
-            sel(SambaCSInquiry).where(
-                SambaCSInquiry.collected_product_id.is_(None),
+        unlinked_items = []
+        if market_name is None:
+            unlinked = await session.execute(
+                sel(SambaCSInquiry).where(
+                    SambaCSInquiry.collected_product_id.is_(None),
+                )
             )
-        )
-        unlinked_items = unlinked.scalars().all()
+            unlinked_items = unlinked.scalars().all()
         if unlinked_items:
             from sqlalchemy import text as sa_text
 
@@ -2020,6 +2043,9 @@ async def _do_sync_cs_from_markets(
         )
         pa_result = await session.execute(pa_stmt)
         pa_accounts = pa_result.scalars().all()
+        # 마켓 필터: 특정 마켓만 선택 시 플레이오토 아니면 스킵
+        if market_name and market_name != "플레이오토":
+            pa_accounts = []
         if account_id:
             pa_accounts = (
                 [acc for acc in pa_accounts if acc.id == account_id]
@@ -2066,7 +2092,11 @@ async def _do_sync_cs_from_markets(
                     existing_row = existing_result.scalar_one_or_none()
 
                     state = qna.get("State", "")
-                    is_answered = state in ("답변완료", "전송완료")
+                    # 답변완료/전송완료 OR 실제 답변(AContent) 존재 시 답변완료 처리
+                    # (답변 있는데 state 미반영돼 미답변으로 잡히던 오류 fix)
+                    is_answered = state in ("답변완료", "전송완료") or bool(
+                        (qna.get("AContent") or "").strip()
+                    )
 
                     site_name = qna.get("SiteName", "")
                     prod_code = qna.get("ProdCode") or qna.get("MasterCode") or ""
@@ -2105,7 +2135,7 @@ async def _do_sync_cs_from_markets(
                         try:
                             from dateutil.parser import parse as parse_dt
 
-                            parsed_date = parse_dt(raw_date)
+                            parsed_date = _ensure_kst(parse_dt(raw_date))
                         except Exception:
                             pass
 
@@ -2677,6 +2707,9 @@ async def _do_sync_cs_from_markets(
         )
         ssg_result = await session.execute(ssg_stmt)
         ssg_accounts = ssg_result.scalars().all()
+        # 마켓 필터: 특정 마켓만 선택 시 SSG(신세계몰) 아니면 스킵
+        if market_name and market_name != "신세계몰":
+            ssg_accounts = []
         if account_id:
             ssg_accounts = (
                 [acc for acc in ssg_accounts if acc.id == account_id]
@@ -2730,6 +2763,9 @@ async def _do_sync_cs_from_markets(
         )
         esm_result = await session.execute(esm_stmt)
         esm_accounts = esm_result.scalars().all()
+        # 마켓 필터: 특정 마켓만 선택 시 ESM(G마켓/옥션) 아니면 스킵
+        if market_name and market_name not in ("G마켓", "옥션"):
+            esm_accounts = []
         if account_id:
             esm_accounts = (
                 [acc for acc in esm_accounts if acc.id == account_id]
