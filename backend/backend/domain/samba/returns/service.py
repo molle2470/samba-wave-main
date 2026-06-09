@@ -200,7 +200,6 @@ class SambaReturnService:
         except Exception as exc:
             logger.warning(f"[반품완료동기화] 실패 order_id={order_id}: {exc}")
 
-
     async def _sync_order_status_by_completion(
         self, order_id: Optional[str], completion_detail: Optional[str]
     ) -> None:
@@ -237,6 +236,7 @@ class SambaReturnService:
                 )
         except Exception as exc:
             logger.warning(f"[완료내역동기화] 실패 order_id={order_id}: {exc}")
+
     async def cancel_return(self, return_id: str) -> Optional[SambaReturn]:
         """반품 요청 취소."""
         ret = await self.repo.get_async(return_id)
