@@ -2500,6 +2500,13 @@ async def _site_autotune_loop(device_id: str, site: str):
                                                     _ssg_qa_e,
                                                 )
 
+                                    # 재고잠금 상품 → 가격/재고 전송 스킵
+                                    if _acc_items and getattr(
+                                        product, "lock_stock", False
+                                    ):
+                                        _nontx_actions.append("재고잠금 → 전송 스킵")
+                                        _acc_items.clear()
+
                                     # 가격+재고 합산 단일 전송 (충돌 방지)
                                     if _acc_items:
                                         # 롯데홈쇼핑 MD 승인 대기 — 전송 직전에만 외부 API 확인
