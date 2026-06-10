@@ -34,9 +34,51 @@ def _to_grouped_options(options: list[dict], group_names: list[str]) -> list[dic
     ):
         return options
     if len(group_names) <= 1:
+        # group_names 가 없어도 "블랙/M" 같은 다축 조합이면(SSG 등 소싱처) 축을 추론해
+        # 색상/사이즈로 분리한다. 분리 안 하면 "블랙/M"이 사이즈 옵션값에 매칭 실패 →
+        # recommendedOptValueNo=0(직접입력) → "대표단품"으로 노출되는 버그가 생긴다.
+        inferred = _infer_group_names(options)
+        if inferred:
+            return _split_multi_group_options(options, inferred)
         group_name = group_names[0] if group_names else "사이즈"
         return [{"name": group_name, "values": options}]
     return _split_multi_group_options(options, group_names)
+
+
+_SIZE_RE = re.compile(r"^(x{0,3}[sl]|ss|m|free|onesize|\d{1,3}|\d+x[sl])$", re.I)
+
+
+def _infer_group_names(options: list[dict]) -> list[str] | None:
+    """group_names 없이 "블랙/M" 같은 2축 조합 옵션이면 축 이름(색상/사이즈)을 추론.
+
+    모든 옵션이 동일하게 "/"로 2분할되고, 한 축만 사이즈 패턴(M/L/XL/2XL/숫자 등)일 때만
+    ["색상","사이즈"](또는 순서 반대)로 확정한다. 애매하면 None(기존 단일 그룹 동작 유지).
+    "S/M"(결합 사이즈)처럼 양 축 모두 사이즈면 분리하지 않는다(오분리 방지).
+    """
+    names = [str(o.get("name") or "").strip() for o in options]
+    names = [n for n in names if n]
+    if not names or any(n.count("/") != 1 for n in names):
+        return None
+    axis0: list[str] = []
+    axis1: list[str] = []
+    for n in names:
+        a, b = (p.strip() for p in n.split("/", 1))
+        axis0.append(a)
+        axis1.append(b)
+
+    def _is_size_axis(vals: list[str]) -> bool:
+        u = [v for v in vals if v]
+        if not u:
+            return False
+        hit = sum(1 for v in u if _SIZE_RE.match(v.replace(" ", "")))
+        return hit >= len(u) * 0.6
+
+    a0, a1 = _is_size_axis(axis0), _is_size_axis(axis1)
+    if a1 and not a0:
+        return ["색상", "사이즈"]
+    if a0 and not a1:
+        return ["사이즈", "색상"]
+    return None
 
 
 def _split_multi_group_options(
