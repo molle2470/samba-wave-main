@@ -325,9 +325,37 @@ export default function ReturnsPage() {
     return result
   }, [returns])
 
-  // 수익총액 계산 (정산금액 - 환수금액) — 중복 제거된 목록 기준
-  const totalProfit = dedupedReturns
-    .reduce((sum, r) => sum + ((r.settlement_amount || 0) - (r.recovery_amount || 0)), 0)
+  // 화면 필터(완료내역/마켓/검색어) 적용 목록 — 렌더와 수익총액 계산에 공용
+  const filteredReturns = dedupedReturns.filter(r => {
+    if (siteFilter && (r.completion_detail || COMPLETION_DEFAULT) !== siteFilter) return false
+    if (marketFilter) {
+      if (marketFilter.startsWith('type:')) {
+        const mType = marketFilter.replace('type:', '')
+        const mName = accounts.find(a => a.market_type === mType)?.market_name || ''
+        if (mName && !r.market?.includes(mName)) return false
+      } else if (marketFilter.startsWith('acc:')) {
+        const accId = marketFilter.replace('acc:', '')
+        const acc = accounts.find(a => a.id === accId)
+        if (acc && !r.market?.includes(acc.market_name || '')) return false
+      }
+    }
+    // 검색어 필터 (카테고리별 필드 기준, 대소문자 무시)
+    const q = searchText.trim().toLowerCase()
+    if (q) {
+      const field =
+        searchCategory === 'customer' ? r.customer_name :
+        searchCategory === 'product' ? r.product_name :
+        searchCategory === 'order_number' ? (r.order_number || r.order_id) :
+        ''
+      if (!(field || '').toLowerCase().includes(q)) return false
+    }
+    return true
+  })
+
+  // 수익총액 계산 (고객비용 - 회사비용) — 화면 필터 적용 목록 기준,
+  // 완료내역 상태(대기/반품완료/교환완료) 무관하게 전체 합산. 값은 문자열일 수 있어 Number()로 변환.
+  const totalProfit = filteredReturns
+    .reduce((sum, r) => sum + ((Number(r.customer_amount) || 0) - (Number(r.company_amount) || 0)), 0)
 
   // completion_detail 기준 통계 — 중복 제거된 목록 기준
   const completionCounts = {
@@ -579,31 +607,7 @@ export default function ReturnsPage() {
                 </tr>
               </thead>
               <tbody>
-                {dedupedReturns.filter(r => {
-                  if (siteFilter && (r.completion_detail || COMPLETION_DEFAULT) !== siteFilter) return false
-                  if (marketFilter) {
-                    if (marketFilter.startsWith('type:')) {
-                      const mType = marketFilter.replace('type:', '')
-                      const mName = accounts.find(a => a.market_type === mType)?.market_name || ''
-                      if (mName && !r.market?.includes(mName)) return false
-                    } else if (marketFilter.startsWith('acc:')) {
-                      const accId = marketFilter.replace('acc:', '')
-                      const acc = accounts.find(a => a.id === accId)
-                      if (acc && !r.market?.includes(acc.market_name || '')) return false
-                    }
-                  }
-                  // 검색어 필터 (카테고리별 필드 기준, 대소문자 무시)
-                  const q = searchText.trim().toLowerCase()
-                  if (q) {
-                    const field =
-                      searchCategory === 'customer' ? r.customer_name :
-                      searchCategory === 'product' ? r.product_name :
-                      searchCategory === 'order_number' ? (r.order_number || r.order_id) :
-                      ''
-                    if (!(field || '').toLowerCase().includes(q)) return false
-                  }
-                  return true
-                }).map((r, idx) => {
+                {filteredReturns.map((r, idx) => {
                   return (
                     <Fragment key={r.id}>
                       <tr>
