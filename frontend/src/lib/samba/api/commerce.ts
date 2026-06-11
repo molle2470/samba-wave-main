@@ -26,4 +26,5 @@ export type {
   ProxyConfigItem,
   MessageLog,
   TrackingInfo,
+  SambaForbiddenWord,
 } from '../legacy'

@@ -866,7 +866,9 @@ class RewardRunRequest(BaseModel):
     actions: Optional[list[str]] = None  # None이면 사이트별 전체 액션
 
 
-def _reward_owner_override(site: str, trigger_device_id: Optional[str]) -> Optional[str]:
+def _reward_owner_override(
+    site: str, trigger_device_id: Optional[str]
+) -> Optional[str]:
     """수동 적립 실행 시 잡 owner 결정 — 오토튠 PC 바인딩과 동일 맥락.
 
     트리거 PC(버튼 누른 브라우저)의 device_id 가 있으면, 확장앱 라우팅 사이트

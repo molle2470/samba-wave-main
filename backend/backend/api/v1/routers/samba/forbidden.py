@@ -13,10 +13,21 @@ from backend.domain.samba.tenant.middleware import get_optional_tenant_id
 router = APIRouter(prefix="/forbidden", tags=["samba-forbidden"])
 
 
+def _norm_market(m: Optional[str]) -> Optional[str]:
+    """'공통' 계열 값('', 'common', '공통', None) → None, 그 외는 마켓 id 그대로."""
+    if m is None:
+        return None
+    m = m.strip()
+    if m in ("", "common", "공통"):
+        return None
+    return m
+
+
 class WordCreate(BaseModel):
     word: str
     type: str = "forbidden"  # forbidden | deletion
     scope: str = "title"  # title | description | both
+    market: Optional[str] = None  # None=공통, 'smartstore' 등=마켓 전용
     group_id: Optional[str] = None
     is_active: bool = True
 
@@ -48,6 +59,7 @@ def _get_service(session: AsyncSession):
 @router.get("/words")
 async def list_words(
     type: Optional[str] = None,
+    market: Optional[str] = None,
     session: AsyncSession = Depends(get_read_session_dependency),
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ):
@@ -57,6 +69,14 @@ async def list_words(
     stmt = select(SambaForbiddenWord).order_by(SambaForbiddenWord.created_at.desc())
     if type:
         stmt = stmt.where(SambaForbiddenWord.type == type)
+    # market 파라미터가 명시되면 해당 버킷만(공통은 market IS NULL).
+    # 미명시면 전체(레거시 호환).
+    if market is not None:
+        norm = _norm_market(market)
+        if norm is None:
+            stmt = stmt.where(SambaForbiddenWord.market == None)  # noqa: E711
+        else:
+            stmt = stmt.where(SambaForbiddenWord.market == norm)
     if tenant_id is not None:
         from sqlalchemy import or_
 
@@ -77,6 +97,8 @@ async def create_word(
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ):
     data = body.model_dump(exclude_unset=True)
+    if "market" in data:
+        data["market"] = _norm_market(data["market"])
     # tenant_id가 있으면 신규 금지어에 테넌트 정보 설정
     if tenant_id is not None:
         data["tenant_id"] = tenant_id
@@ -86,6 +108,7 @@ async def create_word(
 class BulkWordsRequest(BaseModel):
     type: str  # forbidden | deletion
     words: list[str]
+    market: Optional[str] = None  # None=공통, 'smartstore' 등=마켓 전용
 
 
 @router.post("/words/bulk", status_code=201)
@@ -94,12 +117,22 @@ async def bulk_save_words(
     session: AsyncSession = Depends(get_write_session_dependency),
     tenant_id: Optional[str] = Depends(get_optional_tenant_id),
 ):
-    """기존 타입의 단어를 전부 삭제 후 새 단어 벌크 저장 (단일 트랜잭션)."""
+    """해당 (타입+마켓 버킷)의 단어만 삭제 후 새 단어 벌크 저장 (단일 트랜잭션).
+
+    마켓 버킷 분리가 핵심: 공통(market IS NULL) 저장이 마켓별 단어를 날리거나
+    그 반대가 되면 안 됨 → DELETE 를 반드시 같은 market 버킷으로 좁힌다.
+    """
     from sqlmodel import delete
     from backend.domain.samba.forbidden.model import SambaForbiddenWord
 
-    # tenant_id가 있으면 해당 테넌트 타입만, 없으면 전체 삭제
+    market = _norm_market(body.market)
+
+    # 같은 타입 + 같은 마켓 버킷만 삭제 (공통 ↔ 마켓별 상호 보존)
     del_stmt = delete(SambaForbiddenWord).where(SambaForbiddenWord.type == body.type)
+    if market is None:
+        del_stmt = del_stmt.where(SambaForbiddenWord.market == None)  # noqa: E711
+    else:
+        del_stmt = del_stmt.where(SambaForbiddenWord.market == market)
     if tenant_id is not None:
         from sqlalchemy import or_
 
@@ -124,6 +157,7 @@ async def bulk_save_words(
                 word=w,
                 type=body.type,
                 scope="all",
+                market=market,
                 is_active=True,
                 tenant_id=tenant_id,
             )

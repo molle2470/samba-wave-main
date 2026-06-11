@@ -1,169 +1,146 @@
 'use client'
 
-import { Dispatch, SetStateAction } from 'react'
+import { Dispatch, SetStateAction, useCallback, useEffect, useState } from 'react'
 import { card, fmtNum } from '@/lib/samba/styles'
-import { forbiddenApi } from '@/lib/samba/api/commerce'
+import { forbiddenApi, type SambaForbiddenWord } from '@/lib/samba/api/commerce'
+import { MARKETS } from '@/lib/samba/markets'
 import { showAlert } from '@/components/samba/Modal'
 
 interface Props {
-  forbiddenText: string
-  deletionText: string
-  optionDeletionText: string
-  wordsSaving: boolean
-  setForbiddenText: (v: string) => void
-  setDeletionText: (v: string) => void
-  setOptionDeletionText: (v: string) => void
-  setWordsSaving: (v: boolean) => void
-  setInitialForbiddenText: (v: string) => void
-  setInitialDeletionText: (v: string) => void
-  setInitialOptionDeletionText: (v: string) => void
+  // 아래 텍스트/세터 props 는 레거시 호환용 — 본 섹션은 마켓별 상태를 자체 관리한다.
+  forbiddenText?: string
+  deletionText?: string
+  optionDeletionText?: string
+  wordsSaving?: boolean
+  setForbiddenText?: (v: string) => void
+  setDeletionText?: (v: string) => void
+  setOptionDeletionText?: (v: string) => void
+  setWordsSaving?: (v: boolean) => void
+  setInitialForbiddenText?: (v: string) => void
+  setInitialDeletionText?: (v: string) => void
+  setInitialOptionDeletionText?: (v: string) => void
   tagBanned: { rejected: string[]; brands: string[]; source_sites: string[] }
   setTagBanned: Dispatch<SetStateAction<{ rejected: string[]; brands: string[]; source_sites: string[] }>>
 }
 
-export function ForbiddenWordsSection(props: Props) {
-  const {
-    forbiddenText, deletionText, optionDeletionText, wordsSaving,
-    setForbiddenText, setDeletionText, setOptionDeletionText, setWordsSaving,
-    setInitialForbiddenText, setInitialDeletionText, setInitialOptionDeletionText,
-    tagBanned, setTagBanned,
-  } = props
+// 공통 + 전송 대상 마켓(카테고리 전용 제외)
+const MARKET_OPTIONS: { value: string; label: string }[] = [
+  { value: 'common', label: '공통 (모든 마켓)' },
+  ...MARKETS.filter(m => !m.categoryOnly).map(m => ({ value: m.id, label: m.label })),
+]
+
+const wordsToText = (words: SambaForbiddenWord[], type: string) =>
+  [...new Set(words.filter(w => w.type === type).map(w => w.word.trim()).filter(Boolean))].join('; ')
+
+export function ForbiddenWordsSection({ tagBanned, setTagBanned }: Props) {
+  const [market, setMarket] = useState('common')
+  const [forbiddenText, setForbiddenText] = useState('')
+  const [deletionText, setDeletionText] = useState('')
+  const [optionDeletionText, setOptionDeletionText] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [saving, setSaving] = useState('')  // 저장 중인 type ('' = 없음)
+
+  // 선택 마켓의 단어 로드
+  const loadWords = useCallback((mk: string) => {
+    setLoading(true)
+    forbiddenApi.listWords(undefined, mk)
+      .then((words: SambaForbiddenWord[]) => {
+        setForbiddenText(wordsToText(words, 'forbidden'))
+        setDeletionText(wordsToText(words, 'deletion'))
+        setOptionDeletionText(wordsToText(words, 'option_deletion'))
+      })
+      .catch(() => { showAlert('금지어 로드 실패', 'error') })
+      .finally(() => setLoading(false))
+  }, [])
+
+  useEffect(() => { loadWords(market) }, [market, loadWords])
+
+  const save = async (type: string, text: string) => {
+    setSaving(type)
+    try {
+      const words = [...new Set(text.split(';').map(w => w.trim()).filter(Boolean))]
+      await forbiddenApi.bulkSaveWords(type, words, market)
+      const deduped = words.join('; ')
+      if (type === 'forbidden') setForbiddenText(deduped)
+      else if (type === 'deletion') setDeletionText(deduped)
+      else setOptionDeletionText(deduped)
+      const label = type === 'forbidden' ? '금지어' : type === 'deletion' ? '삭제어' : '옵션삭제어'
+      const mkLabel = MARKET_OPTIONS.find(m => m.value === market)?.label ?? market
+      showAlert(`[${mkLabel}] ${label} ${fmtNum(words.length)}개 저장 완료`, 'success')
+    } catch {
+      showAlert('저장 실패', 'error')
+    }
+    setSaving('')
+  }
+
+  const isCommon = market === 'common'
+
+  // 입력 컬럼 1개 렌더
+  const column = (
+    type: string, title: string, color: string, bg: string, border: string,
+    value: string, setValue: (v: string) => void, placeholder: string, note?: string,
+  ) => (
+    <div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.4rem' }}>
+        <div style={{ fontSize: '0.8125rem', color, fontWeight: 600 }}>{title}</div>
+        <button
+          disabled={saving !== '' || loading}
+          onClick={() => save(type, value)}
+          style={{
+            padding: '0.25rem 0.75rem', borderRadius: '4px', fontSize: '0.75rem', fontWeight: 600,
+            background: bg, border: `1px solid ${border}`, color, cursor: 'pointer',
+          }}
+        >{saving === type ? '...' : '저장'}</button>
+      </div>
+      <textarea
+        value={value}
+        onChange={e => setValue(e.target.value)}
+        placeholder={placeholder}
+        style={{
+          width: '100%', height: '100px', background: '#0A0A0A', border: '1px solid #2D2D2D',
+          borderRadius: '6px', padding: '8px', color: '#E5E5E5', fontSize: '0.8125rem',
+          resize: 'vertical', fontFamily: 'monospace',
+        }}
+      />
+      <div style={{ fontSize: '0.75rem', color: '#666', marginTop: '2px' }}>
+        {fmtNum(value.split(';').filter(w => w.trim()).length)}개
+        {note && <span style={{ marginLeft: '0.5rem', color: '#7a6a3a' }}>{note}</span>}
+      </div>
+    </div>
+  )
 
   return (
     <>
-      {/* 금지어 / 삭제어 (전역) */}
+      {/* 금지어 / 삭제어 (마켓별) */}
       <div style={{ ...card, padding: '1.5rem', marginTop: '1.25rem' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '1rem' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '1rem', flexWrap: 'wrap' }}>
           <span style={{ fontSize: '0.9375rem', fontWeight: 700, color: '#E5E5E5' }}>금지어 / 삭제어</span>
-          <span style={{ fontSize: '0.8125rem', color: '#666' }}>모든 그룹·상품에 공통 적용</span>
+          <select
+            value={market}
+            onChange={e => setMarket(e.target.value)}
+            style={{
+              background: '#1A1A1A', border: '1px solid #3D3D3D', borderRadius: '6px',
+              color: '#E5E5E5', fontSize: '0.8125rem', padding: '0.3rem 0.6rem', cursor: 'pointer',
+            }}
+          >
+            {MARKET_OPTIONS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+          </select>
+          <span style={{ fontSize: '0.8125rem', color: '#666' }}>
+            {isCommon ? '모든 마켓에 공통 적용' : '공통 + 이 마켓에만 추가 적용'}
+          </span>
+          {loading && <span style={{ fontSize: '0.75rem', color: '#888' }}>불러오는 중…</span>}
         </div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '1rem' }}>
-          <div>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.4rem' }}>
-              <div style={{ fontSize: '0.8125rem', color: '#FF6B6B', fontWeight: 600 }}>
-                금지어 (IP위험 브랜드 포함) — 세미콜론(;) 구분
-              </div>
-              <button
-                disabled={wordsSaving}
-                onClick={async () => {
-                  setWordsSaving(true)
-                  try {
-                    const words = [...new Set(forbiddenText.split(';').map(w => w.trim()).filter(Boolean))]
-                    await forbiddenApi.bulkSaveWords('forbidden', words)
-                    const deduped = words.join('; ')
-                    setForbiddenText(deduped)
-                    setInitialForbiddenText(deduped)
-                    showAlert(`금지어 ${fmtNum(words.length)}개 저장 완료`, 'success')
-                  } catch {
-                    showAlert('저장 실패', 'error')
-                  }
-                  setWordsSaving(false)
-                }}
-                style={{
-                  padding: '0.25rem 0.75rem', borderRadius: '4px', fontSize: '0.75rem', fontWeight: 600,
-                  background: 'rgba(255,107,107,0.12)', border: '1px solid rgba(255,107,107,0.3)',
-                  color: '#FF6B6B', cursor: 'pointer',
-                }}
-              >{wordsSaving ? '...' : '저장'}</button>
-            </div>
-            <textarea
-              value={forbiddenText}
-              onChange={e => setForbiddenText(e.target.value)}
-              placeholder="구찌; 루이비통; 샤넬; 프라다"
-              style={{
-                width: '100%', height: '100px', background: '#0A0A0A', border: '1px solid #2D2D2D',
-                borderRadius: '6px', padding: '8px', color: '#E5E5E5', fontSize: '0.8125rem',
-                resize: 'vertical', fontFamily: 'monospace',
-              }}
-            />
-            <div style={{ fontSize: '0.75rem', color: '#666', marginTop: '2px' }}>
-              {fmtNum(forbiddenText.split(';').filter(w => w.trim()).length)}개
-            </div>
-          </div>
-          <div>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.4rem' }}>
-              <div style={{ fontSize: '0.8125rem', color: '#FFB84D', fontWeight: 600 }}>
-                삭제어 — 상품명에서 자동 제거
-              </div>
-              <button
-                disabled={wordsSaving}
-                onClick={async () => {
-                  setWordsSaving(true)
-                  try {
-                    const words = [...new Set(deletionText.split(';').map(w => w.trim()).filter(Boolean))]
-                    await forbiddenApi.bulkSaveWords('deletion', words)
-                    const deduped = words.join('; ')
-                    setDeletionText(deduped)
-                    setInitialDeletionText(deduped)
-                    showAlert(`삭제어 ${fmtNum(words.length)}개 저장 완료`, 'success')
-                  } catch {
-                    showAlert('저장 실패', 'error')
-                  }
-                  setWordsSaving(false)
-                }}
-                style={{
-                  padding: '0.25rem 0.75rem', borderRadius: '4px', fontSize: '0.75rem', fontWeight: 600,
-                  background: 'rgba(255,184,77,0.12)', border: '1px solid rgba(255,184,77,0.3)',
-                  color: '#FFB84D', cursor: 'pointer',
-                }}
-              >{wordsSaving ? '...' : '저장'}</button>
-            </div>
-            <textarea
-              value={deletionText}
-              onChange={e => setDeletionText(e.target.value)}
-              placeholder="매장정품; 정품; 해외직구; 무료배송"
-              style={{
-                width: '100%', height: '100px', background: '#0A0A0A', border: '1px solid #2D2D2D',
-                borderRadius: '6px', padding: '8px', color: '#E5E5E5', fontSize: '0.8125rem',
-                resize: 'vertical', fontFamily: 'monospace',
-              }}
-            />
-            <div style={{ fontSize: '0.75rem', color: '#666', marginTop: '2px' }}>
-              {fmtNum(deletionText.split(';').filter(w => w.trim()).length)}개
-            </div>
-          </div>
-          <div>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.4rem' }}>
-              <div style={{ fontSize: '0.8125rem', color: '#A29BFE', fontWeight: 600 }}>
-                옵션삭제어 — 옵션명에서 자동 제거
-              </div>
-              <button
-                disabled={wordsSaving}
-                onClick={async () => {
-                  setWordsSaving(true)
-                  try {
-                    const words = [...new Set(optionDeletionText.split(';').map(w => w.trim()).filter(Boolean))]
-                    await forbiddenApi.bulkSaveWords('option_deletion', words)
-                    const deduped = words.join('; ')
-                    setOptionDeletionText(deduped)
-                    setInitialOptionDeletionText(deduped)
-                    showAlert(`옵션삭제어 ${fmtNum(words.length)}개 저장 완료`, 'success')
-                  } catch {
-                    showAlert('저장 실패', 'error')
-                  }
-                  setWordsSaving(false)
-                }}
-                style={{
-                  padding: '0.25rem 0.75rem', borderRadius: '4px', fontSize: '0.75rem', fontWeight: 600,
-                  background: 'rgba(162,155,254,0.12)', border: '1px solid rgba(162,155,254,0.3)',
-                  color: '#A29BFE', cursor: 'pointer',
-                }}
-              >{wordsSaving ? '...' : '저장'}</button>
-            </div>
-            <textarea
-              value={optionDeletionText}
-              onChange={e => setOptionDeletionText(e.target.value)}
-              placeholder="01(; 02(; ); [품절]"
-              style={{
-                width: '100%', height: '100px', background: '#0A0A0A', border: '1px solid #2D2D2D',
-                borderRadius: '6px', padding: '8px', color: '#E5E5E5', fontSize: '0.8125rem',
-                resize: 'vertical', fontFamily: 'monospace',
-              }}
-            />
-            <div style={{ fontSize: '0.75rem', color: '#666', marginTop: '2px' }}>
-              {fmtNum(optionDeletionText.split(';').filter(w => w.trim()).length)}개
-            </div>
-          </div>
+          {column('forbidden', '금지어 (포함 시 해당 마켓 전송 제외) — 세미콜론(;) 구분', '#FF6B6B',
+            'rgba(255,107,107,0.12)', 'rgba(255,107,107,0.3)',
+            forbiddenText, setForbiddenText, '구찌; 루이비통; 샤넬; 프라다')}
+          {column('deletion', '삭제어 — 상품명에서 자동 제거', '#FFB84D',
+            'rgba(255,184,77,0.12)', 'rgba(255,184,77,0.3)',
+            deletionText, setDeletionText, '매장정품; 정품; 해외직구; 무료배송')}
+          {column('option_deletion', '옵션삭제어 — 옵션명에서 자동 제거', '#A29BFE',
+            'rgba(162,155,254,0.12)', 'rgba(162,155,254,0.3)',
+            optionDeletionText, setOptionDeletionText, '01(; 02(; ); [품절]',
+            market !== 'common' && market !== 'smartstore' ? '※ 옵션삭제어는 현재 스마트스토어 전송에만 적용됨' : undefined)}
         </div>
       </div>
 
