@@ -158,6 +158,10 @@ def calc_market_price(
         # pointOnly=true: 적립금 사용 가능 상품(is_point_restricted=False)에만 적용
         _point_only = bool(_ssm.get("pointOnly"))
         _apply_ssm = (not _point_only) or (is_point_restricted is False)
+        # costThreshold>0이면 원가가 기준 미만일 때만 추가 마진 적용 (예: SSG 3만원 미만 배송비)
+        _cost_threshold = _ssm.get("costThreshold", 0) or 0
+        if _cost_threshold > 0 and cost >= _cost_threshold:
+            _apply_ssm = False
         if _apply_ssm:
             if _ss_rate != 0:
                 calc_price += round(cost * _ss_rate / 100)

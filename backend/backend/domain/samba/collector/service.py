@@ -861,6 +861,10 @@ class SambaCollectorService:
                     _point_only = bool(_ssm.get("pointOnly"))
                     _is_pr = getattr(p, "is_point_restricted", None)
                     _apply_ssm = (not _point_only) or (_is_pr is False)
+                    # costThreshold>0이면 원가가 기준 미만일 때만 추가 마진 적용 (예: SSG 3만원 미만 배송비)
+                    _cost_threshold = _ssm.get("costThreshold", 0) or 0
+                    if _cost_threshold > 0 and base >= _cost_threshold:
+                        _apply_ssm = False
                     if _apply_ssm:
                         if _ss_rate > 0:
                             source_margin += round(base * _ss_rate / 100)

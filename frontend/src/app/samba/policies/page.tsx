@@ -42,6 +42,8 @@ interface SourceSiteMargin {
   pointOnly?: boolean
   // 보유 적립금 사용 할인을 최대혜택가에서 제외하고 원가 계산 (현재 무신사만 지원)
   excludeHeldPoint?: boolean
+  // 기준 원가(원) — 0이면 전체 적용, >0이면 원가가 이 값 미만일 때만 추가 마진 적용 (예: SSG 3만원 미만 배송비)
+  costThreshold?: number
 }
 
 interface PricingForm {
@@ -645,7 +647,7 @@ export default function PoliciesPage() {
   }
 
   // 소싱처별 추가 마진 업데이트
-  const updateSourceSiteMargin = (siteId: string, field: 'marginRate' | 'marginAmount', value: number) => {
+  const updateSourceSiteMargin = (siteId: string, field: 'marginRate' | 'marginAmount' | 'costThreshold', value: number) => {
     const current = pricing.sourceSiteMargins[siteId] || { marginRate: 0, marginAmount: 0 }
     setPricing({
       ...pricing,
@@ -985,6 +987,7 @@ export default function PoliciesPage() {
                     <span style={{ width: '90px', fontSize: '0.7rem', color: '#555' }}>소싱처</span>
                     <span style={{ width: '100px', fontSize: '0.7rem', color: '#555', textAlign: 'center' }}>추가 마진율(%)</span>
                     <span style={{ width: '110px', fontSize: '0.7rem', color: '#555', textAlign: 'center' }}>추가 마진금액(원)</span>
+                    <span title="0이면 전체 적용, 입력 시 원가가 이 값 미만인 상품에만 추가 마진 적용" style={{ width: '120px', fontSize: '0.7rem', color: '#555', textAlign: 'center' }}>기준원가 미만만(원)</span>
                     <span style={{ width: '170px', fontSize: '0.7rem', color: '#555', textAlign: 'center' }}>적립금 사용가능 상품만</span>
                     <span style={{ width: '170px', fontSize: '0.7rem', color: '#555', textAlign: 'center' }}>보유적립금 할인 제외</span>
                   </div>
@@ -1013,6 +1016,12 @@ export default function PoliciesPage() {
                           value={ssm.marginAmount}
                           onChange={(v) => updateSourceSiteMargin(siteId, 'marginAmount', v)}
                           style={{ width: '100px' }}
+                          suffix="원"
+                        />
+                        <NumInput
+                          value={ssm.costThreshold || 0}
+                          onChange={(v) => updateSourceSiteMargin(siteId, 'costThreshold', v)}
+                          style={{ width: '110px' }}
                           suffix="원"
                         />
                         <label
@@ -1064,6 +1073,7 @@ export default function PoliciesPage() {
                         {isSet && (
                           <span style={{ fontSize: '0.7rem', color: '#FF8C00' }}>
                             {ssm.marginRate > 0 ? '+' : ''}{ssm.marginRate !== 0 ? `${ssm.marginRate}%` : ''}{ssm.marginRate !== 0 && ssm.marginAmount !== 0 ? ' + ' : ''}{ssm.marginAmount > 0 ? '+' : ''}{ssm.marginAmount !== 0 ? `${fmtNum(ssm.marginAmount)}원` : ''}
+                            {(ssm.costThreshold || 0) > 0 ? ` · 원가 ${fmtNum(ssm.costThreshold || 0)}원 미만만` : ''}
                             {ssm.pointOnly && supportsPointOnly ? ' · 적립금가능만' : ''}
                             {ssm.excludeHeldPoint && supportsExcludeHeldPoint ? ' · 보유적립금제외' : ''}
                           </span>

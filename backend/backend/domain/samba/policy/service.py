@@ -145,6 +145,10 @@ class SambaPolicyService:
             # is_point_restricted=True(불가) 또는 None(미수집)이면 추가 마진 스킵
             point_only = bool(site_margin.get("pointOnly"))
             apply_site_margin = (not point_only) or (is_point_restricted is False)
+            # costThreshold>0이면 원가가 기준 미만일 때만 추가 마진 적용 (예: SSG 3만원 미만 배송비)
+            cost_threshold = site_margin.get("costThreshold", 0) or 0
+            if cost_threshold > 0 and effective_cost >= cost_threshold:
+                apply_site_margin = False
             if apply_site_margin:
                 if site_margin.get("marginRate", 0) != 0:
                     price += effective_cost * site_margin["marginRate"] / 100
