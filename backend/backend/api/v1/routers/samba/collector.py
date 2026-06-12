@@ -122,6 +122,7 @@ class CollectedProductUpdate(BaseModel):
     material: Optional[str] = None
     care_instructions: Optional[str] = None
     quality_guarantee: Optional[str] = None
+    original_price: Optional[float] = None
     sale_price: Optional[float] = None
     cost: Optional[float] = None
     status: Optional[str] = None

@@ -21,7 +21,7 @@ interface NavItem {
 const NAV_ITEMS: NavItem[] = [
   { href: "/samba/collector", label: "상품수집" },
   { href: "/samba/products", label: "상품관리" },
-  { href: "/samba/manual-products", label: "수동등록", planned: true },
+  { href: "/samba/manual-products", label: "수동등록" },
   { href: "/samba/policies", label: "정책관리" },
   { href: "/samba/categories", label: "카테고리매핑" },
   { href: "/samba/shipments", label: "상품전송" },
