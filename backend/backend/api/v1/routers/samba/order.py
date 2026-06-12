@@ -7667,7 +7667,17 @@ async def sync_orders_from_markets(
                         _ch_id,
                         _lh_style_cache,
                     )
-                # 3.6) 쿠팡 vendor_item_id 글로벌 폴백 — _pid(productId) 오저장/노후화 대비 (#398).
+                # 3.6) 쿠팡 sellerProductId 글로벌 폴백 (#408) — 다중옵션 리스팅의
+                # 비대표 옵션 주문 미등록 대비. sellerProductId는 상품당 1개·옵션무관·
+                # 안정키라 productId/vendorItemId가 인덱스에 없어도 매칭됨(백필 불필요).
+                # 충돌(ambiguous) 거부 + product_id attempt 뒤에만 발동 → 회귀 없음.
+                if not _matched:
+                    _spid = str(order_data.get("seller_product_id") or "")
+                    if _spid:
+                        _cand = _mpn_global.get(_spid)
+                        if _cand and not _cand.get("ambiguous"):
+                            _matched = _cand
+                # 3.7) 쿠팡 vendor_item_id 글로벌 폴백 — _pid(productId) 오저장/노후화 대비 (#398).
                 # 등록 직후 임시 productId가 승인 후 바뀌어도 _vid(옵션ID)는 안정적.
                 if not _matched:
                     _vid = str(order_data.get("vendor_item_id") or "")
@@ -9222,6 +9232,10 @@ def _parse_coupang_order(
             or first_item.get("sellerProductId", "")
             or ""
         ),
+        # sellerProductId 별도 보존 (#408) — 다중옵션 리스팅의 비대표 옵션 주문은
+        # productId/vendorItemId 가 인덱스에 없어 미등록 → 상품당 1개·옵션무관 안정키인
+        # sellerProductId 로 폴백 매칭. product_id 에 합쳐 버리면 위 fallback 이 못 씀.
+        "seller_product_id": str(first_item.get("sellerProductId", "") or ""),
         "product_name": product_name,
         "coupang_display_name": first_item.get("vendorItemPackageName", "") or "",
         "product_option": option_name,

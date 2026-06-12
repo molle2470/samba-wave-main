@@ -1475,13 +1475,18 @@ export interface SambaForbiddenWord {
   word: string;
   type: string;
   scope: string;
+  market?: string | null;
   is_active: boolean;
   created_at: string;
 }
 
 export const forbiddenApi = {
-  listWords: (type?: string) => {
-    const p = type ? `?type=${type}` : "";
+  listWords: (type?: string, market?: string) => {
+    const qs = new URLSearchParams();
+    if (type) qs.set("type", type);
+    // market 명시(공통은 'common') 시 해당 버킷만, 미명시면 전체
+    if (market !== undefined) qs.set("market", market);
+    const p = qs.toString() ? `?${qs.toString()}` : "";
     return request<SambaForbiddenWord[]>(`${SAMBA_PREFIX}/forbidden/words${p}`);
   },
   createWord: (data: Partial<SambaForbiddenWord>) =>
@@ -1492,8 +1497,8 @@ export const forbiddenApi = {
     request<SambaForbiddenWord>(`${SAMBA_PREFIX}/forbidden/words/${id}/toggle`, { method: "PUT" }),
   deleteWord: (id: string) =>
     request<{ ok: boolean }>(`${SAMBA_PREFIX}/forbidden/words/${id}`, { method: "DELETE" }),
-  bulkSaveWords: (type: string, words: string[]) =>
-    request<{ ok: boolean; created: number }>(`${SAMBA_PREFIX}/forbidden/words/bulk`, { method: "POST", body: JSON.stringify({ type, words }) }),
+  bulkSaveWords: (type: string, words: string[], market?: string) =>
+    request<{ ok: boolean; created: number }>(`${SAMBA_PREFIX}/forbidden/words/bulk`, { method: "POST", body: JSON.stringify({ type, words, market: market ?? null }) }),
   validate: (name: string) =>
     request<{ is_valid: boolean; forbidden_found: string[]; deletion_found: string[]; clean_name: string }>(
       `${SAMBA_PREFIX}/forbidden/validate`, { method: "POST", body: JSON.stringify({ name }) }),

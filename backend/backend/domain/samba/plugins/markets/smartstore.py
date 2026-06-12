@@ -444,7 +444,10 @@ class SmartStorePlugin(MarketPlugin):
             )
 
             _fw_repo = _FWRepo(session)
-            _opt_del_words = await _fw_repo.list_active("option_deletion")
+            # 공통 + 스마트스토어 전용 옵션삭제어 합산
+            _opt_del_words = await _fw_repo.list_active_for_market(
+                "option_deletion", "smartstore"
+            )
             if _opt_del_words:
                 product_copy["_option_deletion_words"] = [
                     w.word for w in _opt_del_words

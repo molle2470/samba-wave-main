@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useCallback, useRef, Fragment } from 'react'
+import { useEffect, useState, useCallback, useRef, useMemo, Fragment } from 'react'
 import { useSearchParams } from 'next/navigation'
 import { accountApi, orderApi, type SambaMarketAccount } from '@/lib/samba/api/commerce'
 import { returnApi, type SambaReturn } from '@/lib/samba/api/support'
@@ -291,16 +291,78 @@ export default function ReturnsPage() {
     } catch (e) { showAlert(e instanceof Error ? e.message : `${label} 실패`, 'error') }
   }
 
-  // 수익총액 계산 (정산금액 - 환수금액)
-  const totalProfit = returns
-    .reduce((sum, r) => sum + ((r.settlement_amount || 0) - (r.recovery_amount || 0)), 0)
+  // 주문번호 기준 중복 제거 — 같은 order_number 행은 하나만 남긴다.
+  // 우선순위: ① 완료 상태(취소/반품/교환) 행을 우선 보존 — 완료 처리한 행이 사라지지 않도록.
+  //          ② 완료 여부가 같으면(둘 다 완료 또는 둘 다 미완료) 최신 접수건
+  //             (return_request_date, 없으면 created_at)을 남긴다.
+  // 주문번호가 다르면 별개 건이므로 유지하고, 주문번호가 비어있는 행은 식별 불가하므로
+  // 묶지 않고 각각 그대로 둔다.
+  const dedupedReturns = useMemo(() => {
+    const isDone = (r: SambaReturn) => ['취소', '반품', '교환'].includes(r.completion_detail || '')
+    const tsOf = (r: SambaReturn) => {
+      const t = new Date(r.return_request_date || r.created_at || 0).getTime()
+      return Number.isNaN(t) ? 0 : t
+    }
+    // 새 행(cand)이 기존 행(cur)을 대체해야 하는지
+    const shouldReplace = (cand: SambaReturn, cur: SambaReturn) => {
+      const candDone = isDone(cand), curDone = isDone(cur)
+      if (candDone !== curDone) return candDone // 완료 상태인 쪽 우선
+      return tsOf(cand) > tsOf(cur)             // 완료 여부 같으면 최신 접수건
+    }
+    const seen = new Map<string, number>() // order_number -> result 내 인덱스
+    const result: SambaReturn[] = []
+    for (const r of returns) {
+      const key = (r.order_number || '').trim()
+      if (!key) { result.push(r); continue } // 주문번호 없음 → 별개 유지
+      const idx = seen.get(key)
+      if (idx === undefined) {
+        seen.set(key, result.length)
+        result.push(r)
+      } else if (shouldReplace(r, result[idx])) {
+        result[idx] = r // 원래 위치 유지하며 교체
+      }
+    }
+    return result
+  }, [returns])
 
-  // completion_detail 기준 통계
+  // 화면 필터(완료내역/마켓/검색어) 적용 목록 — 렌더와 수익총액 계산에 공용
+  const filteredReturns = dedupedReturns.filter(r => {
+    if (siteFilter && (r.completion_detail || COMPLETION_DEFAULT) !== siteFilter) return false
+    if (marketFilter) {
+      if (marketFilter.startsWith('type:')) {
+        const mType = marketFilter.replace('type:', '')
+        const mName = accounts.find(a => a.market_type === mType)?.market_name || ''
+        if (mName && !r.market?.includes(mName)) return false
+      } else if (marketFilter.startsWith('acc:')) {
+        const accId = marketFilter.replace('acc:', '')
+        const acc = accounts.find(a => a.id === accId)
+        if (acc && !r.market?.includes(acc.market_name || '')) return false
+      }
+    }
+    // 검색어 필터 (카테고리별 필드 기준, 대소문자 무시)
+    const q = searchText.trim().toLowerCase()
+    if (q) {
+      const field =
+        searchCategory === 'customer' ? r.customer_name :
+        searchCategory === 'product' ? r.product_name :
+        searchCategory === 'order_number' ? (r.order_number || r.order_id) :
+        ''
+      if (!(field || '').toLowerCase().includes(q)) return false
+    }
+    return true
+  })
+
+  // 수익총액 계산 (고객비용 - 회사비용) — 화면 필터 적용 목록 기준,
+  // 완료내역 상태(대기/반품완료/교환완료) 무관하게 전체 합산. 값은 문자열일 수 있어 Number()로 변환.
+  const totalProfit = filteredReturns
+    .reduce((sum, r) => sum + ((Number(r.customer_amount) || 0) - (Number(r.company_amount) || 0)), 0)
+
+  // completion_detail 기준 통계 — 중복 제거된 목록 기준
   const completionCounts = {
-    total: returns.length,
-    requested: returns.filter(r => (r.completion_detail || COMPLETION_DEFAULT) === '진행중').length,
-    completed: returns.filter(r => ['취소', '반품', '교환'].includes(r.completion_detail || '')).length,
-    rejected: returns.filter(r => (r.completion_detail || '') === '거부').length,
+    total: dedupedReturns.length,
+    requested: dedupedReturns.filter(r => (r.completion_detail || COMPLETION_DEFAULT) === '진행중').length,
+    completed: dedupedReturns.filter(r => ['취소', '반품', '교환'].includes(r.completion_detail || '')).length,
+    rejected: dedupedReturns.filter(r => (r.completion_detail || '') === '거부').length,
   }
 
   return (
@@ -522,9 +584,9 @@ export default function ReturnsPage() {
                   <th rowSpan={2} style={{ width: '36px', textAlign: 'center', padding: '0.3rem 0.5rem', verticalAlign: 'middle' }}>
                     <input
                       type="checkbox"
-                      checked={returns.length > 0 && selectedIds.size === returns.length}
+                      checked={dedupedReturns.length > 0 && selectedIds.size === dedupedReturns.length}
                       onChange={(e) => {
-                        if (e.target.checked) setSelectedIds(new Set(returns.map(r => r.id)))
+                        if (e.target.checked) setSelectedIds(new Set(dedupedReturns.map(r => r.id)))
                         else setSelectedIds(new Set())
                       }}
                       style={{ width: '13px', height: '13px', cursor: 'pointer', accentColor: '#F59E0B' }}
@@ -545,31 +607,7 @@ export default function ReturnsPage() {
                 </tr>
               </thead>
               <tbody>
-                {returns.filter(r => {
-                  if (siteFilter && (r.completion_detail || COMPLETION_DEFAULT) !== siteFilter) return false
-                  if (marketFilter) {
-                    if (marketFilter.startsWith('type:')) {
-                      const mType = marketFilter.replace('type:', '')
-                      const mName = accounts.find(a => a.market_type === mType)?.market_name || ''
-                      if (mName && !r.market?.includes(mName)) return false
-                    } else if (marketFilter.startsWith('acc:')) {
-                      const accId = marketFilter.replace('acc:', '')
-                      const acc = accounts.find(a => a.id === accId)
-                      if (acc && !r.market?.includes(acc.market_name || '')) return false
-                    }
-                  }
-                  // 검색어 필터 (카테고리별 필드 기준, 대소문자 무시)
-                  const q = searchText.trim().toLowerCase()
-                  if (q) {
-                    const field =
-                      searchCategory === 'customer' ? r.customer_name :
-                      searchCategory === 'product' ? r.product_name :
-                      searchCategory === 'order_number' ? (r.order_number || r.order_id) :
-                      ''
-                    if (!(field || '').toLowerCase().includes(q)) return false
-                  }
-                  return true
-                }).map((r, idx) => {
+                {filteredReturns.map((r, idx) => {
                   return (
                     <Fragment key={r.id}>
                       <tr>
@@ -873,7 +911,7 @@ export default function ReturnsPage() {
                     </Fragment>
                   )
                 })}
-                {returns.length === 0 && (
+                {dedupedReturns.length === 0 && (
                   <tr><td colSpan={13} style={{ padding: '3rem', textAlign: 'center', color: '#555' }}>반품/교환 내역이 없습니다</td></tr>
                 )}
               </tbody>

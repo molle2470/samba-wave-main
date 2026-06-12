@@ -43,6 +43,12 @@ class SambaForbiddenWord(SQLModel, table=True):
 
     group_id: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
 
+    # 마켓 한정: None = 공통(모든 마켓), 'smartstore'/'coupang'/'11st' 등 = 해당 마켓 전용
+    # 적용 시 '공통 + 해당 마켓' 합산(additive). markets.ts 의 마켓 id 와 동일 문자열.
+    market: Optional[str] = Field(
+        default=None, sa_column=Column(String, index=True, nullable=True)
+    )
+
     is_active: bool = Field(
         default=True, sa_column=Column(Boolean, nullable=False, server_default="true")
     )

@@ -1105,16 +1105,18 @@ class GsShopSourcingClient:
             parts = raw_val.split("\x08")  # 0x08 = 백스페이스(구분자)
             opt_name = " / ".join(p.strip() for p in parts if p.strip())
 
-            # stockFlg: Y=재고관리중(한정), N=재고관리안함(무제한/항상판매)
-            # 옵션 레벨 품절은 상품 전체 prdSaleSt로 결정
-            stock_flg = attr.get("stockFlg", "N")
+            # stockFlg = GS샵 renderJson의 옵션별 실시간 판매가능 플래그.
+            #   N=구매가능(재고있음), Y=일시품절.
+            # (과거엔 이 값을 버리고 상품 전체 품절값만 복사 → 일부 사이즈만
+            #  품절인 상품의 품절 옵션까지 stock=99로 등록되어 오버셀 발생.)
+            opt_sold_out = is_out_of_stock or attr.get("stockFlg") == "Y"
 
             options.append(
                 {
                     "name": opt_name,
                     "price": 0,  # GS샵 옵션은 추가가격 없음 (동일가)
-                    "stock": 0 if is_out_of_stock else 99,
-                    "isSoldOut": is_out_of_stock,
+                    "stock": 0 if opt_sold_out else 99,
+                    "isSoldOut": opt_sold_out,
                     "attrPrdCd": attr.get("attrPrdCd"),
                 }
             )

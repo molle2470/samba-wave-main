@@ -1255,8 +1255,33 @@ class SambaShipmentService:
         )
 
         fw_repo = SambaForbiddenWordRepository(self.session)
-        forbidden_words = await fw_repo.list_active("deletion")
-        deletion_words = [fw.word for fw in (forbidden_words or []) if fw.word]
+        _all_deletion = await fw_repo.list_active("deletion")
+        _all_forbidden = await fw_repo.list_active("forbidden")
+        # 공통(market=None) 삭제어 — 마켓 미확정 단계(기본 compose)에서 사용
+        deletion_words = [
+            w.word for w in (_all_deletion or []) if w.word and w.market is None
+        ]
+        # 마켓별 추가 삭제어 맵 {market_id: [words]} (공통은 기본 compose에서 이미 처리됨)
+        _market_deletion_map: dict[str, list[str]] = {}
+        for _w in _all_deletion or []:
+            if _w.word and _w.market:
+                _market_deletion_map.setdefault(_w.market, []).append(_w.word)
+        # 금지어(상품 제외) — 공통 + 마켓별, _dispatch_one 의 마켓별 제외 게이트에서 사용
+        _forbidden_common: list[str] = [
+            w.word for w in (_all_forbidden or []) if w.word and w.market is None
+        ]
+        _market_forbidden_map: dict[str, list[str]] = {}
+        for _w in _all_forbidden or []:
+            if _w.word and _w.market:
+                _market_forbidden_map.setdefault(_w.market, []).append(_w.word)
+
+        def _strip_words_from_name(_name: str, _words: list[str]) -> str:
+            """상품명에서 단어 목록 제거 (대소문자 무시 + 공백 정리). clean_product_name 미러."""
+            _out = _name
+            for _ww in _words:
+                if _ww:
+                    _out = re.sub(re.escape(_ww), "", _out, flags=re.IGNORECASE)
+            return re.sub(r"\s+", " ", _out).strip()
 
         # 정책의 상품명 규칙(name_rule) 기반 상품명 조합 적용
         if policy and policy.extras:
@@ -1770,6 +1795,37 @@ class SambaShipmentService:
                             market_type=market_type,
                             deletion_words=product_dict.get("_deletion_words"),
                         )
+
+                # 마켓별 추가 삭제어 제거 (공통은 _compose 단계서 이미 처리됨)
+                _mkt_del_words = _market_deletion_map.get(market_type)
+                if _mkt_del_words and acct_product.get("name"):
+                    acct_product["name"] = _strip_words_from_name(
+                        acct_product["name"], _mkt_del_words
+                    )
+
+                # 마켓별 금지어 제외 게이트 — 공통 + 마켓 전용 금지어가 상품명에
+                # 포함되면 해당 마켓 전송에서 제외(실패/동결 아님 → skipped).
+                # 가격/재고 전용(오토튠) 갱신은 이미 등록된 상품 대상이므로 제외하지 않음
+                # (제외 시 기존 등록분이 가격 갱신에서 영영 누락됨).
+                _fb_words = (
+                    list(_forbidden_common)
+                    + (_market_forbidden_map.get(market_type) or [])
+                    if not is_price_stock_only
+                    else []
+                )
+                if _fb_words:
+                    _nm_lc = (acct_product.get("name") or "").lower()
+                    _hit = next((w for w in _fb_words if w.lower() in _nm_lc), None)
+                    if _hit:
+                        res["status"] = "skipped"
+                        res["error"] = f"금지어 '{_hit}' 포함 — {market_type} 전송 제외"
+                        res["_clear_failed_at"] = True
+                        logger.info(
+                            f"[전송] 금지어 제외 — product={product_id} "
+                            f"market={market_type} word={_hit}"
+                        )
+                        return res
+
                 if not is_price_stock_only:
                     _detail_tpl_id = ""
                     if policy and policy.extras:

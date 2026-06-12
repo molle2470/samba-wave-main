@@ -319,6 +319,64 @@ async def _fail_job_safe(job_id: str, error_msg: str) -> None:
     _add_job_log(job_id, f"수집 실패: {error_msg}", job_type="collect")
 
 
+def _ssg_daemon_detail_fallback(ext_result: dict) -> dict:
+    """SSG 헤드리스 데몬 응답 → 수집용 detail 변환.
+
+    데몬은 html·resultItemObj 없이 파싱 완료값(name/sale_price/best_benefit_price/
+    options/images)만 회신한다. 수집 경로가 html 파싱만 처리해 데몬 응답을 통째로
+    버리던 문제의 폴백 — plugins/sourcing/ssg.py refresh 의 데몬 분기와 동일 규칙.
+    카테고리(dispCtg*)는 데몬이 회신하지 않으므로 호출측 폴백(그룹 ctgPath,
+    필터명 복원 등)에 맡긴다.
+    """
+    if not isinstance(ext_result, dict):
+        return {}
+    _sale = (
+        int(ext_result.get("domSalePrice", 0) or 0)
+        or int(ext_result.get("sale_price", 0) or 0)
+        or int(ext_result.get("best_benefit_price", 0) or 0)
+    )
+    _card = int(ext_result.get("domCardPrice", 0) or 0)
+    _benefit = _card or int(ext_result.get("best_benefit_price", 0) or 0) or _sale
+    _orig = int(ext_result.get("original_price", 0) or 0) or _sale
+    _name = (ext_result.get("name") or "").strip()
+    _opts: list[dict] = []
+    for _o in ext_result.get("options", []) or []:
+        if not isinstance(_o, dict):
+            continue
+        _nm = (_o.get("name") or "").strip()
+        if not _nm:
+            continue
+        _so = bool(_o.get("isSoldOut"))
+        _stk = _o.get("stock")
+        # 품절=0, 실재고 있으면 그대로, 불명(None)→99 (기본 재고 규칙)
+        _opts.append(
+            {
+                "name": _nm,
+                "price": _sale,
+                "stock": 0 if _so else (_stk if _stk is not None else 99),
+                "isSoldOut": _so,
+            }
+        )
+    if not _name and _sale <= 0 and not _opts:
+        return {}
+    _all_sold = bool(_opts) and all(_o["isSoldOut"] for _o in _opts)
+    return {
+        "itemNm": _name,
+        "name": _name,
+        # sellprc/bestAmt: brand_all 저장 루프가 판매가/원가로 읽는 키
+        "sellprc": _sale,
+        "bestAmt": _benefit,
+        "salePrice": _sale,
+        "originalPrice": _orig,
+        "bestBenefitPrice": _benefit,
+        "images": [i for i in (ext_result.get("images") or []) if i][:9],
+        "options": _opts,
+        "soldOut": "Y" if _all_sold else "N",
+        "isSoldOut": _all_sold,
+        "isOutOfStock": _all_sold,
+    }
+
+
 def _run_transmit_in_thread(worker: "JobWorker", job_id: str, payload: dict):
     """별도 스레드에서 독립 이벤트 루프로 전송 실행 — API 요청과 I/O 완전 격리."""
     loop = asyncio.new_event_loop()
@@ -3376,12 +3434,27 @@ class JobWorker:
 
                 _ssg_ext_cache: dict[str, Any] = {}
                 if _non_bl and not _page_cancelled:
-                    _bl_futs = [
-                        SourcingQueue.add_detail_job("SSG", _it["site_product_id"])
-                        for _it in _non_bl
-                    ]
+                    # 상품별 개별 발행 — 데몬 미등록(RuntimeError) 시 잡 전체가 죽지
+                    # 않도록 해당 상품만 실패 future로 대체하고 수집은 계속 진행.
+                    _bl_futs: list[asyncio.Future] = []
+                    for _it in _non_bl:
+                        try:
+                            _bl_futs.append(
+                                SourcingQueue.add_detail_job(
+                                    "SSG", _it["site_product_id"]
+                                )[1]
+                            )
+                        except Exception as _aje:
+                            _f_err: asyncio.Future = (
+                                asyncio.get_event_loop().create_future()
+                            )
+                            _f_err.set_exception(_aje)
+                            _bl_futs.append(_f_err)
+                    # 타임아웃 100s: 데몬 병렬 처리(아이템당 ~20-40s × 배치/페이지 라운드) 감안.
+                    # 150s 이상 금지 — 장수명 session 의 idle_in_transaction_session_timeout
+                    # (120s) 초과 시 커넥션 강제 종료 → 잡 전체 failed (로컬 검증 2026-06-11).
                     _gathered_ext = await asyncio.gather(
-                        *[asyncio.wait_for(f, timeout=55) for _, f in _bl_futs],
+                        *[asyncio.wait_for(f, timeout=100) for f in _bl_futs],
                         return_exceptions=True,
                     )
                     for _bl_it2, _bl_ext in zip(_non_bl, _gathered_ext):
@@ -3468,6 +3541,11 @@ class JobWorker:
                                     "dispCtgSclsNm": "",
                                     "dispCtgId": "",
                                 }
+                        # [데몬 분기] 헤드리스 데몬은 html·resultItemObj 없이 파싱
+                        # 완료값만 회신 — refresh(ssg.py)와 동일 규칙으로 detail 직접
+                        # 구성해 데몬 응답이 통째로 버려지지 않게 함(옵션 누락 수정).
+                        if not detail and not _html:
+                            detail = _ssg_daemon_detail_fallback(_ext_result)
                         # 확장앱 uitemOptions(AJAX 후 실재고+이중옵션)로 옵션 교체 또는 보정
                         # ssg.py refresh와 동일 로직: 이중옵션이면 전체 교체, 아니면 품절만 보정
                         _uitem_opts = _ext_result.get("uitemOptions", [])
@@ -3808,7 +3886,8 @@ class JobWorker:
                     _det: dict = {}
                     try:
                         _, _r_fut = _SQ_r.add_detail_job("SSG", _spid)
-                        _r_ext = await asyncio.wait_for(_r_fut, timeout=45)
+                        # 100s: idle_in_transaction_session_timeout(120s) 미만 유지
+                        _r_ext = await asyncio.wait_for(_r_fut, timeout=100)
                         if isinstance(_r_ext, dict) and _r_ext.get("success"):
                             _r_html = _r_ext.get("html", "")
                             _r_dom_bc = _r_ext.get("domBreadcrumb", []) or []
@@ -3849,6 +3928,9 @@ class JobWorker:
                                         "dispCtgSclsNm": "",
                                         "dispCtgId": "",
                                     }
+                            # [데몬 분기] html 미회신 데몬 응답 — 파싱 완료값으로 구성
+                            if not _det and not _r_html:
+                                _det = _ssg_daemon_detail_fallback(_r_ext)
                     except Exception:
                         _det = {}
                     if not _det or not (_det.get("itemNm") or _det.get("name")):
@@ -5304,14 +5386,27 @@ class JobWorker:
                         await session.commit()
                         return
                     _pb_batch = new_items[_pb_i : _pb_i + _SSG_PREFETCH_BATCH]
-                    _pb_futs = [
-                        _SSGQueue.add_detail_job(
-                            "SSG", str(_pb_it.get("site_product_id", ""))
-                        )
-                        for _pb_it in _pb_batch
-                    ]
+                    # 상품별 개별 발행 — 데몬 미등록(RuntimeError) 시 잡 전체가 죽지
+                    # 않도록 해당 상품만 실패 future로 대체하고 수집은 계속 진행.
+                    _pb_futs: list[asyncio.Future] = []
+                    for _pb_it in _pb_batch:
+                        try:
+                            _pb_futs.append(
+                                _SSGQueue.add_detail_job(
+                                    "SSG", str(_pb_it.get("site_product_id", ""))
+                                )[1]
+                            )
+                        except Exception as _pb_aje:
+                            _pb_f_err: asyncio.Future = (
+                                asyncio.get_event_loop().create_future()
+                            )
+                            _pb_f_err.set_exception(_pb_aje)
+                            _pb_futs.append(_pb_f_err)
+                    # 타임아웃 100s: 데몬 병렬 처리(아이템당 ~20-40s × 배치/페이지 라운드) 감안.
+                    # 150s 이상 금지 — 장수명 session 의 idle_in_transaction_session_timeout
+                    # (120s) 초과 시 커넥션 강제 종료 → 잡 전체 failed (로컬 검증 2026-06-11).
                     _pb_results = await asyncio.gather(
-                        *[asyncio.wait_for(f, timeout=45) for _, f in _pb_futs],
+                        *[asyncio.wait_for(f, timeout=100) for f in _pb_futs],
                         return_exceptions=True,
                     )
                     for _pb_it, _ext_result in zip(_pb_batch, _pb_results):
@@ -5383,8 +5478,13 @@ class JobWorker:
                                             if _o2.get("name") in _soldout_nm2:
                                                 _o2["isSoldOut"] = True
                                                 _o2["stock"] = 0
-                                if det:
-                                    _ssg_details[spid] = det
+                            else:
+                                # [데몬 분기] 헤드리스 데몬은 html·resultItemObj 없이
+                                # 파싱 완료값만 회신 — refresh(ssg.py)와 동일 규칙으로
+                                # det 직접 구성(옵션 누락 수정).
+                                det = _ssg_daemon_detail_fallback(_ext_result)
+                            if det:
+                                _ssg_details[spid] = det
                         _ssg_done += 1
                     await repo.update_progress(job.id, _ssg_done, len(new_items))
                     _add_job_log(
@@ -5413,6 +5513,17 @@ class JobWorker:
                 ]
             else:
                 items_list = new_items
+            # 장시간 선취합으로 열린 트랜잭션 정리 — idle_in_transaction_session_timeout
+            # (120s) 에 커넥션이 강제 종료되어 이후 잡 완료 마킹까지 실패(수집은 정상인데
+            # status=failed)하는 문제 방지. 죽은 커넥션이면 rollback 으로 세션 재생.
+            try:
+                await session.commit()
+            except Exception as _ssg_ce:
+                logger.warning(f"[잡워커] SSG 선취합 후 세션 정리 실패: {_ssg_ce}")
+                try:
+                    await session.rollback()
+                except Exception:
+                    pass
 
         # ABCmart/GrandStage: 저장 전 3건 병렬 선취합 (세션 배치 공유로 속도 향상)
         # LOTTEON(10건)/Nike(10건)/GSShop(20건)과 동일 패턴
