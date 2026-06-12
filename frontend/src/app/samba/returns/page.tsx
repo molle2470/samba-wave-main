@@ -123,7 +123,7 @@ export default function ReturnsPage() {
       undefined,
       filterStatus || undefined,
       filterType || undefined,
-      500,
+      pageSize,
       onf ? undefined : (customStart || undefined),
       onf ? undefined : (customEnd || undefined),
       onf || undefined,
@@ -132,7 +132,7 @@ export default function ReturnsPage() {
     setReturns(data)
     setStats(st)
     setLoading(false)
-  }, [filterStatus, filterType, customStart, customEnd, orderNumberFilter])
+  }, [filterStatus, filterType, customStart, customEnd, orderNumberFilter,pageSize])
 
   useEffect(() => { load() }, [load])
 
