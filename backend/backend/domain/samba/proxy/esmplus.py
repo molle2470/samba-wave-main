@@ -689,6 +689,17 @@ class ESMPlusClient:
                 if ratio > best_ratio:
                     best_ratio = ratio
                     best_no = int(no)
+
+        # 4차: 괄호 코드 제거 후 1회 재시도(#416).
+        # "카키(054)"(LOTTEON 색상코드)/"M(90)"(MUSINSA 치수병기) 등 samba 옵션값이
+        # ESM 추천값("카키"/"M")보다 길어 2차 부분포함(samba ⊆ ESM)에 안 걸리는 케이스.
+        # 원본 우선, 전부 실패 시에만 폴백, 재귀 1단계 한정(무회귀).
+        if best_no is None:
+            _stripped = re.sub(r"\s*\([^)]*\)", "", samba_text).strip()
+            if _stripped and _stripped != samba_text:
+                return ESMPlusClient.match_option_value(
+                    _stripped, esm_values, fuzzy_threshold
+                )
         return best_no
 
     # ------------------------------------------------------------------
