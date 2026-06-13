@@ -594,12 +594,26 @@ class AuctionPlugin(MarketPlugin):
                         f"{opt_result.get('requested')}]"
                     )
                 else:
-                    opt_msg = (
-                        f" [옵션재고 동기화 실패: {opt_result.get('message', '')[:60]}]"
+                    # #413 — 추천옵션 매칭 0건이라도 이미 자유입력(valueNo=0)으로
+                    # 등록된 옵션이면 구조 보존하고 qty/품절만 갱신 (오버셀 방지).
+                    from backend.domain.samba.proxy.esmplus import (
+                        update_existing_freetext_stock,
                     )
-                    logger.warning(
-                        f"[옵션] 옵션 재고 동기화 실패: {opt_result.get('message')}"
+
+                    fb = await update_existing_freetext_stock(
+                        client, master_no, options, site="auction"
                     )
+                    if fb.get("success"):
+                        opt_msg = (
+                            f" [옵션재고(자유입력보존) {fb.get('matched')}/"
+                            f"{fb.get('total')}]"
+                        )
+                    else:
+                        opt_msg = f" [옵션재고 동기화 실패: {opt_result.get('message', '')[:60]}]"
+                        logger.warning(
+                            f"[옥션] 옵션 재고 동기화 실패: {opt_result.get('message')} "
+                            f"/ freetext-fallback: {fb.get('message')}"
+                        )
             except Exception as opt_e:
                 opt_msg = f" [옵션재고 오류: {str(opt_e)[:50]}]"
                 logger.warning(f"[옥션] 옵션 재고 동기화 오류: {opt_e}")

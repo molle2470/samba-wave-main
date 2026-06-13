@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -981,6 +982,27 @@ async def scroll_products(
         q_pat = f"%{escape_like(q)}%"
         q_no_space_pat = f"%{escape_like(q.replace(' ', ''))}%"
 
+        # SEO 등록명 매칭 — 영숫자+완성형 한글만 남긴 정규화 비교(#414②)
+        # 예) 원본 "...(A4FL1LH09_DGN)" ↔ 마켓 등록명 "...A4FL1LH09 DGN"
+        # underscore/괄호/공백 등 특수문자가 한쪽에만 있어도 상호 검색되도록.
+        _SEARCH_NORM_RE = "[^0-9A-Za-z가-힣]"
+        q_norm = re.sub(r"[^0-9A-Za-z가-힣]", "", q)
+        # 빈 쿼리(특수문자만 입력) 시 전체매칭 방지 — 정규화 조건 미적용
+        _norm_conds = []
+        if q_norm:
+            q_norm_pat = f"%{escape_like(q_norm)}%"
+            _norm_conds = [
+                func.regexp_replace(_CP.name, _SEARCH_NORM_RE, "", "g").ilike(
+                    q_norm_pat, escape="\\"
+                ),
+                func.regexp_replace(
+                    func.coalesce(cast(_CP.market_names, String), ""),
+                    _SEARCH_NORM_RE,
+                    "",
+                    "g",
+                ).ilike(q_norm_pat, escape="\\"),
+            ]
+
         # 상품번호 다중 입력(콤마) 지원 — split 결과가 있으면 IN, 없으면 단일 ilike
         _multi_ids = _split_product_ids(q)
         _site_id_clause = (
@@ -1004,6 +1026,7 @@ async def scroll_products(
                     ),
                     func.coalesce(_CP.brand, "").ilike(q_pat, escape="\\"),
                     func.coalesce(_CP.style_code, "").ilike(q_pat, escape="\\"),
+                    *_norm_conds,
                     _site_id_clause,
                 )
             )
@@ -1023,6 +1046,7 @@ async def scroll_products(
                     ),
                     func.coalesce(_CP.brand, "").ilike(q_pat, escape="\\"),
                     func.coalesce(_CP.style_code, "").ilike(q_pat, escape="\\"),
+                    *_norm_conds,
                     _site_id_clause,
                 )
             )
@@ -1953,7 +1977,6 @@ async def bulk_remove_image(
       - detail_images: 상세페이지 이미지 배열
       - detail_html: 상세페이지 HTML 본문 — 해당 URL을 포함한 <img> 태그 통째 제거
     """
-    import re
 
     from backend.domain.samba.collector.model import SambaCollectedProduct
     from sqlalchemy import String, cast

@@ -1818,8 +1818,20 @@ class SambaShipmentService:
                     else []
                 )
                 if _fb_words:
-                    _nm_lc = (acct_product.get("name") or "").lower()
-                    _hit = next((w for w in _fb_words if w.lower() in _nm_lc), None)
+                    # 게이트 haystack 확장 — 등록상품명 + 원상품명 + brand + 영문명.
+                    # 브랜드명을 금지어로 등록한 경우, name_rule 조합/마켓 정규화로
+                    # 등록상품명에 브랜드가 빠져도 brand 필드로 매칭되도록 함(#414①).
+                    _hay = " ".join(
+                        s
+                        for s in (
+                            acct_product.get("name"),
+                            acct_product.get("_original_name"),
+                            acct_product.get("brand"),
+                            acct_product.get("name_en"),
+                        )
+                        if s
+                    ).lower()
+                    _hit = next((w for w in _fb_words if w.lower() in _hay), None)
                     if _hit:
                         res["status"] = "skipped"
                         res["error"] = f"금지어 '{_hit}' 포함 — {market_type} 전송 제외"

@@ -1483,8 +1483,17 @@ _ESM_NOTICE_MAP: dict[str, int] = {
 
 
 def _get_esm_notice_no(group: str) -> int:
-    """고시정보 그룹 → ESM Plus 고시정보 번호."""
-    return _ESM_NOTICE_MAP.get(group, 35)
+    """고시정보 그룹 → ESM Plus 고시정보 번호.
+
+    _ESM_NOTICE_ITEMS 에 항목이 정의된 그룹(1/2/3/4/35)만 details 생성 가능.
+    sports(25)/cosmetic(18)/food(20)/electronics(12) 등 항목 미정의 그룹은
+    기타재화(35, 35-1~35-6 항목 정의됨)로 폴백 — details 빈 리스트로 인한
+    G마켓 resultCode=1000 "고시 코드 입력" 등록거부 방지(#415).
+    """
+    no = _ESM_NOTICE_MAP.get(group, 35)
+    if no not in _ESM_NOTICE_ITEMS:
+        return 35
+    return no
 
 
 # 그룹별 고시정보 항목 코드 매핑 (group → list[(itemelementCode, source_field)])
@@ -2419,4 +2428,172 @@ async def register_esm_options(
         "matched": 0,
         "requested": requested,
         "message": err_msg or "옵션 등록 실패",
+    }
+
+
+# ------------------------------------------------------------------
+# #413 자유입력(직접입력, recommendedOptValueNo=0) 옵션 재고 갱신 fallback
+# ------------------------------------------------------------------
+
+
+def _ft_detail_is_freetext(d: dict[str, Any]) -> bool:
+    """detail 이 자유입력(valueNo=0) 옵션인지.
+
+    - 선택형(독립): recommendedOptValueNo == 0
+    - 조합형: 존재하는 recommendedOptValueNo1/2/3 가 전부 0
+    """
+    if not isinstance(d, dict):
+        return False
+    if "recommendedOptValueNo" in d:
+        return d.get("recommendedOptValueNo") in (0, "0")
+    nos = [
+        d.get("recommendedOptValueNo1"),
+        d.get("recommendedOptValueNo2"),
+        d.get("recommendedOptValueNo3"),
+    ]
+    present = [n for n in nos if n is not None]
+    return bool(present) and all(n in (0, "0") for n in present)
+
+
+def _ft_detail_label(d: dict[str, Any]) -> str:
+    """detail 의 옵션 라벨(koreanText) 추출. 조합형은 축 라벨을 ' / ' 로 결합."""
+    rv = d.get("recommendedOptValue")
+    if isinstance(rv, dict):
+        return rv.get("koreanText") or ""
+    parts: list[str] = []
+    for k in (
+        "recommendedOptValue1",
+        "recommendedOptValue2",
+        "recommendedOptValue3",
+    ):
+        v = d.get(k)
+        if isinstance(v, dict) and v.get("koreanText"):
+            parts.append(v["koreanText"])
+    return " / ".join(parts)
+
+
+def _ft_norm_label(s: str) -> str:
+    """라벨 정규화 — 공백 제거 + 소문자. ('네이비 / 55' ↔ '네이비/55')."""
+    if not isinstance(s, str):
+        return ""
+    return re.sub(r"\s+", "", s).lower()
+
+
+def _ft_build_stock_map(
+    samba_options: list[dict[str, Any]],
+) -> dict[str, tuple[int, bool]]:
+    """soucing flat options → {정규화 옵션명: (qty, sold_out)}.
+
+    samba flat option: {"name": "네이비 / 55", "stock": 99, "isSoldOut": false, ...}
+    """
+    out: dict[str, tuple[int, bool]] = {}
+    for o in samba_options or []:
+        if not isinstance(o, dict):
+            continue
+        name = o.get("name") or o.get("option_name") or ""
+        if not name:
+            continue
+        stock = int(o.get("stock", 0) or 0)
+        sold = bool(o.get("isSoldOut") or o.get("is_sold_out")) or stock <= 0
+        qty = 0 if sold else stock
+        out[_ft_norm_label(name)] = (qty, sold)
+    return out
+
+
+async def update_existing_freetext_stock(
+    client: ESMPlusClient,
+    goods_no: str,
+    samba_options: list[dict[str, Any]],
+    *,
+    site: str = "gmarket",
+) -> dict[str, Any]:
+    """register_esm_options 실패(매칭 0) + 이미 자유입력 옵션으로 등록된 상품의 재고 갱신.
+
+    #395(대표단품 차단) 이전에 recommendedOptValueNo=0(직접입력)으로 등록된 옵션은
+    register 경로가 전부 스킵(매칭 0)해 재고 PUT 이 통째로 누락 → 품절 옵션이
+    '판매중'으로 동결되는 회귀(#413). 기존 옵션구조(GET)를 **보존**한 채 각 옵션의
+    qty/품절만 소싱 재고로 교체해 PUT. 매칭 안 되는(소싱에 없는) 옵션은 품절(qty=0)
+    처리해 오버셀 방지.
+
+    옵션 개수·라벨·manageCode·recommendedOptValueNo 불변 → 단일옵션화/옵션깎임 없음.
+    """
+    site_key_lower = "gmkt" if site == "gmarket" else "iac"
+
+    try:
+        current = await client.get_recommended_options(goods_no)
+    except Exception as exc:
+        return {"success": False, "message": f"기존 옵션 조회 실패: {exc}"}
+    if not isinstance(current, dict):
+        return {"success": False, "message": "기존 옵션 응답 형식 오류"}
+
+    indep = (
+        current.get("independent")
+        if isinstance(current.get("independent"), dict)
+        else None
+    )
+    combo = (
+        current.get("combination")
+        if isinstance(current.get("combination"), dict)
+        else None
+    )
+    indep_details = (indep or {}).get("details") or []
+    combo_details = (combo or {}).get("details") or []
+    all_details = list(indep_details) + list(combo_details)
+
+    if not all_details:
+        return {"success": False, "message": "기존 등록 옵션 없음 — fallback 미적용"}
+    if not any(_ft_detail_is_freetext(d) for d in all_details):
+        # 자유입력 옵션이 아니면(전부 추천옵션) 이 fallback 대상 아님.
+        return {"success": False, "message": "자유입력 옵션 아님 — fallback 미적용"}
+
+    stock_map = _ft_build_stock_map(samba_options)
+
+    matched = 0
+    sold_out_count = 0
+    for d in all_details:
+        if not isinstance(d, dict):
+            continue
+        label = _ft_norm_label(_ft_detail_label(d))
+        info = stock_map.get(label)
+        if info is not None:
+            qty, sold = info
+            matched += 1
+        else:
+            # 소싱 목록에 없는 옵션 → 품절 처리(오버셀 방지)
+            qty, sold = 0, True
+        if sold:
+            sold_out_count += 1
+        # 기존 구조 보존하고 qty/품절만 교체 (qty 키는 GET 형태 소문자 그대로)
+        if isinstance(d.get("qty"), dict):
+            d["qty"][site_key_lower] = qty
+        else:
+            d["qty"] = {site_key_lower: qty}
+        d["isSoldOut"] = sold
+        if isinstance(d.get("isSoldOutSite"), dict):
+            d["isSoldOutSite"][site_key_lower] = sold
+
+    # 전 옵션 품절이면 PUT 거부('최소 1개 판매') — 호출하지 않고 caller 의 sell-status 중지에 위임
+    if sold_out_count >= len(all_details):
+        return {
+            "success": False,
+            "message": "전 옵션 품절 — 옵션 PUT 생략(판매상태 중지로 처리)",
+            "all_sold_out": True,
+        }
+
+    payload = {
+        "type": current.get("type", 1),
+        "isStockManage": True,
+        "independent": indep if indep_details else None,
+        "combination": combo if combo_details else None,
+    }
+    try:
+        await client.set_recommended_options(goods_no, payload)
+    except Exception as exc:
+        return {"success": False, "message": f"옵션재고 PUT 실패: {exc}"}
+
+    return {
+        "success": True,
+        "matched": matched,
+        "total": len(all_details),
+        "note": "freetext-preserve-fallback",
     }
