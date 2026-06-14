@@ -272,9 +272,15 @@ class MusinsaClient:
                     all_images.append(
                         self._to_image_url(img.get("imageUrl") or img.get("url", ""))
                     )
-                # 트래커/확장자 없는 URL drop — 마켓 등록 [1036] 등 차단 방지
+                # 트래커/확장자 없는 URL drop — 마켓 등록 [1036] 등 차단 방지.
+                # msscdn 배너/이벤트/공지 이미지도 제외 — 상세설명 sanitize 와 동일 가드를
+                # goodsImages→images 경로에도 적용해 배너가 마켓 추가이미지로 유입 차단(#420).
                 all_images = [
-                    i for i in all_images if i and self._is_valid_image_url(i)
+                    i
+                    for i in all_images
+                    if i
+                    and self._is_valid_image_url(i)
+                    and not self._is_msscdn_banner_url(i)
                 ]
                 unique_images = list(dict.fromkeys(all_images))[:9]
                 logger.info(
