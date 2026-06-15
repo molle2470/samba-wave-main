@@ -123,12 +123,22 @@ def _lottehome_policy_margin_detail(
     source_site: str = "",
     is_point_restricted: Optional[bool] = None,
 ) -> dict:
-    """롯데홈 등록/수정 전 정책마진 기준 필요 정산가 계산."""
+    """롯데홈 등록/수정 전 정책마진 기준 필요 정산가 계산.
+
+    주의: 롯데홈 ``market_policy.marginRate`` 는 API ``mrgn_rt``(위탁수수료율)
+    이며 Samba 정책마진율이 아니다. 정책마진은 공통 pricing에서만 계산하고,
+    정산 예상액에는 롯데 위탁수수료율을 반영한다.
+    """
     pr = policy_pricing or {}
     mp = market_policy or {}
-    margin_rate = float(mp.get("marginRate") or 0) or float(_resolve_margin_rate(cost, pr))
+    margin_rate = float(_resolve_margin_rate(cost, pr))
     shipping = float(mp.get("shippingCost") or pr.get("shippingCost") or 0)
-    fee_rate = float(mp.get("feeRate") or pr.get("feeRate") or 0)
+    fee_rate = float(
+        mp.get("feeRate")
+        or mp.get("marginRate")
+        or pr.get("feeRate")
+        or 0
+    )
     min_margin = float(pr.get("minMarginAmount") or 0)
 
     policy_margin_amount = round(cost * margin_rate / 100)
@@ -2378,6 +2388,10 @@ class SambaShipmentService:
                                     _pr_now = await _ImmCPRepo(_imm_s).get_async(
                                         product_id
                                     )
+                                    if not _pr_now and market_type == "lottehome":
+                                        raise RuntimeError(
+                                            f"수집상품을 찾을 수 없음: product_id={product_id}"
+                                        )
                                     if _pr_now:
                                         _imm_reg = list(
                                             set(

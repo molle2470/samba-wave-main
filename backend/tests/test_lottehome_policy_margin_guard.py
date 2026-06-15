@@ -18,6 +18,26 @@ def test_lottehome_policy_margin_guard_blocks_below_policy_required_settlement()
     assert detail["shortfall"] == 17234
 
 
+def test_lottehome_margin_rate_is_commission_not_policy_margin():
+    # 롯데홈 market_policy.marginRate 는 API mrgn_rt(위탁수수료율)이다.
+    # 이를 정책마진으로 오해하거나 feeRate=0 으로 처리하면 아래 역마진 케이스가 통과한다.
+    ok, detail = _validate_lottehome_policy_margin_price(
+        sale_price=85000,
+        cost=67670,
+        policy_pricing={"marginRate": 6, "minMarginAmount": 4500, "shippingCost": 0},
+        market_policy={"marginRate": 20},
+        source_site="MUSINSA",
+        is_point_restricted=None,
+    )
+
+    assert ok is False
+    assert detail["policy_margin_rate"] == 6
+    assert detail["lotte_fee_rate"] == 20
+    assert detail["expected_settlement"] == 68000
+    assert detail["required_settlement"] == 72170
+    assert detail["shortfall"] == 4170
+
+
 def test_lottehome_policy_margin_guard_allows_policy_margin_price():
     ok, detail = _validate_lottehome_policy_margin_price(
         sale_price=90300,
