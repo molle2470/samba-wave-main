@@ -5767,9 +5767,31 @@ class JobWorker:
             # 이미지: 확장앱 결과와 검색 API 중 더 많은 쪽 사용
             _detail_imgs = detail.get("images") or []
             _search_imgs = item.get("images", [])
-            images = (
-                _detail_imgs if len(_detail_imgs) > len(_search_imgs) else _search_imgs
-            )
+            if site == "SSG":
+                # SSG: 데몬 배너/UI아이콘 제거 + item_id 기반 sitem 직접 복원(#425/#427).
+                # expand_ssg_images 가 item_id 로 대표 i1 을 구성하므로 sanitize 결과가
+                # 비어도(데몬이 UI쓰레기만 준 경우) 정확한 상품이미지로 복원된다.
+                from backend.domain.samba.proxy.ssg_sourcing import (
+                    expand_ssg_images as _ssg_exp,
+                    sanitize_ssg_images as _ssg_san,
+                )
+
+                _ssg_clean = _ssg_san(
+                    list(_detail_imgs or []) + list(_search_imgs or []), p_id
+                )
+                images = await _ssg_exp(p_id, _ssg_clean)
+                if not images:
+                    images = (
+                        _detail_imgs
+                        if len(_detail_imgs) > len(_search_imgs)
+                        else _search_imgs
+                    )
+            else:
+                images = (
+                    _detail_imgs
+                    if len(_detail_imgs) > len(_search_imgs)
+                    else _search_imgs
+                )
             # 원가: 최대혜택가 옵션 시 bestBenefitPrice 우선
             if _use_max_discount:
                 _bbp = int(detail.get("bestBenefitPrice", 0) or 0) or int(
