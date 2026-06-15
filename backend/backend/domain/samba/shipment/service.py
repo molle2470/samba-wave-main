@@ -116,6 +116,115 @@ def resolve_cost_for_policy(
     return cost
 
 
+def _lottehome_policy_margin_detail(
+    cost: float,
+    policy_pricing: dict | None,
+    market_policy: dict | None,
+    source_site: str = "",
+    is_point_restricted: Optional[bool] = None,
+) -> dict:
+    """롯데홈 등록/수정 전 정책마진 기준 필요 정산가 계산.
+
+    주의: 롯데홈 ``market_policy.marginRate`` 는 API ``mrgn_rt``(위탁수수료율)
+    이며 Samba 정책마진율이 아니다. 정책마진은 공통 pricing에서만 계산하고,
+    정산 예상액에는 롯데 위탁수수료율을 반영한다.
+    """
+    pr = policy_pricing or {}
+    mp = market_policy or {}
+    margin_rate = float(_resolve_margin_rate(cost, pr))
+    shipping = float(mp.get("shippingCost") or pr.get("shippingCost") or 0)
+    fee_rate = float(
+        mp.get("feeRate")
+        or mp.get("marginRate")
+        or pr.get("feeRate")
+        or 0
+    )
+    min_margin = float(pr.get("minMarginAmount") or 0)
+
+    policy_margin_amount = round(cost * margin_rate / 100)
+    if min_margin > 0 and policy_margin_amount < min_margin:
+        policy_margin_amount = min_margin
+
+    source_margin_amount = 0
+    if source_site:
+        ssm = _get_source_site_margin(pr, source_site)
+        point_only = bool(ssm.get("pointOnly"))
+        apply_ssm = (not point_only) or (is_point_restricted is False)
+        cost_threshold = ssm.get("costThreshold", 0) or 0
+        if cost_threshold > 0 and cost >= cost_threshold:
+            apply_ssm = False
+        if apply_ssm:
+            source_margin_amount += round(cost * float(ssm.get("marginRate") or 0) / 100)
+            source_margin_amount += float(ssm.get("marginAmount") or 0)
+
+    required_settlement = int(cost + policy_margin_amount + shipping + source_margin_amount)
+    return {
+        "cost": int(cost),
+        "lotte_fee_rate": fee_rate,
+        "policy_margin_rate": margin_rate,
+        "policy_margin_amount": int(policy_margin_amount),
+        "shipping": int(shipping),
+        "source_margin_amount": int(source_margin_amount),
+        "required_settlement": required_settlement,
+    }
+
+
+def _validate_lottehome_policy_margin_price(
+    sale_price: int,
+    cost: float,
+    policy_pricing: dict | None,
+    market_policy: dict | None,
+    source_site: str = "",
+    is_point_restricted: Optional[bool] = None,
+) -> tuple[bool, dict]:
+    detail = _lottehome_policy_margin_detail(
+        cost, policy_pricing, market_policy, source_site, is_point_restricted
+    )
+    fee_rate = detail["lotte_fee_rate"]
+    expected_settlement = int(sale_price * (1 - fee_rate / 100))
+    detail.update(
+        {
+            "sale_price": int(sale_price),
+            "expected_settlement": expected_settlement,
+            "shortfall": max(0, detail["required_settlement"] - expected_settlement),
+        }
+    )
+    return expected_settlement >= detail["required_settlement"], detail
+
+
+def _lottehome_goods_no_gate(
+    result: dict,
+    product_no: str,
+    is_price_stock_only: bool = False,
+) -> tuple[bool, str]:
+    """롯데홈 성공 응답이 DB 연결 가능한 유효 goods_no 를 갖는지 판정.
+
+    신규등록/재사용 성공은 반드시 유효 goods_no 를 동반해야 한다 — 미연결 라이브
+    상품(삼바 DB 미매핑)은 미등록·미매칭 주문 사고의 근원이기 때문.
+
+    단, price/stock 전용 업데이트(오토튠)는 기존 등록 상품을 수정만 하므로 새
+    goods_no 를 발급하지 않는다. 이 경로까지 goods_no 를 강제하면 정상 가격/재고
+    동기화가 매 사이클 false-failure 로 막혀 재전송 루프/동결을 유발한다. 따라서
+    업데이트는 게이트를 면제한다.
+
+    Returns:
+      (ok, goods_no) — ok=False 면 성공 취소(차단). 면제 시 goods_no 는 빈 문자열일
+      수 있으며, 호출부는 빈 값이면 기존 product_no 처리를 그대로 둔다.
+    """
+    if is_price_stock_only:
+        return True, str(product_no or "").strip()
+    goods_no = str(
+        result.get("goodsNo")
+        or result.get("goods_no")
+        or result.get("product_no")
+        or product_no
+        or ""
+    ).strip()
+    if not goods_no or goods_no in ("0", "0.0"):
+        return False, ""
+    return True, goods_no
+
+
 def calc_market_price(
     cost: float,
     policy_pricing: dict,
@@ -1914,6 +2023,33 @@ class SambaShipmentService:
                         )
                         return res
 
+                    if market_type == "lottehome":
+                        _pkey = MARKET_TYPE_TO_POLICY_KEY.get(market_type, "")
+                        _mp = (_effective_market_data or {}).get(_pkey, {}) if _pkey else {}
+                        _ok, _margin_detail = _validate_lottehome_policy_margin_price(
+                            calc_price,
+                            effective_cost,
+                            policy.pricing,
+                            _mp,
+                            source_site=product_row.source_site or "",
+                            is_point_restricted=getattr(
+                                product_row, "is_point_restricted", None
+                            ),
+                        )
+                        if not _ok:
+                            logger.error(
+                                "[롯데홈쇼핑][가격방어] 정책마진 미달 전송 차단 — "
+                                f"{_margin_detail}"
+                            )
+                            res["error"] = (
+                                "롯데홈쇼핑 정책마진 미달 "
+                                f"(판매가 {calc_price:,}원, "
+                                f"예상정산 {_margin_detail['expected_settlement']:,}원, "
+                                f"필요정산 {_margin_detail['required_settlement']:,}원, "
+                                f"부족 {_margin_detail['shortfall']:,}원)"
+                            )
+                            return res
+
                     acct_product["sale_price"] = calc_price
                     logger.info(
                         f"[전송] 정책 가격 계산: 원가={cost} → 판매가={calc_price}"
@@ -2104,6 +2240,20 @@ class SambaShipmentService:
                     # product_no: 플러그인이 "product_no" 키로 반환 (롯데ON 등)
                     # spdNo: 이전 방식 또는 일부 마켓 직접 반환 — 둘 다 확인
                     product_no = self._extract_market_product_no(result)
+                    if result.get("success") and market_type == "lottehome":
+                        _lh_ok, _lh_goods_no = _lottehome_goods_no_gate(
+                            result, product_no, is_price_stock_only
+                        )
+                        if not _lh_ok:
+                            res["status"] = "failed"
+                            res["error"] = "롯데홈쇼핑 등록 실패: 성공 응답에 유효 goods_no 없음"
+                            logger.error(
+                                f"[롯데홈쇼핑][DB연결방어] goods_no 없는 성공 응답 차단: {result}"
+                            )
+                            return res
+                        # 업데이트 면제 경로는 goods_no 가 빈 값 — 기존 product_no 처리 유지
+                        if _lh_goods_no:
+                            product_no = _lh_goods_no
                     # 스마트스토어 origin/channel 분리를 위해 api_data 는 항상 추출
                     # (기존: product_no 가 비어있을 때만 → smartstore 도 origin 만 저장하던 버그)
                     api_data: dict[str, Any] = {}
@@ -2238,6 +2388,10 @@ class SambaShipmentService:
                                     _pr_now = await _ImmCPRepo(_imm_s).get_async(
                                         product_id
                                     )
+                                    if not _pr_now and market_type == "lottehome":
+                                        raise RuntimeError(
+                                            f"수집상품을 찾을 수 없음: product_id={product_id}"
+                                        )
                                     if _pr_now:
                                         _imm_reg = list(
                                             set(
@@ -2286,6 +2440,14 @@ class SambaShipmentService:
                                     )
                                     await _imm_s.commit()  # _imm_snap 별도 커밋
                         except Exception as _ie:
+                            if market_type == "lottehome" and _imm_nos:
+                                res["status"] = "failed"
+                                res["error"] = f"롯데홈쇼핑 DB 연결 저장 실패: {_ie}"
+                                logger.error(
+                                    f"[롯데홈쇼핑][DB연결방어] 즉시저장 실패 → 성공 취소: {_ie}",
+                                    exc_info=True,
+                                )
+                                return res
                             logger.warning(
                                 f"[전송] {market_type} 즉시저장 실패 (무시): {_ie}"
                             )

@@ -916,56 +916,92 @@ class LotteHomePlugin(MarketPlugin):
             if isinstance(g_result, dict):
                 goods_no = g_result.get("goods_no", "") or g_result.get("Result", "")
 
+        # 롯데홈 신규등록 성공의 hard gate:
+        # 1) API 응답에서 유효 goods_no 확보 필수
+        # 2) Samba DB market_product_nos/registered_accounts 저장 필수
+        # 둘 중 하나라도 실패하면 success=False 로 반환해 미등록 주문/DB 미연결 false success 차단.
+        goods_no = str(goods_no or "").strip()
+        if not goods_no or goods_no in ("0", "0.0"):
+            logger.error(
+                f"[롯데홈쇼핑] 등록 실패 처리 — 유효 goods_no 없음: result={result}"
+            )
+            return {
+                "success": False,
+                "message": "롯데홈쇼핑 등록 실패: API 응답에서 유효 상품번호(goods_no)를 확인하지 못했습니다.",
+                "data": result,
+                "goodsNo": goods_no,
+            }
+
         # DB에 등록 정보 저장 (registered_accounts, market_product_nos)
-        if goods_no and account:
+        if not account:
+            return {
+                "success": False,
+                "message": f"롯데홈쇼핑 등록 실패: 계정 정보가 없어 상품번호 {goods_no}를 DB에 연결하지 못했습니다.",
+                "data": result,
+                "goodsNo": goods_no,
+            }
+
+        try:
+            from backend.domain.samba.collector.model import SambaCollectedProduct
+            from sqlmodel import select
+
+            # 현재 상품 조회
+            stmt = select(SambaCollectedProduct).where(
+                SambaCollectedProduct.id == product.get("id")
+            )
+            result_db = await session.execute(stmt)
+            collected = result_db.scalars().first()
+
+            if not collected:
+                raise RuntimeError(f"수집상품을 찾을 수 없음: product_id={product.get('id')}")
+
+            # registered_accounts 업데이트
+            reg_accts = list(collected.registered_accounts or [])
+            if account.id not in reg_accts:
+                reg_accts.append(account.id)
+                collected.registered_accounts = reg_accts
+
+            # market_product_nos 업데이트
+            market_nos = dict(collected.market_product_nos or {})
+            market_nos[account.id] = goods_no
+            # MD 승인 대기 상태 표시
+            market_nos[f"{account.id}_qa"] = "pending"
+            collected.market_product_nos = market_nos
+
+            # 롯데에 실제로 등록한 상품명으로 업데이트
+            lotte_product_name = goods_data.get("goods_nm", "")
+            if lotte_product_name and collected.name != lotte_product_name:
+                collected.name = lotte_product_name
+
+            # 상품 상태 업데이트
+            if collected.status != "registered":
+                collected.status = "registered"
+
+            session.add(collected)
+            await session.commit()
+            logger.info(
+                f"[롯데홈쇼핑] DB 저장 완료: {collected.id} → "
+                f"registered_accounts={reg_accts}, "
+                f"market_product_nos={market_nos}"
+            )
+        except Exception as e:
             try:
-                from backend.domain.samba.collector.model import SambaCollectedProduct
-                from sqlmodel import select
-
-                # 현재 상품 조회
-                stmt = select(SambaCollectedProduct).where(
-                    SambaCollectedProduct.id == product.get("id")
-                )
-                result_db = await session.execute(stmt)
-                collected = result_db.scalars().first()
-
-                if collected:
-                    # registered_accounts 업데이트
-                    reg_accts = list(collected.registered_accounts or [])
-                    if account.id not in reg_accts:
-                        reg_accts.append(account.id)
-                        collected.registered_accounts = reg_accts
-
-                    # market_product_nos 업데이트
-                    market_nos = dict(collected.market_product_nos or {})
-                    market_nos[account.id] = goods_no
-                    # MD 승인 대기 상태 표시
-                    market_nos[f"{account.id}_qa"] = "pending"
-                    collected.market_product_nos = market_nos
-
-                    # 롯데에 실제로 등록한 상품명으로 업데이트
-                    lotte_product_name = goods_data.get("goods_nm", "")
-                    if lotte_product_name and collected.name != lotte_product_name:
-                        collected.name = lotte_product_name
-
-                    # 상품 상태 업데이트
-                    if collected.status != "registered":
-                        collected.status = "registered"
-
-                    session.add(collected)
-                    await session.commit()
-                    logger.info(
-                        f"[롯데홈쇼핑] DB 저장 완료: {collected.id} → "
-                        f"registered_accounts={reg_accts}, "
-                        f"market_product_nos={market_nos}"
-                    )
-            except Exception as e:
-                logger.warning(f"[롯데홈쇼핑] DB 저장 실패: {e}")
+                await session.rollback()
+            except Exception:
+                pass
+            logger.error(f"[롯데홈쇼핑] 등록 실패 처리 — DB 저장 실패: {e}", exc_info=True)
+            return {
+                "success": False,
+                "message": f"롯데홈쇼핑 등록 실패: 상품번호 {goods_no} DB 연결 저장 실패 — {e}",
+                "data": result,
+                "goodsNo": goods_no,
+            }
 
         return {
             "success": True,
             "message": "롯데홈쇼핑 등록 성공",
             "data": result,
             "goodsNo": goods_no,
+            "product_no": goods_no,
             "qa_pending": True,  # 등록 후 MD 승인 대기 상태
         }
