@@ -182,6 +182,39 @@ def _validate_lottehome_policy_margin_price(
     return expected_settlement >= detail["required_settlement"], detail
 
 
+def _lottehome_goods_no_gate(
+    result: dict,
+    product_no: str,
+    is_price_stock_only: bool = False,
+) -> tuple[bool, str]:
+    """롯데홈 성공 응답이 DB 연결 가능한 유효 goods_no 를 갖는지 판정.
+
+    신규등록/재사용 성공은 반드시 유효 goods_no 를 동반해야 한다 — 미연결 라이브
+    상품(삼바 DB 미매핑)은 미등록·미매칭 주문 사고의 근원이기 때문.
+
+    단, price/stock 전용 업데이트(오토튠)는 기존 등록 상품을 수정만 하므로 새
+    goods_no 를 발급하지 않는다. 이 경로까지 goods_no 를 강제하면 정상 가격/재고
+    동기화가 매 사이클 false-failure 로 막혀 재전송 루프/동결을 유발한다. 따라서
+    업데이트는 게이트를 면제한다.
+
+    Returns:
+      (ok, goods_no) — ok=False 면 성공 취소(차단). 면제 시 goods_no 는 빈 문자열일
+      수 있으며, 호출부는 빈 값이면 기존 product_no 처리를 그대로 둔다.
+    """
+    if is_price_stock_only:
+        return True, str(product_no or "").strip()
+    goods_no = str(
+        result.get("goodsNo")
+        or result.get("goods_no")
+        or result.get("product_no")
+        or product_no
+        or ""
+    ).strip()
+    if not goods_no or goods_no in ("0", "0.0"):
+        return False, ""
+    return True, goods_no
+
+
 def calc_market_price(
     cost: float,
     policy_pricing: dict,
@@ -2198,21 +2231,19 @@ class SambaShipmentService:
                     # spdNo: 이전 방식 또는 일부 마켓 직접 반환 — 둘 다 확인
                     product_no = self._extract_market_product_no(result)
                     if result.get("success") and market_type == "lottehome":
-                        _lh_goods_no = str(
-                            result.get("goodsNo")
-                            or result.get("goods_no")
-                            or result.get("product_no")
-                            or product_no
-                            or ""
-                        ).strip()
-                        if not _lh_goods_no or _lh_goods_no in ("0", "0.0"):
+                        _lh_ok, _lh_goods_no = _lottehome_goods_no_gate(
+                            result, product_no, is_price_stock_only
+                        )
+                        if not _lh_ok:
                             res["status"] = "failed"
                             res["error"] = "롯데홈쇼핑 등록 실패: 성공 응답에 유효 goods_no 없음"
                             logger.error(
                                 f"[롯데홈쇼핑][DB연결방어] goods_no 없는 성공 응답 차단: {result}"
                             )
                             return res
-                        product_no = _lh_goods_no
+                        # 업데이트 면제 경로는 goods_no 가 빈 값 — 기존 product_no 처리 유지
+                        if _lh_goods_no:
+                            product_no = _lh_goods_no
                     # 스마트스토어 origin/channel 분리를 위해 api_data 는 항상 추출
                     # (기존: product_no 가 비어있을 때만 → smartstore 도 origin 만 저장하던 버그)
                     api_data: dict[str, Any] = {}
