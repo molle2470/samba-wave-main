@@ -927,6 +927,11 @@ class ImageTransformService:
         # ai_tools.py 핫링크 목록엔 이미 등록돼 있던 도메인.
         "image.a-rt.com",
         "img.a-rt.com",
+        # 패션플러스 CDN — SSG itemDesc 검수가 비허용 외부 <img>를 strip 해 상품컷이
+        # 빈 div 로 남던 문제(#428, #410 ABCmart와 동일 클래스). referer 처리는 이미
+        # 있으나(아래 fashionplus 분기) R2 선미러 목록엔 누락 → 추가. 우리 서버는
+        # 다운로드 가능(200 실측) → R2 선미러 후 SSG 재전송 시 상품컷 정상 표시.
+        "fashionplus.co.kr",
     )
 
     async def mirror_external_to_r2(
