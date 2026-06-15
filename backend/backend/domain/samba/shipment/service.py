@@ -2197,6 +2197,22 @@ class SambaShipmentService:
                     # product_no: 플러그인이 "product_no" 키로 반환 (롯데ON 등)
                     # spdNo: 이전 방식 또는 일부 마켓 직접 반환 — 둘 다 확인
                     product_no = self._extract_market_product_no(result)
+                    if result.get("success") and market_type == "lottehome":
+                        _lh_goods_no = str(
+                            result.get("goodsNo")
+                            or result.get("goods_no")
+                            or result.get("product_no")
+                            or product_no
+                            or ""
+                        ).strip()
+                        if not _lh_goods_no or _lh_goods_no in ("0", "0.0"):
+                            res["status"] = "failed"
+                            res["error"] = "롯데홈쇼핑 등록 실패: 성공 응답에 유효 goods_no 없음"
+                            logger.error(
+                                f"[롯데홈쇼핑][DB연결방어] goods_no 없는 성공 응답 차단: {result}"
+                            )
+                            return res
+                        product_no = _lh_goods_no
                     # 스마트스토어 origin/channel 분리를 위해 api_data 는 항상 추출
                     # (기존: product_no 가 비어있을 때만 → smartstore 도 origin 만 저장하던 버그)
                     api_data: dict[str, Any] = {}
@@ -2379,6 +2395,14 @@ class SambaShipmentService:
                                     )
                                     await _imm_s.commit()  # _imm_snap 별도 커밋
                         except Exception as _ie:
+                            if market_type == "lottehome" and _imm_nos:
+                                res["status"] = "failed"
+                                res["error"] = f"롯데홈쇼핑 DB 연결 저장 실패: {_ie}"
+                                logger.error(
+                                    f"[롯데홈쇼핑][DB연결방어] 즉시저장 실패 → 성공 취소: {_ie}",
+                                    exc_info=True,
+                                )
+                                return res
                             logger.warning(
                                 f"[전송] {market_type} 즉시저장 실패 (무시): {_ie}"
                             )
