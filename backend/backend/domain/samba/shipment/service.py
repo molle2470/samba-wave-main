@@ -116,6 +116,72 @@ def resolve_cost_for_policy(
     return cost
 
 
+def _lottehome_policy_margin_detail(
+    cost: float,
+    policy_pricing: dict | None,
+    market_policy: dict | None,
+    source_site: str = "",
+    is_point_restricted: Optional[bool] = None,
+) -> dict:
+    """롯데홈 등록/수정 전 정책마진 기준 필요 정산가 계산."""
+    pr = policy_pricing or {}
+    mp = market_policy or {}
+    margin_rate = float(mp.get("marginRate") or 0) or float(_resolve_margin_rate(cost, pr))
+    shipping = float(mp.get("shippingCost") or pr.get("shippingCost") or 0)
+    fee_rate = float(mp.get("feeRate") or pr.get("feeRate") or 0)
+    min_margin = float(pr.get("minMarginAmount") or 0)
+
+    policy_margin_amount = round(cost * margin_rate / 100)
+    if min_margin > 0 and policy_margin_amount < min_margin:
+        policy_margin_amount = min_margin
+
+    source_margin_amount = 0
+    if source_site:
+        ssm = _get_source_site_margin(pr, source_site)
+        point_only = bool(ssm.get("pointOnly"))
+        apply_ssm = (not point_only) or (is_point_restricted is False)
+        cost_threshold = ssm.get("costThreshold", 0) or 0
+        if cost_threshold > 0 and cost >= cost_threshold:
+            apply_ssm = False
+        if apply_ssm:
+            source_margin_amount += round(cost * float(ssm.get("marginRate") or 0) / 100)
+            source_margin_amount += float(ssm.get("marginAmount") or 0)
+
+    required_settlement = int(cost + policy_margin_amount + shipping + source_margin_amount)
+    return {
+        "cost": int(cost),
+        "lotte_fee_rate": fee_rate,
+        "policy_margin_rate": margin_rate,
+        "policy_margin_amount": int(policy_margin_amount),
+        "shipping": int(shipping),
+        "source_margin_amount": int(source_margin_amount),
+        "required_settlement": required_settlement,
+    }
+
+
+def _validate_lottehome_policy_margin_price(
+    sale_price: int,
+    cost: float,
+    policy_pricing: dict | None,
+    market_policy: dict | None,
+    source_site: str = "",
+    is_point_restricted: Optional[bool] = None,
+) -> tuple[bool, dict]:
+    detail = _lottehome_policy_margin_detail(
+        cost, policy_pricing, market_policy, source_site, is_point_restricted
+    )
+    fee_rate = detail["lotte_fee_rate"]
+    expected_settlement = int(sale_price * (1 - fee_rate / 100))
+    detail.update(
+        {
+            "sale_price": int(sale_price),
+            "expected_settlement": expected_settlement,
+            "shortfall": max(0, detail["required_settlement"] - expected_settlement),
+        }
+    )
+    return expected_settlement >= detail["required_settlement"], detail
+
+
 def calc_market_price(
     cost: float,
     policy_pricing: dict,
@@ -1913,6 +1979,33 @@ class SambaShipmentService:
                             f"(원가 {int(cost):,}원 < 정상가 {_orig_price:,}원의 5%)"
                         )
                         return res
+
+                    if market_type == "lottehome":
+                        _pkey = MARKET_TYPE_TO_POLICY_KEY.get(market_type, "")
+                        _mp = (_effective_market_data or {}).get(_pkey, {}) if _pkey else {}
+                        _ok, _margin_detail = _validate_lottehome_policy_margin_price(
+                            calc_price,
+                            effective_cost,
+                            policy.pricing,
+                            _mp,
+                            source_site=product_row.source_site or "",
+                            is_point_restricted=getattr(
+                                product_row, "is_point_restricted", None
+                            ),
+                        )
+                        if not _ok:
+                            logger.error(
+                                "[롯데홈쇼핑][가격방어] 정책마진 미달 전송 차단 — "
+                                f"{_margin_detail}"
+                            )
+                            res["error"] = (
+                                "롯데홈쇼핑 정책마진 미달 "
+                                f"(판매가 {calc_price:,}원, "
+                                f"예상정산 {_margin_detail['expected_settlement']:,}원, "
+                                f"필요정산 {_margin_detail['required_settlement']:,}원, "
+                                f"부족 {_margin_detail['shortfall']:,}원)"
+                            )
+                            return res
 
                     acct_product["sale_price"] = calc_price
                     logger.info(
