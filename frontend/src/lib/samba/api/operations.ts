@@ -24,6 +24,7 @@ export type {
   ChromeProfile,
   RewardAccountRow,
   RewardsStatus,
+  RewardJob,
   SourcingRoi,
   ProductPerformance,
   BrandSales,

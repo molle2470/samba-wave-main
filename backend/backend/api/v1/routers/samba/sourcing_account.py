@@ -1033,6 +1033,73 @@ async def run_rewards_for_account(
     return {"ok": True, "account_id": account.id, "enqueued": enqueued}
 
 
+@router.get("/rewards/job-status")
+async def get_reward_job_status(
+    session: AsyncSession = Depends(get_read_session_dependency),
+):
+    """최근 2시간 reward 잡 실행 상태 — 적립금 페이지 실행 가시화용.
+
+    pending(적재) → dispatched(실행중) → completed/failed. owner_device_id 로 어느 PC가
+    잡을 가져갔는지 노출(트리거 PC 바인딩 확인용). 현재 테넌트의 활성 소싱처 계정
+    잡으로만 스코프 — samba_sourcing_job 은 비-테넌트 테이블이라 타 테넌트 누수 차단.
+    """
+    from datetime import timedelta
+
+    from backend.domain.samba.sourcing_account.model import SambaSourcingAccount
+    from backend.domain.samba.sourcing_job.model import SambaSourcingJob
+
+    acct_stmt = select(SambaSourcingAccount.id).where(
+        SambaSourcingAccount.site_name.in_(  # type: ignore[attr-defined]
+            ["MUSINSA", "ABCmart", "SSG", "GSShop", "LOTTEON", "NAVERSTORE", "KREAM"]
+        ),
+        SambaSourcingAccount.is_active == True,  # noqa: E712
+    )
+    acct_ids = set((await session.execute(acct_stmt)).scalars().all())
+
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(hours=2)
+    job_stmt = (
+        select(SambaSourcingJob)
+        .where(
+            SambaSourcingJob.job_type == "reward",
+            SambaSourcingJob.created_at >= since,
+        )
+        .order_by(SambaSourcingJob.created_at.desc())  # type: ignore[attr-defined]
+        .limit(300)
+    )
+    jobs = (await session.execute(job_stmt)).scalars().all()
+
+    out: list[dict] = []
+    for j in jobs:
+        payload = j.payload or {}
+        acct_id = payload.get("sourcingAccountId") or ""
+        if acct_id not in acct_ids:
+            continue  # 타 테넌트/비활성 계정 잡 제외
+        status = j.status
+        # pending 인데 TTL 지났으면 '만료'로 표기 (claim 안 된 채 expire — 처리 PC 없음 신호)
+        if status == "pending" and j.expires_at and j.expires_at < now:
+            status = "expired"
+        out.append(
+            {
+                "request_id": j.request_id,
+                "account_id": acct_id,
+                "action": payload.get("action") or "",
+                "site": j.site,
+                "status": status,
+                "owner_device_id": j.owner_device_id or "",
+                "created_at": j.created_at.isoformat() if j.created_at else None,
+                "dispatched_at": (
+                    j.dispatched_at.isoformat() if j.dispatched_at else None
+                ),
+                "completed_at": (
+                    j.completed_at.isoformat() if j.completed_at else None
+                ),
+                "error": j.error or None,
+            }
+        )
+    return {"jobs": out}
+
+
 class RewardAutoSettingsRequest(BaseModel):
     interval_hours: int = 0  # 0이면 비활성
 

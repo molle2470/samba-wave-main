@@ -2680,8 +2680,23 @@ export interface RewardsStatus {
   last_auto_run_at: string | null
 }
 
+export interface RewardJob {
+  request_id: string
+  account_id: string
+  action: string
+  site: string
+  status: 'pending' | 'dispatched' | 'completed' | 'failed' | 'expired'
+  owner_device_id: string
+  created_at: string | null
+  dispatched_at: string | null
+  completed_at: string | null
+  error: string | null
+}
+
 export const rewardsApi = {
   status: () => request<RewardsStatus>(`${SAMBA_PREFIX}/sourcing-accounts/rewards/status`),
+  jobStatus: () =>
+    request<{ jobs: RewardJob[] }>(`${SAMBA_PREFIX}/sourcing-accounts/rewards/job-status`),
   runNow: (actions?: string[]) =>
     request<{ ok: boolean; summary: unknown[] }>(`${SAMBA_PREFIX}/sourcing-accounts/rewards/run-now`, {
       method: 'POST',
