@@ -7664,7 +7664,10 @@ async def sync_orders_from_markets(
             _existing_id_map: dict[Any, int] = {}
 
             def _existing_key(_onum: str, _src: str, _seq) -> Any:
-                if _src == "11st":
+                # 한 주문에 여러 라인(ord_prd_seq)을 분리해 내려주는 마켓은
+                # (order_number, ord_prd_seq) 복합키로 매칭 — 2번째+ 라인 누락/덮어쓰기
+                # 방지. 11번가(#422)·SSG(#424). 타 마켓은 order_number 단독(무회귀).
+                if _src in ("11st", "ssg"):
                     return (_onum, str(_seq or ""))
                 return _onum
 
@@ -8148,10 +8151,10 @@ async def sync_orders_from_markets(
                             if d.product_id == order_data["product_id"]
                             and (d.product_option or "")
                             == (order_data.get("product_option") or "")
-                            # 11번가는 ord_prd_seq 일치까지 요구 — 같은 dlvNo·상품의
-                            # 동일옵션 다중라인 오합치 차단(#422)
+                            # 11번가·SSG는 ord_prd_seq 일치까지 요구 — 같은 배송번호·
+                            # 상품의 동일옵션 다중라인 오합치 차단(#422, #424)
                             and (
-                                order_data.get("source") != "11st"
+                                order_data.get("source") not in ("11st", "ssg")
                                 or (d.ord_prd_seq or "")
                                 == (order_data.get("ord_prd_seq") or "")
                             )
