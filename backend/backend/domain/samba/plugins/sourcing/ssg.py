@@ -439,6 +439,12 @@ class SSGPlugin(SourcingPlugin):
                 if _final_dom_card > 0
                 else detail.get("bestBenefitPrice", 0)
             )
+            # SSG 카드혜택가는 결제금액 7만원 이상에서만 적용 — 7만원 미만 단품은 카드할인을
+            # 못 받으므로 판매가(카드할인 전)를 원가로 한다(#430, 수집 게이트와 동일 정책).
+            # refresh 에도 적용해 오토튠 갱신 시 cost 가 카드혜택가로 되돌아가지 않게 한다.
+            _ssg_list_price = int(new_sale_price or 0)
+            if 0 < _ssg_list_price < 70000:
+                best_benefit_price = _ssg_list_price
 
             # 옵션 데이터 변환
             new_options = None

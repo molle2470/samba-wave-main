@@ -836,7 +836,12 @@ async def collect_by_url(
                     # 최대혜택가 체크(use_max_discount=True) 시 bestBenefitPrice 추출 실패
                     # → cost=None (정가 폴백 금지). 다음 사이클 정상 수집 시 채움.
                     # 미체크 시는 사용자가 명시적으로 salePrice를 cost로 선택한 모드.
-                    if use_max_discount:
+                    # SSG 카드혜택가는 결제금액 7만원 이상에서만 적용 — 7만원 미만 단품은
+                    # 카드할인을 못 받으므로 판매가(카드할인 전)를 원가로 한다(#430).
+                    _ssg_sp = int(detail.get("salePrice", 0) or 0)
+                    if 0 < _ssg_sp < 70000:
+                        new_cost = _ssg_sp
+                    elif use_max_discount:
                         _raw_cost = detail.get("bestBenefitPrice")
                         new_cost = (
                             _raw_cost
@@ -942,6 +947,15 @@ async def collect_by_url(
             )
             existing_row = (await session.execute(existing_stmt)).scalar_one_or_none()
 
+            # SSG 카드혜택가는 결제금액 7만원 이상에서만 적용 — 7만원 미만 단품은 카드할인을
+            # 못 받으므로 판매가(카드할인 전)를 원가로 한다. 7만원 이상이면 기존 카드혜택가(#430).
+            _ssg_sp = int(data.get("salePrice", 0) or 0)
+            _single_cost = (
+                _ssg_sp
+                if 0 < _ssg_sp < 70000
+                else (data.get("bestBenefitPrice") or None)
+            )
+
             product_data = {
                 "source_site": "SSG",
                 "site_product_id": item_id,
@@ -950,7 +964,7 @@ async def collect_by_url(
                 "brand": data.get("brand", ""),
                 "original_price": data.get("originalPrice", 0),
                 "sale_price": data.get("salePrice", 0),
-                "cost": data.get("bestBenefitPrice") or None,
+                "cost": _single_cost,
                 "images": data.get("images", []),
                 "detail_images": data.get("detailImages") or [],
                 "options": data.get("options", []),

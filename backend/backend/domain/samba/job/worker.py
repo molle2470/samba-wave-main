@@ -3699,11 +3699,16 @@ class JobWorker:
                         or _sale_price
                     )
                     _bbp = int(detail.get("bestAmt", 0) or 0)
-                    _cost = (
-                        (_bbp if _bbp > 0 else _sale_price)
-                        if _use_max_discount
-                        else _sale_price
-                    )
+                    # SSG 카드혜택가는 결제금액 7만원 이상에서만 적용 — 7만원 미만 단품은
+                    # 카드할인을 못 받으므로 판매가(카드할인 전)를 원가로 한다(#430).
+                    if _sale_price < 70000:
+                        _cost = _sale_price
+                    else:
+                        _cost = (
+                            (_bbp if _bbp > 0 else _sale_price)
+                            if _use_max_discount
+                            else _sale_price
+                        )
                     _is_free = detail.get("freeShipping", False) or it.get(
                         "free_shipping", False
                     )
@@ -3930,7 +3935,12 @@ class JobWorker:
                     _sp = int(_det.get("sellprc", 0) or 0)
                     _op = int(_det.get("originalPrice", 0) or _sp)
                     _bbp = int(_det.get("bestAmt", 0) or 0)
-                    _co = (_bbp if _bbp > 0 else _sp) if _use_max_discount else _sp
+                    # SSG 카드혜택가는 결제금액 7만원 이상에서만 적용 — 7만원 미만은
+                    # 판매가를 원가로(#430). (_sp 는 처리된 판매가 — 정상가 아님)
+                    if _sp < 70000:
+                        _co = _sp
+                    else:
+                        _co = (_bbp if _bbp > 0 else _sp) if _use_max_discount else _sp
                     _fs = _det.get("freeShipping", False)
                     if not _fs:
                         _co += int(_det.get("shippingFee", 0) or 0)
@@ -5792,8 +5802,13 @@ class JobWorker:
                     if len(_detail_imgs) > len(_search_imgs)
                     else _search_imgs
                 )
-            # 원가: 최대혜택가 옵션 시 bestBenefitPrice 우선
-            if _use_max_discount:
+            # 원가: 최대혜택가 옵션 시 bestBenefitPrice 우선.
+            # SSG 카드혜택가는 결제금액 7만원 이상에서만 적용 — 7만원 미만 단품은 카드할인을
+            # 못 받으므로 판매가(카드할인 전 표시가)를 원가로 한다(#430).
+            _ssg_list_price = int(detail.get("salePrice", 0) or 0) or sale_price
+            if site == "SSG" and 0 < _ssg_list_price < 70000:
+                cost = _ssg_list_price
+            elif _use_max_discount:
                 _bbp = int(detail.get("bestBenefitPrice", 0) or 0) or int(
                     item.get("best_benefit_price", 0) or 0
                 )
