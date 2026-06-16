@@ -1,4 +1,7 @@
-from backend.domain.samba.shipment.service import _validate_lottehome_policy_margin_price
+from backend.domain.samba.shipment.service import (
+    _validate_lottehome_policy_margin_price,
+    calc_market_price,
+)
 
 
 def test_lottehome_policy_margin_guard_blocks_below_policy_required_settlement():
@@ -36,6 +39,30 @@ def test_lottehome_margin_rate_is_commission_not_policy_margin():
     assert detail["expected_settlement"] == 68000
     assert detail["required_settlement"] == 72170
     assert detail["shortfall"] == 4170
+
+
+def test_lottehome_calc_market_price_uses_lottehome_margin_rate_as_fee():
+    sale_price = calc_market_price(
+        cost=67670,
+        policy_pricing={"marginRate": 6, "minMarginAmount": 4500, "shippingCost": 0},
+        market_type="lottehome",
+        market_policies={"롯데홈쇼핑": {"marginRate": 20}},
+        source_site="MUSINSA",
+        is_point_restricted=None,
+    )
+
+    assert sale_price == 90300
+    ok, detail = _validate_lottehome_policy_margin_price(
+        sale_price=sale_price,
+        cost=67670,
+        policy_pricing={"marginRate": 6, "minMarginAmount": 4500, "shippingCost": 0},
+        market_policy={"marginRate": 20},
+        source_site="MUSINSA",
+        is_point_restricted=None,
+    )
+    assert ok is True
+    assert detail["expected_settlement"] == 72240
+    assert detail["required_settlement"] == 72170
 
 
 def test_lottehome_policy_margin_guard_allows_policy_margin_price():

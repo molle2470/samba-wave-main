@@ -252,7 +252,9 @@ def calc_market_price(
     mp = (market_policies or {}).get(policy_key, {}) if policy_key else {}
     m_margin_rate = common_margin_rate
     m_shipping = mp.get("shippingCost") or common_shipping
-    m_fee = mp.get("feeRate") or common_fee
+    m_fee = mp.get("feeRate") or (
+        mp.get("marginRate") if market_type == "lottehome" else None
+    ) or common_fee
 
     margin_amt = round(cost * m_margin_rate / 100)
     if min_margin > 0 and margin_amt < min_margin:
@@ -281,6 +283,11 @@ def calc_market_price(
         calc_price = math.ceil(calc_price / (1 - m_fee / 100))
     if common_extra > 0:
         calc_price += common_extra
+    # 롯데홈은 위탁수수료 차감 후 정책마진 필요정산액을 하회하면 안 되므로
+    # 100원 단위 내림 대신 올림 처리한다. 내림 시 10~99원 차이로 가드가
+    # 자기 산출가를 차단할 수 있다.
+    if market_type == "lottehome":
+        return math.ceil(int(calc_price) / 100) * 100
     # 100원 단위 내림 (111 → 100)
     return (int(calc_price) // 100) * 100
 
